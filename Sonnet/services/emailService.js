@@ -420,10 +420,17 @@ This is an automated notification from Next Game Night.
    * @deprecated Use React Email templates instead (Phase 2, Plan 2)
    */
   generateGameSessionEmailTemplate(eventData) {
-    const { gameName, groupName, startDate, startTime, durationMinutes, location, comments, eventUrl, recipientName, rsvpUrls, ballotUrl, timezone } = eventData;
+    const { gameName, groupName, startDate, durationMinutes, location, comments, eventUrl, recipientName, rsvpUrls, ballotUrl, timezone } = eventData;
 
+    // Format date + times in the recipient's timezone, 12h with TZ abbreviation.
+    // Time formatting is centralized here (MAIL-04) — callers pass raw startDate
+    // + timezone instead of pre-formatted strings.
+    const start = new Date(startDate);
     const formattedDate = this.formatEventDate(startDate, timezone);
-    const endTime = this.calculateEndTime(startTime, durationMinutes);
+    const formattedStartTime = this.formatEventTime12h(start, timezone);
+    const formattedEndTime = durationMinutes
+      ? this.formatEventTime12h(new Date(start.getTime() + durationMinutes * 60000), timezone)
+      : '';
 
     // RSVP buttons HTML (table-based layout for email compatibility)
     const rsvpButtonsHtml = rsvpUrls ? `
@@ -513,7 +520,7 @@ RSVP:
         </div>
         <div class="event-detail-row">
           <span class="event-detail-label">Time:</span>
-          <span class="event-detail-value">${startTime} - ${endTime}</span>
+          <span class="event-detail-value">${formattedEndTime ? `${formattedStartTime} - ${formattedEndTime}` : formattedStartTime}</span>
         </div>
         ${durationMinutes ? `
         <div class="event-detail-row">
@@ -562,7 +569,7 @@ ${ballotPlainText}
 Event Details:
 - Game: ${gameName}
 - Date: ${formattedDate}
-- Time: ${startTime} - ${endTime}
+- Time: ${formattedEndTime ? `${formattedStartTime} - ${formattedEndTime}` : formattedStartTime}
 ${durationMinutes ? `- Duration: ${durationMinutes} minutes\n` : ''}
 ${location ? `- Location: ${location}\n` : ''}
 ${comments ? `- Notes: ${comments}\n` : ''}
@@ -628,17 +635,22 @@ You can manage your notification preferences in your profile: ${this.frontendUrl
    * @param {Object} params - Template parameters
    * @param {string} params.gameName - Name of the game
    * @param {string} params.groupName - Name of the group
-   * @param {string} params.newDate - New event date
-   * @param {string} params.newTime - New event start time
-   * @param {number} params.durationMinutes - Event duration
+   * @param {Date|string} params.newDate - New event start (Date or ISO string, UTC ok)
+   * @param {number} params.durationMinutes - Event duration in minutes (drives end time)
    * @param {string} params.eventUrl - URL to the event detail page
    * @param {string} params.recipientName - Recipient display name
    * @param {Object} [params.rsvpUrls] - Optional RSVP button URLs { yesUrl, maybeUrl, noUrl }
    * @returns {{html: string, text: string}} Email content
    */
-  generateDateChangeEmailTemplate({ gameName, groupName, newDate, newTime, durationMinutes, eventUrl, recipientName, rsvpUrls, timezone }) {
+  generateDateChangeEmailTemplate({ gameName, groupName, newDate, durationMinutes, eventUrl, recipientName, rsvpUrls, timezone }) {
+    // Time formatting centralized here (MAIL-04) — callers pass raw newDate
+    // + timezone instead of pre-formatted strings.
+    const start = new Date(newDate);
     const formattedDate = this.formatEventDate(newDate, timezone);
-    const endTime = this.calculateEndTime(newTime, durationMinutes);
+    const formattedStartTime = this.formatEventTime12h(start, timezone);
+    const formattedEndTime = durationMinutes
+      ? this.formatEventTime12h(new Date(start.getTime() + durationMinutes * 60000), timezone)
+      : '';
 
     // RSVP buttons HTML (reusable, same as game session template)
     const rsvpButtonsHtml = rsvpUrls ? `
@@ -708,7 +720,7 @@ RSVP (re-confirm your attendance):
         </div>
         <div class="event-detail-row">
           <span class="event-detail-label">Time:</span>
-          <span class="event-detail-value">${newTime} - ${endTime}</span>
+          <span class="event-detail-value">${formattedEndTime ? `${formattedStartTime} - ${formattedEndTime}` : formattedStartTime}</span>
         </div>
         ${durationMinutes ? `
         <div class="event-detail-row">
@@ -742,7 +754,7 @@ ${rsvpPlainText}
 New Event Details:
 - Game: ${gameName}
 - New Date: ${formattedDate}
-- Time: ${newTime} - ${endTime}
+- Time: ${formattedEndTime ? `${formattedStartTime} - ${formattedEndTime}` : formattedStartTime}
 ${durationMinutes ? `- Duration: ${durationMinutes} minutes\n` : ''}
 
 View event details: ${eventUrl}

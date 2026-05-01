@@ -1,7 +1,7 @@
 // routes/events.js
 const express = require('express');
 const crypto = require('crypto');
-const { Event, Game, User, Group, EventParticipation, UserGroup, EventRsvp, EventBallotOption } = require('../models');
+const { Event, Game, User, Group, EventParticipation, UserGroup, EventRsvp, EventBallotOption, EventAuditLog } = require('../models');
 const { Op } = require('sequelize');
 const router = express.Router();
 const auth0Service = require('../services/auth0Service');
@@ -10,6 +10,11 @@ const emailService = require('../services/emailService');
 const icsService = require('../services/icsService');
 const notificationService = require('../services/notificationService');
 const { generateRsvpUrl } = require('./rsvp');
+
+// MAIL-05 lifecycle constant: cancellation emails fire within 15 minutes
+// after start_time (covers the "oops, no one showed" case). After that
+// window, deletes are silent (audit log still written).
+const FIFTEEN_MIN_MS = 15 * 60 * 1000;
 
 // Helper function to format event with custom participants
 const formatEventWithCustomParticipants = (event) => {
@@ -503,15 +508,8 @@ router.post('/', validateEventCreate, async (req, res) => {
               const recipientTz = user.timezone || 'UTC';
               const eventDate = new Date(start_date);
 
-              // Format start time for email templates (recipient's timezone)
-              const startTime = eventDate.toLocaleTimeString('en-US', {
-                hour: '2-digit',
-                minute: '2-digit',
-                hour12: false,
-                timeZone: recipientTz,
-              });
-
-              // Format dateTime for SMS templates (recipient's timezone)
+              // Format dateTime for SMS templates (recipient's timezone, 12h with TZ).
+              // Email template formats its own time internally via formatEventTime12h (MAIL-04).
               const formattedDateTime = eventDate.toLocaleDateString('en-US', {
                 weekday: 'short',
                 month: 'short',
@@ -537,7 +535,6 @@ router.post('/', validateEventCreate, async (req, res) => {
                   gameName: game?.name || 'Game Night',
                   groupName: group.name,
                   startDate: start_date,
-                  startTime: startTime,
                   durationMinutes: duration_minutes || 60,
                   location: null,
                   comments: comments || null,
@@ -684,11 +681,16 @@ router.put('/:id', validateUUID('id'), validateEventUpdate, async (req, res) => 
     // Format event with custom participants
     const formattedEvent = formatEventWithCustomParticipants(updatedEvent);
 
-    // Send date-change notification if start_date changed and event is in the future
+    // MAIL-05 update lifecycle gate: stop firing update emails AT old start_time
+    // (no grace window). Use the OLD start time as the cutoff — once an event has
+    // started, recipients are en route or on-site; emailing them about a venue
+    // change post-start is worse than silent.
     const dateChanged = start_date && String(oldStartDate) !== String(start_date);
-    const isFutureEvent = start_date && new Date(start_date) > new Date();
+    const updateNowMs = Date.now();
+    const oldStartMs = oldStartDate ? new Date(oldStartDate).getTime() : 0;
+    const updateEmailsAllowed = oldStartMs > 0 && updateNowMs < oldStartMs;
 
-    if (dateChanged && isFutureEvent) {
+    if (dateChanged && updateEmailsAllowed) {
       try {
         // Find members who RSVPed yes or maybe
         const rsvpMembers = await EventRsvp.findAll({
@@ -734,12 +736,8 @@ router.put('/:id', validateUUID('id'), validateEventUpdate, async (req, res) => 
             const recipientTz = user.timezone || 'UTC';
             const newEventDate = new Date(start_date);
 
-            const newTime = newEventDate.toLocaleTimeString('en-US', {
-              hour: '2-digit', minute: '2-digit', hour12: false,
-              timeZone: recipientTz,
-            });
-
-            // Format dateTime for SMS templates (recipient's timezone)
+            // Format dateTime for SMS templates (recipient's timezone, 12h with TZ).
+            // Email template formats its own time internally via formatEventTime12h (MAIL-04).
             const formattedNewDateTime = newEventDate.toLocaleDateString('en-US', {
               weekday: 'short',
               month: 'short',
@@ -764,7 +762,6 @@ router.put('/:id', validateUUID('id'), validateEventUpdate, async (req, res) => 
                 gameName: game?.name || 'Game Session',
                 groupName: group?.name || '',
                 newDate: start_date,
-                newTime,
                 durationMinutes: duration_minutes || event.duration_minutes || 60,
                 eventUrl,
                 recipientName: user.username,
@@ -1026,103 +1023,143 @@ router.delete('/:id', async (req, res) => {
       return res.status(403).json({ error: 'Only group owners and admins can delete events' });
     }
 
-    // Send cancellation notifications to members who RSVPed yes or maybe (before deleting data)
-    try {
-      const rsvpMembers = await EventRsvp.findAll({
-        where: {
-          event_id: event.id,
-          status: { [Op.in]: ['yes', 'maybe'] },
-        },
-        include: [{
-          model: User,
-          attributes: ['id', 'user_id', 'username', 'email', 'email_notifications_enabled', 'sms_enabled', 'phone', 'phone_verified', 'notification_preferences'],
-        }],
-      });
+    // MAIL-05 cancellation lifecycle gate: cancellation emails fire only when
+    // now < start_time + 15min (covers the "oops, no one showed" case).
+    // After that window, the delete is silent (no email, no in-app notice).
+    // Audit log is written REGARDLESS of timing — see below.
+    const deleteNowMs = Date.now();
+    const startMs = event.start_date ? new Date(event.start_date).getTime() : 0;
+    const cancellationEmailsAllowed = startMs === 0 || deleteNowMs < startMs + FIFTEEN_MIN_MS;
+    const wasAfterStart = startMs > 0 && deleteNowMs >= startMs;
+    const wasWithin15MinGrace = wasAfterStart && deleteNowMs < startMs + FIFTEEN_MIN_MS;
+    const suppressedEmail = !cancellationEmailsAllowed;
 
-      const rsvpUsers = rsvpMembers.filter(r => r.User).map(r => r.User);
+    if (cancellationEmailsAllowed) {
+      // Send cancellation notifications to members who RSVPed yes or maybe (before deleting data)
+      try {
+        const rsvpMembers = await EventRsvp.findAll({
+          where: {
+            event_id: event.id,
+            status: { [Op.in]: ['yes', 'maybe'] },
+          },
+          include: [{
+            model: User,
+            attributes: ['id', 'user_id', 'username', 'email', 'email_notifications_enabled', 'sms_enabled', 'phone', 'phone_verified', 'notification_preferences'],
+          }],
+        });
 
-      // Email recipients: RSVP'd users with valid email (matches current behavior)
-      const emailCancelRecipients = rsvpUsers.filter(user => {
-        const hasValidEmail = user.email && !user.email.includes('@auth0.local') && !user.email.includes('@auth0');
-        return hasValidEmail && user.email_notifications_enabled !== false;
-      });
+        const rsvpUsers = rsvpMembers.filter(r => r.User).map(r => r.User);
 
-      // SMS recipients: RSVP'd users with SMS enabled
-      const smsCancelRecipients = rsvpUsers.filter(user => user.sms_enabled && user.phone);
+        // Email recipients: RSVP'd users with valid email (matches current behavior)
+        const emailCancelRecipients = rsvpUsers.filter(user => {
+          const hasValidEmail = user.email && !user.email.includes('@auth0.local') && !user.email.includes('@auth0');
+          return hasValidEmail && user.email_notifications_enabled !== false;
+        });
 
-      // Merge (same dedup pattern)
-      const cancelRecipientMap = new Map();
-      emailCancelRecipients.forEach(u => cancelRecipientMap.set(u.user_id, { ...u.dataValues, _emailEligible: true }));
-      smsCancelRecipients.forEach(u => {
-        if (cancelRecipientMap.has(u.user_id)) {
-          cancelRecipientMap.get(u.user_id)._smsEligible = true;
-        } else {
-          cancelRecipientMap.set(u.user_id, { ...u.dataValues, _smsEligible: true });
-        }
-      });
-      const cancellationRecipients = Array.from(cancelRecipientMap.values());
+        // SMS recipients: RSVP'd users with SMS enabled
+        const smsCancelRecipients = rsvpUsers.filter(user => user.sms_enabled && user.phone);
 
-      if (cancellationRecipients.length > 0) {
-        const frontendUrl = process.env.FRONTEND_URL || process.env.AUTH0_BASE_URL || 'http://localhost:3000';
-        const game = await Game.findByPk(event.game_id, { attributes: ['name'] });
-        const group = await Group.findByPk(event.group_id, { attributes: ['id', 'name'] });
-        const groupUrl = `${frontendUrl}/groupHomePage?id=${group?.id || event.group_id}`;
+        // Merge (same dedup pattern)
+        const cancelRecipientMap = new Map();
+        emailCancelRecipients.forEach(u => cancelRecipientMap.set(u.user_id, { ...u.dataValues, _emailEligible: true }));
+        smsCancelRecipients.forEach(u => {
+          if (cancelRecipientMap.has(u.user_id)) {
+            cancelRecipientMap.get(u.user_id)._smsEligible = true;
+          } else {
+            cancelRecipientMap.set(u.user_id, { ...u.dataValues, _smsEligible: true });
+          }
+        });
+        const cancellationRecipients = Array.from(cancelRecipientMap.values());
 
-        const notifyPromises = notificationService.sendToMany(cancellationRecipients, 'event_cancelled', (user) => {
-          const recipientTz = user.timezone || 'UTC';
-          const cancelDate = new Date(event.start_date);
+        if (cancellationRecipients.length > 0) {
+          const frontendUrl = process.env.FRONTEND_URL || process.env.AUTH0_BASE_URL || 'http://localhost:3000';
+          const game = await Game.findByPk(event.game_id, { attributes: ['name'] });
+          const group = await Group.findByPk(event.group_id, { attributes: ['id', 'name'] });
+          const groupUrl = `${frontendUrl}/groupHomePage?id=${group?.id || event.group_id}`;
 
-          // Format dateTime for SMS templates (recipient's timezone)
-          const formattedCancelDateTime = cancelDate.toLocaleDateString('en-US', {
-            weekday: 'short',
-            month: 'short',
-            day: 'numeric',
-            hour: '2-digit',
-            minute: '2-digit',
-            hour12: true,
-            timeZone: recipientTz,
-            timeZoneName: 'short',
-          });
+          const notifyPromises = notificationService.sendToMany(cancellationRecipients, 'event_cancelled', (user) => {
+            const recipientTz = user.timezone || 'UTC';
+            const cancelDate = new Date(event.start_date);
 
-          // emailParams: ONLY set for email-eligible users
-          let emailParams = null;
-          if (user._emailEligible && user.email) {
-            const { html, text } = emailService.generateCancellationEmailTemplate({
-              gameName: game?.name || 'Game Session',
-              groupName: group?.name || '',
-              eventDate: event.start_date,
-              recipientName: user.username,
-              groupUrl,
-              timezone: recipientTz,
+            // Format dateTime for SMS templates (recipient's timezone, 12h with TZ).
+            const formattedCancelDateTime = cancelDate.toLocaleDateString('en-US', {
+              weekday: 'short',
+              month: 'short',
+              day: 'numeric',
+              hour: '2-digit',
+              minute: '2-digit',
+              hour12: true,
+              timeZone: recipientTz,
+              timeZoneName: 'short',
             });
 
-            emailParams = {
-              to: user.email,
-              subject: `Cancelled: ${game?.name || 'Game Session'} - ${group?.name || ''}`,
-              html,
-              text,
-              groupName: group?.name || ''
-            };
-          }
+            // emailParams: ONLY set for email-eligible users
+            let emailParams = null;
+            if (user._emailEligible && user.email) {
+              const { html, text } = emailService.generateCancellationEmailTemplate({
+                gameName: game?.name || 'Game Session',
+                groupName: group?.name || '',
+                eventDate: event.start_date,
+                recipientName: user.username,
+                groupUrl,
+                timezone: recipientTz,
+              });
 
-          return {
-            emailParams,
-            data: {
-              eventName: game?.name || 'Game Night',
-              groupName: group?.name || '',
-              dateTime: formattedCancelDateTime,
-              rsvpPrompt: false  // cancellation SMS does NOT include RSVP prompt
+              emailParams = {
+                to: user.email,
+                subject: `Cancelled: ${game?.name || 'Game Session'} - ${group?.name || ''}`,
+                html,
+                text,
+                groupName: group?.name || ''
+              };
             }
-          };
-        });
 
-        // Fire-and-forget: don't block deletion on notification sends
-        Promise.allSettled([notifyPromises]).catch(err => {
-          console.error('Error sending cancellation notifications (non-fatal):', err.message);
-        });
+            return {
+              emailParams,
+              data: {
+                eventName: game?.name || 'Game Night',
+                groupName: group?.name || '',
+                dateTime: formattedCancelDateTime,
+                rsvpPrompt: false  // cancellation SMS does NOT include RSVP prompt
+              }
+            };
+          });
+
+          // Fire-and-forget: don't block deletion on notification sends
+          Promise.allSettled([notifyPromises]).catch(err => {
+            console.error('Error sending cancellation notifications (non-fatal):', err.message);
+          });
+        }
+      } catch (cancelNotifyError) {
+        console.error('Error sending cancellation notifications (non-fatal):', cancelNotifyError.message);
       }
-    } catch (cancelNotifyError) {
-      console.error('Error sending cancellation notifications (non-fatal):', cancelNotifyError.message);
+    }
+
+    // MAIL-05 audit log: write a row for EVERY delete, regardless of timing.
+    // This is OUTSIDE the cancellationEmailsAllowed guard intentionally —
+    // silent late-deletes still need to be answerable by support.
+    // Non-fatal: never block the delete on audit log failure.
+    try {
+      await EventAuditLog.create({
+        event_id: event.id,
+        group_id: event.group_id,
+        actor_user_id: userId,
+        action: 'delete',
+        was_after_start: wasAfterStart,
+        was_within_15min_grace: wasWithin15MinGrace,
+        suppressed_email: suppressedEmail,
+        event_snapshot: {
+          id: event.id,
+          group_id: event.group_id,
+          game_id: event.game_id,
+          start_date: event.start_date,
+          duration_minutes: event.duration_minutes,
+          location: event.location || null,
+          comments: event.comments || null,
+        },
+      });
+    } catch (auditErr) {
+      console.error('[events:delete] audit log write failed (non-fatal):', auditErr.message);
     }
 
     // Delete RSVPs for this event
