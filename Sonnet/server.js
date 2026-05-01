@@ -445,13 +445,35 @@ const startServer = async () => {
       if (process.env.NODE_ENV === 'production' || process.env.ENABLE_WORKERS === 'true') {
         try {
           const { promptWorker, deadlineWorker, reminderWorker } = require('./workers');
-          const { syncPromptSchedulesToQueue } = require('./schedulers/promptScheduler');
-          syncPromptSchedulesToQueue().catch(err => console.error('Failed to sync prompt schedules:', err.message));
+          // Use the telemetry wrapper so the prompt-schedule sync at boot lands
+          // in SchedulerRun and is visible to the anomaly sweep.
+          const { syncPromptSchedulesWithTelemetry } = require('./schedulers/promptScheduler');
+          syncPromptSchedulesWithTelemetry().catch(err => console.error('Failed to sync prompt schedules:', err.message));
         } catch (err) {
           console.error('BullMQ workers failed to start:', err.message, err.stack);
         }
       } else {
         console.log('BullMQ workers disabled (set ENABLE_WORKERS=true to enable)');
+      }
+
+      // Scheduler anomaly sweep (every 30 min, production + ENABLE_SCHEDULER only).
+      // Sentry-pages when historically-non-zero jobs go silent. See
+      // services/schedulerHealthService.js for the full criteria.
+      if (process.env.NODE_ENV === 'production' || process.env.ENABLE_SCHEDULER === 'true') {
+        try {
+          const cron = require('node-cron');
+          const { runAnomalySweep } = require('./services/schedulerHealthService');
+          cron.schedule('*/30 * * * *', async () => {
+            try {
+              await runAnomalySweep();
+            } catch (err) {
+              console.error('Anomaly sweep error:', err.message);
+            }
+          }, { timezone: 'UTC' });
+          console.log('Scheduler anomaly sweep started (every 30 min)');
+        } catch (err) {
+          console.error('Anomaly sweep failed to start:', err.message);
+        }
       }
 
       // Mount Bull Board dashboard (only if workers are enabled)

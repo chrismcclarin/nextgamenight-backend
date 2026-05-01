@@ -4,6 +4,7 @@ const cron = require('node-cron');
 const { Event, EventRsvp, User, Game, Group } = require('../models');
 const { Op } = require('sequelize');
 const smsService = require('../services/smsService');
+const { recordRun } = require('../services/schedulerHealthService');
 
 // Check interval - default every 5 minutes, configurable via env
 const REMINDER_CHECK_INTERVAL = process.env.REMINDER_CHECK_INTERVAL || '*/5 * * * *';
@@ -89,6 +90,7 @@ async function processUpcomingReminders() {
   });
 
   let sentCount = 0;
+  let skippedCount = 0;
 
   for (const event of upcomingEvents) {
     const eventName = event.Game ? event.Game.name : 'Game Night';
@@ -106,11 +108,13 @@ async function processUpcomingReminders() {
       // Check if event is within this user's reminder window
       const timeDiffMs = event.start_date.getTime() - now.getTime();
       if (timeDiffMs > windowHours * 3600000) {
+        skippedCount++;
         continue; // Event is outside this user's window, skip
       }
 
       // Only send if SMS service is configured
       if (!smsService.isConfigured()) {
+        skippedCount++;
         continue;
       }
 
@@ -133,16 +137,20 @@ async function processUpcomingReminders() {
         if (result.success) {
           await rsvp.update({ reminder_sent_at: new Date() });
           sentCount++;
+        } else {
+          // result.success === false -- leave reminder_sent_at null for retry
+          skippedCount++;
         }
-        // If result.success === false, leave reminder_sent_at null for retry
       } catch (error) {
         // Log but don't throw -- leave reminder_sent_at null for retry
         console.error(`[reminderScheduler] Failed to send reminder to ${user.user_id}:`, error.message);
+        skippedCount++;
       }
     }
   }
 
   console.log(`[reminderScheduler] Sent ${sentCount} reminders for ${upcomingEvents.length} events`);
+  return { sent: sentCount, skipped: skippedCount };
 }
 
 /**
@@ -152,8 +160,11 @@ async function processUpcomingReminders() {
 const reminderJob = cron.schedule(REMINDER_CHECK_INTERVAL, async () => {
   console.log(`[${new Date().toISOString()}] Running reminder check...`);
   try {
-    await processUpcomingReminders();
+    // recordRun persists telemetry + sends Sentry events on throw, then re-throws
+    await recordRun('reminder', () => processUpcomingReminders());
   } catch (error) {
+    // recordRun already logged + reported to Sentry; preserve scheduler-level
+    // log line so existing operational tooling still sees it.
     console.error('Reminder scheduler error:', error);
   }
 }, {

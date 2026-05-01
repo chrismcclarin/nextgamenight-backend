@@ -3,6 +3,7 @@
 const { promptQueue } = require('../queues');
 const { GroupPromptSettings } = require('../models');
 const { Op } = require('sequelize');
+const { recordRun } = require('../services/schedulerHealthService');
 
 /**
  * Convert day of week (0-6, 0=Sunday) and time (HH:MM:SS) to cron pattern
@@ -111,8 +112,22 @@ async function removePromptScheduler(settingsId) {
   }
 }
 
+/**
+ * Telemetry-wrapped variant used at server startup. Maps the underlying
+ * { synced, skipped, total } shape to the { sent, skipped } contract that
+ * schedulerHealthService.recordRun expects, so prompt_sync runs land in the
+ * same SchedulerRun feed as the cron-based jobs and can be swept for anomalies.
+ */
+async function syncPromptSchedulesWithTelemetry() {
+  return recordRun('prompt_sync', async () => {
+    const { synced, skipped } = await syncPromptSchedulesToQueue();
+    return { sent: synced, skipped };
+  });
+}
+
 module.exports = {
   syncPromptSchedulesToQueue,
+  syncPromptSchedulesWithTelemetry,
   removePromptScheduler,
   buildCronPattern // Export for testing
 };
