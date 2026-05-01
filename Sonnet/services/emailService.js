@@ -851,6 +851,204 @@ You can manage your notification preferences in your profile: ${this.frontendUrl
 
     return { html, text };
   }
+
+  // ============================================
+  // Game-Join (QR) Confirmation Email — MAIL-03
+  // ============================================
+
+  /**
+   * Format a time-of-day string in the recipient's timezone, 12h format.
+   * Example: "6:00 PM MDT"
+   * @param {Date|string} date
+   * @param {string} [timezone] - IANA timezone
+   * @returns {string}
+   */
+  formatEventTime12h(date, timezone) {
+    const d = new Date(date);
+    const opts = {
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true,
+    };
+    if (timezone) {
+      opts.timeZone = timezone;
+      opts.timeZoneName = 'short';
+    }
+    return d.toLocaleTimeString('en-US', opts);
+  }
+
+  /**
+   * Generate a receipt-style confirmation email for QR game-join.
+   * Single template for all recipients (returning + brand-new users).
+   * @param {Object} params
+   * @param {string} params.gameName
+   * @param {string} params.groupName
+   * @param {Date|string} params.eventDate - Start (UTC)
+   * @param {number} [params.durationMinutes]
+   * @param {string} [params.location]
+   * @param {string} [params.hostName]
+   * @param {string} [params.recipientName]
+   * @param {string} params.eventUrl - Auth-required deep link to /gameDetail
+   * @param {string} params.googleCalendarUrl
+   * @param {string} [params.timezone] - IANA timezone string for display
+   * @returns {{html: string, text: string, subject: string}}
+   */
+  generateGameJoinConfirmationTemplate({
+    gameName,
+    groupName,
+    eventDate,
+    durationMinutes,
+    location,
+    hostName,
+    recipientName,
+    eventUrl,
+    googleCalendarUrl,
+    timezone,
+  }) {
+    const formattedDate = this.formatEventDate(eventDate, timezone);
+    const formattedTime = this.formatEventTime12h(eventDate, timezone);
+    const subject = `You're in: ${gameName} with ${groupName}`;
+    const greetingName = recipientName || 'there';
+    const host = hostName || groupName || 'your group';
+
+    const html = `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+    .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+    .header { background-color: #4F46E5; color: white; padding: 20px; text-align: center; border-radius: 5px 5px 0 0; }
+    .content { background-color: #f9fafb; padding: 30px; border-radius: 0 0 5px 5px; }
+    .event-details { background-color: white; padding: 20px; margin: 20px 0; border-radius: 5px; border-left: 4px solid #4F46E5; }
+    .event-detail-row { margin: 10px 0; }
+    .event-detail-label { font-weight: bold; color: #6B7280; }
+    .event-detail-value { color: #111827; margin-left: 10px; }
+    .footer { text-align: center; color: #6B7280; font-size: 12px; margin-top: 30px; padding-top: 20px; border-top: 1px solid #E5E7EB; }
+    .footer a { color: #4F46E5; text-decoration: none; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>You're in!</h1>
+    </div>
+    <div class="content">
+      <p>Hi ${greetingName}, you've joined <strong>${gameName}</strong> with <strong>${groupName}</strong>. Here are the details:</p>
+
+      <div class="event-details">
+        <div class="event-detail-row">
+          <span class="event-detail-label">Game:</span>
+          <span class="event-detail-value">${gameName}</span>
+        </div>
+        <div class="event-detail-row">
+          <span class="event-detail-label">Date:</span>
+          <span class="event-detail-value">${formattedDate}</span>
+        </div>
+        <div class="event-detail-row">
+          <span class="event-detail-label">Time:</span>
+          <span class="event-detail-value">${formattedTime}</span>
+        </div>
+        ${durationMinutes ? `
+        <div class="event-detail-row">
+          <span class="event-detail-label">Duration:</span>
+          <span class="event-detail-value">${durationMinutes} minutes</span>
+        </div>
+        ` : ''}
+        <div class="event-detail-row">
+          <span class="event-detail-label">Host:</span>
+          <span class="event-detail-value">${host}</span>
+        </div>
+        ${location ? `
+        <div class="event-detail-row">
+          <span class="event-detail-label">Location:</span>
+          <span class="event-detail-value">${location}</span>
+        </div>
+        ` : ''}
+      </div>
+
+      <div style="text-align: center; margin: 24px 0 8px;">
+        <table role="presentation" cellspacing="0" cellpadding="0" border="0" align="center">
+          <tr>
+            <td style="padding: 0 6px;">
+              <a href="${eventUrl}" style="display: inline-block; padding: 12px 24px; background-color: #4F46E5; color: white; text-decoration: none; border-radius: 5px; font-weight: bold; font-size: 14px;">View Event</a>
+            </td>
+            <td style="padding: 0 6px;">
+              <a href="${googleCalendarUrl}" style="display: inline-block; padding: 12px 24px; background-color: white; color: #4F46E5; text-decoration: none; border: 2px solid #4F46E5; border-radius: 5px; font-weight: bold; font-size: 14px;">Add to Google Calendar</a>
+            </td>
+          </tr>
+        </table>
+      </div>
+
+      <p style="font-size: 13px; color: #6B7280; text-align: center; margin: 8px 0 0;">Or open the attached .ics file to add this to any calendar app.</p>
+
+      <div class="footer">
+        <p><strong>What is Nextgamenight?</strong> A simple way for game groups to plan and play together. <a href="${this.frontendUrl}/about">Learn more</a>.</p>
+        <p>This is an automated notification from NextGameNight.</p>
+        <p>You can manage your notification preferences in your <a href="${this.frontendUrl}/userProfile">profile settings</a>.</p>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
+    `.trim();
+
+    const text = `
+You're in!
+
+Hi ${greetingName}, you've joined ${gameName} with ${groupName}. Here are the details:
+
+- Game: ${gameName}
+- Date: ${formattedDate}
+- Time: ${formattedTime}
+${durationMinutes ? `- Duration: ${durationMinutes} minutes\n` : ''}- Host: ${host}
+${location ? `- Location: ${location}\n` : ''}
+View event: ${eventUrl}
+Add to Google Calendar: ${googleCalendarUrl}
+
+Or open the attached .ics file to add this to any calendar app.
+
+---
+What is Nextgamenight? A simple way for game groups to plan and play together. Learn more: ${this.frontendUrl}/about
+
+This is an automated notification from NextGameNight.
+You can manage your notification preferences in your profile: ${this.frontendUrl}/userProfile
+    `.trim();
+
+    return { html, text, subject };
+  }
+
+  /**
+   * Send a QR game-join confirmation email.
+   * Caller is responsible for guarding on already_joined and the master
+   * email_notifications_enabled toggle.
+   * @param {string} recipientEmail
+   * @param {Object} params - Same shape as generateGameJoinConfirmationTemplate plus icsAttachmentBase64
+   * @param {string} [params.icsAttachmentBase64] - Base64-encoded ICS string
+   * @returns {Promise<{success: boolean, id?: string, error?: string}>}
+   */
+  async sendGameJoinConfirmation(recipientEmail, params) {
+    const { html, text, subject } = this.generateGameJoinConfirmationTemplate(params);
+
+    const attachments = params.icsAttachmentBase64
+      ? [{
+          filename: 'event.ics',
+          content: params.icsAttachmentBase64, // base64 string per Resend attachment API
+          contentType: 'text/calendar',
+        }]
+      : [];
+
+    return this.send({
+      to: recipientEmail,
+      subject,
+      html,
+      text,
+      groupName: params.groupName, // produces "${groupName} via NextGameNight" — existing convention
+      emailType: 'game_join_confirmation',
+      attachments,
+    });
+  }
 }
 
 module.exports = new EmailService();
