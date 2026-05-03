@@ -225,27 +225,38 @@ class AvailabilityService {
   }
 
   /**
-   * Check if a time slot matches a specific override
+   * Check if a time slot matches a specific override.
+   *
+   * Overrides are stored in the user's local time:
+   *   pattern_data: { date: 'YYYY-MM-DD', startTime: 'HH:MM' (local), ... }
+   * Slots are generated in UTC (slot.date / slot.startTime are UTC). Convert
+   * the slot to the user's local timezone before comparing -- otherwise the
+   * matcher marks the wrong UTC slot (e.g. 14:00 UTC instead of 14:00 local).
+   * Mirrors matchesRecurringPattern's slotToLocal flow.
    */
-  matchesSpecificOverride(slot, override) {
-    const slotDate = new Date(slot.date);
+  matchesSpecificOverride(slot, override, timezone) {
+    const local = (timezone && timezone !== 'UTC') ? this.slotToLocal(slot, timezone) : null;
+    const matchDate = local ? local.date : slot.date;
+    const matchTime = local ? local.startTime : slot.startTime;
+
+    const slotDate = new Date(matchDate);
     const overrideDate = new Date(override.pattern_data.date);
-    
-    // Check if dates match
+
+    // Check if dates match (in the user's local timezone)
     if (slotDate.toISOString().split('T')[0] !== overrideDate.toISOString().split('T')[0]) {
       return false;
     }
-    
+
     // Check if date is within override's date range
     if (!this.isDateInRange(slotDate, override.start_date, override.end_date)) {
       return false;
     }
-    
-    // Check if time slot is within override's time range
-    const slotStart = this.timeToMinutes(slot.startTime);
+
+    // Check if time slot is within override's time range (both in local minutes-since-midnight)
+    const slotStart = this.timeToMinutes(matchTime);
     const overrideStart = this.timeToMinutes(override.pattern_data.startTime);
     const overrideEnd = this.timeToMinutes(override.pattern_data.endTime);
-    
+
     return slotStart >= overrideStart && slotStart < overrideEnd;
   }
 
@@ -309,12 +320,14 @@ class AvailabilityService {
         });
       }
 
-      // Apply specific overrides (these take precedence over recurring patterns)
+      // Apply specific overrides (these take precedence over recurring patterns).
+      // Pass the user's timezone so the matcher can compare in local time --
+      // overrides are stored in local time but slots are generated in UTC.
       const specificOverrides = manualPatterns.filter(p => p.type === 'specific_override');
       for (const override of specificOverrides) {
         allSlots.forEach(slot => {
           const key = `${slot.date}_${slot.startTime}`;
-          if (this.matchesSpecificOverride(slot, override)) {
+          if (this.matchesSpecificOverride(slot, override, timezone)) {
             const slotData = availabilityMap.get(key);
             if (slotData) {
               slotData.isAvailable = override.is_available !== false; // Default to true if not explicitly false
