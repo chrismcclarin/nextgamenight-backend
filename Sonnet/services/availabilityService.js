@@ -289,11 +289,19 @@ class AvailabilityService {
         manualPatterns = [];
       }
 
-      // Determine initial availability state
-      // If user has recurring patterns, start with all slots unavailable
-      // Otherwise, default to available (user is available unless they say otherwise)
-      const hasRecurringPatterns = manualPatterns.some(p => p.type === 'recurring_pattern');
-      const defaultAvailability = !hasRecurringPatterns; // true if no patterns, false if patterns exist
+      // Determine initial availability state.
+      // If the user has ANY availability data (recurring patterns OR specific
+      // overrides), start with all slots UNAVAILABLE -- they've spoken, so
+      // only what they declared is true. Default-to-available is reserved for
+      // users with ZERO availability data ("we have no info, assume open").
+      //
+      // Previously this only checked for recurring_pattern, so an override-
+      // only user (e.g. two 2-hour overrides on a Tuesday) would default the
+      // entire week to AVAILABLE and the positive overrides would become
+      // no-ops -- the heatmap rendered fully green. Aligns with CONTEXT D-01:
+      // "data-less" = no schedule AND no override.
+      const hasAnyPatterns = manualPatterns.length > 0;
+      const defaultAvailability = !hasAnyPatterns; // true only when user has zero availability data
       
       // Initialize all slots
       const availabilityMap = new Map();

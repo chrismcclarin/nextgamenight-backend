@@ -825,4 +825,55 @@ describe('availabilityService.getGroupHeatmap -- specific_override survival (HEA
     expect(slot).toBeDefined();
     expect(slot.availableMembers.map(m => m.user_id)).toContain(userT.user_id);
   });
+
+  // -------------------------------------------------------------------------
+  // Variant 5 (manual-test regression discovered after Task 2 commit):
+  // User has ONLY specific overrides (no recurring patterns). The previous
+  // logic in calculateUserAvailability checked `manualPatterns.some(p => p.type
+  // === 'recurring_pattern')` to decide defaultAvailability. With overrides-
+  // only, no recurring pattern was found -> defaultAvailability = true ->
+  // EVERY slot started as available -> positive overrides became no-ops ->
+  // heatmap rendered fully green even though the user only flagged 14:00-16:00
+  // and 22:00-23:00.
+  //
+  // Correct semantic: any availability data (recurring OR override) means
+  // "user has spoken; only what they declared is true". Default-to-available
+  // is reserved for users with ZERO availability data ("we have no info").
+  //
+  // CONTEXT D-07 widening: this lives in calculateUserAvailability, the
+  // shared aggregation code already touched by HEAT-02, so it's in scope.
+  // -------------------------------------------------------------------------
+  it('override-only user: slots OUTSIDE override window are NOT available', async () => {
+    setupOverrideOnlyUser({
+      overrides: [
+        // Only two specific overrides, NO recurring patterns
+        buildOverrideRow(overrideTuesday, '14:00', '16:00', true),
+        buildOverrideRow(overrideTuesday, '22:00', '23:00', true),
+      ],
+    });
+
+    const result = await availabilityService.getGroupHeatmap('test-group-id', weekMonday, denverTz);
+
+    // Slot INSIDE first override window: Tue local 14:00 MDT = UTC 20:00 on 2026-04-21
+    const insideFirstWindow = result.slots.find(s => s.date === overrideTuesday && s.hour === 20);
+    expect(insideFirstWindow).toBeDefined();
+    expect(insideFirstWindow.availableMembers.map(m => m.user_id)).toContain(userT.user_id);
+
+    // Slot INSIDE second override window: Tue local 22:00 MDT = UTC 04:00 on 2026-04-22
+    const insideSecondWindow = result.slots.find(s => s.date === '2026-04-22' && s.hour === 4);
+    expect(insideSecondWindow).toBeDefined();
+    expect(insideSecondWindow.availableMembers.map(m => m.user_id)).toContain(userT.user_id);
+
+    // Slot OUTSIDE any override: Tue local 10:00 MDT = UTC 16:00 on 2026-04-21.
+    // BUG: this currently shows the user available because defaultAvailability=true
+    // when only specific_override patterns exist.
+    const outsideOverride = result.slots.find(s => s.date === overrideTuesday && s.hour === 16);
+    expect(outsideOverride).toBeDefined();
+    expect(outsideOverride.availableMembers.map(m => m.user_id)).not.toContain(userT.user_id);
+
+    // Wednesday (no override at all): Wed local 14:00 MDT = UTC 20:00 on 2026-04-22
+    const wednesdayMidday = result.slots.find(s => s.date === '2026-04-22' && s.hour === 20);
+    expect(wednesdayMidday).toBeDefined();
+    expect(wednesdayMidday.availableMembers.map(m => m.user_id)).not.toContain(userT.user_id);
+  });
 });
