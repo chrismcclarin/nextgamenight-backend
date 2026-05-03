@@ -407,8 +407,9 @@ class AvailabilityService {
   async calculateGroupOverlaps(groupId, startDate, endDate, timezone = 'UTC') {
     try {
       const { Group, UserGroup } = require('../models');
-      
+
       // Get all group members
+      const __tCO_findGroup = Date.now();
       let group;
       try {
         group = await Group.findByPk(groupId, {
@@ -422,6 +423,7 @@ class AvailabilityService {
         console.error('Database error fetching group:', dbError);
         throw new Error(`Database error: ${dbError.message}`);
       }
+      console.log(`[heatmap profile]   CO.Group.findByPk: ${Date.now() - __tCO_findGroup}ms`);
 
       if (!group) {
         throw new Error('Group not found');
@@ -433,6 +435,7 @@ class AvailabilityService {
       }
 
       // Calculate availability for each member using their stored timezone
+      const __tCO_userAvail = Date.now();
       const memberAvailabilities = await Promise.all(
         members.map(member =>
           this.calculateUserAvailability(member, startDate, endDate, member.timezone || 'UTC')
@@ -443,11 +446,15 @@ class AvailabilityService {
             })
         )
       );
+      console.log(`[heatmap profile]   CO.calculateUserAvailability x${members.length}: ${Date.now() - __tCO_userAvail}ms`);
 
       // Generate all time slots
+      const __tCO_genSlots = Date.now();
       const allSlots = this.generateTimeSlots(startDate, endDate, timezone);
-      
+      console.log(`[heatmap profile]   CO.generateTimeSlots (${allSlots.length} slots): ${Date.now() - __tCO_genSlots}ms`);
+
       // Calculate overlaps
+      const __tCO_overlap = Date.now();
       const overlaps = allSlots.map(slot => {
         const key = `${slot.date}_${slot.startTime}`;
         const availableMembers = [];
@@ -476,6 +483,7 @@ class AvailabilityService {
           unavailableCount: members.length - availableMembers.length,
         };
       });
+      console.log(`[heatmap profile]   CO.overlap-loop (${overlaps.length} slots x ${members.length} members): ${Date.now() - __tCO_overlap}ms`);
 
       return overlaps;
     } catch (error) {
@@ -517,6 +525,8 @@ class AvailabilityService {
    * @returns {Promise<Object>} Normalized heatmap data
    */
   async getGroupHeatmap(groupId, weekStart, timezone = 'UTC') {
+    const __t0 = Date.now();
+    console.log(`[heatmap profile] start group=${groupId} tz=${timezone}`);
     // 1. Validate weekStart is a Monday
     const startDate = new Date(weekStart + 'T00:00:00Z');
     if (isNaN(startDate.getTime())) {
@@ -542,10 +552,13 @@ class AvailabilityService {
     overlapEnd.setUTCDate(overlapEnd.getUTCDate() + 1);
 
     // 3. Get raw 30-min overlaps from existing method
+    const __tCalcOverlaps = Date.now();
     const overlaps = await this.calculateGroupOverlaps(groupId, overlapStart, overlapEnd, timezone);
+    console.log(`[heatmap profile] calculateGroupOverlaps: ${Date.now() - __tCalcOverlaps}ms`);
 
     // 4. Query group members to determine who has/lacks availability data
     const { Group, UserGroup, AvailabilityPrompt, AvailabilityResponse } = require('../models');
+    const __tGroup2 = Date.now();
     const group = await Group.findByPk(groupId, {
       include: [{
         model: User,
@@ -554,10 +567,13 @@ class AvailabilityService {
       }],
     });
 
+    console.log(`[heatmap profile] second Group.findByPk: ${Date.now() - __tGroup2}ms`);
+
     const members = group ? group.Users || [] : [];
     const totalMembers = members.length;
 
     // 5. Query active poll responses for this week
+    const __tPolls = Date.now();
     // Derive ISO week string from weekStart to match prompt's week_identifier
     const weekDate = new Date(weekStart + 'T00:00:00Z');
     // ISO week calculation: find the Thursday of this week, then get its week number
@@ -603,7 +619,10 @@ class AvailabilityService {
       }
     }
 
+    console.log(`[heatmap profile] poll responses load: ${Date.now() - __tPolls}ms`);
+
     // 6. Build gcal busy map for users with both poll responses AND gcal enabled
+    const __tGcal = Date.now();
     const gcalBusyMap = new Map(); // user_id -> { username, busySlots: Set<"date_HH:MM"> }
     for (const member of members) {
       const hasGcal = member.google_calendar_enabled && member.google_calendar_token;
@@ -624,7 +643,10 @@ class AvailabilityService {
       }
     }
 
+    console.log(`[heatmap profile] gcalBusyMap loop: ${Date.now() - __tGcal}ms`);
+
     // Check each member for availability data sources (including poll responses)
+    const __tNoData = Date.now();
     const membersWithoutData = [];
     for (const member of members) {
       const hasGcal = member.google_calendar_enabled && member.google_calendar_token;
@@ -641,12 +663,15 @@ class AvailabilityService {
       }
     }
 
+    console.log(`[heatmap profile] noData check: ${Date.now() - __tNoData}ms`);
+
     const membersWithData = totalMembers - membersWithoutData.length;
 
     // Build exclusion set for data-less members (Bug 3 fix)
     const noDataUserIds = new Set(membersWithoutData.map(m => m.user_id));
 
     // 7. Build a lookup map for overlaps: key = "date_HH:MM"
+    const __tBucket = Date.now();
     const overlapMap = new Map();
     for (const slot of overlaps) {
       overlapMap.set(`${slot.date}_${slot.timeSlot}`, slot);
@@ -751,6 +776,9 @@ class AvailabilityService {
         });
       }
     }
+
+    console.log(`[heatmap profile] bucketing loop: ${Date.now() - __tBucket}ms`);
+    console.log(`[heatmap profile] TOTAL: ${Date.now() - __t0}ms`);
 
     return {
       weekStart: weekStartStr,
