@@ -4,6 +4,39 @@
 const { UserAvailability, User } = require('../models');
 const googleCalendarService = require('./googleCalendarService');
 
+// Process-local cache for Google Calendar busy results. Same user reloading
+// the same week within ~30s skips the network round trip; concurrent fetches
+// for the same key share one in-flight promise instead of duplicating calls.
+const __gcalBusyCache = new Map(); // cacheKey -> { value, expiresAt } | { promise, expiresAt }
+const __GCAL_CACHE_TTL_MS = 60 * 1000;
+
+function __gcalCacheKey(userId, startDate, endDate, timezone) {
+  const s = (startDate instanceof Date) ? startDate.toISOString() : String(startDate);
+  const e = (endDate instanceof Date) ? endDate.toISOString() : String(endDate);
+  return `${userId}|${timezone || 'UTC'}|${s}|${e}`;
+}
+
+async function getGcalBusyCached(user, startDate, endDate, timezone) {
+  const key = __gcalCacheKey(user.user_id, startDate, endDate, timezone);
+  const now = Date.now();
+  const hit = __gcalBusyCache.get(key);
+  if (hit && hit.expiresAt > now) {
+    if (hit.promise) return hit.promise;
+    return hit.value;
+  }
+  const promise = googleCalendarService.getBusyTimesForDateRange(user, startDate, endDate, timezone)
+    .then(value => {
+      __gcalBusyCache.set(key, { value, expiresAt: Date.now() + __GCAL_CACHE_TTL_MS });
+      return value;
+    })
+    .catch(err => {
+      __gcalBusyCache.delete(key);
+      throw err;
+    });
+  __gcalBusyCache.set(key, { promise, expiresAt: now + __GCAL_CACHE_TTL_MS });
+  return promise;
+}
+
 /**
  * Validate an IANA timezone string.
  * @param {string} tz
@@ -193,10 +226,14 @@ class AvailabilityService {
   /**
    * Check if a time slot matches a recurring pattern
    */
-  matchesRecurringPattern(slot, pattern, timezone) {
+  matchesRecurringPattern(slot, pattern, timezone, precomputedLocal) {
     // Patterns store times in the user's local timezone.
     // Slots are generated in UTC (on a UTC server). Convert to local for matching.
-    const local = (timezone && timezone !== 'UTC') ? this.slotToLocal(slot, timezone) : null;
+    // `precomputedLocal` lets the caller skip slotToLocal -- ~3000 calls/render
+    // each constructing 2 Intl.DateTimeFormat instances were the dominant cost.
+    const local = precomputedLocal !== undefined
+      ? precomputedLocal
+      : ((timezone && timezone !== 'UTC') ? this.slotToLocal(slot, timezone) : null);
     const matchDate = local ? local.date : slot.date;
     const matchTime = local ? local.startTime : slot.startTime;
     const matchDay = local ? local.dayOfWeek : this.getDayOfWeek(new Date(slot.date));
@@ -241,8 +278,10 @@ class AvailabilityService {
    * matcher marks the wrong UTC slot (e.g. 14:00 UTC instead of 14:00 local).
    * Mirrors matchesRecurringPattern's slotToLocal flow.
    */
-  matchesSpecificOverride(slot, override, timezone) {
-    const local = (timezone && timezone !== 'UTC') ? this.slotToLocal(slot, timezone) : null;
+  matchesSpecificOverride(slot, override, timezone, precomputedLocal) {
+    const local = precomputedLocal !== undefined
+      ? precomputedLocal
+      : ((timezone && timezone !== 'UTC') ? this.slotToLocal(slot, timezone) : null);
     const matchDate = local ? local.date : slot.date;
     const matchTime = local ? local.startTime : slot.startTime;
 
@@ -278,11 +317,19 @@ class AvailabilityService {
    * @param {string} timezone - Timezone string
    * @returns {Promise<Array>} Array of time slots with availability status
    */
-  async calculateUserAvailability(user, startDate, endDate, timezone = 'UTC') {
+  async calculateUserAvailability(user, startDate, endDate, timezone = 'UTC', preloadedGcalBusy) {
     try {
       // Generate all time slots for the date range
       const allSlots = this.generateTimeSlots(startDate, endDate, timezone);
-      
+
+      // Precompute the local-TZ view of every slot ONCE per user. The matchers
+      // previously called slotToLocal per (slot, pattern) pair -- ~3000 calls
+      // per render at 7 patterns x 432 slots, each constructing 2 fresh
+      // Intl.DateTimeFormat instances. Doing it once cuts that to 432 calls.
+      const slotsLocal = (timezone && timezone !== 'UTC')
+        ? allSlots.map(slot => this.slotToLocal(slot, timezone))
+        : null;
+
       // Fetch manual availability patterns from database
       let manualPatterns;
       try {
@@ -325,16 +372,17 @@ class AvailabilityService {
       // Apply recurring patterns - mark matching slots as available
       const recurringPatterns = manualPatterns.filter(p => p.type === 'recurring_pattern');
       for (const pattern of recurringPatterns) {
-        allSlots.forEach(slot => {
-          const key = `${slot.date}_${slot.startTime}`;
-          if (this.matchesRecurringPattern(slot, pattern, timezone)) {
-            const slotData = availabilityMap.get(key);
+        for (let i = 0; i < allSlots.length; i++) {
+          const slot = allSlots[i];
+          const local = slotsLocal ? slotsLocal[i] : null;
+          if (this.matchesRecurringPattern(slot, pattern, timezone, local)) {
+            const slotData = availabilityMap.get(`${slot.date}_${slot.startTime}`);
             if (slotData) {
               slotData.isAvailable = true;
               slotData.source = 'recurring_pattern';
             }
           }
-        });
+        }
       }
 
       // Apply specific overrides (these take precedence over recurring patterns).
@@ -342,28 +390,29 @@ class AvailabilityService {
       // overrides are stored in local time but slots are generated in UTC.
       const specificOverrides = manualPatterns.filter(p => p.type === 'specific_override');
       for (const override of specificOverrides) {
-        allSlots.forEach(slot => {
-          const key = `${slot.date}_${slot.startTime}`;
-          if (this.matchesSpecificOverride(slot, override, timezone)) {
-            const slotData = availabilityMap.get(key);
+        for (let i = 0; i < allSlots.length; i++) {
+          const slot = allSlots[i];
+          const local = slotsLocal ? slotsLocal[i] : null;
+          if (this.matchesSpecificOverride(slot, override, timezone, local)) {
+            const slotData = availabilityMap.get(`${slot.date}_${slot.startTime}`);
             if (slotData) {
               slotData.isAvailable = override.is_available !== false; // Default to true if not explicitly false
               slotData.source = 'specific_override';
             }
           }
-        });
+        }
       }
 
       // If Google Calendar is enabled, use it as full availability override (gcal > recurring in priority)
-      // Free on calendar = available, busy on calendar = unavailable
+      // Free on calendar = available, busy on calendar = unavailable.
+      // Caller may pass `preloadedGcalBusy` (already-fetched busy slots) so we
+      // don't fan out N parallel gcal calls when the parent already paid for
+      // them; falls back to the cached helper otherwise.
       if (user.google_calendar_enabled && user.google_calendar_token) {
         try {
-          const busySlots = await googleCalendarService.getBusyTimesForDateRange(
-            user,
-            startDate,
-            endDate,
-            timezone
-          );
+          const busySlots = preloadedGcalBusy !== undefined
+            ? preloadedGcalBusy
+            : await getGcalBusyCached(user, startDate, endDate, timezone);
 
           // Build set of busy slot keys for quick lookup
           const busyKeys = new Set(busySlots.map(s => `${s.date}_${s.startTime}`));
@@ -404,7 +453,7 @@ class AvailabilityService {
    * @param {string} timezone - Timezone string
    * @returns {Promise<Array>} Array of time slots with overlap information
    */
-  async calculateGroupOverlaps(groupId, startDate, endDate, timezone = 'UTC', preloadedGroup = null) {
+  async calculateGroupOverlaps(groupId, startDate, endDate, timezone = 'UTC', preloadedGroup = null, preloadedGcalBusyByUser = null) {
     try {
       const { Group, UserGroup } = require('../models');
 
@@ -435,16 +484,22 @@ class AvailabilityService {
         return [];
       }
 
-      // Calculate availability for each member using their stored timezone
+      // Calculate availability for each member using their stored timezone.
+      // If the caller pre-fetched gcal busy data (HEAT-03 perf hoist), pass
+      // the per-member slice through so calculateUserAvailability skips its
+      // own gcal fetch.
       const memberAvailabilities = await Promise.all(
-        members.map(member =>
-          this.calculateUserAvailability(member, startDate, endDate, member.timezone || 'UTC')
+        members.map(member => {
+          const preloadedBusy = preloadedGcalBusyByUser
+            ? preloadedGcalBusyByUser.get(member.user_id)
+            : undefined;
+          return this.calculateUserAvailability(member, startDate, endDate, member.timezone || 'UTC', preloadedBusy)
             .then(availability => ({ member, availability }))
             .catch(error => {
               console.error(`Error calculating availability for member ${member.user_id}:`, error);
               return { member, availability: [] };
-            })
-        )
+            });
+        })
       );
 
       // Generate all time slots
@@ -559,9 +614,30 @@ class AvailabilityService {
     const members = group ? group.Users || [] : [];
     const totalMembers = members.length;
 
-    // 4. Get raw 30-min overlaps -- pass the preloaded group to skip the
-    //    duplicate findByPk inside calculateGroupOverlaps.
-    const overlaps = await this.calculateGroupOverlaps(groupId, overlapStart, overlapEnd, timezone, group);
+    // 3.5. Pre-fetch Google Calendar busy slots for every gcal-enabled member
+    //      ONCE in parallel, before calculateGroupOverlaps runs. This:
+    //      (a) lets calculateUserAvailability skip its own gcal fetch,
+    //      (b) eliminates the redundant `gcalBusyMap` second-fetch loop below,
+    //      (c) hits the 60s in-process cache for warm reloads of the same week.
+    const gcalEnabledMembers = members.filter(m => m.google_calendar_enabled && m.google_calendar_token);
+    const gcalBusyByUser = new Map(); // user_id -> Array<{date,startTime,endTime}>
+    if (gcalEnabledMembers.length > 0) {
+      const results = await Promise.all(gcalEnabledMembers.map(member =>
+        getGcalBusyCached(member, overlapStart, overlapEnd, member.timezone || timezone)
+          .then(busy => ({ member, busy }))
+          .catch(err => {
+            console.warn(`Failed to fetch gcal for ${member.user_id}:`, err.message);
+            return { member, busy: [] };
+          })
+      ));
+      for (const { member, busy } of results) {
+        gcalBusyByUser.set(member.user_id, busy);
+      }
+    }
+
+    // 4. Get raw 30-min overlaps -- pass the preloaded group AND the gcal busy
+    //    map so calculateUserAvailability doesn't re-fetch per-member.
+    const overlaps = await this.calculateGroupOverlaps(groupId, overlapStart, overlapEnd, timezone, group, gcalBusyByUser);
 
     // 5. Query active poll responses for this week
     // Derive ISO week string from weekStart to match prompt's week_identifier
@@ -609,25 +685,19 @@ class AvailabilityService {
       }
     }
 
-    // 6. Build gcal busy map for users with both poll responses AND gcal enabled
+    // 6. Build gcal busy map for users with both poll responses AND gcal enabled.
+    // Reuses the already-fetched gcalBusyByUser from step 3.5 -- no new network
+    // calls. Only includes users with poll responses (the conflict-detection
+    // path in the bucketing loop below only consults this map for those users).
     const gcalBusyMap = new Map(); // user_id -> { username, busySlots: Set<"date_HH:MM"> }
     for (const member of members) {
-      const hasGcal = member.google_calendar_enabled && member.google_calendar_token;
-      if (hasGcal && pollResponseMap.has(member.user_id)) {
-        try {
-          const busyTimes = await googleCalendarService.getBusyTimesForDateRange(
-            member, overlapStart, overlapEnd, timezone
-          );
-          const busySet = new Set();
-          for (const busy of busyTimes) {
-            // busy has { date, startTime, endTime } format from getBusyTimesForDateRange
-            busySet.add(`${busy.date}_${busy.startTime}`);
-          }
-          gcalBusyMap.set(member.user_id, { username: member.username, busySlots: busySet });
-        } catch (err) {
-          console.warn(`Failed to fetch gcal for ${member.user_id}:`, err.message);
-        }
+      if (!gcalBusyByUser.has(member.user_id)) continue;
+      if (!pollResponseMap.has(member.user_id)) continue;
+      const busySet = new Set();
+      for (const busy of gcalBusyByUser.get(member.user_id)) {
+        busySet.add(`${busy.date}_${busy.startTime}`);
       }
+      gcalBusyMap.set(member.user_id, { username: member.username, busySlots: busySet });
     }
 
     // Check each member for availability data sources (including poll responses).
