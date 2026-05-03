@@ -404,26 +404,27 @@ class AvailabilityService {
    * @param {string} timezone - Timezone string
    * @returns {Promise<Array>} Array of time slots with overlap information
    */
-  async calculateGroupOverlaps(groupId, startDate, endDate, timezone = 'UTC') {
+  async calculateGroupOverlaps(groupId, startDate, endDate, timezone = 'UTC', preloadedGroup = null) {
     try {
       const { Group, UserGroup } = require('../models');
 
-      // Get all group members
-      const __tCO_findGroup = Date.now();
-      let group;
-      try {
-        group = await Group.findByPk(groupId, {
-          include: [{
-            model: User,
-            through: UserGroup,
-            attributes: ['id', 'user_id', 'username', 'email', 'google_calendar_enabled', 'google_calendar_token', 'google_calendar_refresh_token', 'timezone'],
-          }],
-        });
-      } catch (dbError) {
-        console.error('Database error fetching group:', dbError);
-        throw new Error(`Database error: ${dbError.message}`);
+      // Get all group members. Caller may pass a preloaded Group instance to
+      // avoid a duplicate findByPk roundtrip (HEAT-03 perf).
+      let group = preloadedGroup;
+      if (!group) {
+        try {
+          group = await Group.findByPk(groupId, {
+            include: [{
+              model: User,
+              through: UserGroup,
+              attributes: ['id', 'user_id', 'username', 'email', 'google_calendar_enabled', 'google_calendar_token', 'google_calendar_refresh_token', 'timezone'],
+            }],
+          });
+        } catch (dbError) {
+          console.error('Database error fetching group:', dbError);
+          throw new Error(`Database error: ${dbError.message}`);
+        }
       }
-      console.log(`[heatmap profile]   CO.Group.findByPk: ${Date.now() - __tCO_findGroup}ms`);
 
       if (!group) {
         throw new Error('Group not found');
@@ -435,7 +436,6 @@ class AvailabilityService {
       }
 
       // Calculate availability for each member using their stored timezone
-      const __tCO_userAvail = Date.now();
       const memberAvailabilities = await Promise.all(
         members.map(member =>
           this.calculateUserAvailability(member, startDate, endDate, member.timezone || 'UTC')
@@ -446,15 +446,11 @@ class AvailabilityService {
             })
         )
       );
-      console.log(`[heatmap profile]   CO.calculateUserAvailability x${members.length}: ${Date.now() - __tCO_userAvail}ms`);
 
       // Generate all time slots
-      const __tCO_genSlots = Date.now();
       const allSlots = this.generateTimeSlots(startDate, endDate, timezone);
-      console.log(`[heatmap profile]   CO.generateTimeSlots (${allSlots.length} slots): ${Date.now() - __tCO_genSlots}ms`);
 
       // Calculate overlaps
-      const __tCO_overlap = Date.now();
       const overlaps = allSlots.map(slot => {
         const key = `${slot.date}_${slot.startTime}`;
         const availableMembers = [];
@@ -483,7 +479,6 @@ class AvailabilityService {
           unavailableCount: members.length - availableMembers.length,
         };
       });
-      console.log(`[heatmap profile]   CO.overlap-loop (${overlaps.length} slots x ${members.length} members): ${Date.now() - __tCO_overlap}ms`);
 
       return overlaps;
     } catch (error) {
@@ -526,7 +521,6 @@ class AvailabilityService {
    */
   async getGroupHeatmap(groupId, weekStart, timezone = 'UTC') {
     const __t0 = Date.now();
-    console.log(`[heatmap profile] start group=${groupId} tz=${timezone}`);
     // 1. Validate weekStart is a Monday
     const startDate = new Date(weekStart + 'T00:00:00Z');
     if (isNaN(startDate.getTime())) {
@@ -551,14 +545,10 @@ class AvailabilityService {
     const overlapEnd = new Date(endDate);
     overlapEnd.setUTCDate(overlapEnd.getUTCDate() + 1);
 
-    // 3. Get raw 30-min overlaps from existing method
-    const __tCalcOverlaps = Date.now();
-    const overlaps = await this.calculateGroupOverlaps(groupId, overlapStart, overlapEnd, timezone);
-    console.log(`[heatmap profile] calculateGroupOverlaps: ${Date.now() - __tCalcOverlaps}ms`);
-
-    // 4. Query group members to determine who has/lacks availability data
+    // 3. Load the group ONCE and reuse for both the overlap calc and the
+    //    members/no-data accounting below (HEAT-03 perf: removes a duplicate
+    //    findByPk that was costing 5-50ms per render).
     const { Group, UserGroup, AvailabilityPrompt, AvailabilityResponse } = require('../models');
-    const __tGroup2 = Date.now();
     const group = await Group.findByPk(groupId, {
       include: [{
         model: User,
@@ -566,14 +556,14 @@ class AvailabilityService {
         attributes: ['id', 'user_id', 'username', 'email', 'google_calendar_enabled', 'google_calendar_token', 'google_calendar_refresh_token', 'timezone'],
       }],
     });
-
-    console.log(`[heatmap profile] second Group.findByPk: ${Date.now() - __tGroup2}ms`);
-
     const members = group ? group.Users || [] : [];
     const totalMembers = members.length;
 
+    // 4. Get raw 30-min overlaps -- pass the preloaded group to skip the
+    //    duplicate findByPk inside calculateGroupOverlaps.
+    const overlaps = await this.calculateGroupOverlaps(groupId, overlapStart, overlapEnd, timezone, group);
+
     // 5. Query active poll responses for this week
-    const __tPolls = Date.now();
     // Derive ISO week string from weekStart to match prompt's week_identifier
     const weekDate = new Date(weekStart + 'T00:00:00Z');
     // ISO week calculation: find the Thursday of this week, then get its week number
@@ -619,10 +609,7 @@ class AvailabilityService {
       }
     }
 
-    console.log(`[heatmap profile] poll responses load: ${Date.now() - __tPolls}ms`);
-
     // 6. Build gcal busy map for users with both poll responses AND gcal enabled
-    const __tGcal = Date.now();
     const gcalBusyMap = new Map(); // user_id -> { username, busySlots: Set<"date_HH:MM"> }
     for (const member of members) {
       const hasGcal = member.google_calendar_enabled && member.google_calendar_token;
@@ -643,27 +630,35 @@ class AvailabilityService {
       }
     }
 
-    console.log(`[heatmap profile] gcalBusyMap loop: ${Date.now() - __tGcal}ms`);
+    // Check each member for availability data sources (including poll responses).
+    // Batch the UserAvailability lookup into a single query (HEAT-03 perf:
+    // was N+1, one findAll per member; now O(1) regardless of member count).
+    const { Op } = require('sequelize');
+    const candidatesNeedingDbCheck = members.filter(m => {
+      const hasGcal = m.google_calendar_enabled && m.google_calendar_token;
+      const hasPollResponse = pollResponseMap.has(m.user_id);
+      return !hasGcal && !hasPollResponse;
+    });
 
-    // Check each member for availability data sources (including poll responses)
-    const __tNoData = Date.now();
+    const recurringByUser = new Set();
+    if (candidatesNeedingDbCheck.length > 0) {
+      const ids = candidatesNeedingDbCheck.map(m => m.user_id);
+      const rows = await UserAvailability.findAll({
+        where: { user_id: { [Op.in]: ids } },
+        attributes: ['user_id'],
+      });
+      for (const r of rows) recurringByUser.add(r.user_id);
+    }
+
     const membersWithoutData = [];
     for (const member of members) {
       const hasGcal = member.google_calendar_enabled && member.google_calendar_token;
       const hasPollResponse = pollResponseMap.has(member.user_id);
-      let hasRecurring = false;
-      if (!hasGcal && !hasPollResponse) {
-        const records = await UserAvailability.findAll({
-          where: { user_id: member.user_id },
-        });
-        hasRecurring = records.length > 0;
-      }
+      const hasRecurring = recurringByUser.has(member.user_id);
       if (!hasGcal && !hasRecurring && !hasPollResponse) {
         membersWithoutData.push({ user_id: member.user_id, username: member.username });
       }
     }
-
-    console.log(`[heatmap profile] noData check: ${Date.now() - __tNoData}ms`);
 
     const membersWithData = totalMembers - membersWithoutData.length;
 
@@ -671,7 +666,6 @@ class AvailabilityService {
     const noDataUserIds = new Set(membersWithoutData.map(m => m.user_id));
 
     // 7. Build a lookup map for overlaps: key = "date_HH:MM"
-    const __tBucket = Date.now();
     const overlapMap = new Map();
     for (const slot of overlaps) {
       overlapMap.set(`${slot.date}_${slot.timeSlot}`, slot);
@@ -680,6 +674,13 @@ class AvailabilityService {
     // 8. Generate hourly slots (7 days x 14 hours: 10am-midnight) with poll merging
     //    When a valid timezone is provided, convert local 10-23 to UTC hours per day.
     //    Otherwise fall back to UTC 10-23.
+    //
+    //    HEAT-03 perf: localToUtc is the dominant cost (each call constructs
+    //    two Intl.DateTimeFormat instances). Original code called it 7*14=98
+    //    times per render. We now probe each day at hour 10 AND hour 23: if
+    //    the resulting UTC delta equals 13 (i.e. no DST flip inside the day),
+    //    we derive hours 11-22 arithmetically. Drops 98 calls to 14 on normal
+    //    days; DST days fall back to per-hour resolution to stay correct.
     const validTz = isValidTimezone(timezone) && timezone !== 'UTC' ? timezone : null;
     if (timezone && timezone !== 'UTC' && !validTz) {
       console.warn(`getGroupHeatmap: invalid timezone "${timezone}", falling back to UTC`);
@@ -687,25 +688,72 @@ class AvailabilityService {
 
     const gcalConflicts = [];
     const slots = [];
+    // Hoist the localBase Date once -- inner loop only mutates dayOffset.
+    const localBase = validTz ? new Date(weekStart + 'T12:00:00Z') : null;
+
     for (let dayOffset = 0; dayOffset < 7; dayOffset++) {
       const slotDate = new Date(startDate);
       slotDate.setUTCDate(slotDate.getUTCDate() + dayOffset);
+
+      // Per-day TZ resolution: probe hour 10 and hour 23 once.
+      let dayResolutions = null; // map<localHour, {utcDate, utcHour, isoDayOfWeek}>
+      if (validTz) {
+        const dayBase = new Date(localBase.getTime());
+        dayBase.setUTCDate(dayBase.getUTCDate() + dayOffset);
+        const localDateStr = dayBase.toISOString().split('T')[0];
+
+        const c10 = localToUtc(localDateStr, 10, validTz);
+        const c23 = localToUtc(localDateStr, 23, validTz);
+        const totalUtcMs10 = Date.UTC(
+          parseInt(c10.utcDate.slice(0, 4), 10),
+          parseInt(c10.utcDate.slice(5, 7), 10) - 1,
+          parseInt(c10.utcDate.slice(8, 10), 10),
+          c10.utcHour
+        );
+        const totalUtcMs23 = Date.UTC(
+          parseInt(c23.utcDate.slice(0, 4), 10),
+          parseInt(c23.utcDate.slice(5, 7), 10) - 1,
+          parseInt(c23.utcDate.slice(8, 10), 10),
+          c23.utcHour
+        );
+        const expectedDeltaMs = 13 * 3600000; // hour 23 - hour 10 = 13 hours
+        const noDstFlip = (totalUtcMs23 - totalUtcMs10) === expectedDeltaMs;
+
+        dayResolutions = new Map();
+        if (noDstFlip) {
+          // Normal day: derive hours 10-23 arithmetically from hour 10 anchor.
+          for (let h = 10; h <= 23; h++) {
+            const offsetMs = (h - 10) * 3600000;
+            const utcMs = totalUtcMs10 + offsetMs;
+            const d = new Date(utcMs);
+            const utcDate = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+            dayResolutions.set(h, {
+              utcDate,
+              utcHour: d.getUTCHours(),
+              isoDayOfWeek: this.getISODayOfWeek(new Date(utcDate + 'T00:00:00Z')),
+            });
+          }
+        } else {
+          // DST transition day: fall back to per-hour resolution.
+          for (let h = 10; h <= 23; h++) {
+            const c = localToUtc(localDateStr, h, validTz);
+            dayResolutions.set(h, {
+              utcDate: c.utcDate,
+              utcHour: c.utcHour,
+              isoDayOfWeek: this.getISODayOfWeek(new Date(c.utcDate + 'T00:00:00Z')),
+            });
+          }
+        }
+      }
 
       for (let localHour = 10; localHour <= 23; localHour++) {
         let dateStr, utcHour, isoDayOfWeek;
 
         if (validTz) {
-          // Compute local date by adding dayOffset to the weekStart date string.
-          // weekStart is always a Monday; local days are Mon-Sun regardless of timezone.
-          const localBase = new Date(weekStart + 'T12:00:00Z'); // noon UTC avoids day-boundary issues
-          localBase.setUTCDate(localBase.getUTCDate() + dayOffset);
-          const localDateStr = localBase.toISOString().split('T')[0]; // YYYY-MM-DD
-          const converted = localToUtc(localDateStr, localHour, validTz);
-          dateStr = converted.utcDate;
-          utcHour = converted.utcHour;
-          // dayOfWeek based on the UTC date of the emitted slot
-          const utcSlotDate = new Date(dateStr + 'T00:00:00Z');
-          isoDayOfWeek = this.getISODayOfWeek(utcSlotDate);
+          const r = dayResolutions.get(localHour);
+          dateStr = r.utcDate;
+          utcHour = r.utcHour;
+          isoDayOfWeek = r.isoDayOfWeek;
         } else {
           // Fallback: use UTC hours directly
           dateStr = this.formatDateISO(slotDate);
@@ -777,8 +825,8 @@ class AvailabilityService {
       }
     }
 
-    console.log(`[heatmap profile] bucketing loop: ${Date.now() - __tBucket}ms`);
-    console.log(`[heatmap profile] TOTAL: ${Date.now() - __t0}ms`);
+    const __renderMs = Date.now() - __t0;
+    console.log(`heatmap render: ${__renderMs}ms group=${groupId} members=${totalMembers}`);
 
     return {
       weekStart: weekStartStr,

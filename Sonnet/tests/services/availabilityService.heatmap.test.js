@@ -90,10 +90,22 @@ describe('availabilityService.getGroupHeatmap', () => {
       Users: groupUsers,
     });
 
-    // Mock UserAvailability.findAll to return records for users marked as having data
+    // Mock UserAvailability.findAll to return records for users marked as having data.
+    // Supports both the legacy per-member shape ({ user_id: 'X' }) AND the
+    // post-HEAT-03 batched shape ({ user_id: { [Op.in]: [...] } }).
     UserAvailability.findAll.mockImplementation(async ({ where }) => {
-      if (hasAvailability[where.user_id]) {
-        return [{ id: 'some-record', user_id: where.user_id, type: 'recurring_pattern' }];
+      const uid = where.user_id;
+      if (uid && typeof uid === 'object') {
+        // Batched: pull the array of ids out of any Sequelize Op.in symbol-keyed object
+        const symbols = Object.getOwnPropertySymbols(uid);
+        const ids = symbols.length ? uid[symbols[0]] : (uid.in || []);
+        return ids
+          .filter(id => hasAvailability[id])
+          .map(id => ({ id: 'some-record', user_id: id, type: 'recurring_pattern' }));
+      }
+      // Legacy per-member shape
+      if (hasAvailability[uid]) {
+        return [{ id: 'some-record', user_id: uid, type: 'recurring_pattern' }];
       }
       return [];
     });
@@ -665,8 +677,21 @@ describe('availabilityService.getGroupHeatmap -- specific_override survival (HEA
     });
 
     UserAvailability.findAll.mockImplementation(async ({ where }) => {
-      if (where.user_id === userT.user_id) return overrides;
-      if (extraAvailabilityByUser[where.user_id]) return extraAvailabilityByUser[where.user_id];
+      const uid = where.user_id;
+      // Batched shape from getGroupHeatmap noData check (post-HEAT-03)
+      if (uid && typeof uid === 'object') {
+        const symbols = Object.getOwnPropertySymbols(uid);
+        const ids = symbols.length ? uid[symbols[0]] : (uid.in || []);
+        const out = [];
+        for (const id of ids) {
+          if (id === userT.user_id && overrides.length) out.push(...overrides);
+          if (extraAvailabilityByUser[id]) out.push(...extraAvailabilityByUser[id]);
+        }
+        return out;
+      }
+      // Per-user shape from calculateUserAvailability
+      if (uid === userT.user_id) return overrides;
+      if (extraAvailabilityByUser[uid]) return extraAvailabilityByUser[uid];
       return [];
     });
 
