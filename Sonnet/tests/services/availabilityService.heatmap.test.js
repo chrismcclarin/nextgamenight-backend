@@ -948,3 +948,142 @@ describe('availabilityService.generateTimeSlots -- UTC-consistent slot keys (dev
     }
   });
 });
+
+// ============================================================================
+// HEAT-02 expansion 4: save-side TZ inconsistency in specific overrides.
+//
+// Diagnostic on a PDT dev box revealed override rows persisted with DIVERGENT
+// date fields:
+//   pattern_data.date = "2026-05-02"  (raw string from frontend)
+//   start_date        = "2026-05-01"  (Sequelize DATEONLY of new Date(date)
+//                                      = UTC midnight, truncated to local day)
+//   end_date          = "2026-05-01"
+// Two distinct bugs collide here:
+//   1. routes/availability.js POST /override does `new Date(date)` and passes
+//      the Date to Sequelize DATEONLY -- which truncates to LOCAL day on a
+//      non-UTC server, dropping the date by one in negative offsets.
+//   2. The frontend default `new Date().toISOString().split('T')[0]` evaluates
+//      "now" in UTC, so a user clicking the form at local Mon 22:00 PDT sees
+//      Tue prefilled and submits Tue.
+//
+// The matcher then runs `isDateInRange(slotDate, start_date, end_date)` and
+// fails because the slot for the override's intended day (May 2) is OUTSIDE
+// the persisted [May 1, May 1] window. Net effect: override silently lost.
+//
+// These tests cover both (a) the legacy/divergent-shape robustness and
+// (b) the post-fix coherent-shape happy path.
+// ============================================================================
+describe('availabilityService.matchesSpecificOverride -- save-side TZ divergence (HEAT-02 expansion 4)', () => {
+  const denverTz = 'America/Denver'; // UTC-6 MDT in late April / early May 2026
+
+  // Build a slot the way generateTimeSlots emits them (UTC-keyed).
+  function buildUtcSlot(utcDate, utcHour) {
+    const ts = new Date(`${utcDate}T${String(utcHour).padStart(2, '0')}:00:00Z`).getTime();
+    return {
+      date: utcDate,
+      startTime: `${String(utcHour).padStart(2, '0')}:00`,
+      endTime: `${String(utcHour).padStart(2, '0')}:30`,
+      timestamp: ts,
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // The bug-catcher: persisted override has pattern_data.date AHEAD of
+  // start_date/end_date by one day (the exact divergence diagnostic captured).
+  // The matcher MUST treat pattern_data.date as the source of truth and ignore
+  // (or be tolerant of) the inconsistent start_date/end_date window.
+  // ---------------------------------------------------------------------------
+  it('matches when pattern_data.date is AHEAD of start_date/end_date (legacy bad-data shape)', () => {
+    // User intent: override on local 2026-05-02 14:00-16:00 MDT
+    // (Diagnostic showed exactly this divergence on disk.)
+    const override = {
+      type: 'specific_override',
+      pattern_data: {
+        date: '2026-05-02',
+        startTime: '14:00',
+        endTime: '16:00',
+        isAvailable: true,
+      },
+      start_date: '2026-05-01',  // Sequelize DATEONLY truncated by 1 day
+      end_date: '2026-05-01',
+      is_available: true,
+      timezone: 'UTC',
+    };
+
+    // Slot at local 2026-05-02 14:00 MDT (UTC-6) = UTC 2026-05-02 20:00
+    const slot = buildUtcSlot('2026-05-02', 20);
+
+    const matched = availabilityService.matchesSpecificOverride(slot, override, denverTz);
+    expect(matched).toBe(true);
+  });
+
+  // Sanity-check the converse: with bad-data shape, the WRONG day's slots must
+  // not light up. The override's intent is May 2, NOT May 1. The persisted
+  // start_date/end_date both point at May 1 -- if the matcher trusted that
+  // window, it would mark a May 1 slot as available. It must not.
+  it('does NOT match a slot on start_date/end_date when pattern_data.date points at a different day', () => {
+    const override = {
+      type: 'specific_override',
+      pattern_data: {
+        date: '2026-05-02',
+        startTime: '14:00',
+        endTime: '16:00',
+        isAvailable: true,
+      },
+      start_date: '2026-05-01',
+      end_date: '2026-05-01',
+      is_available: true,
+      timezone: 'UTC',
+    };
+
+    // Slot at local 2026-05-01 14:00 MDT = UTC 2026-05-01 20:00
+    const wrongDaySlot = buildUtcSlot('2026-05-01', 20);
+
+    const matched = availabilityService.matchesSpecificOverride(wrongDaySlot, override, denverTz);
+    expect(matched).toBe(false);
+  });
+
+  // Happy path with the post-fix coherent shape. Same intent, but
+  // pattern_data.date and start_date/end_date all agree.
+  it('matches when all date fields are coherent (post-fix shape)', () => {
+    const override = {
+      type: 'specific_override',
+      pattern_data: {
+        date: '2026-05-02',
+        startTime: '14:00',
+        endTime: '16:00',
+        isAvailable: true,
+      },
+      start_date: '2026-05-02',
+      end_date: '2026-05-02',
+      is_available: true,
+      timezone: 'UTC',
+    };
+
+    const slot = buildUtcSlot('2026-05-02', 20);
+    const matched = availabilityService.matchesSpecificOverride(slot, override, denverTz);
+    expect(matched).toBe(true);
+  });
+
+  // Out-of-window time check still works under coherent shape.
+  it('does NOT match when slot time is outside override time window (coherent shape)', () => {
+    const override = {
+      type: 'specific_override',
+      pattern_data: {
+        date: '2026-05-02',
+        startTime: '14:00',
+        endTime: '16:00',
+        isAvailable: true,
+      },
+      start_date: '2026-05-02',
+      end_date: '2026-05-02',
+      is_available: true,
+      timezone: 'UTC',
+    };
+
+    // Local 2026-05-02 18:00 MDT = UTC 2026-05-03 00:00 (next day UTC)
+    const outOfTimeSlot = buildUtcSlot('2026-05-03', 0);
+    const matched = availabilityService.matchesSpecificOverride(outOfTimeSlot, override, denverTz);
+    expect(matched).toBe(false);
+  });
+});

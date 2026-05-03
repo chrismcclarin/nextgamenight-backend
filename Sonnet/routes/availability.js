@@ -203,9 +203,19 @@ router.post('/user/:user_id/override',
         return res.status(400).json({ error: 'Start time must be before end time' });
       }
 
-      const overrideDate = new Date(date);
-      if (isNaN(overrideDate.getTime())) {
-        return res.status(400).json({ error: 'Invalid date format' });
+      // Validate strict YYYY-MM-DD shape. The previous implementation did
+      // `new Date(date)` and passed the Date object to Sequelize DATEONLY,
+      // which truncates to LOCAL day on a non-UTC server (e.g. PDT dev box):
+      //   new Date("2026-05-02") -> UTC midnight -> local 2026-05-01 17:00 PDT
+      //   -> DATEONLY -> "2026-05-01"
+      // pattern_data.date kept the raw string ("2026-05-02"), producing a
+      // 1-day divergence between pattern_data.date and start_date/end_date
+      // and silently dropping the override from the heatmap matcher.
+      // Pass the raw string directly to Sequelize -- DATEONLY accepts
+      // "YYYY-MM-DD" as-is, with no Date round-trip and no TZ ambiguity.
+      const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+      if (!dateRegex.test(date)) {
+        return res.status(400).json({ error: 'Invalid date format. Expected YYYY-MM-DD.' });
       }
 
       const override = await UserAvailability.create({
@@ -217,8 +227,8 @@ router.post('/user/:user_id/override',
           endTime,
           isAvailable,
         },
-        start_date: overrideDate,
-        end_date: overrideDate, // Same day
+        start_date: date,  // raw "YYYY-MM-DD" string; Sequelize DATEONLY stores as-is
+        end_date: date,    // same day, same string
         is_available: isAvailable,
         timezone: 'UTC',
       });

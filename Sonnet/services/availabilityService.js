@@ -246,18 +246,20 @@ class AvailabilityService {
     const matchDate = local ? local.date : slot.date;
     const matchTime = local ? local.startTime : slot.startTime;
 
-    const slotDate = new Date(matchDate);
-    const overrideDate = new Date(override.pattern_data.date);
-
-    // Check if dates match (in the user's local timezone)
-    if (slotDate.toISOString().split('T')[0] !== overrideDate.toISOString().split('T')[0]) {
+    // pattern_data.date is the canonical user-intended local date for this
+    // override. Compare as raw strings to avoid any TZ round-trip (both are
+    // already "YYYY-MM-DD" in the user's local timezone).
+    if (matchDate !== override.pattern_data.date) {
       return false;
     }
 
-    // Check if date is within override's date range
-    if (!this.isDateInRange(slotDate, override.start_date, override.end_date)) {
-      return false;
-    }
+    // NOTE: Intentionally do NOT cross-check start_date/end_date here.
+    // For a single-day override they are redundant with pattern_data.date,
+    // and historical bad-data rows (HEAT-02 expansion 4) persisted them with
+    // a 1-day shift caused by `new Date("YYYY-MM-DD")` -> UTC midnight ->
+    // Sequelize DATEONLY -> local-day truncation on non-UTC servers. Trusting
+    // pattern_data.date alone makes the matcher robust to that legacy shape
+    // AND the post-fix coherent shape.
 
     // Check if time slot is within override's time range (both in local minutes-since-midnight)
     const slotStart = this.timeToMinutes(matchTime);
