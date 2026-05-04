@@ -925,19 +925,23 @@ router.post('/join-game-by-token', async (req, res) => {
     // email — sending "Welcome to [event]!" right after an admin removed them
     // is the wrong tone (silent welcome-back per Phase 65 plan 01).
     // The remove-participant handler embeds the removed User.id in
-    // event_snapshot.removed_user_id; use Op.contains for JSONB equality.
+    // event_snapshot.removed_user_id. Use Op.contains for JSONB containment —
+    // a plain `event_snapshot: { removed_user_id: x }` would attempt full-row
+    // equality on the JSONB column and never match (the snapshot also stores
+    // id, group_id, game_id, etc.).
     let isReJoinAfterRemoval = false;
     try {
       const priorRemoval = await EventAuditLog.findOne({
         where: {
           event_id: event.id,
           action: 'remove_participant',
-          event_snapshot: { removed_user_id: dbUser.id },
+          event_snapshot: { [Op.contains]: { removed_user_id: dbUser.id } },
         },
       });
       if (priorRemoval) {
         isReJoinAfterRemoval = true;
       }
+      console.log(`[join-game-by-token] EVT-08 suppression check: event=${event.id} user=${dbUser.id} priorRemoval=${!!priorRemoval} willSuppressEmail=${isReJoinAfterRemoval}`);
     } catch (auditLookupErr) {
       // Non-fatal — if the lookup fails, default to the old behavior (email
       // fires). A failed lookup should not block the join itself.
