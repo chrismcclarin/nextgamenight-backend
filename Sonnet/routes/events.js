@@ -337,9 +337,17 @@ router.get('/:event_id', async (req, res) => {
     }
 
     // Re-fetch with includes — gateEvent is the bare row.
+    // Phase 71.1-02 Blocker 2 fix: include Group so the frontend breadcrumb
+    // can render "Game night with [actual group name]" instead of falling back
+    // to the literal word "group". The plan's GAMP-11 acceptance copy depends
+    // on Group.name being present in the response. Without this include, the
+    // frontend's `singleEvent?.Group?.name || 'group'` fallback always fired
+    // because Group was never eager-loaded on this endpoint after the Plan 01
+    // gate swap.
     const event = await Event.findByPk(req.params.event_id, {
       include: [
         { model: Game, attributes: ['name', 'image_url', 'theme'] },
+        { model: Group, attributes: ['id', 'name'] },
         { model: User, as: 'Winner', attributes: ['id', 'username', 'user_id'] },
         { model: User, as: 'PickedBy', attributes: ['id', 'username'] },
         {
@@ -915,6 +923,14 @@ router.get('/invite-preview/:token', async (req, res) => {
       event_date: event.start_date,
       group_name: event.Group?.name,
       event_id: event.id,
+      // Phase 71.1-02 Blocker 1 fix: include group_id so the QR-join landing
+      // page can build a complete `/gameDetail?event_id=X&group_id=Y` href on
+      // "Go to event". Without group_id, gameDetail's `if (group_id && user?.sub)`
+      // branch is skipped, groupMembers is never fetched, userScope stays
+      // 'none', and the participants strip + kebab don't render. This is also
+      // covered defensively by gameDetail deriving group_id from the event
+      // response, but exposing it here keeps the source of truth at the API.
+      group_id: event.group_id,
     });
   } catch (error) {
     console.error('Error getting event invite preview:', error);
@@ -964,7 +980,7 @@ router.post('/join-game-by-token', async (req, res) => {
     // created row + one fallback select with `created=false`. Matches the
     // existing findOrCreate pattern in routes/users.js, routes/groups.js,
     // routes/invites.js, routes/userGames.js (idempotent upsert idiom).
-    const [, created] = await EventParticipation.findOrCreate({
+    const [participation, created] = await EventParticipation.findOrCreate({
       where: { event_id: event.id, user_id: dbUser.id },
       defaults: {
         event_id: event.id,
@@ -972,6 +988,19 @@ router.post('/join-game-by-token', async (req, res) => {
         is_guest: true,
       },
     });
+
+    // Phase 71.1-02 Blocker 3 fix: arriving via game-token MUST set is_guest=true
+    // on the participation row regardless of whether the row already existed.
+    // Previously `is_guest: true` only landed on the INSERT path (via defaults).
+    // If a former group member (whose old EventParticipation row had is_guest=false)
+    // re-joined via game-token, their row stayed is_guest=false — so the Guest
+    // pill never rendered for organizers viewing the event. Per CONTEXT decision
+    // (project_pending_role_frozen.md → two-QR model): anyone arriving via
+    // game-token IS a guest for that event, regardless of prior state.
+    if (!created && participation.is_guest !== true) {
+      participation.is_guest = true;
+      await participation.save();
+    }
 
     if (!created) {
       return res.json({ already_joined: true, event_id: event.id });
