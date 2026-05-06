@@ -5,7 +5,13 @@ const { Group, User, UserGroup, Event, Game, EventParticipation, GameReview, Use
 const { Op } = require('sequelize');
 const router = express.Router();
 const { validateGroupCreate, validateGroupUpdate, validateUUID } = require('../middleware/validators');
-const { getUserRoleInGroup, isOwnerOrAdmin, isOwner, isActiveMember } = require('../services/authorizationService');
+const {
+  getUserRoleInGroup,
+  isOwnerOrAdmin,
+  isOwner,
+  isActiveMember,
+  stripMemberPII,
+} = require('../services/authorizationService');
 
 // Get all groups for a user
 // user_id is now extracted from verified JWT token (req.user.user_id)
@@ -152,23 +158,109 @@ router.get('/:group_id', validateUUID('group_id'), async (req, res) => {
   }
 });
 
-// Get all users in a group
+// Get all users in a group.
+//
+// Phase 71.1 made this endpoint role-aware (Path 1 in CONTEXT — branched
+// response shape inside this handler so the frontend has a single uniform
+// data-fetch shape):
+//
+//   - Group-member caller (any active role): full roster, current behavior
+//     unchanged. Email/phone/calendar fields exposed as before.
+//   - Game-only caller (no UserGroup row but at least one EventParticipation
+//     row on a non-cancelled event in this group): roster filtered to
+//     event participants only, PII stripped, AND the caller's own row
+//     injected with UserGroup=null. The injection is a load-bearing
+//     cross-plan contract — Plan 02 frontend reads it as the SINGLE
+//     authoritative source of (a) userScope='game-only' detection and
+//     (b) the caller's User.id UUID for the Leave-event DELETE call.
+//   - Neither (no UserGroup row AND no EventParticipation row in this
+//     group): 403.
+//
+// Previously this endpoint had NO authz gate at all (T-71.1-02 information
+// disclosure). The new gate is intentional and tightens existing behavior.
 router.get('/:group_id/users', async (req, res) => {
   try {
-    const group = await Group.findByPk(req.params.group_id, {
+    const callerAuth0Id = req.user?.user_id;
+    if (!callerAuth0Id) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { group_id } = req.params;
+
+    const group = await Group.findByPk(group_id, {
       include: [{
         model: User,
         attributes: ['id', 'username', 'user_id', 'email'],
-        through: { where: { status: 'active' }, attributes: ['role', 'joined_at'] }
-      }]
+        through: { where: { status: 'active' }, attributes: ['role', 'joined_at'] },
+      }],
     });
-    
-    if (!group) {
-      return res.status(404).json({ error: 'Group not found' });
+    if (!group) return res.status(404).json({ error: 'Group not found' });
+
+    // Branch 1 — group-member caller. Existing behavior preserved verbatim.
+    const callerIsMember = await isActiveMember(callerAuth0Id, group_id);
+    if (callerIsMember) {
+      return res.json(group.Users || []);
     }
-    
-    res.json(group.Users || []);
+
+    // Branch 2 — game-only caller. Must have at least one EventParticipation
+    // row on a non-cancelled event in THIS group. Resolve caller User UUID
+    // first (EventParticipation.user_id is UUID, NOT Auth0 string).
+    const callerUser = await User.findOne({ where: { user_id: callerAuth0Id } });
+    if (!callerUser) return res.status(403).json({ error: 'Access denied' });
+
+    const callerEventsInGroup = await Event.findAll({
+      where: { group_id, status: { [Op.ne]: 'cancelled' } },
+      attributes: ['id'],
+      include: [{
+        model: EventParticipation,
+        where: { user_id: callerUser.id },
+        required: true,
+        attributes: ['id'],
+      }],
+    });
+
+    if (callerEventsInGroup.length === 0) {
+      // Branch 3 — neither group-member nor game-only.
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    // Caller is a game-only participant. Build the filtered roster:
+    // co-attendees on the events the caller is participating in.
+    const callerEventIds = callerEventsInGroup.map(e => e.id);
+    const coParticipations = await EventParticipation.findAll({
+      where: { event_id: { [Op.in]: callerEventIds } },
+      attributes: ['user_id'], // User.id UUIDs
+    });
+    const coParticipantUuids = [...new Set(coParticipations.map(p => p.user_id))];
+
+    // The full roster from the Group.Users include is keyed by User.id UUID.
+    // Filter to co-attendees only, then strip PII. Role badges (User.UserGroup)
+    // are preserved for actual group members in the result so "who's running
+    // this" is visible per CONTEXT decision.
+    const rosterFromGroup = (group.Users || [])
+      .filter(u => coParticipantUuids.includes(u.id))
+      .map(u => stripMemberPII(u));
+
+    // CRITICAL — Phase 71.1 cross-plan contract for Plan 02:
+    // The caller is a game-only participant — they have no UserGroup row, so
+    // group.Users will NEVER include them naturally. Inject a synthetic row
+    // built from `callerUser` with UserGroup=null as the explicit signal the
+    // frontend uses to (a) detect userScope='game-only' and (b) resolve the
+    // caller's User.id UUID for the Leave-event DELETE path.
+    const callerJson = callerUser.toJSON ? callerUser.toJSON() : callerUser;
+    const callerRow = stripMemberPII({
+      ...callerJson,
+      UserGroup: null, // explicit null — game-only signal
+    });
+
+    // Dedupe by id in case any future include-graph change accidentally
+    // surfaces the caller via group.Users.
+    const rosterFiltered = [
+      callerRow,
+      ...rosterFromGroup.filter(u => u.id !== callerRow.id),
+    ];
+
+    return res.json(rosterFiltered);
   } catch (error) {
+    console.error('Error fetching group users:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
