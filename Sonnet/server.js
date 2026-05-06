@@ -64,6 +64,7 @@ const rsvpRoutes = require('./routes/rsvp');
 const eventBringRoutes = require('./routes/eventBrings');
 const ballotRoutes = require('./routes/ballot');
 const suggestionRoutes = require('./routes/suggestions');
+const pollRoutes = require('./routes/polls');
 
 // Scheduler for deadline-based auto-scheduling
 const { deadlineJob } = require('./schedulers/deadlineScheduler');
@@ -193,6 +194,7 @@ app.use((req, res, next) => {
     '/api/user-games',
     '/api/invites',
     '/api/friendships',
+    '/api/polls',
   ];
   
   // Exclude public routes that don't require auth
@@ -301,6 +303,9 @@ app.use('/api/friendships', writeOperationLimiter, verifyAuth0Token, friendshipR
 app.use('/api/ballot', writeOperationLimiter, verifyAuth0Token, ballotRoutes);
 // Suggestion routes (smart game suggestions based on group collections)
 app.use('/api/suggestions', verifyAuth0Token, suggestionRoutes);
+// Poll routes (member-created availability polls — POLL-01).
+// All endpoints require Auth0; writeOperationLimiter applies to POST/PUT/DELETE.
+app.use('/api/polls', writeOperationLimiter, verifyAuth0Token, pollRoutes);
 // RSVP routes moved to public section above (per-route auth inside rsvp.js)
 
 // Health check
