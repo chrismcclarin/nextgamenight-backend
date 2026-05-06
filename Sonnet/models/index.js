@@ -28,6 +28,8 @@ const EventBallotVote = require('./EventBallotVote');
 const SentNotification = require('./SentNotification');
 const SchedulerRun = require('./SchedulerRun');
 const EventAuditLog = require('./EventAuditLog');
+const Poll = require('./Poll');
+const PollResponse = require('./PollResponse');
 const sequelize = require('../config/database');
 
 
@@ -192,6 +194,22 @@ SentNotification.belongsTo(Event, { foreignKey: 'event_id' });
 User.hasMany(SentNotification, { foreignKey: 'user_id', sourceKey: 'user_id' });
 SentNotification.belongsTo(User, { foreignKey: 'user_id', targetKey: 'user_id' });
 
+// Polls (POLL-01) — member-created availability polls
+// Group → Polls (One-to-Many)
+Group.hasMany(Poll, { foreignKey: 'group_id' });
+Poll.belongsTo(Group, { foreignKey: 'group_id' });
+// User → Polls (creator) — Auth0 string FK pattern
+User.hasMany(Poll, { as: 'CreatedPolls', foreignKey: 'created_by_user_id', sourceKey: 'user_id' });
+Poll.belongsTo(User, { as: 'Creator', foreignKey: 'created_by_user_id', targetKey: 'user_id' });
+
+// Poll → PollResponses (One-to-Many)
+Poll.hasMany(PollResponse, { foreignKey: 'poll_id' });
+PollResponse.belongsTo(Poll, { foreignKey: 'poll_id' });
+
+// User → PollResponses — Auth0 string FK pattern
+User.hasMany(PollResponse, { foreignKey: 'user_id', sourceKey: 'user_id' });
+PollResponse.belongsTo(User, { foreignKey: 'user_id', targetKey: 'user_id' });
+
 
 module.exports = {
   User,
@@ -220,5 +238,7 @@ module.exports = {
   SentNotification,
   SchedulerRun,
   EventAuditLog,
+  Poll,
+  PollResponse,
   sequelize,
 };
