@@ -10,7 +10,11 @@ const {
   Game,
 } = require('../models');
 const { validateBallotOptions, validateBallotVote } = require('../middleware/validators');
-const { isOwnerOrAdmin, isActiveMember, isMemberOrHigher } = require('../services/authorizationService');
+const {
+  isOwnerOrAdmin,
+  isMemberOrHigher,
+  canReadEventScopedSurface,
+} = require('../services/authorizationService');
 const router = express.Router();
 
 /**
@@ -79,10 +83,13 @@ router.get('/:eventId', async (req, res) => {
       return res.status(404).json({ error: 'Event not found' });
     }
 
-    // Verify user is in the event's group
-    const isMember = await isActiveMember(userId, event.group_id);
-    if (!isMember) {
-      return res.status(403).json({ error: 'You must be an active member of this group' });
+    // Phase 71.1: event-scoped read access. Game-only participants can read
+    // the ballot for the event they joined. Helper resolves the Event again
+    // internally — discard its bare event; we keep the includes-laden one
+    // already loaded above for downstream rendering.
+    const { allowed } = await canReadEventScopedSurface(userId, eventId);
+    if (!allowed) {
+      return res.status(403).json({ error: 'Only event participants and group members can view the ballot' });
     }
 
     // If no ballot exists
@@ -325,17 +332,18 @@ router.post('/:eventId/vote', validateBallotVote, async (req, res) => {
     // POLL-06 (D-BALLOT-02 + D-BALLOT-06 + D-BALLOT-07):
     // Belt-and-suspenders gate. Apply to ALL ballots immediately, NO flag.
     //
-    // 1. Active group membership (closes the H-D edge case from the POLL-06
-    //    investigation: a non-member-with-stale-EventRsvp could otherwise
-    //    pass the RSVP-only gate that lived here previously). isActiveMember
-    //    matches the existing predicate used on GET /:eventId.
+    // 1. Event-scoped surface access — Phase 71.1 widened from active-group
+    //    membership to canReadEventScopedSurface so a game-only participant
+    //    (EventParticipation row, no UserGroup row) can vote on the event
+    //    they joined. Closes the H-D edge case from POLL-06: a stale
+    //    EventRsvp without any current scope-membership now fails this gate.
     // 2. Yes/Maybe RSVP for this event (D-BALLOT-02 — keep current scope).
     //    Look up the row WITHOUT a status filter so we can include the
     //    actual status in the 403 message ("...your RSVP is currently no").
-    const isMember = await isActiveMember(userId, event.group_id);
-    if (!isMember) {
+    const { allowed } = await canReadEventScopedSurface(userId, eventId);
+    if (!allowed) {
       return res.status(403).json({
-        error: 'Only active members of this group can vote on the ballot',
+        error: 'Only event participants can vote on the ballot',
       });
     }
 

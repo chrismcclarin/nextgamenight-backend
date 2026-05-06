@@ -90,7 +90,12 @@ const formatEventWithCustomParticipants = (event) => {
   };
 };
 const { validateEventCreate, validateEventUpdate, validateUUID } = require('../middleware/validators');
-const { isOwnerOrAdmin, isActiveMember, isMemberOrHigher } = require('../services/authorizationService');
+const {
+  isOwnerOrAdmin,
+  isActiveMember,
+  isMemberOrHigher,
+  canReadEventScopedSurface,
+} = require('../services/authorizationService');
 
 // Helper: attach RSVP summary counts to an array of formatted events
 const attachRsvpSummaries = async (events) => {
@@ -205,21 +210,40 @@ router.get('/user/:user_id', async (req, res) => {
       where: { user_id: user.user_id, status: 'active' }, // Use user.user_id (Auth0 string) not user.id (UUID)
       attributes: ['group_id']
     });
-    
+
     const groupIds = userGroups.map(ug => ug.group_id);
-    
-    if (groupIds.length === 0) {
+
+    // Phase 71.1: UNION game-only events (EventParticipation rows where the
+    // user has no UserGroup row in the event's group). Without this, a user
+    // who joined a single event via the QR-game-invite never sees it on
+    // UserHomePage. EventParticipation.user_id is a User.id UUID — use the
+    // resolved `user.id` from above.
+    const participations = await EventParticipation.findAll({
+      where: { user_id: user.id },
+      attributes: ['event_id']
+    });
+    const participatingEventIds = participations.map(p => p.event_id);
+
+    if (groupIds.length === 0 && participatingEventIds.length === 0) {
       return res.json([]);
     }
-    
-    // Get all events from user's groups
+
+    // UNION via Op.or — events from the user's groups OR events the user is
+    // participating in directly (game-only QR-join). Postgres dedupes
+    // naturally because Event.id is unique; group-member callers attending a
+    // game-invite event in a group they ALSO belong to still get a single
+    // row in the response.
+    const orClauses = [];
+    if (groupIds.length > 0) orClauses.push({ group_id: { [Op.in]: groupIds } });
+    if (participatingEventIds.length > 0) orClauses.push({ id: { [Op.in]: participatingEventIds } });
+
     const events = await Event.findAll({
-      where: { group_id: { [Op.in]: groupIds } },
+      where: { [Op.or]: orClauses },
       include: [
         { model: Game, attributes: ['id', 'name', 'image_url', 'theme'] },
-        { 
-          model: Group, 
-          attributes: ['id', 'name', 'profile_picture_url', 'background_color', 'background_image_url'] 
+        {
+          model: Group,
+          attributes: ['id', 'name', 'profile_picture_url', 'background_color', 'background_image_url']
         },
         { model: User, as: 'Winner', attributes: ['id', 'username', 'user_id'] },
         { model: User, as: 'PickedBy', attributes: ['id', 'username'] },
@@ -293,6 +317,26 @@ router.get('/group/:group_id', async (req, res) => {
 // Get a single event by ID (must come after /user/ and /group/ routes)
 router.get('/:event_id', async (req, res) => {
   try {
+    const userId = req.user?.user_id;
+    if (!userId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    // Phase 71.1: this endpoint previously had NO authz gate (any
+    // authenticated user could fetch any event detail — T-71.1-01
+    // information disclosure). Add canReadEventScopedSurface so:
+    //   - active group members pass for any event in their group
+    //   - game-only participants pass ONLY for events they joined
+    //   - everyone else gets 403 (or 404 if the event doesn't exist)
+    const { allowed, event: gateEvent } = await canReadEventScopedSurface(userId, req.params.event_id);
+    if (!gateEvent) {
+      return res.status(404).json({ error: 'Event not found' });
+    }
+    if (!allowed) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    // Re-fetch with includes — gateEvent is the bare row.
     const event = await Event.findByPk(req.params.event_id, {
       include: [
         { model: Game, attributes: ['name', 'image_url', 'theme'] },
@@ -1073,10 +1117,19 @@ router.delete('/:event_id/participations/:user_id', validateUUID('event_id'), va
       return res.status(404).json({ error: 'Event not found' });
     }
 
-    // Permission gate: owner/admin only (mirrors DELETE /events/:id)
-    const hasPermission = await isOwnerOrAdmin(userId, event.group_id);
-    if (!hasPermission) {
-      return res.status(403).json({ error: 'Only group owners and admins can remove participants' });
+    // Phase 71.1: widened from owner/admin-only to also allow self-leave.
+    // A game-only participant (and any group member, for that matter) must
+    // be able to remove their own EventParticipation row — this is the
+    // hard "I'm not coming, take me off the list" symmetric with QR-join.
+    // Resolve the caller's User UUID first because participationUserId is
+    // the User.id UUID (matches EventParticipation.user_id).
+    const callerDbUser = await User.findOne({ where: { user_id: userId } });
+    const isSelf = !!(callerDbUser && callerDbUser.id === participationUserId);
+    const isOrganizer = await isOwnerOrAdmin(userId, event.group_id);
+    if (!isSelf && !isOrganizer) {
+      return res.status(403).json({
+        error: 'You can only remove yourself or, as an admin, remove others',
+      });
     }
 
     const participation = await EventParticipation.findOne({

@@ -5,7 +5,7 @@
 const express = require('express');
 const { Event } = require('../models');
 const { getSuggestions } = require('../services/suggestionService');
-const { isActiveMember } = require('../services/authorizationService');
+const { isActiveMember, canReadEventScopedSurface } = require('../services/authorizationService');
 const router = express.Router();
 
 // ============================================
@@ -19,16 +19,15 @@ router.get('/event/:eventId', async (req, res) => {
     const { maxPlayTime, minWeight, maxWeight, sort } = req.query;
     const userId = req.user.user_id;
 
-    // Look up event to get group_id
-    const event = await Event.findByPk(eventId);
+    // Phase 71.1: event-scoped read access. Game-only participants can view
+    // suggestions for the event they joined. Helper resolves Event internally
+    // and returns it so we can pass event.group_id to getSuggestions.
+    const { allowed, event } = await canReadEventScopedSurface(userId, eventId);
     if (!event) {
       return res.status(404).json({ error: 'Event not found' });
     }
-
-    // Verify requesting user is an active group member
-    const isMember = await isActiveMember(userId, event.group_id);
-    if (!isMember) {
-      return res.status(403).json({ error: 'You must be an active group member to view suggestions' });
+    if (!allowed) {
+      return res.status(403).json({ error: 'You must be a participant on this event to view suggestions' });
     }
 
     const result = await getSuggestions({

@@ -3,7 +3,7 @@
 const express = require('express');
 const { EventBring, EventRsvp, Event, User, UserGame, Game, sequelize } = require('../models');
 const { verifyAuth0Token } = require('../middleware/auth0');
-const { isActiveMember } = require('../services/authorizationService');
+const { canReadEventScopedSurface } = require('../services/authorizationService');
 const router = express.Router();
 
 // GET /event/:event_id -- Fetch all brings for an event
@@ -12,16 +12,14 @@ router.get('/event/:event_id', verifyAuth0Token, async (req, res) => {
     const { event_id } = req.params;
     const userId = req.user.user_id;
 
-    // Verify event exists
-    const event = await Event.findByPk(event_id);
+    // Phase 71.1: event-scoped read access. Game-only participants can view
+    // brings for the event they joined. Helper resolves Event internally.
+    const { allowed, event } = await canReadEventScopedSurface(userId, event_id);
     if (!event) {
       return res.status(404).json({ error: 'Event not found' });
     }
-
-    // Verify user is an active member of the event's group
-    const isMember = await isActiveMember(userId, event.group_id);
-    if (!isMember) {
-      return res.status(403).json({ error: 'You must be an active member of this group to view brings' });
+    if (!allowed) {
+      return res.status(403).json({ error: 'You must be a participant on this event to view brings' });
     }
 
     const brings = await EventBring.findAll({

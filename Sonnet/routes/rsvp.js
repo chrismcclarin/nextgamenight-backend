@@ -40,7 +40,7 @@ function generateRsvpUrl(frontendUrl, eventId, userId, status) {
   return `${frontendUrl}/rsvp/${token}?e=${eventId}&u=${encodeURIComponent(userId)}&s=${status}`;
 }
 
-const { isActiveMember } = require('../services/authorizationService');
+const { canReadEventScopedSurface } = require('../services/authorizationService');
 
 // ============================================
 // Public endpoint (no auth required)
@@ -143,19 +143,24 @@ router.post('/', verifyAuth0Token, validateRsvpCreate, async (req, res) => {
     const { event_id, status, note } = req.body;
     const userId = req.user.user_id;
 
-    // Look up the event (must exist and not be cancelled)
+    // Phase 71.1: gate widened from group-membership to event-scoped surface.
+    // Game-only participants (EventParticipation row, no UserGroup row) can
+    // RSVP on the specific event they joined.
+    const { allowed } = await canReadEventScopedSurface(userId, event_id);
+    if (!allowed) {
+      return res.status(403).json({ error: 'You must be a participant on this event to RSVP' });
+    }
+
+    // Look up the event (must exist and not be cancelled). The helper above
+    // also resolved the event but downstream code reads event.status, and the
+    // helper's bare event lacks any includes — keep the dedicated findByPk so
+    // future include additions stay co-located with their consumer.
     const event = await Event.findByPk(event_id);
     if (!event) {
       return res.status(404).json({ error: 'Event not found' });
     }
     if (event.status === 'cancelled') {
       return res.status(400).json({ error: 'Cannot RSVP to a cancelled event' });
-    }
-
-    // Verify user is an active member of the event's group
-    const isMember = await isActiveMember(userId, event.group_id);
-    if (!isMember) {
-      return res.status(403).json({ error: 'You must be an active member of this group to RSVP' });
     }
 
     // Upsert: find existing RSVP or create new
@@ -204,16 +209,14 @@ router.get('/event/:event_id', verifyAuth0Token, async (req, res) => {
     const { event_id } = req.params;
     const userId = req.user.user_id;
 
-    // Look up the event
-    const event = await Event.findByPk(event_id);
+    // Phase 71.1: event-scoped read access. Game-only participants can view
+    // RSVPs for the event they joined.
+    const { allowed, event } = await canReadEventScopedSurface(userId, event_id);
     if (!event) {
       return res.status(404).json({ error: 'Event not found' });
     }
-
-    // Verify user is an active member of the event's group
-    const isMember = await isActiveMember(userId, event.group_id);
-    if (!isMember) {
-      return res.status(403).json({ error: 'You must be an active member of this group to view RSVPs' });
+    if (!allowed) {
+      return res.status(403).json({ error: 'You must be a participant on this event to view RSVPs' });
     }
 
     // Fetch all RSVPs for this event

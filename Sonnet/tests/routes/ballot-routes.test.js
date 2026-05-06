@@ -132,10 +132,16 @@ describe('POLL-06 vote gate coverage (structural)', () => {
   const afterVote = ballotSource.indexOf("router.post('/:eventId/resolve-tie'", voteHandlerStart);
   const voteHandler = ballotSource.slice(voteHandlerStart, afterVote);
 
-  it('vote handler enforces the active-member predicate (H-D edge case)', () => {
-    expect(voteHandler).toMatch(/isActiveMember\s*\(\s*userId\s*,\s*event\.group_id\s*\)/);
-    // Must 403 when not an active member
-    expect(voteHandler).toMatch(/Only active members of this group can vote/);
+  it('vote handler enforces the event-scoped surface predicate (H-D edge case)', () => {
+    // Phase 71.1 widened the gate from isActiveMember to
+    // canReadEventScopedSurface so game-only participants can vote on the
+    // event they joined. The H-D edge case (stale EventRsvp without any
+    // current scope membership) is still closed because the helper returns
+    // allowed=false when neither isActiveMember nor isEventParticipant
+    // resolves true.
+    expect(voteHandler).toMatch(/canReadEventScopedSurface\s*\(\s*userId\s*,\s*eventId\s*\)/);
+    // Must 403 when not allowed by the event-scoped helper
+    expect(voteHandler).toMatch(/Only event participants can vote on the ballot/);
   });
 
   it('vote handler enforces the yes/maybe RSVP predicate (D-BALLOT-02)', () => {
@@ -157,13 +163,16 @@ describe('POLL-06 vote gate coverage (structural)', () => {
   });
 
   it('vote handler runs the gate BEFORE EventBallotVote.create (no race)', () => {
+    // Phase 71.1: predicate is now canReadEventScopedSurface, not
+    // isActiveMember. The structural invariant is the same — both the
+    // surface gate and the RSVP gate must run before any vote write.
     const createIdx = voteHandler.indexOf('EventBallotVote.create');
-    const memberIdx = voteHandler.indexOf('isActiveMember');
+    const surfaceIdx = voteHandler.indexOf('canReadEventScopedSurface');
     const rsvpIdx = voteHandler.indexOf('EventRsvp.findOne');
     expect(createIdx).toBeGreaterThan(-1);
-    expect(memberIdx).toBeGreaterThan(-1);
+    expect(surfaceIdx).toBeGreaterThan(-1);
     expect(rsvpIdx).toBeGreaterThan(-1);
-    expect(memberIdx).toBeLessThan(createIdx);
+    expect(surfaceIdx).toBeLessThan(createIdx);
     expect(rsvpIdx).toBeLessThan(createIdx);
   });
 
