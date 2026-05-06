@@ -911,12 +911,25 @@ router.post('/join-game-by-token', async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    // Check for existing participation
-    const existingParticipation = await EventParticipation.findOne({
+    // POLL-05: race-safe participation check. Previously this was a TOCTOU
+    // pair (findOne → create) — two concurrent POSTs for the same
+    // (event_id, user_id) both saw "no existing row" and both tried to
+    // INSERT, second INSERT 500'd on EventParticipations_event_id_user_id_key
+    // unique constraint. findOrCreate uses INSERT ... ON CONFLICT DO NOTHING
+    // + fallback SELECT under Postgres, so concurrent calls collapse to one
+    // created row + one fallback select with `created=false`. Matches the
+    // existing findOrCreate pattern in routes/users.js, routes/groups.js,
+    // routes/invites.js, routes/userGames.js (idempotent upsert idiom).
+    const [, created] = await EventParticipation.findOrCreate({
       where: { event_id: event.id, user_id: dbUser.id },
+      defaults: {
+        event_id: event.id,
+        user_id: dbUser.id,
+        is_guest: true,
+      },
     });
 
-    if (existingParticipation) {
+    if (!created) {
       return res.json({ already_joined: true, event_id: event.id });
     }
 
@@ -929,6 +942,9 @@ router.post('/join-game-by-token', async (req, res) => {
     // a plain `event_snapshot: { removed_user_id: x }` would attempt full-row
     // equality on the JSONB column and never match (the snapshot also stores
     // id, group_id, game_id, etc.).
+    //
+    // Runs only on the create-path (created=true) — the early-return above
+    // covers the existing-row case so we don't re-check audit logs needlessly.
     let isReJoinAfterRemoval = false;
     try {
       const priorRemoval = await EventAuditLog.findOne({
@@ -947,13 +963,6 @@ router.post('/join-game-by-token', async (req, res) => {
       // fires). A failed lookup should not block the join itself.
       console.error('[join-game-by-token] EventAuditLog lookup failed (non-fatal):', auditLookupErr.message);
     }
-
-    // Create guest participation
-    await EventParticipation.create({
-      event_id: event.id,
-      user_id: dbUser.id,
-      is_guest: true,
-    });
 
     // Fire-and-forget confirmation email (do not block on send) — MAIL-03
     // Only reached on a brand-new participation; the existing already_joined
