@@ -466,6 +466,17 @@ router.patch('/availability-prompts/:id/close', verifyAuth0Token, async (req, re
     }
 
     await prompt.update({ status: 'closed' });
+
+    // Phase 71.2 / D-ADAPT-04: dispatch close-notification email + Schedule it?
+    // CTA via the unified lifecycle service. Best-effort — close already
+    // committed, errors here are non-fatal.
+    try {
+      const lifecycleService = require('../services/promptLifecycleService');
+      await lifecycleService.handlePromptClosed(prompt);
+    } catch (notifyErr) {
+      console.error('[availabilityPrompt] close-notification dispatch failed (non-fatal):', notifyErr.message);
+    }
+
     // can_close is now false for everyone (D-CLOSE-04 — closed is final).
     res.json({ success: true, prompt, can_close: false });
   } catch (error) {

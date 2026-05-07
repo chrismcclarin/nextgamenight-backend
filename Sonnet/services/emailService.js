@@ -317,6 +317,228 @@ Review suggestions: ${dashboardUrl}
   }
 
   // ============================================
+  // Poll Closed Email Template (Phase 71.2 / D-ADAPT-04)
+  // ============================================
+
+  /**
+   * Escape HTML special characters in user-supplied strings to prevent
+   * injection in the rendered email body. Mitigates T-71.2-06 (Information
+   * Disclosure / template-interpolated strings rendered as raw HTML).
+   * @param {string} value - Untrusted string
+   * @returns {string} Escaped string safe for HTML interpolation.
+   */
+  escapeHtml(value) {
+    if (value === null || value === undefined) return '';
+    return String(value)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  /**
+   * Generate the close-notification email sent when an AvailabilityPrompt
+   * transitions to status='closed' (Phase 71.2 / D-ADAPT-04).
+   *
+   * One CTA per top slot ("Schedule it?") deep-links to /groupPlanning with
+   * the createEvent prefill query params (`prefillDate`, `prefillTime`,
+   * `prefillDuration`, `prefillGameId`) verified against the front-end
+   * createEvent component (createEvent.js line 19 reads these names).
+   *
+   * Multiple top slots (ties) render as separate rows with separate CTAs,
+   * sorted ascending by `suggested_start` so the earliest tie is rendered
+   * first (D-POLL-CREATE-12 carry-forward intent).
+   *
+   * Subject: "${groupName} - poll closed - schedule a session?"
+   *
+   * All user-supplied strings (groupName, gameName, recipientName) are
+   * HTML-escaped per T-71.2-06.
+   *
+   * @param {Object} params
+   * @param {string} params.recipientName
+   * @param {string} params.groupName
+   * @param {string|null} params.gameName
+   * @param {Array<{suggested_start: Date|string, suggested_end: Date|string|null, score: number, duration_minutes?: number|null}>} params.topSlots
+   * @param {string} params.scheduleItBaseUrl - e.g. https://app.com/groupPlanning
+   * @param {string} params.promptId
+   * @param {string} params.groupId
+   * @param {string} params.timezone - IANA timezone for human-readable formatting
+   * @returns {{html: string, text: string, subject: string}}
+   */
+  generatePollClosedEmailTemplate({
+    recipientName,
+    groupName,
+    gameName,
+    topSlots,
+    scheduleItBaseUrl,
+    promptId,
+    groupId,
+    timezone,
+  }) {
+    const safeRecipient = this.escapeHtml(recipientName || 'there');
+    const safeGroupName = this.escapeHtml(groupName || 'your group');
+    const safeGameName = gameName ? this.escapeHtml(gameName) : null;
+    const tz = timezone || 'UTC';
+    const baseUrl = scheduleItBaseUrl || `${this.frontendUrl}/groupPlanning`;
+
+    // Sort ties by suggested_start ASC so the earliest tie renders first.
+    const sortedSlots = (topSlots || []).slice().sort((a, b) => {
+      return new Date(a.suggested_start) - new Date(b.suggested_start);
+    });
+
+    // Build a CTA URL for one slot per the createEvent.js prefill contract.
+    // Query keys (verified in periodictabletop/src/app/components/createEvent.js):
+    //   group_id, prompt_id, prefillDate (YYYY-MM-DD), prefillTime (HH:mm),
+    //   prefillDuration (minutes), prefillGameId.
+    const buildSlotCtaUrl = (slot) => {
+      const start = new Date(slot.suggested_start);
+      // Date in recipient's timezone — render YYYY-MM-DD + HH:mm.
+      const dateOnly = start
+        .toLocaleString('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' })
+        .replace(/,.*$/, ''); // 'YYYY-MM-DD'
+      const timeOnly = start
+        .toLocaleString('en-GB', { timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: false })
+        .replace(/[^\d:]/g, '');
+
+      let durationMinutes = slot.duration_minutes;
+      if (!durationMinutes && slot.suggested_end) {
+        durationMinutes = Math.round(
+          (new Date(slot.suggested_end) - new Date(slot.suggested_start)) / 60000
+        );
+      }
+
+      const params = new URLSearchParams();
+      if (groupId) params.set('group_id', groupId);
+      if (promptId) params.set('prompt_id', promptId);
+      params.set('prefillDate', dateOnly);
+      params.set('prefillTime', timeOnly);
+      if (durationMinutes) params.set('prefillDuration', String(durationMinutes));
+      // game_id is optional — only emit if we have one (top-level prompt has it
+      // or null). The lifecycle service passes gameName but not gameId in the
+      // current scope; emit prefillGameId only when the param actually exists.
+      // This template doesn't have gameId in its signature, so leave it out
+      // and let the recipient pick a game in the modal if needed.
+      return `${baseUrl}?${params.toString()}`;
+    };
+
+    const formatSlotForDisplay = (slot) => {
+      const start = new Date(slot.suggested_start);
+      const dayLabel = start.toLocaleString('en-US', {
+        timeZone: tz,
+        weekday: 'long',
+        month: 'long',
+        day: 'numeric',
+      });
+      const timeLabel = start.toLocaleString('en-US', {
+        timeZone: tz,
+        hour: 'numeric',
+        minute: '2-digit',
+        hour12: true,
+        timeZoneName: 'short',
+      });
+      return `${dayLabel} at ${timeLabel}`;
+    };
+
+    const subject = `${groupName || 'Your group'} - poll closed - schedule a session?`;
+
+    // Slot cards
+    const slotCardsHtml = sortedSlots
+      .map((slot) => {
+        const display = this.escapeHtml(formatSlotForDisplay(slot));
+        const ctaUrl = buildSlotCtaUrl(slot);
+        return `
+        <div style="background-color: #ffffff; border: 1px solid #E5E7EB; border-radius: 8px; padding: 16px; margin: 12px 0;">
+          <p style="margin: 0 0 12px 0; font-size: 16px; color: #111827;"><strong>${display}</strong></p>
+          <a href="${ctaUrl}" class="button" style="display: inline-block; padding: 10px 20px; background-color: #4F46E5; color: white; text-decoration: none; border-radius: 5px; font-weight: bold;">Schedule it?</a>
+        </div>`;
+      })
+      .join('');
+
+    const intro =
+      sortedSlots.length === 1
+        ? `The best time was <strong>${this.escapeHtml(formatSlotForDisplay(sortedSlots[0]))}</strong>. Want to schedule it?`
+        : `${sortedSlots.length} times tied for best. Pick one to schedule:`;
+
+    const gameLine = safeGameName
+      ? `<p>The poll was for <strong>${safeGameName}</strong>.</p>`
+      : '';
+
+    const fallbackPlanningUrl = (() => {
+      const params = new URLSearchParams();
+      if (groupId) params.set('group_id', groupId);
+      if (promptId) params.set('prompt_id', promptId);
+      const qs = params.toString();
+      return qs ? `${baseUrl}?${qs}` : baseUrl;
+    })();
+
+    const html = `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+    .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+    .header { background-color: #4F46E5; color: white; padding: 20px; text-align: center; border-radius: 5px 5px 0 0; }
+    .content { background-color: #f9fafb; padding: 30px; border-radius: 0 0 5px 5px; }
+    .footer { text-align: center; color: #6B7280; font-size: 12px; margin-top: 30px; padding-top: 20px; border-top: 1px solid #E5E7EB; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>Poll closed</h1>
+    </div>
+    <div class="content">
+      <p>Hi ${safeRecipient},</p>
+      <p>Your availability poll for <strong>${safeGroupName}</strong> has closed.</p>
+      ${gameLine}
+      <p>${intro}</p>
+      ${slotCardsHtml}
+      <p style="color: #6B7280; font-size: 14px; margin-top: 24px;">If none of these work, you can pick a different time on the planning page: <a href="${fallbackPlanningUrl}" style="color: #4F46E5;">Open group planning</a>.</p>
+      <div class="footer">
+        <p>This is an automated notification from Next Game Night.</p>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
+    `.trim();
+
+    // Plain-text version mirrors the html copy.
+    const textSlotsList = sortedSlots
+      .map((slot) => {
+        const display = formatSlotForDisplay(slot);
+        const ctaUrl = buildSlotCtaUrl(slot);
+        return `- ${display}\n  Schedule it? ${ctaUrl}`;
+      })
+      .join('\n\n');
+
+    const textIntro =
+      sortedSlots.length === 1
+        ? `The best time was ${formatSlotForDisplay(sortedSlots[0])}. Want to schedule it?`
+        : `${sortedSlots.length} times tied for best. Pick one to schedule:`;
+
+    const text = `
+Hi ${recipientName || 'there'},
+
+Your availability poll for ${groupName || 'your group'} has closed.${gameName ? `\n\nThe poll was for ${gameName}.` : ''}
+
+${textIntro}
+
+${textSlotsList}
+
+If none of these work, you can pick a different time on the planning page: ${fallbackPlanningUrl}
+
+---
+This is an automated notification from Next Game Night.
+    `.trim();
+
+    return { html, text, subject };
+  }
+
+  // ============================================
   // Group Invite Email Template
   // ============================================
 

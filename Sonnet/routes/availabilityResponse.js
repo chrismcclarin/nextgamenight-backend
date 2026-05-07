@@ -160,6 +160,18 @@ router.post('/', magicTokenLimiter, async (req, res) => {
       }
     }
 
+    // Phase 71.2 / D-ADAPT-03: after a successful response upsert, check whether
+    // all active members have now responded. If so, the lifecycle service
+    // closes the prompt and fires the close-notification email + Schedule it?
+    // CTA. Best-effort — errors logged not thrown so the response submit still
+    // succeeds even if the consensus check fails.
+    try {
+      const lifecycleService = require('../services/promptLifecycleService');
+      await lifecycleService.checkConsensusAndClose(promptId);
+    } catch (consensusErr) {
+      console.error('[availabilityResponse] consensus check failed (non-fatal):', consensusErr.message);
+    }
+
     res.status(200).json({
       success: true,
       response_id: response.id,
