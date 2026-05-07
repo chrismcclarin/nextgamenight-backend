@@ -328,7 +328,14 @@ router.post('/prompts', verifyAuth0Token, async (req, res) => {
         group_id,
         prompt_date: new Date(),
         deadline: new Date(deadline),
-        status: 'pending',
+        // Phase 71.2 / Plan 03 hotfix — create manual polls as 'active' directly.
+        // The 'pending → active' transition exists in workers/promptWorker.js
+        // because that worker fans out emails synchronously and flips to active
+        // after the loop finishes. Manual polls fan out non-blocking, so leaving
+        // status='pending' would permanently reject responses (see
+        // routes/availabilityResponse.js status gate). Auto-prompts still
+        // transition pending → active per the worker.
+        status: 'active',
         week_identifier: week_identifier || null,
         auto_schedule_enabled: auto_schedule_enabled ?? true,
         blind_voting_enabled: blind_voting_enabled ?? false,
