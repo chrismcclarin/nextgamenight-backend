@@ -163,7 +163,20 @@ async function handlePromptClosed(prompt) {
       gameName = game ? game.name : null;
     }
 
-    // Step 4 — build top-slot list (ties allowed).
+    // Step 4a — aggregate responses into AvailabilitySuggestion rows. Idempotent
+    // (heatmapService destroys + recreates per prompt). Auto-prompts pre-aggregate
+    // via the suggestions API when admins open the heatmap, but manual polls
+    // never had a trigger, so the close-notification email always silently
+    // skipped on the "no viable suggestions" gate. Running aggregation here
+    // covers all close paths uniformly.
+    try {
+      const heatmapService = require('./heatmapService');
+      await heatmapService.aggregateResponses(prompt.id);
+    } catch (aggErr) {
+      console.error(`[promptLifecycle] aggregateResponses failed for prompt ${prompt.id} (continuing): ${aggErr.message}`);
+    }
+
+    // Step 4b — build top-slot list (ties allowed).
     const suggestions = await AvailabilitySuggestion.findAll({
       where: { prompt_id: prompt.id, meets_minimum: true },
       order: [['score', 'DESC'], ['suggested_start', 'ASC']],
