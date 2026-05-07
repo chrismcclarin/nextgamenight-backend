@@ -205,13 +205,28 @@ router.post('/:group_id/prompt-settings/schedules', async (req, res) => {
       return res.status(400).json({ error: 'schedule_timezone is required' });
     }
 
-    // Find or create GroupPromptSettings
+    // Find or create GroupPromptSettings.
+    //
+    // Phase 71.2 / D-SCHEMA-06: when the row is first created (i.e., this is the
+    // first schedule for the group), stamp `created_by_user_id` with the requester's
+    // User.id (UUID) so Plan 02's close-notification recipient resolution can route
+    // auto-prompt close emails to the schedule creator (rule:
+    // settings.created_by_user_id || group owner). For groups with an existing
+    // GroupPromptSettings row, the column stays at whatever it was (NULL for legacy
+    // rows, or the original setter for rows created post-migration). Per-schedule
+    // creator-tracking lives inside template_config.schedules[].created_by_user_id
+    // below.
     let settings = await GroupPromptSettings.findOne({ where: { group_id } });
     if (!settings) {
+      const dbUser = await User.findOne({ where: { user_id: userId } });
+      if (!dbUser) {
+        return res.status(404).json({ error: 'User record not found' });
+      }
       settings = await GroupPromptSettings.create({
         group_id,
         schedule_timezone,
-        template_config: { schedules: [] }
+        template_config: { schedules: [] },
+        created_by_user_id: dbUser.id
       });
     }
 

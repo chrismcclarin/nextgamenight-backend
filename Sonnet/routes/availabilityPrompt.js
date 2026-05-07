@@ -11,7 +11,8 @@ const {
   User,
   UserGroup,
   Group,
-  Game
+  Game,
+  GroupPromptSettings
 } = require('../models');
 const emailService = require('../services/emailService');
 const { scheduleReminders, scheduleDeadlineJob } = require('../services/reminderService');
@@ -292,25 +293,50 @@ router.post('/prompts', verifyAuth0Token, async (req, res) => {
       return res.status(404).json({ error: 'Group not found' });
     }
 
-    // Verify requester is admin/owner
+    // Phase 71.2 / D-CLOSE-06: any active group member can fire an availability
+    // prompt — admin gate replaced with active-member gate. Pending and removed
+    // members still receive 403.
     const userGroup = await UserGroup.findOne({
       where: { group_id, user_id: userId, status: 'active' }
     });
 
-    if (!userGroup || !['owner', 'admin'].includes(userGroup.role)) {
-      return res.status(403).json({ error: 'Only admins can create availability prompts' });
+    if (!userGroup || userGroup.status !== 'active') {
+      return res.status(403).json({ error: 'You must be an active group member to create a poll' });
     }
 
-    // Create the prompt
-    const prompt = await AvailabilityPrompt.create({
-      group_id,
-      prompt_date: new Date(),
-      deadline: new Date(deadline),
-      status: 'pending',
-      week_identifier: week_identifier || null,
-      auto_schedule_enabled: auto_schedule_enabled ?? true,
-      blind_voting_enabled: blind_voting_enabled ?? false
-    });
+    // Phase 71.2 / D-SCHEMA-04: stamp the creator on manual polls. The frontend
+    // body cannot supply this field — it's derived server-side from the verified
+    // Auth0 sub via the User table (see threat T-71.2-05 in plan threat model).
+    const dbUser = await User.findOne({ where: { user_id: userId } });
+    if (!dbUser) {
+      return res.status(404).json({ error: 'User record not found' });
+    }
+
+    // Create the prompt. Wrap in try/catch on UniqueConstraintError so the
+    // partial unique index `availability_prompts_one_open_manual` (D-ADAPT-02)
+    // surfaces as a 409 instead of a 500.
+    let prompt;
+    try {
+      prompt = await AvailabilityPrompt.create({
+        group_id,
+        prompt_date: new Date(),
+        deadline: new Date(deadline),
+        status: 'pending',
+        week_identifier: week_identifier || null,
+        auto_schedule_enabled: auto_schedule_enabled ?? true,
+        blind_voting_enabled: blind_voting_enabled ?? false,
+        created_by_user_id: dbUser.id
+      });
+    } catch (err) {
+      if (err.name === 'SequelizeUniqueConstraintError') {
+        // Partial unique index hit — group already has an open manual poll.
+        // The path on this constraint is reported as 'group_id' by Sequelize.
+        return res.status(409).json({
+          error: 'This group already has an open poll. Close it before starting another.'
+        });
+      }
+      throw err;
+    }
 
     // Schedule reminder and deadline jobs (only if BullMQ is enabled)
     if (process.env.NODE_ENV === 'production' || process.env.ENABLE_WORKERS === 'true') {
@@ -398,6 +424,120 @@ router.get('/prompts/:promptId', verifyAuth0Token, async (req, res) => {
   } catch (error) {
     console.error('Error fetching prompt:', error);
     res.status(500).json({ error: 'Failed to fetch prompt' });
+  }
+});
+
+
+/**
+ * PATCH /api/availability-prompts/:id/close
+ * Phase 71.2 / D-CLOSE-05 — Soft-close an availability prompt (manual poll OR auto-prompt).
+ * Auth: prompt creator OR group owner/admin.
+ * Soft close: sets status='closed', preserves all responses.
+ * D-CLOSE-04: closed is final — no re-open path.
+ *
+ * Plan 02 will hook an after-update lifecycle handler for the close-notification
+ * email + "Schedule it?" CTA. This route is intentionally thin — no email logic here.
+ */
+router.patch('/availability-prompts/:id/close', verifyAuth0Token, async (req, res) => {
+  try {
+    const userId = req.user.user_id;
+    const { id } = req.params;
+
+    const prompt = await AvailabilityPrompt.findByPk(id);
+    if (!prompt) return res.status(404).json({ error: 'Poll not found' });
+
+    if (prompt.status === 'closed' || prompt.status === 'converted') {
+      // D-CLOSE-04: closed is final. Return 409 to make state-machine violations loud.
+      return res.status(409).json({ error: `Poll is already ${prompt.status}` });
+    }
+
+    const dbUser = await User.findOne({ where: { user_id: userId } });
+    if (!dbUser) return res.status(404).json({ error: 'User record not found' });
+
+    const userGroup = await UserGroup.findOne({
+      where: { user_id: userId, group_id: prompt.group_id, status: 'active' }
+    });
+
+    const isAdmin = !!userGroup && ['owner', 'admin'].includes(userGroup.role);
+    const isCreator = prompt.created_by_user_id !== null && prompt.created_by_user_id === dbUser.id;
+
+    if (!isAdmin && !isCreator) {
+      return res.status(403).json({ error: 'Only the poll creator or a group admin can close this poll' });
+    }
+
+    await prompt.update({ status: 'closed' });
+    // can_close is now false for everyone (D-CLOSE-04 — closed is final).
+    res.json({ success: true, prompt, can_close: false });
+  } catch (error) {
+    console.error('Error closing prompt:', error);
+    res.status(500).json({ error: 'Failed to close prompt' });
+  }
+});
+
+
+/**
+ * GET /api/groups/:groupId/prompts/open
+ * Phase 71.2 / D-UI-02 — list ALL open AvailabilityPrompts (manual + auto) for a group,
+ * with creator info, the parent recurring-schedule name (for auto-prompts via
+ * GroupPromptSettings.template_name), and a per-requester `can_close` flag.
+ *
+ * Used by the unified open-polls list UI.
+ *
+ * Note on field name: the plan/CONTEXT references `GroupPromptSettings.name` (D-UI-02)
+ * but the actual model column is `template_name`. We expose it as `template_name` in
+ * the include payload — Plan 03 maps that to the "From [schedule name]" UI label.
+ *
+ * D-CLOSE-05: server-derived `can_close` flag scoped to the requester so the
+ * frontend never sees raw creator UUIDs. We also strip `created_by_user_id`
+ * from the wire payload (T-71.2-02 mitigation).
+ */
+router.get('/groups/:groupId/prompts/open', verifyAuth0Token, async (req, res) => {
+  try {
+    const { groupId } = req.params;
+    const userId = req.user.user_id;
+
+    const userGroup = await UserGroup.findOne({
+      where: { group_id: groupId, user_id: userId, status: 'active' }
+    });
+    if (!userGroup) return res.status(403).json({ error: 'You must be a member of this group' });
+
+    const dbUser = await User.findOne({ where: { user_id: userId } });
+    if (!dbUser) return res.status(404).json({ error: 'User record not found' });
+    const isAdmin = ['owner', 'admin'].includes(userGroup.role);
+
+    const prompts = await AvailabilityPrompt.findAll({
+      where: {
+        group_id: groupId,
+        status: { [Op.in]: ['pending', 'active'] }
+      },
+      include: [
+        // D-SCHEMA-05 — creator info for "Started by [name]" on manual polls.
+        // required:false so auto-prompts (created_by_user_id IS NULL) still come back.
+        { model: User, as: 'Creator', attributes: ['id', 'username'], required: false },
+        // D-UI-02 — parent recurring-schedule name for auto-prompts. The default
+        // belongsTo alias is used (matches the existing AvailabilityPrompt.belongsTo
+        // (GroupPromptSettings, { foreignKey: 'created_by_settings_id' }) wired in
+        // models/index.js with no `as`). template_name is the model field that maps
+        // to the user-facing "schedule name" referenced in the CONTEXT as `name`.
+        { model: GroupPromptSettings, attributes: ['id', 'template_name'], required: false }
+      ],
+      order: [['createdAt', 'DESC']]
+    });
+
+    const decorated = prompts.map(p => {
+      const isCreator = p.created_by_user_id !== null && p.created_by_user_id === dbUser.id;
+      const can_close = isAdmin || isCreator;
+      const json = p.toJSON();
+      // T-71.2-02: strip raw creator UUID from the wire — UI uses can_close +
+      // Creator.username only.
+      delete json.created_by_user_id;
+      return { ...json, can_close };
+    });
+
+    res.json({ prompts: decorated });
+  } catch (error) {
+    console.error('Error fetching open prompts:', error);
+    res.status(500).json({ error: 'Failed to fetch open prompts' });
   }
 });
 
