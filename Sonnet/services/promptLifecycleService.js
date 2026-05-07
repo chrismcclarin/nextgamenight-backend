@@ -108,9 +108,11 @@ async function handlePromptClosed(prompt) {
       where: { prompt_id: prompt.id, submitted_at: { [require('sequelize').Op.ne]: null } },
     });
     if (responseCount === 0) {
-      // No responses → no top slot to suggest → no email.
+      // No responses → no top slot to suggest → no email (D-CLOSE-03).
+      console.log(`[promptLifecycle] prompt ${prompt.id} closed with 0 submitted responses; skipping email per D-CLOSE-03`);
       return;
     }
+    console.log(`[promptLifecycle] prompt ${prompt.id} has ${responseCount} submitted response(s); continuing close-notification dispatch`);
 
     // Step 2 — resolve recipient per the LOCKED rule (D-ADAPT-05).
     let recipient = null;
@@ -167,9 +169,14 @@ async function handlePromptClosed(prompt) {
       order: [['score', 'DESC'], ['suggested_start', 'ASC']],
     });
     if (!suggestions || suggestions.length === 0) {
-      // No viable slot — no CTA to send. Skip silently.
+      // No viable slot (no AvailabilitySuggestion rows with meets_minimum=true).
+      // The suggestion engine generates these from responses; if it hasn't run
+      // or the responses don't pass min-attendance threshold, there's no top
+      // slot to recommend in the CTA. Skip the email.
+      console.log(`[promptLifecycle] prompt ${prompt.id} has no viable AvailabilitySuggestion rows (meets_minimum=true); skipping email`);
       return;
     }
+    console.log(`[promptLifecycle] prompt ${prompt.id} resolved ${suggestions.length} suggestion(s); top score=${suggestions[0].score}; recipient=${recipient.email}`);
     const topScore = suggestions[0].score;
     // Render all ties at the top score, sorted ascending by start time so the
     // earliest tie is rendered first.
