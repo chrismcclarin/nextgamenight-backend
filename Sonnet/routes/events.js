@@ -98,6 +98,53 @@ const {
   canReadEventScopedSurface,
 } = require('../services/authorizationService');
 
+// Phase 71.1-02 — Cascade a user's per-event side rows when they are removed
+// from an event (called from DELETE /:event_id/participations/:user_id and
+// from PUT /:id Edit Event for each diff'd-removed participant).
+//
+// :userUuid is the User.id UUID (matches EventParticipation.user_id). The
+// RSVP / EventBring / EventBallotVote tables are Auth0-string-keyed, so we
+// resolve the target's Auth0 string user_id via User.findByPk first. The
+// user_id type asymmetry is load-bearing — see services/authorizationService.js
+// and the Phase 71.1-01 SUMMARY.
+//
+// Caller is responsible for destroying the EventParticipation row itself and
+// for opening the surrounding transaction. This helper does NOT write the
+// EventAuditLog 'remove_participant' row — that stays at the call site so
+// each endpoint can emit its own context (actor, suppressed_email, etc.) per
+// the EVT-08 silent-welcome-back contract from Phase 65-01.
+const cascadeRemoveUserFromEvent = async ({ event_id, userUuid, transaction }) => {
+  const targetUser = await User.findByPk(userUuid, {
+    attributes: ['user_id'],
+    transaction,
+  });
+  if (!targetUser) return;
+  const targetAuth0Id = targetUser.user_id;
+
+  await EventRsvp.destroy({
+    where: { event_id, user_id: targetAuth0Id },
+    transaction,
+  });
+  await EventBring.destroy({
+    where: { event_id, user_id: targetAuth0Id },
+    transaction,
+  });
+  const ballotOptions = await EventBallotOption.findAll({
+    where: { event_id },
+    attributes: ['id'],
+    transaction,
+  });
+  if (ballotOptions.length > 0) {
+    await EventBallotVote.destroy({
+      where: {
+        option_id: { [Op.in]: ballotOptions.map(o => o.id) },
+        user_id: targetAuth0Id,
+      },
+      transaction,
+    });
+  }
+};
+
 // Helper: attach RSVP summary counts to an array of formatted events
 const attachRsvpSummaries = async (events) => {
   const eventIds = events.map(e => e.id);
@@ -698,26 +745,89 @@ router.put('/:id', validateUUID('id'), validateEventUpdate, async (req, res) => 
       rsvp_deadline: rsvp_deadline || null
     });
 
-    // Update participations if provided
+    // Update participations if provided.
+    //
+    // Phase 71.1-02: this PUT path was the "Edit Event → remove participant"
+    // surface user-tested. The destroy-then-recreate pattern dropped the
+    // EventParticipation row but never cascaded the removed user's RSVP /
+    // EventBring / EventBallotVote rows, so they orphaned and stayed visible
+    // to organizers (same bug class as the leave-group / leave-event cascade
+    // gaps, third trigger).
+    //
+    // Fix: capture the OLD participant UUIDs before destroy, compute removed =
+    // old - new from req.body.participants, then cascade RSVP/brings/votes
+    // for each removed user via the shared helper. Wrap destroy + recreate +
+    // cascade in one transaction so the participant set transition is atomic.
     if (participants) {
-      // Remove existing participations
-      await EventParticipation.destroy({ where: { event_id: event.id } });
+      const oldParticipations = await EventParticipation.findAll({
+        where: { event_id: event.id },
+        attributes: ['user_id'],
+      });
+      const oldUserIds = new Set(oldParticipations.map(p => p.user_id));
+      const newUserIds = new Set(
+        participants.filter(p => p.user_id).map(p => p.user_id)
+      );
+      const removedUserIds = [...oldUserIds].filter(id => !newUserIds.has(id));
 
-      // Create new participations for group members (with user_id)
-      if (participants.length > 0) {
-        const participationData = participants
-          .filter(p => p.user_id) // Only include participants with user_id
-          .map(p => ({
+      await sequelize.transaction(async (t) => {
+        await EventParticipation.destroy({ where: { event_id: event.id }, transaction: t });
+
+        if (participants.length > 0) {
+          const participationData = participants
+            .filter(p => p.user_id)
+            .map(p => ({
+              event_id: event.id,
+              user_id: p.user_id,
+              score: p.score,
+              faction: p.faction,
+              is_new_player: p.is_new_player || false,
+              placement: p.placement,
+            }));
+          if (participationData.length > 0) {
+            await EventParticipation.bulkCreate(participationData, { transaction: t });
+          }
+        }
+
+        for (const removedUuid of removedUserIds) {
+          await cascadeRemoveUserFromEvent({
             event_id: event.id,
-            user_id: p.user_id,
-            score: p.score,
-            faction: p.faction,
-            is_new_player: p.is_new_player || false,
-            placement: p.placement
-          }));
+            userUuid: removedUuid,
+            transaction: t,
+          });
+        }
+      });
 
-        if (participationData.length > 0) {
-          await EventParticipation.bulkCreate(participationData);
+      // Audit-log writes — non-fatal, outside the transaction (mirrors the
+      // DELETE endpoint pattern). One row per removed user so EVT-08
+      // silent-welcome-back suppression on QR re-join works the same whether
+      // the user was removed via Edit Event or via the per-row Remove control.
+      for (const removedUuid of removedUserIds) {
+        try {
+          const removeNowMs = Date.now();
+          const startMs = event.start_date ? new Date(event.start_date).getTime() : 0;
+          const wasAfterStart = startMs > 0 && removeNowMs >= startMs;
+          const wasWithin15MinGrace = wasAfterStart && removeNowMs < startMs + FIFTEEN_MIN_MS;
+          await EventAuditLog.create({
+            event_id: event.id,
+            group_id: event.group_id,
+            actor_user_id: userId,
+            action: 'remove_participant',
+            was_after_start: wasAfterStart,
+            was_within_15min_grace: wasWithin15MinGrace,
+            suppressed_email: false,
+            event_snapshot: {
+              id: event.id,
+              group_id: event.group_id,
+              game_id: event.game_id,
+              start_date: event.start_date,
+              duration_minutes: event.duration_minutes,
+              location: event.location || null,
+              comments: event.comments || null,
+              removed_user_id: removedUuid,
+            },
+          });
+        } catch (auditErr) {
+          console.error('[events:put-participants] audit log write failed (non-fatal):', auditErr.message);
         }
       }
     }
@@ -1170,51 +1280,16 @@ router.delete('/:event_id/participations/:user_id', validateUUID('event_id'), va
     }
 
     // Phase 71.1-02: cascade RSVP / brings / ballot votes for this user on
-    // this event. Game-only participants have no group membership to leave
-    // from, so leave-event is their only exit — without the cascade their
-    // forward-commitment rows orphan and remain visible to organizers.
-    //
-    // The :user_id path param is the User.id UUID (matches
-    // EventParticipation.user_id). Resolve the target's Auth0 string user_id
-    // for the RSVP / EventBring / EventBallotVote where-clauses (those tables
-    // are Auth0-string-keyed; the user_id type asymmetry is load-bearing —
-    // see services/authorizationService.js).
-    //
-    // Hard-destroy on EventParticipation chosen over soft-delete (see header
-    // comment). Wrap participation destroy + cascade in a single transaction
-    // so the membership removal and side-row cleanup are atomic.
+    // this event via the shared helper (also used by PUT /:id Edit Event).
+    // Wrap participation destroy + cascade in one transaction so the
+    // membership removal and side-row cleanup are atomic.
     await sequelize.transaction(async (t) => {
       await participation.destroy({ transaction: t });
-
-      const targetUser = await User.findByPk(participationUserId, {
-        attributes: ['user_id'],
+      await cascadeRemoveUserFromEvent({
+        event_id,
+        userUuid: participationUserId,
         transaction: t,
       });
-      if (targetUser) {
-        const targetAuth0Id = targetUser.user_id;
-        await EventRsvp.destroy({
-          where: { event_id, user_id: targetAuth0Id },
-          transaction: t,
-        });
-        await EventBring.destroy({
-          where: { event_id, user_id: targetAuth0Id },
-          transaction: t,
-        });
-        const ballotOptions = await EventBallotOption.findAll({
-          where: { event_id },
-          attributes: ['id'],
-          transaction: t,
-        });
-        if (ballotOptions.length > 0) {
-          await EventBallotVote.destroy({
-            where: {
-              option_id: { [Op.in]: ballotOptions.map(o => o.id) },
-              user_id: targetAuth0Id,
-            },
-            transaction: t,
-          });
-        }
-      }
     });
 
     // Audit-log write — non-fatal, never block the destroy.

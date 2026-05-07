@@ -171,6 +171,58 @@ describe('Leave-event cascade (Phase 71.1-02)', () => {
     ).toBe(1);
   });
 
+  it('PUT /events/:id (Edit Event) cascades RSVP/brings/votes for diff-removed participants', async () => {
+    // Edit Event uses PUT /:id with a participants array. The handler does
+    // destroy-then-recreate; participants omitted from the new array are
+    // implicitly removed. This test covers the third cascade trigger:
+    // organizer removes someone via Edit Event rather than the per-row
+    // Remove control or Leave Event.
+    const app = makeApp(owner.user_id);
+
+    // Submit Edit Event with leaver omitted from participants array.
+    // Bystander is kept. Backend destroys all then recreates only kept ones.
+    const res = await request(app)
+      .put(`/api/events/${event.id}`)
+      .send({
+        game_id: game.id,
+        start_date: event.start_date.toISOString(),
+        duration_minutes: 120,
+        is_group_win: false,
+        comments: '',
+        participants: [
+          { user_id: bystanderRow.id, score: null, faction: null, is_new_player: false, placement: null },
+        ],
+        custom_participants: [],
+      });
+    expect(res.status).toBe(200);
+
+    // Leaver's participation gone (destroy-then-recreate left them out)
+    expect(await EventParticipation.count({ where: { event_id: event.id, user_id: leaverRow.id } })).toBe(0);
+    // Cascade fired for diff-removed leaver: RSVP/brings/votes also gone
+    expect(await EventRsvp.count({ where: { event_id: event.id, user_id: leaver.user_id } })).toBe(0);
+    expect(await EventBring.count({ where: { event_id: event.id, user_id: leaver.user_id } })).toBe(0);
+    expect(
+      await EventBallotVote.count({ where: { option_id: ballotOption.id, user_id: leaver.user_id } })
+    ).toBe(0);
+
+    // Bystander preserved across all tables (kept in the new participants array)
+    expect(await EventParticipation.count({ where: { event_id: event.id, user_id: bystanderRow.id } })).toBe(1);
+    expect(await EventRsvp.count({ where: { event_id: event.id, user_id: bystander.user_id } })).toBe(1);
+    expect(await EventBring.count({ where: { event_id: event.id, user_id: bystander.user_id } })).toBe(1);
+    expect(
+      await EventBallotVote.count({ where: { option_id: ballotOption.id, user_id: bystander.user_id } })
+    ).toBe(1);
+
+    // Audit log written for the diff-removed leaver (EVT-08 contract parity)
+    const auditRows = await EventAuditLog.findAll({
+      where: { event_id: event.id, action: 'remove_participant' },
+    });
+    expect(auditRows.length).toBe(1);
+    expect(auditRows[0].event_snapshot).toEqual(
+      expect.objectContaining({ removed_user_id: leaverRow.id })
+    );
+  });
+
   it('owner removing a game-only participant cascades the same four tables', async () => {
     const app = makeApp(owner.user_id);
     const res = await request(app)
