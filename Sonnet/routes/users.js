@@ -413,12 +413,8 @@ router.patch('/:user_id/notification-preferences', async (req, res) => {
       return res.status(400).json({ error: 'preferences object is required' });
     }
 
-    // Validate shape: each key must have boolean email/sms values.
-    // poll_created added in Plan 71-05 per D-POLL-CREATE-08 — symmetric with
-    // PREF_KEYS in the phone-removal cascade below + DEFAULT_PREFERENCES in
-    // notificationService.js. Without it the frontend matrix's "New polls"
-    // toggle would 400 with "Unknown notification type: poll_created".
-    const validTypes = ['event_created', 'reminder', 'event_updated', 'event_cancelled', 'poll_created'];
+    // Validate shape: each key must have boolean email/sms values
+    const validTypes = ['event_created', 'reminder', 'event_updated', 'event_cancelled'];
     for (const [type, channels] of Object.entries(preferences)) {
       if (!validTypes.includes(type)) {
         return res.status(400).json({ error: `Unknown notification type: ${type}` });
@@ -649,13 +645,11 @@ router.delete('/:user_id/phone', async (req, res) => {
 
     // Build cleared notification_preferences. Mirrors DEFAULT_PREFERENCES
     // shape from periodictabletop/src/app/userProfile/page.js (lines 29-34):
-    // 5 keys (event_created, reminder, event_updated, event_cancelled, poll_created),
-    // each with email + sms (and reminder.window_hours). Preserve existing email
+    // 4 keys (event_created, reminder, event_updated, event_cancelled), each
+    // with email + sms (and reminder.window_hours). Preserve existing email
     // values + reminder.window_hours; only flip every sms key to false.
-    // poll_created added in Phase 71-04 per D-POLL-CREATE-08 — extends the Plan 70-01
-    // defensive prefs cascade so phone removal also clears poll_created.sms.
     const existingPrefs = user.notification_preferences || {};
-    const PREF_KEYS = ['event_created', 'reminder', 'event_updated', 'event_cancelled', 'poll_created'];
+    const PREF_KEYS = ['event_created', 'reminder', 'event_updated', 'event_cancelled'];
     const clearedPrefs = {};
     for (const key of PREF_KEYS) {
       const existing = existingPrefs[key] || {};

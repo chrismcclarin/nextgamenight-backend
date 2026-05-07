@@ -5,24 +5,6 @@ const emailService = require('./emailService');
 const smsService = require('./smsService');
 const { SentNotification } = require('../models');
 
-// Backend default preferences mirror the frontend shape in
-// periodictabletop/src/app/userProfile/page.js. New notification channels MUST
-// be added here so null-prefs users get a sensible default at read time.
-// poll_created added in Phase 71-04 (D-POLL-CREATE-08).
-//
-// Note: getPreference() applies the strict-opt-in defaults (email=true, sms=false)
-// at the channel level for any unknown type, so this constant is primarily a
-// traceability marker + a single-source-of-truth for documenting which channels
-// the backend understands. If a future channel needs non-standard defaults
-// (e.g. window_hours, sms-default-true), wire that override into getPreference().
-const DEFAULT_PREFERENCES = {
-  event_created: { email: true, sms: false },
-  reminder: { email: true, sms: false, window_hours: 1 },
-  event_updated: { email: true, sms: false },
-  event_cancelled: { email: true, sms: false },
-  poll_created: { email: true, sms: false },
-};
-
 class NotificationService {
   constructor() {
     this.emailService = emailService;
@@ -166,5 +148,3 @@ module.exports = notificationService;
 
 // Named export for direct testing of getPreference without going through send()
 module.exports.getPreference = NotificationService.prototype.getPreference;
-// Named export so other modules / tests can reference the canonical defaults shape
-module.exports.DEFAULT_PREFERENCES = DEFAULT_PREFERENCES;
