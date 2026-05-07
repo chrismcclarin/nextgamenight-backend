@@ -58,12 +58,20 @@ async function cascadeDeleteFutureEventDataOnLeaveGroup({
   group_id,
   transaction,
 }) {
+  // Scope: any event whose start_date is in the future, regardless of status.
+  // We deliberately do NOT filter on status. Two reasons:
+  //   1. Production data has been observed with future events stamped
+  //      `status='completed'` (data hygiene bug, separate todo). A status
+  //      filter would silently exclude them and leak forward-commitment rows.
+  //   2. The cascade is about removing forward intent — if the event hasn't
+  //      happened yet, the leaving user's RSVP/brings/vote on it is moot
+  //      regardless of whether it's scheduled, in_progress, completed, or
+  //      cancelled. Past events stay untouched (history preserved).
   const now = new Date();
   const futureEvents = await Event.findAll({
     where: {
       group_id,
       start_date: { [Op.gt]: now },
-      status: { [Op.in]: ['scheduled', 'in_progress'] },
     },
     attributes: ['id'],
     transaction,

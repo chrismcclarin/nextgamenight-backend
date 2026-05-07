@@ -197,6 +197,36 @@ describe('Group leave cascade (Phase 71.1-02)', () => {
       ).toBeGreaterThanOrEqual(1);
     });
 
+    it("cascades future events regardless of status (defends against data-corrupt 'completed' future events)", async () => {
+      // Production data has been observed with future events stamped
+      // status='completed' (data hygiene bug, separate todo). The cascade
+      // scope must rely on start_date alone — a status filter would let
+      // these slip through and orphan the user's forward-commitment rows.
+      const corruptedFutureEvent = await Event.create({
+        group_id: group.id,
+        game_id: game.id,
+        start_date: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000), // +14 days
+        duration_minutes: 120,
+        status: 'completed', // ← the corruption: future event marked completed
+      });
+      await EventParticipation.create({ event_id: corruptedFutureEvent.id, user_id: leaverRow.id, score: null });
+      await EventRsvp.create({ event_id: corruptedFutureEvent.id, user_id: leaver.user_id, status: 'yes' });
+      await EventBring.create({ event_id: corruptedFutureEvent.id, user_id: leaver.user_id, game_id: game.id });
+
+      const app = makeApp(leaver.user_id);
+      await request(app).post(`/api/groups/${group.id}/leave`).send().expect(200);
+
+      expect(
+        await EventParticipation.count({ where: { event_id: corruptedFutureEvent.id, user_id: leaverRow.id } })
+      ).toBe(0);
+      expect(
+        await EventRsvp.count({ where: { event_id: corruptedFutureEvent.id, user_id: leaver.user_id } })
+      ).toBe(0);
+      expect(
+        await EventBring.count({ where: { event_id: corruptedFutureEvent.id, user_id: leaver.user_id } })
+      ).toBe(0);
+    });
+
     it("does not touch other users' rows on the same future event", async () => {
       const app = makeApp(leaver.user_id);
       await request(app).post(`/api/groups/${group.id}/leave`).send().expect(200);
