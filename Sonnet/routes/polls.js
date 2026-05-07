@@ -39,6 +39,20 @@ router.get('/pending-for-me', async (req, res) => {
   }
 });
 
+// GET /api/polls/closed-awaiting-me — closed polls where caller is the creator
+// AND closed_notification_dismissed_at is null (consumed by Plan 71-05
+// NotificationBell for the "Schedule it?" CTA). Server-side filter avoids the
+// N+1 per-group loop the plan body called out as the v1 fallback.
+router.get('/closed-awaiting-me', async (req, res) => {
+  try {
+    const polls = await pollService.getClosedPollsAwaitingMe(req.user.user_id);
+    res.json(polls);
+  } catch (err) {
+    console.error('[polls] GET /closed-awaiting-me error:', err.message);
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
+
 // GET /api/polls/group/:groupId — active poll + responses (D-POLL-CREATE-11).
 // Lazy-on-read deadline auto-close: if response_deadline is past, force-close
 // before returning so any read by any user surfaces the closed state.

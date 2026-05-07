@@ -431,6 +431,34 @@ async function getPollsPendingForUser(userId) {
 }
 
 /**
+ * Returns closed polls where the caller is the creator AND the close-notification
+ * has not been dismissed (closed_notification_dismissed_at IS NULL). Plan 71-05's
+ * NotificationBell consumes this as the "Schedule it?" CTA feed.
+ *
+ * Pairs with `getPollsPendingForUser` to give the bell two complementary feeds:
+ *   - pending: open polls the caller has not yet responded to
+ *   - awaiting-me: closed polls the caller created and has not yet dismissed
+ *
+ * Added in Plan 71-05 per the plan body's "OR (simpler) the bell fetches the
+ * user's groups and pulls latest poll per group" alternative — collapsed into a
+ * single endpoint to avoid N+1 fetches on bell mount.
+ */
+async function getClosedPollsAwaitingMe(userId) {
+  return Poll.findAll({
+    where: {
+      created_by_user_id: userId,
+      status: 'closed',
+      closed_notification_dismissed_at: null,
+    },
+    include: [
+      { model: PollResponse },
+      { model: Group, attributes: ['id', 'name', 'group_id'] },
+    ],
+    order: [['closed_at', 'DESC']],
+  });
+}
+
+/**
  * Fetch the active poll for a group + responses + creator.
  * Intentionally returns only the OPEN poll (or null) — `closed` polls live in
  * history. Plan 71-05's group home page reads this for the live heatmap surface.
@@ -466,6 +494,7 @@ module.exports = {
   getPoll,
   dismissCloseNotification,
   getPollsPendingForUser,
+  getClosedPollsAwaitingMe,
   // Exported for test isolation
   notifyPollCreated,
   notifyPollClosed,
