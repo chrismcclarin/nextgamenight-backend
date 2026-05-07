@@ -115,6 +115,15 @@ AvailabilityPrompt.belongsTo(Game, { foreignKey: 'game_id' });
 GroupPromptSettings.hasMany(AvailabilityPrompt, { foreignKey: 'created_by_settings_id' });
 AvailabilityPrompt.belongsTo(GroupPromptSettings, { foreignKey: 'created_by_settings_id' });
 
+// Phase 71.2 / D-SCHEMA-05: AvailabilityPrompt creator (manual polls only).
+// Used by Plan 03's UI to render "Started by [creator name]" via the Creator association.
+// User.id is UUID, so this association uses the default FK (no sourceKey/targetKey override).
+AvailabilityPrompt.belongsTo(User, { as: 'Creator', foreignKey: 'created_by_user_id', onDelete: 'SET NULL' });
+
+// Phase 71.2 / D-SCHEMA-06: GroupPromptSettings creator (the user who first set up scheduling).
+// Used by Plan 02's recipient resolution: settings.created_by_user_id || group owner.
+GroupPromptSettings.belongsTo(User, { as: 'Creator', foreignKey: 'created_by_user_id', onDelete: 'SET NULL' });
+
 // Availability Responses (One-to-Many from Prompt)
 AvailabilityPrompt.hasMany(AvailabilityResponse, { foreignKey: 'prompt_id' });
 AvailabilityResponse.belongsTo(AvailabilityPrompt, { foreignKey: 'prompt_id' });

@@ -85,6 +85,19 @@ const GroupPromptSettings = sequelize.define('GroupPromptSettings', {
     // Stores saved prompt configurations for reuse
     // Structure: { games: [uuid], customMessage: string, etc. }
   },
+  created_by_user_id: {
+    type: DataTypes.UUID,
+    allowNull: true,
+    references: {
+      model: 'Users',
+      key: 'id',
+    },
+    onDelete: 'SET NULL',
+    // Phase 71.2 / D-SCHEMA-06: NULL = legacy/pre-migration row (resolves to
+    // group-owner fallback at runtime per D-ADAPT-05). NOT NULL = the user who
+    // first set up scheduling for this group (set at POST /:group_id/prompt-settings/schedules
+    // create time when the GroupPromptSettings row is first inserted).
+  },
 }, {
   timestamps: true,
   indexes: [
@@ -97,6 +110,9 @@ const GroupPromptSettings = sequelize.define('GroupPromptSettings', {
     },
     {
       fields: ['schedule_day_of_week', 'schedule_time']
+    },
+    {
+      fields: ['created_by_user_id']
     }
   ]
 });

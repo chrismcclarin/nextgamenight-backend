@@ -80,6 +80,18 @@ const AvailabilityPrompt = sequelize.define('AvailabilityPrompt', {
     defaultValue: false,
     // When true, auto-creates event from best suggestion when deadline passes
   },
+  created_by_user_id: {
+    type: DataTypes.UUID,
+    allowNull: true,
+    references: {
+      model: 'Users',
+      key: 'id',
+    },
+    onDelete: 'SET NULL',
+    // Phase 71.2 / D-SCHEMA-04: NULL = legacy or auto-prompt (created_by_settings_id
+    // discriminates per D-SCHEMA-01); NOT NULL = manual poll, populated from
+    // dbUser.id (User.id UUID, NOT User.user_id Auth0 sub) at create time.
+  },
 }, {
   timestamps: true,
   indexes: [
@@ -91,6 +103,9 @@ const AvailabilityPrompt = sequelize.define('AvailabilityPrompt', {
     },
     {
       fields: ['deadline']
+    },
+    {
+      fields: ['created_by_user_id']
     },
     {
       unique: true,
