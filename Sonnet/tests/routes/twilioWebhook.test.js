@@ -267,8 +267,10 @@ describe('Twilio Inbound SMS Webhook', () => {
     expect(res.text).toContain('RSVP recorded: Yes');
   });
 
-  // Test 12: Confirmation includes group URL
-  it('includes group page URL in RSVP confirmation', async () => {
+  // Test 12: Confirmation does NOT include a URL.
+  // The original SMS the user replied to already carries the event-detail link;
+  // repeating a (broken) link in the confirmation just adds clutter and segments.
+  it('does not include a URL in RSVP confirmation', async () => {
     mockUserFindOne.mockResolvedValue(mockUser);
     mockParseReply.mockReturnValue({ type: 'rsvp', status: 'yes' });
     mockSentNotificationFindOne.mockResolvedValue(mockNotification);
@@ -278,6 +280,7 @@ describe('Twilio Inbound SMS Webhook', () => {
     const res = await postSms({ From: '+15551234567', Body: '1' });
 
     expect(res.status).toBe(200);
-    expect(res.text).toContain('/groupHomePage/group-uuid-1');
+    expect(res.text).not.toContain('http');
+    expect(res.text).not.toContain('groupHomePage');
   });
 });

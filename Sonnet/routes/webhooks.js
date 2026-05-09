@@ -300,13 +300,14 @@ router.post('/twilio/sms', smsInboundLimiter, twilioWebhookValidation, async (re
       });
     }
 
-    // 5. Build confirmation TwiML
+    // 5. Build confirmation TwiML. No link — game name + date in the body is
+    // enough verification, and the original SMS the user replied to already
+    // carries the event-detail link if they want to navigate there.
     const statusLabel = parsed.status.charAt(0).toUpperCase() + parsed.status.slice(1);
     const eventName = notification.Event.Game ? notification.Event.Game.name : 'Game Night';
     const dateStr = eventDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-    const eventUrl = `${process.env.FRONTEND_URL || 'https://nextgamenight.app'}/groupHomePage/${notification.Event.group_id}`;
 
-    twiml.message(`RSVP recorded: ${statusLabel} for ${eventName} (${dateStr}). ${eventUrl}`);
+    twiml.message(`RSVP recorded: ${statusLabel} for ${eventName} (${dateStr}).`);
     return res.type('text/xml').send(twiml.toString());
 
   } catch (error) {
