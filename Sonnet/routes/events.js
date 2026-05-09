@@ -660,6 +660,10 @@ router.post('/', validateEventCreate, async (req, res) => {
 
               return {
                 emailParams,
+                // eventId required for SentNotification logging (notificationService.js:97)
+                // — without it, inbound SMS replies (RSVP via "1"/"2"/"3") cannot resolve
+                // back to this event in the webhook handler.
+                eventId: event.id,
                 data: {
                   eventName: game?.name || 'Game Night',
                   groupName: group.name,
@@ -947,6 +951,11 @@ router.put('/:id', validateUUID('id'), validateEventUpdate, async (req, res) => 
 
             return {
               emailParams,
+              // eventId required for SentNotification logging (notificationService.js:97).
+              // Update SMS does not prompt for RSVP, but logging keeps the row uniform
+              // with event_created and lets future webhook flows (e.g. "still coming?"
+              // confirmations) resolve the event.
+              eventId: event.id,
               data: {
                 eventName: game?.name || 'Game Night',
                 groupName: group?.name || '',
@@ -1445,6 +1454,11 @@ router.delete('/:id', async (req, res) => {
 
             return {
               emailParams,
+              // eventId required for SentNotification logging (notificationService.js:97).
+              // Cancellation rows will be filtered out by the webhook lookup (which
+              // excludes cancelled events), but writing them keeps dispatch logic
+              // uniform across the three event-lifecycle SMS types.
+              eventId: event.id,
               data: {
                 eventName: game?.name || 'Game Night',
                 groupName: group?.name || '',
