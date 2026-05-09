@@ -4,6 +4,7 @@ const cron = require('node-cron');
 const { Event, EventRsvp, User, Game, Group } = require('../models');
 const { Op } = require('sequelize');
 const smsService = require('../services/smsService');
+const notificationService = require('../services/notificationService');
 const { recordRun } = require('../services/schedulerHealthService');
 
 // Check interval - default every 5 minutes, configurable via env
@@ -81,7 +82,8 @@ async function processUpcomingReminders() {
           attributes: ['user_id', 'phone', 'phone_verified', 'sms_enabled', 'notification_preferences', 'timezone'],
           where: {
             sms_enabled: true,
-            phone: { [Op.ne]: null }
+            phone: { [Op.ne]: null },
+            phone_verified: true
           },
           required: true
         }]
@@ -110,6 +112,16 @@ async function processUpcomingReminders() {
       if (timeDiffMs > windowHours * 3600000) {
         skippedCount++;
         continue; // Event is outside this user's window, skip
+      }
+
+      // Honor the per-user SMS routing decision. The DB filter above is a
+      // cheap pre-filter (sms_enabled + phone + phone_verified); this is the
+      // final per-type check that respects notification_preferences.reminder.sms.
+      // Mirrors the defense-in-depth pattern in workers/reminderWorker.js
+      // (DB pre-filter + getPreference final routing).
+      if (!notificationService.getPreference(user, 'reminder', 'sms')) {
+        skippedCount++;
+        continue;
       }
 
       // Only send if SMS service is configured

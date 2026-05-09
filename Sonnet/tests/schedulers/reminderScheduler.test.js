@@ -66,7 +66,8 @@ describe('reminderScheduler', () => {
           user_id: 'auth0|user1',
           phone: '+15551234567',
           sms_enabled: true,
-          notification_preferences: null
+          phone_verified: true,
+          notification_preferences: { reminder: { sms: true } }
         },
         update: mockRsvpUpdate
       }))
@@ -85,7 +86,8 @@ describe('reminderScheduler', () => {
               user_id: 'auth0|user1',
               phone: '+15551234567',
               sms_enabled: true,
-              notification_preferences: null
+              phone_verified: true,
+              notification_preferences: { reminder: { sms: true } }
             }
           }]
         })
@@ -127,7 +129,8 @@ describe('reminderScheduler', () => {
               user_id: 'auth0|user1',
               phone: '+15551234567',
               sms_enabled: true,
-              notification_preferences: null // defaults to 1 hour window
+              phone_verified: true,
+              notification_preferences: { reminder: { sms: true } } // defaults to 1 hour window
             }
           }]
         })
@@ -161,8 +164,9 @@ describe('reminderScheduler', () => {
               user_id: 'auth0|user1',
               phone: '+15551234567',
               sms_enabled: true,
+              phone_verified: true,
               notification_preferences: {
-                reminder: { window_hours: 3 }
+                reminder: { window_hours: 3, sms: true }
               }
             }
           }]
@@ -188,7 +192,8 @@ describe('reminderScheduler', () => {
               user_id: 'auth0|user1',
               phone: '+15551234567',
               sms_enabled: true,
-              notification_preferences: null
+              phone_verified: true,
+              notification_preferences: { reminder: { sms: true } }
             }
           }]
         })
@@ -215,7 +220,8 @@ describe('reminderScheduler', () => {
               user_id: 'auth0|user1',
               phone: '+15551234567',
               sms_enabled: true,
-              notification_preferences: null
+              phone_verified: true,
+              notification_preferences: { reminder: { sms: true } }
             }
           }]
         })
@@ -248,14 +254,14 @@ describe('reminderScheduler', () => {
               id: 'rsvp-1',
               status: 'yes',
               reminder_sent_at: null,
-              User: { user_id: 'auth0|u1', phone: '+15551111111', sms_enabled: true, notification_preferences: null },
+              User: { user_id: 'auth0|u1', phone: '+15551111111', sms_enabled: true, phone_verified: true, notification_preferences: { reminder: { sms: true } } },
               update: mockUpdate1
             },
             {
               id: 'rsvp-2',
               status: 'maybe',
               reminder_sent_at: null,
-              User: { user_id: 'auth0|u2', phone: '+15552222222', sms_enabled: true, notification_preferences: null },
+              User: { user_id: 'auth0|u2', phone: '+15552222222', sms_enabled: true, phone_verified: true, notification_preferences: { reminder: { sms: true } } },
               update: mockUpdate2
             }
           ]
@@ -270,7 +276,7 @@ describe('reminderScheduler', () => {
               id: 'rsvp-3',
               status: 'yes',
               reminder_sent_at: null,
-              User: { user_id: 'auth0|u3', phone: '+15553333333', sms_enabled: true, notification_preferences: null },
+              User: { user_id: 'auth0|u3', phone: '+15553333333', sms_enabled: true, phone_verified: true, notification_preferences: { reminder: { sms: true } } },
               update: mockUpdate3
             }
           ]
@@ -298,7 +304,8 @@ describe('reminderScheduler', () => {
               user_id: 'auth0|user1',
               phone: '+15551234567',
               sms_enabled: true,
-              notification_preferences: null
+              phone_verified: true,
+              notification_preferences: { reminder: { sms: true } }
             }
           }]
         })
@@ -322,7 +329,8 @@ describe('reminderScheduler', () => {
               user_id: 'auth0|user1',
               phone: '+15551234567',
               sms_enabled: true,
-              notification_preferences: null
+              phone_verified: true,
+              notification_preferences: { reminder: { sms: true } }
             }
           }]
         })
