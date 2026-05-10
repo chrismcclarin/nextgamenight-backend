@@ -1522,6 +1522,23 @@ router.delete('/:id', async (req, res) => {
       console.error('[events:delete] audit log write failed (non-fatal):', auditErr.message);
     }
 
+    // Phase 75 / GCAL-01 (Plan 75-03): enqueue per-attendee GCal cleanup jobs
+    // BEFORE destroying EventParticipation rows -- the jobs need to read the
+    // google_calendar_event_id off those rows, which is gone after destroy.
+    // Best-effort + non-blocking: gcalCleanupService swallows enqueue errors
+    // internally, but we still wrap in try/catch as defense-in-depth so a
+    // require/throw at module load can't kill the delete.
+    try {
+      const { enqueueCleanupJobsForEvent } = require('../services/gcalCleanupService');
+      const cleanupCounters = await enqueueCleanupJobsForEvent({ eventId: event.id });
+      console.log(
+        `[events:delete] Enqueued ${cleanupCounters.enqueued} GCal cleanup jobs ` +
+        `(${cleanupCounters.skipped} skipped null, ${cleanupCounters.errors || 0} enqueue errors)`
+      );
+    } catch (gcalEnqueueErr) {
+      console.error('[events:delete] GCal cleanup enqueue failed (non-fatal):', gcalEnqueueErr.message);
+    }
+
     // Delete RSVPs for this event
     await EventRsvp.destroy({ where: { event_id: event.id } });
 
