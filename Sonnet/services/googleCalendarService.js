@@ -576,6 +576,124 @@ class GoogleCalendarService {
   }
 
   /**
+   * Phase 75 / GCAL-01: Delete a single Google Calendar event for the
+   * outbound-cleanup worker (event cancel/delete + RSVP yes->no).
+   *
+   * Differs from deleteTentativeHold above: instead of swallowing errors and
+   * returning a boolean, this method CLASSIFIES errors via `error.code` so
+   * the BullMQ worker can decide whether to retry, alert, or skip:
+   *   - 200/204                 -> { deleted: true }
+   *   - 404 / 410               -> { deleted: true, alreadyGone: true }   (idempotent retry safety)
+   *   - 401 + refresh token     -> refresh, retry once, return { ..., _new_access_token }
+   *   - 401 (no refresh / fail) -> throw with err.code === 'GCAL_DISCONNECTED'   (worker: skip, breadcrumb)
+   *   - 403                     -> throw with err.code === 'GCAL_PERMANENT'     (worker: re-throw, exhaust attempts -> Sentry alert)
+   *   - 429                     -> throw with err.code === 'GCAL_RATE_LIMITED'  (worker: re-throw, BullMQ retries)
+   *   - 5xx                     -> throw original error                          (worker: re-throw, BullMQ retries)
+   *   - other 4xx               -> throw with err.code === 'GCAL_PERMANENT'
+   *
+   * @param {string} calendarEventId - GCal event id stored on EventParticipation.google_calendar_event_id
+   * @param {string} accessToken     - Attendee's Google OAuth access token
+   * @param {string|null} refreshToken - Attendee's Google OAuth refresh token (enables one-shot retry)
+   * @returns {Promise<{ deleted: boolean, alreadyGone?: boolean, _new_access_token?: string }>}
+   */
+  async deleteCalendarEventForUser(calendarEventId, accessToken, refreshToken = null) {
+    if (!accessToken) {
+      const err = new Error('Google Calendar access token is required');
+      err.code = 'GCAL_DISCONNECTED';
+      throw err;
+    }
+    if (!calendarEventId) {
+      // Defensive: caller should have filtered nulls. Not an error -- no-op.
+      return { skipped: true, reason: 'no_event_id' };
+    }
+
+    try {
+      const oauth2Client = new google.auth.OAuth2(
+        process.env.GOOGLE_CLIENT_ID,
+        process.env.GOOGLE_CLIENT_SECRET,
+        getGoogleRedirectUri()
+      );
+      oauth2Client.setCredentials({
+        access_token: accessToken,
+        refresh_token: refreshToken,
+      });
+
+      const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
+
+      await calendar.events.delete({
+        calendarId: 'primary',
+        eventId: calendarEventId,
+        sendUpdates: 'none',         // Silent removal — no email blast to attendees
+      });
+
+      return { deleted: true };
+    } catch (error) {
+      const httpCode = error.code || error.response?.status;
+
+      // Already-gone: success (idempotent retry safety per CONTEXT D-CLAUDE-DISCRETION)
+      if (httpCode === 404 || httpCode === 410) {
+        return { deleted: true, alreadyGone: true };
+      }
+
+      // 401 + refresh token: try refresh and retry once (without refresh to avoid recursion)
+      if (httpCode === 401 && refreshToken) {
+        try {
+          const newAccessToken = await this.refreshAccessToken(refreshToken);
+          const retryResult = await this.deleteCalendarEventForUser(
+            calendarEventId,
+            newAccessToken,
+            null
+          );
+          return { ...retryResult, _new_access_token: newAccessToken };
+        } catch (refreshErr) {
+          // Refresh failed (revoked grant / no longer authorized): treat as disconnect.
+          const err = new Error(`Token refresh failed: ${refreshErr.message}`);
+          err.code = 'GCAL_DISCONNECTED';
+          throw err;
+        }
+      }
+
+      // 401 without refresh token: user disconnected GCal between event-add and cleanup.
+      if (httpCode === 401) {
+        const err = new Error('User has disconnected Google Calendar');
+        err.code = 'GCAL_DISCONNECTED';
+        throw err;
+      }
+
+      // 403: forbidden — permanent, no retry.
+      if (httpCode === 403) {
+        const err = new Error(`Forbidden: ${error.message}`);
+        err.code = 'GCAL_PERMANENT';
+        throw err;
+      }
+
+      // 429: rate limited — transient (BullMQ will retry per the queue's exponential backoff).
+      if (httpCode === 429) {
+        const err = new Error(`Rate limited: ${error.message}`);
+        err.code = 'GCAL_RATE_LIMITED';
+        throw err;
+      }
+
+      // 5xx: transient — re-throw the ORIGINAL error so BullMQ retries.
+      if (httpCode >= 500 && httpCode < 600) {
+        throw error;
+      }
+
+      // Other 4xx (including 400): permanent.
+      if (httpCode >= 400 && httpCode < 500) {
+        const err = new Error(`Permanent error: ${error.message}`);
+        err.code = 'GCAL_PERMANENT';
+        throw err;
+      }
+
+      // Unknown / no httpCode: treat as permanent so we don't retry blindly.
+      const err = new Error(`Unknown error: ${error.message}`);
+      err.code = 'GCAL_PERMANENT';
+      throw err;
+    }
+  }
+
+  /**
    * Delete multiple tentative calendar holds
    * Catches errors per-event so one failure doesn't stop others
    * @param {Array<string>} calendarEventIds - Array of Google Calendar event IDs to delete
