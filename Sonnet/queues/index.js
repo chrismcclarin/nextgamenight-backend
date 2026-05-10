@@ -18,10 +18,12 @@ connection.on('error', (err) => console.error('Redis connection error:', err.mes
 const promptQueue = require('./promptQueue');
 const deadlineQueue = require('./deadlineQueue');
 const reminderQueue = require('./reminderQueue');
+const gcalSyncQueue = require('./gcalSyncQueue');
 
 module.exports = {
   connection,
   promptQueue,
   deadlineQueue,
-  reminderQueue
+  reminderQueue,
+  gcalSyncQueue
 };

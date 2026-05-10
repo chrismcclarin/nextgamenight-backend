@@ -3,6 +3,7 @@
 const promptWorker = require('./promptWorker');
 const deadlineWorker = require('./deadlineWorker');
 const reminderWorker = require('./reminderWorker');
+const gcalSyncWorker = require('./gcalSyncWorker');
 
 async function gracefulShutdown(signal) {
   console.log(`\n${signal} received, closing BullMQ workers gracefully...`);
@@ -16,7 +17,8 @@ async function gracefulShutdown(signal) {
     await Promise.all([
       promptWorker.close(),
       deadlineWorker.close(),
-      reminderWorker.close()
+      reminderWorker.close(),
+      gcalSyncWorker.close()
     ]);
 
     clearTimeout(timeout);
@@ -32,6 +34,6 @@ async function gracefulShutdown(signal) {
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
-console.log('BullMQ workers started (prompts, deadlines, reminders)');
+console.log('BullMQ workers started (prompts, deadlines, reminders, gcal-sync)');
 
-module.exports = { promptWorker, deadlineWorker, reminderWorker };
+module.exports = { promptWorker, deadlineWorker, reminderWorker, gcalSyncWorker };
