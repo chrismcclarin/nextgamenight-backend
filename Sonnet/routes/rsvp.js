@@ -380,10 +380,30 @@ router.delete('/:rsvp_id', verifyAuth0Token, async (req, res) => {
       return res.status(403).json({ error: 'You can only remove your own RSVP' });
     }
 
+    // Phase 75 / GCAL-01: capture status + event_id BEFORE destroy.
+    // rsvp.status is gone after destroy; we need it to detect the
+    // "was-yes" condition that triggers a cleanup dispatch.
+    const priorStatus = rsvp.status;
+    const eventId = rsvp.event_id;
+
     // Hard-delete bring commitments when RSVP is removed
     await EventBring.destroy({ where: { event_id: rsvp.event_id, user_id: rsvp.user_id } });
 
     await rsvp.destroy();
+
+    // Phase 75 / GCAL-01: if the user was previously RSVPed 'yes', dispatch
+    // a GCal cleanup job — same code path as the yes->no transition.
+    // Synthesize newStatus='no' since the row is gone (effective non-attendance).
+    // Fire-and-forget; never blocks the DELETE response.
+    maybeDispatchGcalCleanup({
+      eventId,
+      authUserId: userId,
+      oldStatus: priorStatus,
+      newStatus: 'no',
+    }).catch((err) =>
+      console.error('[rsvp:DELETE] GCal cleanup dispatch error (non-fatal):', err.message)
+    );
+
     return res.status(200).json({ message: 'RSVP removed' });
   } catch (error) {
     console.error('Error removing RSVP:', error.message);
