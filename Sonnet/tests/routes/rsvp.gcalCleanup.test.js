@@ -2,8 +2,12 @@
 // Phase 75 / Plan 04: RSVP-driven GCal cleanup dispatch.
 //
 // Verifies that the RSVP route handlers dispatch a per-attendee gcal-sync
-// job whenever an attendee transitions yes->no (POST or GET /respond) or
-// DELETE-of-yes their RSVP — and ONLY in those cases.
+// job whenever an attendee transitions INTO 'no' from any non-'no' prior
+// state (null, maybe, or yes) — covering all three RSVP entry points: POST,
+// GET /respond (magic link), and DELETE (synthesizes newStatus='no').
+// Gate skips no->no as idempotent. GCal entries are created for every
+// connected attendee at event creation, so the cleanup gate must cover
+// every non-'no' -> 'no' path, not just yes->no.
 //
 // Pattern follows tests/routes/events.gcalCleanup.test.js: mock all models +
 // services + middleware, drive the route via supertest. No DB, no Redis.
@@ -185,7 +189,7 @@ describe('POST /api/rsvp/ — Phase 75 / Plan 04 GCal cleanup dispatch', () => {
     expect(mockEnqueueCleanupJobForAttendee).not.toHaveBeenCalled();
   });
 
-  test('Test 3: yes->maybe transition → NO cleanup job (only yes->no per CONTEXT)', async () => {
+  test('Test 3: yes->maybe transition → NO cleanup job (newStatus is not no)', async () => {
     mockEventRsvpFindOne.mockResolvedValueOnce(buildExistingRsvp('yes'));
 
     const res = await request(app)
@@ -251,6 +255,57 @@ describe('POST /api/rsvp/ — Phase 75 / Plan 04 GCal cleanup dispatch', () => {
     await new Promise((r) => setImmediate(r));
     expect(mockEnqueueCleanupJobForAttendee).toHaveBeenCalled();
   });
+
+  test('Test 7a: null->no (first-time RSVP "no") → cleanup IS dispatched (regression for null->no ghost bug)', async () => {
+    // No existing RSVP row; user clicks "no" first time. GCal entry was
+    // placed at event creation, so we need to clean it up.
+    // POST returns 201 (Created) for first-time create, 200 for update.
+    mockEventRsvpFindOne.mockResolvedValueOnce(null);
+
+    const res = await request(app)
+      .post('/api/rsvp/')
+      .send({ event_id: TEST_EVENT_ID, status: 'no' });
+
+    expect(res.status).toBe(201);
+    await new Promise((r) => setImmediate(r));
+    expect(mockEnqueueCleanupJobForAttendee).toHaveBeenCalledTimes(1);
+    expect(mockEnqueueCleanupJobForAttendee).toHaveBeenCalledWith({
+      eventId: TEST_EVENT_ID,
+      eventParticipationId: TEST_EP_ID,
+      userId: TEST_USER_ID_UUID,
+      googleCalendarEventId: TEST_GCAL_EVENT_ID,
+    });
+  });
+
+  test('Test 7b: maybe->no transition → cleanup IS dispatched', async () => {
+    mockEventRsvpFindOne.mockResolvedValueOnce(buildExistingRsvp('maybe'));
+
+    const res = await request(app)
+      .post('/api/rsvp/')
+      .send({ event_id: TEST_EVENT_ID, status: 'no' });
+
+    expect(res.status).toBe(200);
+    await new Promise((r) => setImmediate(r));
+    expect(mockEnqueueCleanupJobForAttendee).toHaveBeenCalledTimes(1);
+    expect(mockEnqueueCleanupJobForAttendee).toHaveBeenCalledWith({
+      eventId: TEST_EVENT_ID,
+      eventParticipationId: TEST_EP_ID,
+      userId: TEST_USER_ID_UUID,
+      googleCalendarEventId: TEST_GCAL_EVENT_ID,
+    });
+  });
+
+  test('Test 7c: no->no (idempotent re-submit) → NO cleanup (oldStatus is already no)', async () => {
+    mockEventRsvpFindOne.mockResolvedValueOnce(buildExistingRsvp('no'));
+
+    const res = await request(app)
+      .post('/api/rsvp/')
+      .send({ event_id: TEST_EVENT_ID, status: 'no' });
+
+    expect(res.status).toBe(200);
+    await new Promise((r) => setImmediate(r));
+    expect(mockEnqueueCleanupJobForAttendee).not.toHaveBeenCalled();
+  });
 });
 
 // ============================================================================
@@ -299,14 +354,46 @@ describe('GET /api/rsvp/respond — Phase 75 / Plan 04 GCal cleanup dispatch', (
     expect(mockEnqueueCleanupJobForAttendee).not.toHaveBeenCalled();
   });
 
-  test('Test 10: existing is null (first-time RSVP via magic link) → NO cleanup regardless of incoming status', async () => {
+  test('Test 10a: existing is null (first-time RSVP "yes" via magic link) → NO cleanup (newStatus is yes)', async () => {
+    mockEventRsvpFindOne.mockResolvedValueOnce(null);
+
+    const res = await request(app).get(magicLinkUrl('yes'));
+
+    expect(res.status).toBe(200);
+    await new Promise((r) => setImmediate(r));
+    expect(mockEnqueueCleanupJobForAttendee).not.toHaveBeenCalled();
+  });
+
+  test('Test 10b: existing is null (first-time RSVP "no" via magic link) → cleanup IS dispatched (regression test for the null->no ghost bug)', async () => {
     mockEventRsvpFindOne.mockResolvedValueOnce(null);
 
     const res = await request(app).get(magicLinkUrl('no'));
 
     expect(res.status).toBe(200);
     await new Promise((r) => setImmediate(r));
-    expect(mockEnqueueCleanupJobForAttendee).not.toHaveBeenCalled();
+    expect(mockEnqueueCleanupJobForAttendee).toHaveBeenCalledTimes(1);
+    expect(mockEnqueueCleanupJobForAttendee).toHaveBeenCalledWith({
+      eventId: TEST_EVENT_ID,
+      eventParticipationId: TEST_EP_ID,
+      userId: TEST_USER_ID_UUID,
+      googleCalendarEventId: TEST_GCAL_EVENT_ID,
+    });
+  });
+
+  test('Test 10c: maybe->no via magic link → cleanup IS dispatched', async () => {
+    mockEventRsvpFindOne.mockResolvedValueOnce(buildExistingRsvp('maybe'));
+
+    const res = await request(app).get(magicLinkUrl('no'));
+
+    expect(res.status).toBe(200);
+    await new Promise((r) => setImmediate(r));
+    expect(mockEnqueueCleanupJobForAttendee).toHaveBeenCalledTimes(1);
+    expect(mockEnqueueCleanupJobForAttendee).toHaveBeenCalledWith({
+      eventId: TEST_EVENT_ID,
+      eventParticipationId: TEST_EP_ID,
+      userId: TEST_USER_ID_UUID,
+      googleCalendarEventId: TEST_GCAL_EVENT_ID,
+    });
   });
 
   test('Test 11: HTTP response shape unchanged (POST returns RSVP-with-User; GET returns success object)', async () => {
@@ -379,14 +466,20 @@ describe('DELETE /api/rsvp/:rsvp_id — Phase 75 / Plan 04 GCal cleanup dispatch
     expect(mockEnqueueCleanupJobForAttendee).not.toHaveBeenCalled();
   });
 
-  test('Test 14: DELETE-of-maybe → NO cleanup job', async () => {
+  test('Test 14: DELETE-of-maybe → cleanup IS dispatched (synthesizes newStatus=no, maybe->no transition)', async () => {
     mockEventRsvpFindByPk.mockResolvedValueOnce(buildLoadedRsvp('maybe'));
 
     const res = await request(app).delete(`/api/rsvp/${RSVP_ID}`);
 
     expect(res.status).toBe(200);
     await new Promise((r) => setImmediate(r));
-    expect(mockEnqueueCleanupJobForAttendee).not.toHaveBeenCalled();
+    expect(mockEnqueueCleanupJobForAttendee).toHaveBeenCalledTimes(1);
+    expect(mockEnqueueCleanupJobForAttendee).toHaveBeenCalledWith({
+      eventId: TEST_EVENT_ID,
+      eventParticipationId: TEST_EP_ID,
+      userId: TEST_USER_ID_UUID,
+      googleCalendarEventId: TEST_GCAL_EVENT_ID,
+    });
   });
 
   test('Test 15: DELETE-of-yes but missing EventParticipation row → no crash, NO cleanup job', async () => {

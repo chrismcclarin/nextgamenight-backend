@@ -16,9 +16,15 @@ const router = express.Router();
  * Dispatch a GCal cleanup job for the user-event pair IF this represents a
  * transition that leaves a ghost on the user's calendar.
  *
- * Triggering condition (per CONTEXT D-RSVP-CHANGE + post-verification update):
- *   - oldStatus='yes' AND newStatus='no'   (yes->no transition)
- *   - DELETE-of-yes synthesizes newStatus='no' so the same gate applies
+ * Triggering condition: any transition INTO 'no' from a non-'no' prior state
+ * leaves a ghost to clean up, because GCal entries are created for every
+ * connected attendee at event creation (not just on RSVP yes). So:
+ *   - null -> no    (RSVP "no" without ever clicking yes)
+ *   - maybe -> no
+ *   - yes -> no
+ *   - DELETE-of-any-non-no synthesizes newStatus='no' and flows through here
+ * The no -> no path short-circuits as idempotent (nothing to clean up that
+ * a prior no -> no transition didn't already handle).
  *
  * Only fires if the user has a stored google_calendar_event_id on their
  * EventParticipation row. Best-effort + non-blocking — caller's RSVP
@@ -31,9 +37,9 @@ const router = express.Router();
  * @param {string} params.newStatus   'yes' | 'no' | 'maybe'
  */
 async function maybeDispatchGcalCleanup({ eventId, authUserId, oldStatus, newStatus }) {
-  // Strict transition gate: only yes->no per CONTEXT D-RSVP-CHANGE.
-  // (DELETE-of-yes callers synthesize newStatus='no' to flow through this same gate.)
-  if (oldStatus !== 'yes' || newStatus !== 'no') return;
+  // Fire on any transition INTO 'no' from a non-'no' state. The no->no
+  // path is idempotent and intentionally skipped.
+  if (newStatus !== 'no' || oldStatus === 'no') return;
   try {
     // Translate Auth0 string user_id -> User.id (UUID) for EventParticipation lookup.
     // EventRsvp.user_id is the Auth0 sub; EventParticipation.user_id is the User UUID.
