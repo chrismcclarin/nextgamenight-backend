@@ -3,10 +3,32 @@
 
 const express = require('express');
 const router = express.Router();
+const { Op } = require('sequelize');
 const { validateToken } = require('../services/magicTokenService');
 const { magicTokenLimiter } = require('../middleware/rateLimiter');
 const { trackValidation, extractTokenId } = require('../services/tokenAnalyticsService');
 const { User, UserAvailability } = require('../models');
+
+// Phase 81 Plan 03 Task 4 — compute the upcoming-Monday UTC date string
+// (YYYY-MM-DD) that the check-in form will paint for. Mirrors the frontend's
+// `nextMonday(new Date())` from date-fns: if today is Monday, returns the
+// Monday a week from now. Used to gate `has_saved_availability` so the
+// "Use my saved availability" button only renders when at least one
+// UserAvailability row's date range overlaps that week.
+function getUpcomingMondayUTC(now = new Date()) {
+  const d = new Date(now);
+  d.setUTCHours(0, 0, 0, 0);
+  const day = d.getUTCDay(); // 0=Sun, 1=Mon, ... 6=Sat
+  const daysUntilMonday = ((8 - day) % 7) || 7; // 1-7 days, never 0
+  d.setUTCDate(d.getUTCDate() + daysUntilMonday);
+  return d.toISOString().slice(0, 10); // YYYY-MM-DD
+}
+
+function addDaysUTC(yyyyMmDd, days) {
+  const d = new Date(`${yyyyMmDd}T00:00:00.000Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
 
 /**
  * POST /api/magic-auth/validate
@@ -89,10 +111,28 @@ router.post('/validate', magicTokenLimiter, async (req, res) => {
     // button. Source-of-truth is row count, NOT a derived isAvailable check
     // (research Pitfall 3: source: 'default' is the no-data fallback and
     // would falsely flip this on for users with zero stored patterns).
+    //
+    // Plan 03 Task 4 tightening — also gate on date-range overlap with the
+    // upcoming-Monday week the form will paint. A user with only stale rows
+    // (e.g. a recurring pattern that ended last month, or a one-off override
+    // from 2025) should NOT see the button — otherwise it renders, returns
+    // zero matches, and confuses the user with "No saved availability matches
+    // this week." The single predicate covers both row types: recurring
+    // patterns set end_date NULL for open-ended, and specific_overrides set
+    // start_date = end_date = the override's date (see routes/availability.js).
     let hasSavedAvailability = false;
     try {
+      const weekStart = getUpcomingMondayUTC();
+      const weekEnd = addDaysUTC(weekStart, 6); // 7-day window, inclusive
       const savedCount = await UserAvailability.count({
-        where: { user_id: result.decoded.sub },
+        where: {
+          user_id: result.decoded.sub,
+          start_date: { [Op.lte]: weekEnd },
+          [Op.or]: [
+            { end_date: null },
+            { end_date: { [Op.gte]: weekStart } },
+          ],
+        },
       });
       hasSavedAvailability = savedCount > 0;
     } catch (countErr) {
