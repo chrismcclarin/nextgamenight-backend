@@ -1,5 +1,7 @@
 # Railway Database Migration Instructions
 
+> **Parked CI idea — not yet wired up:** [`docs/migrations-check.ci.yml.disabled`](docs/migrations-check.ci.yml.disabled) is a GitHub Actions workflow that smoke-tests migrations on PRs (fresh Postgres → apply all migrations from scratch → re-run for idempotency). It was written in phase 74-03 but never ran (it lived in the remote-less umbrella repo). If you're doing migration work and want an automated safety net, see that file's header for the ~6-step "to activate" checklist. Otherwise leave it parked.
+
 ## Migrating UserGroup.user_id from UUID to STRING
 
 This migration changes the `UserGroups.user_id` column from UUID to VARCHAR(255) to support Auth0 user IDs (which are strings like `google-oauth2|107459289778553956693`).

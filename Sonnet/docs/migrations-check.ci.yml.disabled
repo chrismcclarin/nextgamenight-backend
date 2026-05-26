@@ -1,0 +1,87 @@
+# ============================================================================
+# PARKED — NOT ACTIVE. This file does NOT run.
+# (It lives in docs/ with a `.disabled` suffix, outside `.github/workflows/`,
+#  so GitHub Actions ignores it entirely.)
+# ----------------------------------------------------------------------------
+# WHAT THIS IS
+#   A GitHub Actions workflow that smoke-tests database migrations on every PR
+#   that touches the DB layer: it spins up a throwaway Postgres 15, applies ALL
+#   migrations from scratch against an empty DB, then re-runs them once more as
+#   an idempotency check (a second apply should be a no-op). Catches broken,
+#   out-of-order, or non-idempotent migrations before they reach a deploy.
+#
+# WHY IT'S PARKED HERE
+#   Written in the umbrella repo (phase 74-03) and stored there in
+#   `.github/workflows/`. The umbrella had no git remote, so it NEVER RAN —
+#   anywhere. Removed from umbrella history on 2026-05-26 and preserved here
+#   verbatim so the code isn't lost. This (the backend repo, GameCalendarbackendv2)
+#   is its natural home: it has a remote and is where the migrations live.
+#
+# TO ACTIVATE (when you next work on migrations and decide you want CI):
+#   1. Move/copy this into `.github/workflows/migrations-check.yml` in THIS repo.
+#   2. Rewrite the trigger `paths:` — drop the umbrella prefix
+#        `periodictabletopbackend_v2/Sonnet/**`  →  `Sonnet/**`
+#      (and remove the `.github/workflows/migrations-check.yml` self-path or fix it).
+#   3. Set `defaults.run.working-directory: Sonnet` (drop the `periodictabletopbackend_v2/`).
+#   4. Fix `cache-dependency-path` the same way → `Sonnet/package-lock.json`.
+#   5. Remove `submodules: recursive` from checkout — the standalone backend repo
+#      has no submodules (that line only mattered in the umbrella layout).
+#   6. Pushing a workflow file requires a `gh`/PAT token with the `workflow` scope.
+#
+# NOTE: it uses `npm run migrate:apply` (= `npx sequelize-cli db:migrate`), NOT
+# the custom `npm run migrate` (`scripts/run-migrations.js`), which historically
+# did not write to SequelizeMeta — see RAILWAY_MIGRATION_INSTRUCTIONS.md.
+# ============================================================================
+
+# ----- original workflow, verbatim (umbrella-relative paths preserved) ------
+
+name: Migrations check
+
+on:
+  pull_request:
+    paths:
+      - 'periodictabletopbackend_v2/Sonnet/migrations/**'
+      - 'periodictabletopbackend_v2/Sonnet/models/**'
+      - 'periodictabletopbackend_v2/Sonnet/package.json'
+      - 'periodictabletopbackend_v2/Sonnet/package-lock.json'
+      - 'periodictabletopbackend_v2/Sonnet/.sequelizerc'
+      - 'periodictabletopbackend_v2/Sonnet/config/sequelize-cli.config.js'
+      - '.github/workflows/migrations-check.yml'
+
+jobs:
+  apply-migrations:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ngn_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    defaults:
+      run:
+        working-directory: periodictabletopbackend_v2/Sonnet
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/ngn_ci
+      NODE_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: periodictabletopbackend_v2/Sonnet/package-lock.json
+      - run: npm ci
+      - name: Apply all migrations
+        run: npm run migrate:apply
+      - name: Re-run migrations (idempotency check)
+        run: npm run migrate:apply
