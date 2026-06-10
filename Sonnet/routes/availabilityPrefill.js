@@ -52,7 +52,7 @@ function isValidTimezone(tz) {
  *
  * Request body: {
  *   magic_token: string,            // Required - magic token from email link
- *   start_date: "YYYY-MM-DD",       // Required - Monday of the target week (client computes via nextMonday(now))
+ *   start_date: "YYYY-MM-DD",       // Required - first day of the 7-day check-in window (the prompt's window_start)
  *   num_days: number (1-14),        // Required - typically 7
  *   timezone: string                // Required - IANA timezone (e.g. 'America/Los_Angeles')
  * }
@@ -101,7 +101,7 @@ router.post('/gcal', magicTokenLimiter, async (req, res) => {
     }
 
     // ---- Compute date range ----
-    // start_date is the Monday the client computed via nextMonday(now); we trust
+    // start_date is the window anchor the client received from /magic-auth/validate; we trust
     // it verbatim to avoid client/server divergence at the timezone boundary
     // (research Pitfall 4).
     const startDate = new Date(`${start_date}T00:00:00.000Z`);
@@ -149,7 +149,7 @@ router.post('/gcal', magicTokenLimiter, async (req, res) => {
  *
  * Request body: {
  *   magic_token: string,            // Required - magic token from email link
- *   start_date: "YYYY-MM-DD",       // Required - Monday of the target week (client computes via nextMonday(now))
+ *   start_date: "YYYY-MM-DD",       // Required - first day of the 7-day check-in window (the prompt's window_start)
  *   num_days: number (1-14),        // Required - typically 7
  *   timezone: string                // Required - IANA timezone (e.g. 'America/Los_Angeles')
  * }
@@ -201,7 +201,7 @@ router.post('/saved', magicTokenLimiter, async (req, res) => {
     const userForCalc = { ...user.toJSON(), google_calendar_enabled: false };
 
     // ---- Compute date range ----
-    // start_date is the Monday the client computed via nextMonday(now); we
+    // start_date is the window anchor the client received from /magic-auth/validate; we
     // trust it verbatim to avoid client/server divergence (research Pitfall 4).
     const startDate = new Date(`${start_date}T00:00:00.000Z`);
     const endDate = new Date(startDate);

@@ -7,14 +7,12 @@ const { Op } = require('sequelize');
 const { validateToken } = require('../services/magicTokenService');
 const { magicTokenLimiter } = require('../middleware/rateLimiter');
 const { trackValidation, extractTokenId } = require('../services/tokenAnalyticsService');
-const { User, UserAvailability } = require('../models');
+const { User, UserAvailability, AvailabilityPrompt, GroupPromptSettings } = require('../models');
 
 // Phase 81 Plan 03 Task 4 — compute the upcoming-Monday UTC date string
-// (YYYY-MM-DD) that the check-in form will paint for. Mirrors the frontend's
-// `nextMonday(new Date())` from date-fns: if today is Monday, returns the
-// Monday a week from now. Used to gate `has_saved_availability` so the
-// "Use my saved availability" button only renders when at least one
-// UserAvailability row's date range overlaps that week.
+// (YYYY-MM-DD). Retained ONLY as the window-anchor fallback for prompts that
+// can't be loaded (deleted prompt, lookup error) — the primary anchor is the
+// prompt's send day (see getPromptWindowStart).
 function getUpcomingMondayUTC(now = new Date()) {
   const d = new Date(now);
   d.setUTCHours(0, 0, 0, 0);
@@ -22,6 +20,52 @@ function getUpcomingMondayUTC(now = new Date()) {
   const daysUntilMonday = ((8 - day) % 7) || 7; // 1-7 days, never 0
   d.setUTCDate(d.getUTCDate() + daysUntilMonday);
   return d.toISOString().slice(0, 10); // YYYY-MM-DD
+}
+
+// Render a timestamp as a YYYY-MM-DD calendar date in the given IANA
+// timezone (en-CA locale formats as YYYY-MM-DD). Falls back to the UTC date
+// when the timezone is missing/invalid.
+function dateInTimezone(date, tz) {
+  if (tz) {
+    try {
+      return new Intl.DateTimeFormat('en-CA', {
+        timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
+      }).format(date);
+    } catch {
+      // invalid tz — fall through to UTC
+    }
+  }
+  return date.toISOString().slice(0, 10);
+}
+
+// The check-in covers a rolling 7-day window anchored to the calendar day
+// the prompt email was sent (a Thursday send paints Thu..Wed), NOT a
+// Monday-anchored week. "Calendar day" is judged in the group's schedule
+// timezone (GroupPromptSettings.schedule_timezone) so a Thursday-11pm send
+// doesn't become a Friday anchor for the whole group; falls back to UTC.
+// Returns YYYY-MM-DD, or null when the prompt can't be loaded.
+async function getPromptWindowStart(promptId) {
+  if (!promptId) return null;
+  try {
+    const prompt = await AvailabilityPrompt.findByPk(promptId, {
+      attributes: ['prompt_date', 'group_id'],
+    });
+    if (!prompt || !prompt.prompt_date) return null;
+    let scheduleTz = null;
+    try {
+      const settings = await GroupPromptSettings.findOne({
+        where: { group_id: prompt.group_id },
+        attributes: ['schedule_timezone'],
+      });
+      scheduleTz = settings?.schedule_timezone || null;
+    } catch {
+      // settings lookup is best-effort; UTC fallback below
+    }
+    return dateInTimezone(new Date(prompt.prompt_date), scheduleTz);
+  } catch (err) {
+    console.error('[magic-auth] failed to load prompt for window anchor:', err.message);
+    return null;
+  }
 }
 
 function addDaysUTC(yyyyMmDd, days) {
@@ -37,7 +81,7 @@ function addDaysUTC(yyyyMmDd, days) {
  * Body: { token: string, formLoadedAt?: string }
  * Response:
  *   Success: { valid: true, user: { name, timezone }, prompt_id, expiresAt, graceUsed,
- *             gcal_connected, has_saved_availability }
+ *             gcal_connected, has_saved_availability, window_start }
  *   Failure: { error: string, action: string }
  */
 router.post('/validate', magicTokenLimiter, async (req, res) => {
@@ -107,22 +151,28 @@ router.post('/validate', magicTokenLimiter, async (req, res) => {
       console.error('[magic-auth] failed to look up user profile:', tzErr.message);
     }
 
+    // Rolling 7-day check-in window anchored to the prompt's send day —
+    // this is the window the form paints, the prefill endpoints fill, and
+    // the has_saved_availability gate counts against. Falls back to the
+    // legacy upcoming-Monday anchor only when the prompt can't be loaded.
+    const windowStart = (await getPromptWindowStart(result.decoded.prompt_id))
+      || getUpcomingMondayUTC();
+
     // Phase 81 / Plan 01 — boolean for "Use my saved availability" pre-fill
     // button. Source-of-truth is row count, NOT a derived isAvailable check
     // (research Pitfall 3: source: 'default' is the no-data fallback and
     // would falsely flip this on for users with zero stored patterns).
     //
     // Plan 03 Task 4 tightening — also gate on date-range overlap with the
-    // upcoming-Monday week the form will paint. A user with only stale rows
-    // (e.g. a recurring pattern that ended last month, or a one-off override
-    // from 2025) should NOT see the button — otherwise it renders, returns
-    // zero matches, and confuses the user with "No saved availability matches
-    // this week." The single predicate covers both row types: recurring
-    // patterns set end_date NULL for open-ended, and specific_overrides set
-    // start_date = end_date = the override's date (see routes/availability.js).
+    // window the form will paint. A user with only stale rows (e.g. a
+    // recurring pattern that ended last month, or a one-off override from
+    // 2025) should NOT get an enabled button — it would return zero matches.
+    // The single predicate covers both row types: recurring patterns set
+    // end_date NULL for open-ended, and specific_overrides set start_date =
+    // end_date = the override's date (see routes/availability.js).
     let hasSavedAvailability = false;
     try {
-      const weekStart = getUpcomingMondayUTC();
+      const weekStart = windowStart;
       const weekEnd = addDaysUTC(weekStart, 6); // 7-day window, inclusive
       const savedCount = await UserAvailability.count({
         where: {
@@ -153,6 +203,9 @@ router.post('/validate', magicTokenLimiter, async (req, res) => {
       // Phase 81 — pre-fill button gates (read by AvailabilityForm in 81-02 / 81-03)
       gcal_connected: gcalConnected,
       has_saved_availability: hasSavedAvailability,
+      // Rolling 7-day window anchor (YYYY-MM-DD): the calendar day the prompt
+      // email was sent. The form paints [window_start, window_start+6].
+      window_start: windowStart,
     });
 
   } catch (err) {
