@@ -399,21 +399,21 @@ async function seedDatabase() {
     console.log('⭐ Creating game reviews...');
     const reviews = [
       // Weekend Warriors reviews
-      { user: users[0], group: weekendGroup, game: games[0], rating: 9, review_text: 'One of my favorites! Always a good time.', is_recommended: true },
-      { user: users[1], group: weekendGroup, game: games[0], rating: 8, review_text: 'Classic strategy game. Great for groups.', is_recommended: true },
-      { user: users[2], group: weekendGroup, game: games[1], rating: 10, review_text: 'Perfect gateway game. Easy to teach!', is_recommended: true },
-      { user: users[3], group: weekendGroup, game: games[2], rating: 9, review_text: 'Beautiful artwork and engaging gameplay.', is_recommended: true },
+      { user: users[0], group: weekendGroup, game: games[0], rating: 4.5, review_text: 'One of my favorites! Always a good time.', is_recommended: true },
+      { user: users[1], group: weekendGroup, game: games[0], rating: 4, review_text: 'Classic strategy game. Great for groups.', is_recommended: true },
+      { user: users[2], group: weekendGroup, game: games[1], rating: 5, review_text: 'Perfect gateway game. Easy to teach!', is_recommended: true },
+      { user: users[3], group: weekendGroup, game: games[2], rating: 4.5, review_text: 'Beautiful artwork and engaging gameplay.', is_recommended: true },
       
       // Strategy Squad reviews
-      { user: users[1], group: strategyGroup, game: games[5], rating: 10, review_text: 'Epic campaign game. Hours of fun!', is_recommended: true },
-      { user: users[2], group: strategyGroup, game: games[5], rating: 9, review_text: 'Complex but rewarding. Love the legacy elements.', is_recommended: true },
-      { user: users[4], group: strategyGroup, game: games[3], rating: 8, review_text: 'Quick and tactical. Great filler game.', is_recommended: true },
-      { user: users[5], group: strategyGroup, game: games[3], rating: 7, review_text: 'Nice abstract game, but can be a bit dry.', is_recommended: false },
+      { user: users[1], group: strategyGroup, game: games[5], rating: 5, review_text: 'Epic campaign game. Hours of fun!', is_recommended: true },
+      { user: users[2], group: strategyGroup, game: games[5], rating: 4.5, review_text: 'Complex but rewarding. Love the legacy elements.', is_recommended: true },
+      { user: users[4], group: strategyGroup, game: games[3], rating: 4, review_text: 'Quick and tactical. Great filler game.', is_recommended: true },
+      { user: users[5], group: strategyGroup, game: games[3], rating: 3.5, review_text: 'Nice abstract game, but can be a bit dry.', is_recommended: false },
       
       // Casual Gamers reviews
-      { user: users[3], group: casualGroup, game: games[4], rating: 9, review_text: 'Perfect party game! Always gets laughs.', is_recommended: true },
-      { user: users[4], group: casualGroup, game: games[4], rating: 8, review_text: 'Great for non-gamers. Easy to learn.', is_recommended: true },
-      { user: users[5], group: casualGroup, game: games[6], rating: 6, review_text: 'Needs more playtesting. Some rules unclear.', is_recommended: false },
+      { user: users[3], group: casualGroup, game: games[4], rating: 4.5, review_text: 'Perfect party game! Always gets laughs.', is_recommended: true },
+      { user: users[4], group: casualGroup, game: games[4], rating: 4, review_text: 'Great for non-gamers. Easy to learn.', is_recommended: true },
+      { user: users[5], group: casualGroup, game: games[6], rating: 3, review_text: 'Needs more playtesting. Some rules unclear.', is_recommended: false },
     ];
 
     for (const { user, group, game, rating, review_text, is_recommended } of reviews) {
