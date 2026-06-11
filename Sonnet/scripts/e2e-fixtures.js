@@ -38,6 +38,11 @@ async function main() {
     throw new Error('Seed data missing (Alice / Weekend Warriors) — run seed-sample-data.js first');
   }
 
+  // Mark the E2E login identity tutorial-complete — TutorialProvider shows a
+  // click-blocking overlay whenever tutorial_version < CURRENT_TUTORIAL_VERSION,
+  // which swallowed every journey click on '/' (run 27317492586 screenshot).
+  await alice.update({ tutorial_version: 999 });
+
   // Future event so the RSVP respond endpoint accepts it.
   const event = await Event.create({
     group_id: group.id,
