@@ -37,7 +37,7 @@ The code has been updated to support the Authorization header. Once you have an 
 
 **Important Format Notes**:
 - Use "Bearer" followed by a **space** (no colon!)
-- Token format: `e3f8c3ff-9926-4efc-863c-3b92acda4d32`
+- Token format: a UUID, e.g. `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` (the real value lives ONLY in `.env` as `BGG_APPLICATION_TOKEN` — never commit it)
 - Must use HTTPS
 - Must use `boardgamegeek.com` (NO leading `www`)
 
