@@ -15,9 +15,21 @@
 // Requires MAGIC_TOKEN_SECRET in env (same value the booted server uses, or
 // token validation will fail server-side).
 
+const crypto = require('crypto');
 const { User, Group, Event, AvailabilityPrompt, sequelize } = require('../models');
 const { generateToken } = require('../services/magicTokenService');
-const { generateRsvpToken } = require('../routes/rsvp.js');
+
+// Mirrors routes/rsvp.js generateRsvpToken EXACTLY (same payload + HMAC).
+// Inlined rather than required: pulling in the route module drags rate
+// limiters / services whose timers keep the event loop alive forever —
+// the script printed its output but never exited (hung CI run 27309008729).
+function generateRsvpToken(eventId, userId, status) {
+  const payload = `${eventId}:${userId}:${status}`;
+  return crypto
+    .createHmac('sha256', process.env.MAGIC_TOKEN_SECRET)
+    .update(payload)
+    .digest('base64url');
+}
 
 async function main() {
   const alice = await User.findOne({ where: { username: 'Alice' } });
@@ -57,6 +69,9 @@ async function main() {
   })}`);
 
   await sequelize.close();
+  // Belt-and-braces: exit explicitly so no lingering handle (pool, timer from
+  // any transitively-required module) can keep the process alive after success.
+  process.exit(0);
 }
 
 main().catch((err) => {
