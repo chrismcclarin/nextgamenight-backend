@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const { sequelize } = require('./models');
+const { buildAllowedOrigins } = require('./config/allowedOrigins');
 
 // Global error handlers to prevent crashes from unhandled promise rejections
 process.on('unhandledRejection', (reason, promise) => {
@@ -117,18 +118,10 @@ app.use(helmet({
 }));
 
 // 2. CORS configuration - allow frontend domains
-// Support both localhost (development) and production domains
-const allowedOrigins = [
-  'http://localhost:3000',
-  'http://localhost:3001', // Alternative local port
-  process.env.FRONTEND_URL, // Production frontend URL from env
-  process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : null, // Vercel preview deployments
-].filter(Boolean); // Remove null/undefined values
-
-// Add any additional origins from environment variable (comma-separated)
-if (process.env.ALLOWED_ORIGINS) {
-  allowedOrigins.push(...process.env.ALLOWED_ORIGINS.split(',').map(origin => origin.trim()));
-}
+// Support both localhost (development) and production domains.
+// The allow-list is built in config/allowedOrigins.js so the OAuth redirect
+// allow-list (routes/googleAuth.js, D-04) reuses the SAME source — no drift.
+const allowedOrigins = buildAllowedOrigins();
 
 // Log allowed origins on startup (helpful for debugging)
 console.log('CORS allowed origins:', allowedOrigins.length > 0 ? allowedOrigins.join(', ') : 'None configured');

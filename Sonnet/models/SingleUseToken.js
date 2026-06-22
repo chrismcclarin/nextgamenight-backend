@@ -9,7 +9,7 @@
 // SingleUseToken intentionally has NO prompt_id FK / CASCADE (which would
 // cascade-delete unrelated nonces), a three-value status ENUM that adds 'used',
 // and extra columns (frontend_url, event_id, email_batch_id, rsvp_status, used_at).
-const { DataTypes } = require('sequelize');
+const { DataTypes, Op } = require('sequelize');
 const sequelize = require('../config/database');
 
 const SingleUseToken = sequelize.define('SingleUseToken', {
@@ -102,5 +102,35 @@ const SingleUseToken = sequelize.define('SingleUseToken', {
     },
   ],
 });
+
+/**
+ * Atomically consume a single-use token by nonce (Pattern 2).
+ *
+ * Race-free: a single `UPDATE … WHERE status='active' AND expires_at > now`
+ * either flips exactly one active row to 'used' or affects zero rows. Two
+ * concurrent calls therefore yield exactly one success — never check-then-mark.
+ *
+ * @param {string} nonce - The token nonce to consume.
+ * @returns {Promise<Object|null>} The consumed row (with its pre-update field
+ *   values, plus the now-'used' status) if consumption succeeded, else null.
+ */
+SingleUseToken.consumeByNonce = async function consumeByNonce(nonce) {
+  if (!nonce) return null;
+  const [, rows] = await SingleUseToken.update(
+    { status: 'used', used_at: new Date() },
+    {
+      where: {
+        nonce,
+        status: 'active',
+        expires_at: { [Op.gt]: new Date() },
+      },
+      returning: true,
+    }
+  );
+  // Postgres `returning: true` yields the affected rows array as the 2nd tuple
+  // element. Zero rows -> already used / expired / revoked -> consume failed.
+  if (!rows || rows.length === 0) return null;
+  return rows[0];
+};
 
 module.exports = SingleUseToken;

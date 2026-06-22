@@ -1,9 +1,14 @@
 // routes/googleAuth.js
 // Google OAuth 2.0 routes for Calendar integration
 const express = require('express');
+const crypto = require('crypto');
 const { google } = require('googleapis');
-const { User } = require('../models');
+const { User, SingleUseToken } = require('../models');
+const { resolveAllowedFrontendUrl } = require('../config/allowedOrigins');
 const router = express.Router();
+
+// OAuth state nonce lifetime: the consent round-trip is short; 30 min is generous.
+const OAUTH_STATE_TTL_MS = 30 * 60 * 1000;
 
 // Initialize OAuth2 client
 const getOAuth2Client = () => {
@@ -58,28 +63,39 @@ const generateGoogleAuthUrl = async (user_id, email = null, username = null, fro
   }
 
   const oauth2Client = getOAuth2Client();
-  
+
   // Generate authorization URL
   const scopes = [
     'https://www.googleapis.com/auth/calendar.events',
     'https://www.googleapis.com/auth/calendar.readonly'
   ];
-  
-  // Encode state with user_id and frontend URL (so callback knows where to redirect)
-  // Use URL-safe base64 encoding to avoid issues with special characters in query strings
-  const stateData = {
-    user_id: user_id,
-    frontend_url: frontendUrl || process.env.FRONTEND_URL || 'http://localhost:3000'
-  };
-  const base64State = Buffer.from(JSON.stringify(stateData)).toString('base64');
-  // Make base64 URL-safe by replacing + with -, / with _, and removing padding =
-  const state = base64State.replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
-  
+
+  // D-04 / BSEC-03: server-stored crypto nonce instead of unsigned base64-JSON state.
+  // The callback resolves user_id FROM the stored row (kills BE-001 login-CSRF) and
+  // redirects to the allow-listed frontend_url stored alongside it (kills BE-024 open redirect).
+  // Allow-list the requested frontend_url against the SAME allow-list CORS uses;
+  // reject anything not on it by falling back to FRONTEND_URL (never reflect attacker input).
+  const allowedFrontendUrl =
+    resolveAllowedFrontendUrl(frontendUrl) ||
+    resolveAllowedFrontendUrl(process.env.FRONTEND_URL) ||
+    process.env.FRONTEND_URL ||
+    'http://localhost:3000';
+
+  const nonce = crypto.randomBytes(32).toString('base64url');
+  await SingleUseToken.create({
+    nonce,
+    user_id,
+    purpose: 'oauth_state',
+    frontend_url: allowedFrontendUrl,
+    status: 'active',
+    expires_at: new Date(Date.now() + OAUTH_STATE_TTL_MS),
+  });
+
   const authUrl = oauth2Client.generateAuthUrl({
     access_type: 'offline', // Required to get refresh token
     scope: scopes,
     prompt: 'consent', // Force consent screen to get refresh token
-    state: state, // Pass encoded state with user_id and frontend_url
+    state: nonce, // Opaque server-stored nonce — NOT client-controlled state
   });
 
   return authUrl;
@@ -138,9 +154,13 @@ router.get('/google', async (req, res) => {
 
 // Step 2: Handle OAuth callback from Google (PUBLIC - no auth required)
 router.get('/google/callback', async (req, res) => {
+  // D-04: the resolved nonce row is hoisted so BOTH the success path AND the
+  // catch-block error redirect derive frontend_url from it — never from a
+  // re-parse of req.query.state (the second open-redirect sink, now removed).
+  let consumedToken = null;
   try {
     const { code, state } = req.query;
-    
+
     if (!code) {
       return res.status(400).json({ error: 'Authorization code is required' });
     }
@@ -149,39 +169,20 @@ router.get('/google/callback', async (req, res) => {
       return res.status(400).json({ error: 'State parameter is required' });
     }
 
-    // Parse state to get user_id and frontend_url
-    let user_id;
-    let frontendUrl;
-    
-    try {
-      // Decode URL-safe base64: restore +, /, and padding = first
-      // Express automatically URL-decodes query params, but we need to restore base64 characters
-      const base64State = state.replace(/-/g, '+').replace(/_/g, '/');
-      // Add padding if needed (base64 strings should be multiple of 4)
-      const padding = base64State.length % 4;
-      const paddedState = base64State + (padding ? '='.repeat(4 - padding) : '');
-      
-      // Decode base64 to get JSON string
-      const jsonString = Buffer.from(paddedState, 'base64').toString('utf-8');
-      const stateData = JSON.parse(jsonString);
-      user_id = stateData.user_id;
-      frontendUrl = stateData.frontend_url;
-    } catch (parseError) {
-      // Fallback: if state is not JSON, treat it as plain user_id (backwards compatibility)
-      user_id = state;
-      frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+    // D-04 / BSEC-03: atomically consume the server-stored single-use nonce.
+    // Zero rows => forged / replayed / expired => 403. This resolves user_id
+    // and frontend_url FROM the row (the client cannot influence either).
+    consumedToken = await SingleUseToken.consumeByNonce(state);
+    if (!consumedToken || consumedToken.purpose !== 'oauth_state') {
+      console.error('OAuth callback rejected: invalid, expired, or already-used state nonce');
+      const errUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+      return res.redirect(`${errUrl}/userProfile/?google_calendar=error&message=${encodeURIComponent('Invalid or expired authorization request')}`);
     }
 
-    if (!user_id) {
-      console.error('No user_id found in state parameter');
-      return res.status(400).json({ error: 'Invalid state parameter: missing user_id' });
-    }
+    const user_id = consumedToken.user_id;
+    // frontend_url was allow-listed at mint time; trust the stored value.
+    const frontendUrl = consumedToken.frontend_url || process.env.FRONTEND_URL || 'http://localhost:3000';
 
-    // Ensure frontend URL has a default
-    if (!frontendUrl) {
-      frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
-    }
-    
     // Find or create user (should exist from step 1, but create if needed)
     const [user] = await User.findOrCreate({
       where: { user_id },
@@ -193,44 +194,40 @@ router.get('/google/callback', async (req, res) => {
     });
 
     const oauth2Client = getOAuth2Client();
-    
+
     // Exchange authorization code for tokens
     const { tokens } = await oauth2Client.getToken(code);
-    
+
     if (!tokens.access_token) {
       console.error('No access token received from Google');
       throw new Error('Failed to get access token from Google');
     }
-    
+
     // Store tokens in database
     // Note: Refresh token might be null if user already granted permission (Google reuses existing consent)
     const updateData = {
       google_calendar_token: tokens.access_token,
       google_calendar_enabled: true,
     };
-    
+
     // Only update refresh token if we received one (if null, keep existing refresh token)
     if (tokens.refresh_token) {
       updateData.google_calendar_refresh_token = tokens.refresh_token;
     }
-    
+
     await user.update(updateData);
 
-    // Redirect to frontend success page using the frontend URL from state
+    // Redirect to frontend success page using the allow-listed frontend URL from the row
     res.redirect(`${frontendUrl}/userProfile/?google_calendar=connected`);
   } catch (error) {
     console.error('Error handling Google OAuth callback:', error.message);
-    // Try to get frontend URL from state, fallback to env or localhost
-    let frontendUrl = 'http://localhost:3000';
-    try {
-      if (req.query.state) {
-        const decodedState = Buffer.from(req.query.state, 'base64').toString('utf-8');
-        const stateData = JSON.parse(decodedState);
-        frontendUrl = stateData.frontend_url || process.env.FRONTEND_URL || 'http://localhost:3000';
-      }
-    } catch (e) {
-      frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
-    }
+    // D-04: derive the error-redirect target from the RESOLVED row's allow-listed
+    // frontend_url (or the env default) — NEVER from re-parsing req.query.state.
+    // An attacker-supplied state cannot influence the error redirect.
+    const frontendUrl =
+      (consumedToken && consumedToken.frontend_url) ||
+      process.env.FRONTEND_URL ||
+      'http://localhost:3000';
     res.redirect(`${frontendUrl}/userProfile/?google_calendar=error&message=${encodeURIComponent(error.message)}`);
   }
 });
