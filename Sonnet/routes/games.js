@@ -2,7 +2,18 @@
 const express = require('express');
 const { Game, Event, EventParticipation, GameReview, User, UserGame, UserGroup } = require('../models');
 const { Op } = require('sequelize');
+const { requireParamMatchesToken } = require('../middleware/objectAuth');
 const router = express.Router();
+
+// BSEC-02 / BE-098: this router is mounted under the global `/api` default-deny
+// authn layer (server.js). The public game-search GETs (`/`, `/search-all`,
+// `/:id`, `/bgg/search`) are EXACT-match allow-listed there, so they reach the
+// handlers below with no token. The write handlers (`POST /`, `POST /resolve`,
+// `POST /import-bgg/:bgg_id`, `PUT /:id`, `DELETE /:id`) are NOT allow-listed,
+// so the default-deny layer already requires a valid JWT before they run.
+// `GET /for-event/:group_id/:user_id` is also NOT allow-listed (it is not one
+// of the four public search paths) — it requires a token AND, because it returns
+// the named user's OWNED games, an object-level self-check (see its handler).
 
 
 // BGG API integration helper
@@ -352,7 +363,11 @@ router.get('/bgg/search', async (req, res) => {
 });
 
 // Get games for event form (group played + user owned)
-router.get('/for-event/:group_id/:user_id', async (req, res) => {
+// BSEC-02 audit (Task 1): this returns the named user's OWNED games merged with
+// the group's played games, so it is a self-scoped read — a BOLA candidate, NOT
+// public event-form data. Gate it: the actor (verified JWT) must equal the
+// :user_id param. The frontend only ever calls this for the logged-in user.
+router.get('/for-event/:group_id/:user_id', requireParamMatchesToken('user_id'), async (req, res) => {
   try {
     const { group_id, user_id } = req.params;
     

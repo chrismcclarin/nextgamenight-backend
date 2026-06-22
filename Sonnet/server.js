@@ -231,72 +231,125 @@ app.use(requestLogger);
 // 5. Rate limiting - Apply general API rate limiter to all routes
 app.use('/api/', apiLimiter);
 
-// Routes
-// Public routes (no auth required)
-app.use('/api/games', gameRoutes); // Game search is public
-app.use('/api/feedback', feedbackLimiter, optionalAuth, feedbackRoutes); // Feedback with strict rate limiting
-app.use('/api/webhooks', webhooksRoutes); // External service webhooks (Resend, etc.)
-app.use('/api/magic-auth', magicAuthRoutes); // Magic link validation (no Auth0 required)
-app.use('/api/availability-responses', availabilityResponseRoutes); // Availability form submission (magic token auth)
-app.use('/api/availability-prefill', availabilityPrefillRoutes); // Check-in pre-fill (GCal / saved availability — magic token auth)
-// Public invite info endpoint handled by conditional auth below
-app.use('/api/rsvp', writeOperationLimiter, rsvpRoutes); // RSVP: GET /respond is public; POST/GET/DELETE have per-route auth
-app.use('/api/event-brings', writeOperationLimiter, eventBringRoutes); // Event brings: per-route auth inside
+// =====================================================================
+// DEFAULT-DENY AUTHENTICATION LAYER (D-01 / BSEC-01)
+// =====================================================================
+//
+// SECURITY-CRITICAL. Replaces the previous per-router opt-in `verifyAuth0Token`
+// mounts AND the four removed conditional-auth closures that special-cased the
+// groups/events invite-preview GETs, the Google OAuth callback, and the invite
+// info GET. Those public GETs now live in the allow-list below. A single
+// authn gate runs FIRST for every `/api/*` request: unless the request matches
+// the EXPLICIT public allow-list below, a valid Auth0 JWT is REQUIRED. "Public"
+// is now a deliberate, visible act; the default is locked.
+//
+// Mounted on `/api` (NOT app root): `/health` (below) and `/admin/queues`
+// (Bull Board, mounted at app root via mountBullBoard, gated by
+// requirePlatformAdmin from 83-03) live OUTSIDE `/api` and are intentionally
+// NOT touched by this layer. `/api/admin/metrics` IS under `/api`: this layer
+// proves authn, then the in-handler requirePlatformAdmin (83-03) proves authz —
+// no double-`verifyAuth0Token` because this is the ONLY authn mount.
+//
+// The allow-list matches on EXACT method + path (mount-relative, i.e. with the
+// `/api` prefix already stripped). It is NOT a `startsWith` prefix for the
+// game-search routes — `GET /games/:id` is public but `GET /games/for-event/...`
+// is NOT, so it stays gated (Task 1 BOLA audit). The prefix entries below are
+// reserved for routers that are wholly public (webhooks, magic-auth) or
+// self-authenticate via a magic token inside the handler.
+//
+// MUST include `GET /api/auth/google/callback` — Google redirects the OAuth
+// flow back here carrying NO Auth0 bearer token; omitting it would 401 the
+// callback under default-deny and break Google Calendar login (REVIEW HIGH).
 
-// Protected routes (require Auth0 token)
-// Apply write operation rate limiting only to POST/PUT/DELETE requests
-// GET requests will use the general apiLimiter
-app.use('/api/users', verifyAuth0Token, userRoutes);
-// Groups: public QR invite preview, auth for everything else
-const conditionalGroupAuth = (req, res, next) => {
-  if (req.method === 'GET' && req.path.match(/^\/invite-preview\//)) return next();
-  return verifyAuth0Token(req, res, next);
-};
-app.use('/api/groups', writeOperationLimiter, conditionalGroupAuth, groupRoutes);
-app.use('/api/groups', writeOperationLimiter, verifyAuth0Token, groupPromptSettingsRoutes);
-// Events: public QR invite preview, auth for everything else
-const conditionalEventAuth = (req, res, next) => {
-  if (req.method === 'GET' && req.path.match(/^\/invite-preview\//)) return next();
-  return verifyAuth0Token(req, res, next);
-};
-app.use('/api/events', writeOperationLimiter, conditionalEventAuth, eventRoutes);
-app.use('/api/lists', verifyAuth0Token, listRoutes);
-app.use('/api/game-reviews', writeOperationLimiter, verifyAuth0Token, gameReviewRoutes);
-app.use('/api/user-games', writeOperationLimiter, verifyAuth0Token, userGameRoutes);
-// Google Auth routes - callback is public (Google redirects to it), others require auth
-// Conditional middleware: skip auth for callback route
-const conditionalAuth = (req, res, next) => {
-  // Skip auth for callback route (Google redirects to it without auth header)
-  // req.path will be '/google/callback' when router is mounted at '/api/auth'
-  if (req.path === '/google/callback' || req.originalUrl.includes('/google/callback')) {
-    return next();
+// Exact (method, path-regex) public routes — path is mount-relative to `/api`.
+const PUBLIC_EXACT = [
+  // Game search (public) — `/games/:id` and `/games/search-all` are single
+  // dynamic segments; `/games/for-event/:group_id/:user_id` (3 segments) is
+  // deliberately NOT matched and stays gated.
+  { method: 'GET', re: /^\/games$/ },
+  { method: 'GET', re: /^\/games\/bgg\/search$/ },
+  { method: 'GET', re: /^\/games\/[^/]+$/ },
+  // Google OAuth callback — Google redirects here with no Auth0 token.
+  { method: 'GET', re: /^\/auth\/google\/callback$/ },
+  // RSVP magic-link response (HMAC-token authed inside the handler).
+  { method: 'GET', re: /^\/rsvp\/respond$/ },
+  // QR invite previews / invite info (token in the path; public by design).
+  { method: 'GET', re: /^\/groups\/invite-preview(\/|$)/ },
+  { method: 'GET', re: /^\/events\/invite-preview(\/|$)/ },
+  { method: 'GET', re: /^\/invites\/info(\/|$)/ },
+];
+
+// Wholly-public prefixes (router self-authenticates via magic token, is an
+// external webhook surface, or is public-with-optional-auth). Mount-relative
+// to `/api`.
+//
+// `/feedback` is allow-listed here so anonymous `POST /api/feedback` reaches the
+// router; the router runs `optionalAuth` (populating req.user-if-present) and
+// gates `GET /api/feedback` with `requirePlatformAdmin` (83-03 / BE-099). The
+// gate passing it through is correct — the ROUTER, not the gate, enforces the
+// admin check on the read.
+const PUBLIC_PREFIX = [
+  '/feedback',
+  '/webhooks',
+  '/magic-auth',
+  '/availability-responses',
+  '/availability-prefill',
+];
+
+const isPublicApiRequest = (req) => {
+  const p = req.path; // mount-relative (the `/api` prefix is already stripped)
+  if (PUBLIC_PREFIX.some((prefix) => p === prefix || p.startsWith(prefix + '/'))) {
+    return true;
   }
-  // Apply auth for all other routes
-  return verifyAuth0Token(req, res, next);
+  return PUBLIC_EXACT.some((entry) => req.method === entry.method && entry.re.test(p));
 };
-app.use('/api/auth', authLimiter, conditionalAuth, googleAuthRoutes);
-app.use('/api/availability', writeOperationLimiter, verifyAuth0Token, availabilityRoutes);
-// Availability suggestion routes (protected by Auth0 in the route handlers)
+
+// The single global authn gate. Public allow-list short-circuits; everything
+// else must carry a valid Auth0 JWT (verifyAuth0Token 401s a missing/invalid
+// token before any handler or DB read runs).
+app.use('/api', (req, res, next) => {
+  if (isPublicApiRequest(req)) return next();
+  return verifyAuth0Token(req, res, next);
+});
+
+// Routes
+// ---- Public / optional-auth routers ----
+app.use('/api/feedback', feedbackLimiter, optionalAuth, feedbackRoutes); // GET / gated by requirePlatformAdmin inside
+app.use('/api/webhooks', webhooksRoutes); // External service webhooks
+app.use('/api/magic-auth', magicAuthRoutes); // Magic link validation (no Auth0 required)
+app.use('/api/availability-responses', availabilityResponseRoutes); // Magic-token authed
+app.use('/api/availability-prefill', availabilityPrefillRoutes); // Magic-token authed
+app.use('/api/games', gameRoutes); // Search GETs public (allow-list); writes + for-event gated by the layer / per-route
+app.use('/api/rsvp', writeOperationLimiter, rsvpRoutes); // GET /respond public (allow-list); POST/GET/DELETE authed by the layer
+app.use('/api/event-brings', writeOperationLimiter, eventBringRoutes);
+
+// ---- Authed routers (the global `/api` layer already required a valid JWT) ----
+// Per-router `verifyAuth0Token` args removed (would double-run authn); the
+// rate limiters and route-specific limiters are preserved.
+app.use('/api/users', userRoutes);
+app.use('/api/groups', writeOperationLimiter, groupRoutes); // invite-preview GET allow-listed at the layer
+app.use('/api/groups', writeOperationLimiter, groupPromptSettingsRoutes);
+app.use('/api/events', writeOperationLimiter, eventRoutes); // invite-preview GET allow-listed at the layer
+app.use('/api/lists', listRoutes);
+app.use('/api/game-reviews', writeOperationLimiter, gameReviewRoutes);
+app.use('/api/user-games', writeOperationLimiter, userGameRoutes);
+app.use('/api/auth', authLimiter, googleAuthRoutes); // google/callback GET allow-listed at the layer
+app.use('/api/availability', writeOperationLimiter, availabilityRoutes);
+// Availability suggestion routes (authz in the route handlers)
 app.use('/api', writeOperationLimiter, availabilitySuggestionRoutes);
 // Availability prompt routes (respondent list, reminders)
 app.use('/api', writeOperationLimiter, availabilityPromptRoutes);
-// Admin metrics dashboard (protected by Auth0 token)
+// Admin metrics dashboard — authn by the layer, then requirePlatformAdmin (83-03) in-handler
 app.use('/api', adminMetricsRoutes);
-// Token analytics (requires Auth0 token)
-app.use('/api/tokens', verifyAuth0Token, tokenRoutes);
-// Group invites: GET /info/:token is public, all other endpoints require auth
-const conditionalInviteAuth = (req, res, next) => {
-  if (req.method === 'GET' && req.path.match(/^\/info\//)) return next();
-  return verifyAuth0Token(req, res, next);
-};
-app.use('/api/invites', writeOperationLimiter, conditionalInviteAuth, inviteRoutes);
+// Token analytics
+app.use('/api/tokens', tokenRoutes);
+app.use('/api/invites', writeOperationLimiter, inviteRoutes); // GET /info allow-listed at the layer
 // Friendships (social graph: friend requests, accept, decline, remove)
-app.use('/api/friendships', writeOperationLimiter, verifyAuth0Token, friendshipRoutes);
-// Ballot routes (game voting: ballot CRUD, vote toggle, auto-close)
-app.use('/api/ballot', writeOperationLimiter, verifyAuth0Token, ballotRoutes);
+app.use('/api/friendships', writeOperationLimiter, friendshipRoutes);
+// Ballot routes (game voting)
+app.use('/api/ballot', writeOperationLimiter, ballotRoutes);
 // Suggestion routes (smart game suggestions based on group collections)
-app.use('/api/suggestions', verifyAuth0Token, suggestionRoutes);
-// RSVP routes moved to public section above (per-route auth inside rsvp.js)
+app.use('/api/suggestions', suggestionRoutes);
 
 // Health check
 app.get('/health', (req, res) => {
