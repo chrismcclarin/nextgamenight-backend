@@ -84,6 +84,9 @@ describe('BOLA cross-actor 403 regression (Plan 83-05)', () => {
     });
 
     it('lets the owner delete their own review → 200', async () => {
+      // The prior test leaves a review for the same (user_id, group_id, game_id);
+      // GameReview has a unique index on that triple, so clear it before re-creating.
+      await GameReview.destroy({ where: { user_id: owner.id, group_id: group.id, game_id: game.id } });
       const review = await GameReview.create({
         user_id: owner.id, group_id: group.id, game_id: game.id, rating: 5,
       });
@@ -145,6 +148,36 @@ describe('BOLA cross-actor 403 regression (Plan 83-05)', () => {
       const app = appWith({ user_id: attacker.user_id }, '/api/feedback', feedbackRoutes, { optional: true });
       const res = await request(app).get('/api/feedback');
       expect(res.status).toBe(403);
+    });
+  });
+
+  // ---- Test 5: groups POST /:group_id/users — owner/admin only (BE-044) --------
+  describe('POST /api/groups/:group_id/users (BE-044)', () => {
+    it('non-member/non-admin attacker → 403 and no membership created', async () => {
+      const target = await User.create({
+        user_id: `bola-target-${ts}`, username: `target-${ts}`, email: `target-${ts}@example.com`,
+      });
+      const app = appWith({ user_id: attacker.user_id }, '/api/groups', groupRoutes);
+      const res = await request(app)
+        .post(`/api/groups/${group.id}/users`)
+        .send({ user_id: target.user_id });
+      expect(res.status).toBe(403);
+      const membership = await UserGroup.findOne({ where: { user_id: target.user_id, group_id: group.id } });
+      expect(membership).toBeNull();
+    });
+
+    it('owner → 200 and the target user is added as a member', async () => {
+      const target = await User.create({
+        user_id: `bola-target2-${ts}`, username: `target2-${ts}`, email: `target2-${ts}@example.com`,
+      });
+      const app = appWith({ user_id: owner.user_id }, '/api/groups', groupRoutes);
+      const res = await request(app)
+        .post(`/api/groups/${group.id}/users`)
+        .send({ user_id: target.user_id });
+      expect(res.status).toBe(200);
+      const membership = await UserGroup.findOne({ where: { user_id: target.user_id, group_id: group.id } });
+      expect(membership).not.toBeNull();
+      expect(membership.role).toBe('member');
     });
   });
 });

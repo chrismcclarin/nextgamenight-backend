@@ -369,20 +369,31 @@ router.delete('/:user_id/tutorial', async (req, res) => {
   }
 });
 
-// Create or update user
+// Create or update the AUTHENTICATED user's own row (BE-049).
+// FOLLOW-UP: this duplicates POST /:user_id/refresh (which reconciles
+// username/email authoritatively from Auth0); consider removing this route
+// and the unused FE `createOrUpdateUser` client method in a later cleanup.
 router.post('/', async (req, res) => {
   try {
-    const { username, email, user_id } = req.body;
-    
+    const { username, email } = req.body;
+
+    // BE-049 (BSEC-01): derive the subject from the verified JWT, NEVER from the
+    // request body. Previously `user_id` came from req.body, letting any
+    // authenticated caller create/overwrite ANY user's username+email.
+    const user_id = req.user?.user_id;
+    if (!user_id) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
     const [user, created] = await User.findOrCreate({
       where: { user_id },
       defaults: { username, email, user_id }
     });
-    
+
     if (!created) {
       await user.update({ username, email });
     }
-    
+
     res.json(user);
   } catch (error) {
     res.status(500).json({ error: error.message });

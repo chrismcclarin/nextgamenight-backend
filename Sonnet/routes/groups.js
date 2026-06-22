@@ -388,14 +388,22 @@ router.get('/:group_id/users', async (req, res) => {
   }
 });
 
-// Add user to group
+// Add user to group (owner/admin only — BE-044)
 router.post('/:group_id/users', async (req, res) => {
   try {
     const { user_id } = req.body;
-    
+
+    // BE-044 (BSEC-01): gate behind owner/admin. Without this any authenticated
+    // caller could add arbitrary users to any group (object-level authz hole).
+    const callerAuth0Id = req.user?.user_id;
+    const hasPermission = await isOwnerOrAdmin(callerAuth0Id, req.params.group_id);
+    if (!hasPermission) {
+      return res.status(403).json({ error: 'Only owners and admins can add members to a group' });
+    }
+
     const user = await User.findOne({ where: { user_id } });
     const group = await Group.findByPk(req.params.group_id);
-    
+
     if (!user || !group) {
       return res.status(404).json({ error: 'User or Group not found' });
     }
