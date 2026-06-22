@@ -10,7 +10,7 @@ const googleCalendarService = require('../services/googleCalendarService');
 const emailService = require('../services/emailService');
 const icsService = require('../services/icsService');
 const notificationService = require('../services/notificationService');
-const { generateRsvpUrl } = require('./rsvp');
+const { generateRsvpUrl, mintRsvpBatch } = require('./rsvp');
 
 // MAIL-05 lifecycle constant: cancellation emails fire within 15 minutes
 // after start_time (covers the "oops, no one showed" case). After that
@@ -625,6 +625,21 @@ router.post('/', validateEventCreate, async (req, res) => {
             const eventUrl = `${frontendUrl}/gameDetail?event_id=${event.id}&group_id=${group_id}`;
             const ballotUrl = hasBallot ? `${eventUrl}#vote` : null;
 
+            // D-04 / BSEC-03: mint the three single-use RSVP rows (yes/maybe/no)
+            // per email-eligible recipient BEFORE the (synchronous) mapper builds
+            // the HMAC links. The row nonce IS the HMAC token, so the links the
+            // mapper generates are exactly the consumable rows. Best-effort:
+            // a mint failure must never block event creation.
+            await Promise.all(
+              recipients
+                .filter((u) => u._emailEligible && u.email)
+                .map((u) =>
+                  mintRsvpBatch(event.id, u.user_id).catch((err) =>
+                    console.error('Error minting RSVP single-use batch (non-fatal):', err.message)
+                  )
+                )
+            );
+
             const notifyPromises = notificationService.sendToMany(recipients, 'event_created', (user) => {
               const recipientTz = user.timezone || 'UTC';
               const eventDate = new Date(start_date);
@@ -920,6 +935,21 @@ router.put('/:id', validateUUID('id'), validateEventUpdate, async (req, res) => 
           const eventUrl = `${frontendUrl}/gameDetail?event_id=${event.id}&group_id=${event.group_id}`;
           const game = updatedEvent.Game || await Game.findByPk(event.game_id, { attributes: ['name'] });
           const group = await Group.findByPk(event.group_id, { attributes: ['name'] });
+
+          // D-04 / BSEC-03: re-mint the single-use RSVP batch for this date-change
+          // reminder. mintRsvpBatch revokes all prior active rsvp rows for each
+          // (user, event) before minting the new batch, so links from the OLD
+          // email stop working and only the newest batch is consumable.
+          await Promise.all(
+            updateRecipients
+              .filter((u) => u._emailEligible && u.email)
+              .map((u) =>
+                mintRsvpBatch(event.id, u.user_id).catch((err) =>
+                  console.error('Error re-minting RSVP single-use batch (non-fatal):', err.message)
+                )
+              )
+          );
+
           const notifyPromises = notificationService.sendToMany(updateRecipients, 'event_updated', (user) => {
             const recipientTz = user.timezone || 'UTC';
             const newEventDate = new Date(start_date);

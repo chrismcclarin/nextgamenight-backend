@@ -2,7 +2,8 @@
 // RSVP CRUD API endpoints for event responses (yes/no/maybe)
 const express = require('express');
 const crypto = require('crypto');
-const { EventRsvp, EventBring, Event, User, Game, Group, EventParticipation } = require('../models');
+const { Op } = require('sequelize');
+const { EventRsvp, EventBring, Event, User, Game, Group, EventParticipation, SingleUseToken } = require('../models');
 const { validateRsvpCreate } = require('../middleware/validators');
 const { verifyAuth0Token } = require('../middleware/auth0');
 const { enqueueCleanupJobForAttendee } = require('../services/gcalCleanupService');
@@ -105,6 +106,85 @@ function generateRsvpUrl(frontendUrl, eventId, userId, status) {
   return `${frontendUrl}/rsvp/${token}?e=${eventId}&u=${encodeURIComponent(userId)}&s=${status}`;
 }
 
+// RSVP single-use link lifetime. Reminder emails go out around an event; 30 days
+// is generous and still bounds replayability (BE-071). DB-row exp (not signed
+// into the HMAC payload) so in-flight links don't break by a signature change.
+const RSVP_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+/**
+ * D-04 / BSEC-03: mint the THREE single-use rows (yes/maybe/no) for one email,
+ * sharing one email_batch_id so consuming any one revokes its siblings.
+ *
+ * Resend semantics: the RSVP HMAC is DETERMINISTIC over `${eventId}:${userId}:${status}`,
+ * so the three link strings are byte-identical across emails for a given user/event.
+ * The `nonce` column (= the HMAC token) is UNIQUE, so a resend cannot insert a second
+ * row for the same status. Instead, resending REACTIVATES the three rows: it revokes
+ * any prior active rsvp rows for this (user_id, event_id) — covering the case where a
+ * status is no longer in this batch — then UPSERTS the three rows back to `active` with
+ * a FRESH email_batch_id and a new expiry. Net effect: after a resend exactly one of the
+ * three is consumable (single-use), any previously-consumed answer is re-enabled (the
+ * point of resending), and only the newest batch_id is consumable so sibling revocation
+ * still scopes to one email.
+ *
+ * The row `nonce` IS the HMAC token string (the signature layer stays; the row adds
+ * exp + single-use), so /respond can consume directly by the recomputed HMAC.
+ *
+ * Best-effort + non-blocking at the call site: a mint failure must never block
+ * event creation/update. Returns the email_batch_id (or null on failure).
+ *
+ * @param {string} eventId
+ * @param {string} userId - Auth0 user_id string
+ * @returns {Promise<string|null>} email_batch_id
+ */
+async function mintRsvpBatch(eventId, userId) {
+  const emailBatchId = crypto.randomUUID();
+  const expiresAt = new Date(Date.now() + RSVP_TOKEN_TTL_MS);
+
+  // Resend-revoke: invalidate every prior active rsvp link for this user/event,
+  // so any status NOT in the new batch (and any stale batch_id) stops being consumable.
+  await SingleUseToken.update(
+    { status: 'revoked' },
+    {
+      where: {
+        purpose: 'rsvp',
+        user_id: userId,
+        event_id: eventId,
+        status: 'active',
+      },
+    }
+  );
+
+  const statuses = ['yes', 'maybe', 'no'];
+  // UPSERT on the unique `nonce` so a deterministic-HMAC resend reactivates the
+  // SAME three rows (active again, fresh batch_id + expiry, used_at cleared)
+  // rather than colliding on the unique constraint.
+  await SingleUseToken.bulkCreate(
+    statuses.map((status) => ({
+      nonce: generateRsvpToken(eventId, userId, status),
+      user_id: userId,
+      purpose: 'rsvp',
+      event_id: eventId,
+      email_batch_id: emailBatchId,
+      rsvp_status: status,
+      status: 'active',
+      expires_at: expiresAt,
+      used_at: null,
+    })),
+    {
+      updateOnDuplicate: [
+        'email_batch_id',
+        'rsvp_status',
+        'status',
+        'expires_at',
+        'used_at',
+        'updatedAt',
+      ],
+    }
+  );
+
+  return emailBatchId;
+}
+
 const { canReadEventScopedSurface } = require('../services/authorizationService');
 
 // ============================================
@@ -126,10 +206,49 @@ router.get('/respond', async (req, res) => {
       return res.status(400).json({ error: 'Invalid status. Must be yes, maybe, or no.' });
     }
 
-    // Verify HMAC token by recomputing
+    // Verify HMAC token by recomputing (the signature layer)
     const expectedToken = generateRsvpToken(eventId, userId, status);
     if (token !== expectedToken) {
       return res.status(403).json({ error: 'Invalid or expired link' });
+    }
+
+    // D-04 / BSEC-03: single-use gate. ATOMICALLY consume the matching active
+    // SingleUseToken row (the row nonce IS this HMAC token). This MUST happen
+    // AFTER the HMAC check but BEFORE any EventRsvp write, so a replayed/expired/
+    // superseded link returns 403 WITHOUT mutating RSVP state. Zero rows ->
+    //   - already used (replay)
+    //   - expired (past expires_at)
+    //   - revoked (a sibling answer in the same email was consumed, or a newer
+    //     reminder superseded this batch)
+    //   - BACKWARD-COMPAT: an HMAC-valid in-flight pre-deploy link that has NO
+    //     paired row. Accepted one-time breakage (documented in SUMMARY): the
+    //     user gets a friendly "link expired — open the event to RSVP" 403.
+    const consumed = await SingleUseToken.consumeByNonce(token);
+    if (
+      !consumed ||
+      consumed.purpose !== 'rsvp' ||
+      consumed.event_id !== eventId ||
+      consumed.user_id !== userId ||
+      consumed.rsvp_status !== status
+    ) {
+      return res.status(403).json({
+        error: 'expired_link',
+        message: 'This RSVP link has expired or was already used. Open the event to RSVP.',
+      });
+    }
+
+    // Consuming one answer revokes the OTHER answers from the same email
+    // (one RSVP answer per email — the user can't later click a different answer).
+    if (consumed.email_batch_id) {
+      await SingleUseToken.update(
+        { status: 'revoked' },
+        {
+          where: {
+            email_batch_id: consumed.email_batch_id,
+            status: 'active',
+          },
+        }
+      );
     }
 
     // Look up the event
@@ -421,3 +540,4 @@ router.delete('/:rsvp_id', verifyAuth0Token, async (req, res) => {
 module.exports = router;
 module.exports.generateRsvpUrl = generateRsvpUrl;
 module.exports.generateRsvpToken = generateRsvpToken;
+module.exports.mintRsvpBatch = mintRsvpBatch;
