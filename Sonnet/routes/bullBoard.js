@@ -4,7 +4,7 @@ const { createBullBoard } = require('@bull-board/api');
 const { BullMQAdapter } = require('@bull-board/api/bullMQAdapter');
 const { ExpressAdapter } = require('@bull-board/express');
 const { verifyAuth0Token } = require('../middleware/auth0');
-const { requireGroupAdmin } = require('../middleware/adminAuth');
+const { requirePlatformAdmin } = require('../middleware/adminAuth');
 const { promptQueue, deadlineQueue, reminderQueue, gcalSyncQueue } = require('../queues');
 
 /**
@@ -42,15 +42,16 @@ function mountBullBoard(app) {
     }
   });
 
-  // Mount with Auth0 + admin role protection
+  // Mount with Auth0 + platform-admin protection (D-02 / BSEC-02 — was
+  // requireGroupAdmin, which let ANY group owner reach system-wide queues).
   app.use(
     '/admin/queues',
     verifyAuth0Token,
-    requireGroupAdmin,
+    requirePlatformAdmin,
     serverAdapter.getRouter()
   );
 
-  console.log('Bull Board mounted at /admin/queues (Auth0 + admin role protected)');
+  console.log('Bull Board mounted at /admin/queues (Auth0 + platform-admin protected)');
 }
 
 module.exports = mountBullBoard;
