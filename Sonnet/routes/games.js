@@ -234,16 +234,44 @@ router.get('/:id', async (req, res) => {
 });
 
 
+// BSEC-01 / D-05C: mass-assignment allow-list for the Game write sinks.
+// games.js has NO express-validator validators, so the Sequelize `fields:`
+// option is the ONLY guard against a client setting columns the handler never
+// intended (e.g. forging is_custom/bgg_id/id). Excludes server-controlled
+// columns: id (PK), bgg_id + is_custom (forced by the handlers below).
+const GAME_USER_FIELDS = [
+  'name',
+  'year_published',
+  'min_players',
+  'max_players',
+  'playing_time',
+  'weight',
+  'description',
+  'image_url',
+  'thumbnail_url',
+  'theme',
+  'url'
+];
+
 // Create custom game
 router.post('/', async (req, res) => {
   try {
-    const gameData = {
-      ...req.body,
-      is_custom: true,
-      bgg_id: null
-    };
-    
-    const game = await Game.create(gameData);
+    // BSEC-01 / D-05C: build gameData by EXPLICIT allow-list pick rather than a
+    // body spread. This is defense-in-depth (the `fields:` option below is a
+    // second guard) AND keeps the file clear of the mass-assignment spread
+    // idiom the CI grep gate forbids.
+    const gameData = { is_custom: true, bgg_id: null };
+    for (const key of GAME_USER_FIELDS) {
+      if (Object.prototype.hasOwnProperty.call(req.body, key)) {
+        gameData[key] = req.body[key];
+      }
+    }
+
+    // fields: includes the user-supplyable columns PLUS the two the handler
+    // force-sets (is_custom/bgg_id) so the explicit values above persist.
+    const game = await Game.create(gameData, {
+      fields: [...GAME_USER_FIELDS, 'is_custom', 'bgg_id']
+    });
     res.json(game);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -309,7 +337,10 @@ router.put('/:id', async (req, res) => {
       return res.status(404).json({ error: 'Game not found' });
     }
     
-    await game.update(req.body);
+    // BSEC-01 / D-05C: only user-editable columns may be updated. is_custom,
+    // bgg_id, and id are NOT in the allow-list so a client cannot flip a BGG
+    // game to custom or forge its bgg_id via PUT.
+    await game.update(req.body, { fields: GAME_USER_FIELDS });
     res.json(game);
   } catch (error) {
     res.status(500).json({ error: error.message });

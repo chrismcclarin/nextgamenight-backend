@@ -332,10 +332,45 @@ router.patch('/:group_id/prompt-settings/schedules/:schedule_id', async (req, re
       }
     }
 
+    // BSEC-01 / D-05C: explicit key allow-list for the JSONB schedule merge.
+    // A raw body spread is a mass-assignment sink — a client could
+    // inject arbitrary keys into the template_config.schedules JSONB blob.
+    // Sequelize `fields:` does NOT apply here (the whole template_config is one
+    // JSONB column), so we pick by key. This list is the UNION of every field
+    // EVERY downstream consumer reads, NOT just the write line:
+    //   (a) the re-register/unregister branch below (:354-357) reads
+    //       is_active + deleted_at,
+    //   (b) upsertSinglePromptScheduler reads schedule_day_of_week,
+    //       schedule_time, schedule_timezone, game_id, default_deadline_hours,
+    //       default_token_expiry_hours, min_participants, selected_member_ids,
+    //   (c) the legit user-editable schedule shape (create path) adds
+    //       template_name.
+    // Omitting any field a consumer reads would silently mis-schedule the job
+    // or fire the wrong branch. id/updated_at stay server-managed.
+    const SCHEDULE_USER_FIELDS = [
+      'schedule_day_of_week',
+      'schedule_time',
+      'schedule_timezone',
+      'game_id',
+      'template_name',
+      'default_deadline_hours',
+      'default_token_expiry_hours',
+      'min_participants',
+      'selected_member_ids',
+      'is_active',
+      'deleted_at'
+    ];
+    const allowedUpdates = {};
+    for (const key of SCHEDULE_USER_FIELDS) {
+      if (Object.prototype.hasOwnProperty.call(req.body, key)) {
+        allowedUpdates[key] = req.body[key];
+      }
+    }
+
     // Merge updates
     const updatedSchedule = {
       ...schedules[scheduleIndex],
-      ...req.body,
+      ...allowedUpdates,
       id: schedule_id, // Preserve original ID
       updated_at: new Date().toISOString()
     };

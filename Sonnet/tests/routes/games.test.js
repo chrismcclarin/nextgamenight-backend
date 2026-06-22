@@ -119,6 +119,43 @@ describe('Game Routes', () => {
 
       expect(response.body).toHaveProperty('error');
     });
+
+    // BSEC-01 / D-05C: mass-assignment guard. A client must not be able to
+    // override the server-forced is_custom/bgg_id columns via POST body.
+    it('should not honor a client-forged is_custom/bgg_id on create', async () => {
+      const response = await request(app)
+        .post('/api/games')
+        .send({
+          name: 'Forged Game',
+          is_custom: false,   // attempt to forge a non-custom game
+          bgg_id: 99999        // attempt to forge a BGG id
+        })
+        .expect(200);
+
+      // Handler force-sets is_custom:true / bgg_id:null — the forged values
+      // are ignored even though they are columns (they're in fields:, but the
+      // handler's explicit object wins on create).
+      expect(response.body.is_custom).toBe(true);
+      expect(response.body.bgg_id).toBeNull();
+    });
+
+    // BSEC-01 / D-05C: a body key that is NOT a real column / not in the
+    // allow-list must not be persisted (Sequelize fields: drops it silently).
+    it('should not persist a non-allow-listed body key on create', async () => {
+      const response = await request(app)
+        .post('/api/games')
+        .send({
+          name: 'Clean Game',
+          totally_made_up_column: 'evil'
+        })
+        .expect(200);
+
+      const reloaded = await Game.findByPk(response.body.id);
+      expect(reloaded).not.toBeNull();
+      // The bogus key is not a model attribute, so it never reaches the row.
+      expect(reloaded.get('totally_made_up_column')).toBeUndefined();
+      expect(reloaded.dataValues.totally_made_up_column).toBeUndefined();
+    });
   });
 
   describe('PUT /api/games/:id', () => {
@@ -150,6 +187,32 @@ describe('Game Routes', () => {
         .expect(404);
 
       expect(response.body.error).toBe('Game not found');
+    });
+
+    // BSEC-01 / D-05C: a client must not be able to flip is_custom or forge
+    // bgg_id via PUT — those columns are excluded from the update allow-list.
+    it('should not allow flipping is_custom or forging bgg_id on update', async () => {
+      const testGame = await Game.create({
+        name: 'BGG Game',
+        is_custom: false,
+        bgg_id: 12345
+      });
+
+      const response = await request(app)
+        .put(`/api/games/${testGame.id}`)
+        .send({
+          name: 'Renamed',
+          is_custom: true,   // attempt to flip to custom
+          bgg_id: 67890       // attempt to forge a different bgg_id
+        })
+        .expect(200);
+
+      // Allowed field changed...
+      expect(response.body.name).toBe('Renamed');
+      // ...but the protected columns are unchanged (not in fields: allow-list).
+      const reloaded = await Game.findByPk(testGame.id);
+      expect(reloaded.is_custom).toBe(false);
+      expect(reloaded.bgg_id).toBe(12345);
     });
   });
 

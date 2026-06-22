@@ -1,12 +1,12 @@
 // middleware/validators.js
 // Input validation middleware using express-validator
-const { body, param, query, validationResult } = require('express-validator');
+const { body, param, query, validationResult, matchedData } = require('express-validator');
 
 // Middleware to check validation results
 const validate = (req, res, next) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
-    return res.status(400).json({ 
+    return res.status(400).json({
       error: 'Validation failed',
       errors: errors.array().map(err => ({
         field: err.path || err.param,
@@ -15,6 +15,36 @@ const validate = (req, res, next) => {
       }))
     });
   }
+  next();
+};
+
+// BSEC-01 / D-05B: strip-unknown variant of `validate`.
+//
+// `validateStrict` runs the standard validation-result check AND, when it
+// passes, REPLACES `req.body` with only the body fields that a validator chain
+// actually declared (matchedData strip-unknown). This closes the
+// mass-assignment surface at the validator layer for the handlers that opt in.
+//
+// CRITICAL — opt-in ONLY where the validator set is provably COMPLETE.
+// matchedData on an INCOMPLETE validator chain silently DROPS every legitimate
+// field the chain forgot to declare (RESEARCH §Anti-Patterns / Pitfall 4). So
+// this is exported as a separate opt-in middleware rather than swapped into the
+// shared `validate`, and it is NOT used on the games sinks (which have no
+// validators at all and rely solely on the Sequelize `fields:` allow-list).
+const validateStrict = (req, res, next) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({
+      error: 'Validation failed',
+      errors: errors.array().map(err => ({
+        field: err.path || err.param,
+        message: err.msg,
+        value: err.value
+      }))
+    });
+  }
+  // Strip any body key not declared by a validator on this route.
+  req.body = matchedData(req, { onlyValidData: true, locations: ['body'] });
   next();
 };
 
@@ -345,6 +375,7 @@ const validateBallotVote = [
 
 module.exports = {
   validate,
+  validateStrict,
   validateGroupCreate,
   validateGroupUpdate,
   validateEventCreate,
