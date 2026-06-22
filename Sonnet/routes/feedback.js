@@ -12,6 +12,7 @@ async function getOctokit() {
 }
 const { validateFeedback } = require('../middleware/validators');
 const { verifyAuth0Token } = require('../middleware/auth0');
+const { requirePlatformAdmin } = require('../middleware/adminAuth');
 const { Feedback } = require('../models');
 const emailService = require('../services/emailService');
 
@@ -163,8 +164,16 @@ router.post('/', validateFeedback, async (req, res) => {
   }
 });
 
-// GET /api/feedback — retrieve all submissions (admin only, requires Auth0 token)
-router.get('/', verifyAuth0Token, async (req, res) => {
+// GET /api/feedback — retrieve all submissions (PLATFORM-ADMIN ONLY).
+//
+// BSEC-02 / BE-099: this returns EVERY feedback row including every submitter's
+// `user_email`. The router runs under the mount-level `optionalAuth`
+// (server.js), so `req.user` is populated-if-present. We REPLACE the previous
+// inline `verifyAuth0Token` with `requirePlatformAdmin` (83-03) — NOT stack
+// them. requirePlatformAdmin yields 403 for a null OR non-admin req.user
+// (whereas the old verifyAuth0Token 401'd a no-token request; 403 is the
+// correct "you are not allowed" signal here, and a null req.user is handled).
+router.get('/', requirePlatformAdmin, async (req, res) => {
   try {
     const entries = await Feedback.findAll({
       order: [['created_at', 'DESC']],

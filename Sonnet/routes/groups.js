@@ -185,7 +185,9 @@ router.get('/user/:user_id', async (req, res) => {
       include: [
         {
           model: User,
-          attributes: ['id', 'username', 'user_id', 'email'],
+          // BSEC-01 / BE-043: drop `email` from this list-all read (PII leak).
+          // The durable safe-by-default fix is the User defaultScope (D-03 / 83-06).
+          attributes: ['id', 'username', 'user_id'],
           through: { where: { status: 'active' }, attributes: ['role', 'joined_at'] }
         },
         {
@@ -243,12 +245,34 @@ router.post('/', validateGroupCreate, async (req, res) => {
 // Get a single group by ID
 router.get('/:group_id', validateUUID('group_id'), async (req, res) => {
   try {
-    const group = await Group.findByPk(req.params.group_id);
-    
+    // BSEC-01 / BE-043: this was OPEN — any authenticated user could read any
+    // group's whole row INCLUDING `invite_token` (a join secret). Two fixes:
+    //   1) Object-level gate: the caller must be an active member of the group.
+    //   2) Stop the `invite_token` leak — exclude it from this read.
+    // NOTE: the durable safe-by-default fix is the `Group.defaultScope`
+    // excluding `invite_token` (D-03, lands in 83-06, later wave); it supersedes
+    // this per-query exclude. The membership GATE here is the load-bearing fix
+    // in THIS plan and must stay even after 83-06's scope lands.
+    const callerAuth0Id = req.user?.user_id;
+    if (!callerAuth0Id) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const { group_id } = req.params;
+
+    const hasAccess = await isActiveMember(callerAuth0Id, group_id);
+    if (!hasAccess) {
+      return res.status(403).json({ error: 'Access denied to this group' });
+    }
+
+    const group = await Group.findByPk(group_id, {
+      attributes: { exclude: ['invite_token'] },
+    });
+
     if (!group) {
       return res.status(404).json({ error: 'Group not found' });
     }
-    
+
     res.json(group);
   } catch (error) {
     res.status(500).json({ error: error.message });

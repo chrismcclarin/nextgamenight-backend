@@ -91,6 +91,7 @@ const formatEventWithCustomParticipants = (event) => {
   };
 };
 const { validateEventCreate, validateEventUpdate, validateUUID } = require('../middleware/validators');
+const { requireParamMatchesToken } = require('../middleware/objectAuth');
 const {
   isOwnerOrAdmin,
   isActiveMember,
@@ -173,7 +174,12 @@ const attachRsvpSummaries = async (events) => {
 
 
 // Get all events for a user across all their groups
-router.get('/user/:user_id', async (req, res) => {
+// BSEC-01 (Task 1 audit, Rule 2 — same shape as BE-048): this READ was NOT
+// self-gated — only the auto-create branch checked the actor against the param,
+// so any authenticated user could read ANY user's full cross-group event list
+// (including participant emails). Add the object-level self-gate. The frontend
+// only calls this for the logged-in user (eventsAPI.getUserEvents on UserHome).
+router.get('/user/:user_id', requireParamMatchesToken('user_id'), async (req, res) => {
   try {
     let user = await User.findOne({ where: { user_id: req.params.user_id } });
     
@@ -320,15 +326,20 @@ router.get('/user/:user_id', async (req, res) => {
 // Get all events for a group
 router.get('/group/:group_id', async (req, res) => {
   try {
-    const { user_id } = req.query;
-    
-    if (user_id) {
-      const hasAccess = await isActiveMember(user_id, req.params.group_id);
-      if (!hasAccess) {
-        return res.status(403).json({ error: 'Access denied to this group' });
-      }
+    // BSEC-01 / BE-040: this was bypassable — membership was only checked IF a
+    // `req.query.user_id` was present, so omitting the param skipped the gate
+    // entirely (and trusted a client-supplied actor besides). Fix: derive the
+    // actor from the verified JWT (Auth0 STRING) and ALWAYS membership-check.
+    const callerAuth0Id = req.user?.user_id;
+    if (!callerAuth0Id) {
+      return res.status(401).json({ error: 'Unauthorized' });
     }
-    
+
+    const hasAccess = await isActiveMember(callerAuth0Id, req.params.group_id);
+    if (!hasAccess) {
+      return res.status(403).json({ error: 'Access denied to this group' });
+    }
+
     const events = await Event.findAll({
       where: { group_id: req.params.group_id },
       include: [
@@ -341,7 +352,8 @@ router.get('/group/:group_id', async (req, res) => {
         { model: User, as: 'PickedBy', attributes: ['id', 'username'] },
         {
           model: EventParticipation,
-          include: [{ model: User, attributes: ['id', 'username', 'user_id', 'email'] }]
+          // BSEC-01 / BE-040: drop `email` from the participation roster (PII leak).
+          include: [{ model: User, attributes: ['id', 'username', 'user_id'] }]
         }
       ],
       order: [['start_date', 'DESC']]

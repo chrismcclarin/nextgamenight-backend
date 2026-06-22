@@ -4,6 +4,7 @@ const { User, Group, UserGroup, sequelize } = require('../models');
 const router = express.Router();
 const { validateUserSearch } = require('../middleware/validators');
 const { writeOperationLimiter } = require('../middleware/rateLimiter');
+const { requireParamMatchesToken } = require('../middleware/objectAuth');
 const auth0Service = require('../services/auth0Service');
 const smsService = require('../services/smsService');
 
@@ -82,10 +83,16 @@ router.get('/search/email/:email', validateUserSearch, async (req, res) => {
 
 // Get user by user_id (auto-creates if doesn't exist and user is authenticated)
 // SECURITY: We only create users if:
-// 1. They have a valid Auth0 token (verified by verifyAuth0Token middleware)
+// 1. They have a valid Auth0 token (verified by the global /api authn layer)
 // 2. The token's user_id matches the requested user_id
 // This ensures the user MUST exist in Auth0 before we create them in our database
-router.get('/:user_id', async (req, res) => {
+//
+// BSEC-01 / BE-048 (Task 1 audit): the READ path was NOT self-gated — only the
+// auto-create branch checked `req.user.user_id === req.params.user_id`, so any
+// authenticated user could read ANY user's full profile (email/phone). Add the
+// object-level self-gate: the actor must equal the :user_id param. The frontend
+// only ever calls this for the logged-in user (usersAPI.getUser(sub)).
+router.get('/:user_id', requireParamMatchesToken('user_id'), async (req, res) => {
   try {
     // Phase 78 / TZ-01: accept optional browser-detected timezone for auto-create
     // persistence and existing-user null backfill. Query param wins over body to
