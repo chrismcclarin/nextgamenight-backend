@@ -75,25 +75,28 @@ class SmsService {
         `NextGameNight: You're subscribed to game night alerts. Msg frequency varies. Msg & data rates may apply. Reply HELP for help, STOP to unsubscribe.`
     };
 
-    // Phase 49 legacy templates (unchanged behavior)
+    // Phase 49 legacy templates. User-supplied fields (game/group/inviter/
+    // requester names) are routed through sanitizeForSms — same as the
+    // Phase 50 event templates below — to strip GSM-7-unsafe / injection
+    // characters (BSEC-04 / B8). Dates and URLs are server-derived.
     const legacyTemplates = {
       event_confirmation: () =>
-        `NextGameNight: ${d.gameName} is set for ${d.date}! ${d.actionUrl || ''}`.trim(),
+        `NextGameNight: ${sanitizeForSms(d.gameName)} is set for ${d.date}! ${d.actionUrl || ''}`.trim(),
 
       availability_prompt: () =>
-        `NextGameNight: ${d.groupName} wants to schedule a game. Share your availability: ${d.actionUrl || ''}`.trim(),
+        `NextGameNight: ${sanitizeForSms(d.groupName)} wants to schedule a game. Share your availability: ${d.actionUrl || ''}`.trim(),
 
       no_consensus: () =>
-        `NextGameNight: No consensus for ${d.groupName}. Review options: ${d.actionUrl || ''}`.trim(),
+        `NextGameNight: No consensus for ${sanitizeForSms(d.groupName)}. Review options: ${d.actionUrl || ''}`.trim(),
 
       group_invite: () =>
-        `NextGameNight: ${d.inviterName} invited you to ${d.groupName}! ${d.actionUrl || ''}`.trim(),
+        `NextGameNight: ${sanitizeForSms(d.inviterName)} invited you to ${sanitizeForSms(d.groupName)}! ${d.actionUrl || ''}`.trim(),
 
       rsvp_magic_link: () =>
-        `NextGameNight: RSVP for ${d.gameName} on ${d.date}: ${d.actionUrl || ''}`.trim(),
+        `NextGameNight: RSVP for ${sanitizeForSms(d.gameName)} on ${d.date}: ${d.actionUrl || ''}`.trim(),
 
       friend_request: () =>
-        `NextGameNight: ${d.requesterName} sent you a friend request! ${d.actionUrl || ''}`.trim()
+        `NextGameNight: ${sanitizeForSms(d.requesterName)} sent you a friend request! ${d.actionUrl || ''}`.trim()
     };
 
     // Phase 50 event notification templates (casual tone, GSM-7 sanitized)

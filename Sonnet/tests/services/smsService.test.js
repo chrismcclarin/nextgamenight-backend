@@ -115,6 +115,74 @@ describe('smsService', () => {
   });
 
   // =============================================
+  // BSEC-04 / B8: legacy (Phase 49) templates sanitize user content
+  // The legacy templates must route user-supplied fields through
+  // sanitizeForSms, mirroring the Phase 50 event templates. We prove this
+  // by feeding emoji / smart-quote payloads and asserting they are stripped
+  // (the GSM-7-unsafe chars are removed exactly as sanitizeForSms does).
+  // =============================================
+  describe('legacy templates sanitize user content (BSEC-04)', () => {
+
+    it('event_confirmation sanitizes gameName', () => {
+      const msg = smsService.buildMessage('event_confirmation', {
+        gameName: 'Catan 🎲', // "Catan 🎲"
+        date: 'Friday',
+        actionUrl: 'https://app.test/a'
+      });
+      expect(msg).toContain('Catan');
+      expect(msg).not.toMatch(/[\uD800-\uDFFF]/); // no surrogate-pair emoji survive
+    });
+
+    it('availability_prompt sanitizes groupName', () => {
+      const msg = smsService.buildMessage('availability_prompt', {
+        groupName: 'Gamers 🎲',
+        actionUrl: 'https://app.test/a'
+      });
+      expect(msg).toContain('Gamers');
+      expect(msg).not.toMatch(/[\uD800-\uDFFF]/);
+    });
+
+    it('no_consensus sanitizes groupName', () => {
+      const msg = smsService.buildMessage('no_consensus', {
+        groupName: 'Gamers 🎲',
+        actionUrl: 'https://app.test/a'
+      });
+      expect(msg).toContain('Gamers');
+      expect(msg).not.toMatch(/[\uD800-\uDFFF]/);
+    });
+
+    it('group_invite sanitizes inviterName and groupName', () => {
+      const msg = smsService.buildMessage('group_invite', {
+        inviterName: 'Alice 🎲',
+        groupName: 'Gamers 🎲',
+        actionUrl: 'https://app.test/a'
+      });
+      expect(msg).toContain('Alice');
+      expect(msg).toContain('Gamers');
+      expect(msg).not.toMatch(/[\uD800-\uDFFF]/);
+    });
+
+    it('rsvp_magic_link sanitizes gameName', () => {
+      const msg = smsService.buildMessage('rsvp_magic_link', {
+        gameName: 'Catan 🎲',
+        date: 'Friday',
+        actionUrl: 'https://app.test/a'
+      });
+      expect(msg).toContain('Catan');
+      expect(msg).not.toMatch(/[\uD800-\uDFFF]/);
+    });
+
+    it('friend_request sanitizes requesterName', () => {
+      const msg = smsService.buildMessage('friend_request', {
+        requesterName: 'Bob 🎲',
+        actionUrl: 'https://app.test/a'
+      });
+      expect(msg).toContain('Bob');
+      expect(msg).not.toMatch(/[\uD800-\uDFFF]/);
+    });
+  });
+
+  // =============================================
   // send tests (with mocked Twilio)
   // =============================================
   describe('send', () => {
