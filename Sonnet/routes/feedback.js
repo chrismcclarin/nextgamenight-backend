@@ -101,6 +101,12 @@ router.post('/', validateFeedback, async (req, res) => {
     // Email notification to admin
     const adminEmail = process.env.FEEDBACK_EMAIL;
     if (adminEmail && emailService.isConfigured()) {
+      // HTML-escape user-supplied content before HTML interpolation, and
+      // CRLF-strip the subject to block mail-header injection (BSEC-04).
+      const safeType = emailService.escapeHtml(type);
+      const safeSubject = emailService.escapeHtml(subject);
+      const safeDescription = emailService.escapeHtml(description);
+      const safeFrom = emailService.escapeHtml(user_email || 'Anonymous');
       const html = `
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
           <div style="background-color: #064e3b; color: white; padding: 16px 20px; border-radius: 6px 6px 0 0;">
@@ -108,14 +114,14 @@ router.post('/', validateFeedback, async (req, res) => {
           </div>
           <div style="background-color: #f9fafb; padding: 24px; border-radius: 0 0 6px 6px; border: 1px solid #e5e7eb;">
             <table style="width: 100%; border-collapse: collapse;">
-              <tr><td style="padding: 8px 0; color: #6b7280; width: 120px;"><strong>Type</strong></td><td style="padding: 8px 0;">${type}</td></tr>
-              <tr><td style="padding: 8px 0; color: #6b7280;"><strong>Subject</strong></td><td style="padding: 8px 0;">${subject}</td></tr>
-              <tr><td style="padding: 8px 0; color: #6b7280;"><strong>From</strong></td><td style="padding: 8px 0;">${user_email || 'Anonymous'}</td></tr>
+              <tr><td style="padding: 8px 0; color: #6b7280; width: 120px;"><strong>Type</strong></td><td style="padding: 8px 0;">${safeType}</td></tr>
+              <tr><td style="padding: 8px 0; color: #6b7280;"><strong>Subject</strong></td><td style="padding: 8px 0;">${safeSubject}</td></tr>
+              <tr><td style="padding: 8px 0; color: #6b7280;"><strong>From</strong></td><td style="padding: 8px 0;">${safeFrom}</td></tr>
               <tr><td style="padding: 8px 0; color: #6b7280;"><strong>Time</strong></td><td style="padding: 8px 0;">${new Date(entry.created_at).toLocaleString()}</td></tr>
             </table>
             <div style="margin-top: 16px; padding: 16px; background: white; border-radius: 4px; border-left: 4px solid #d97706;">
               <strong style="color: #6b7280;">Description</strong>
-              <p style="margin: 8px 0 0; color: #111827;">${description}</p>
+              <p style="margin: 8px 0 0; color: #111827;">${safeDescription}</p>
             </div>
           </div>
         </div>
@@ -139,7 +145,7 @@ router.post('/', validateFeedback, async (req, res) => {
 
       await emailService.send({
         to: adminEmail,
-        subject: `[Feedback] ${type}: ${subject}`,
+        subject: emailService.stripCrlf(`[Feedback] ${type}: ${subject}`),
         html,
         text,
         ...(user_email && { replyTo: user_email }),

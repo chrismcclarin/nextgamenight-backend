@@ -23,8 +23,15 @@ if (process.env.SENTRY_DSN) {
 }
 
 function buildInvitationHtml({ recipientName, groupName, gameName, weekDescription, responseDeadline, formUrl, customMessage }) {
+  // HTML-escape all user-supplied strings before HTML interpolation (BSEC-04
+  // / BE-111). Reuse the shared emailService.escapeHtml primitive — no new
+  // escaper. weekDescription/responseDeadline are server-derived strings.
+  const safeRecipientName = emailService.escapeHtml(recipientName);
+  const safeGroupName = emailService.escapeHtml(groupName);
+  const safeGameName = emailService.escapeHtml(gameName);
+  const safeCustomMessage = emailService.escapeHtml(customMessage);
   const customBlock = customMessage
-    ? `<p style="margin:0 0 16px;font-size:15px;line-height:1.6;color:#444;background:#f3f4f6;padding:12px 16px;border-radius:6px;font-style:italic">"${customMessage}"</p>`
+    ? `<p style="margin:0 0 16px;font-size:15px;line-height:1.6;color:#444;background:#f3f4f6;padding:12px 16px;border-radius:6px;font-style:italic">"${safeCustomMessage}"</p>`
     : '';
   return `<!DOCTYPE html>
 <html lang="en">
@@ -34,8 +41,8 @@ function buildInvitationHtml({ recipientName, groupName, gameName, weekDescripti
     <tr><td align="center">
       <table width="600" cellpadding="0" cellspacing="0" style="background:#fff;border-radius:8px;overflow:hidden;max-width:600px;width:100%">
         <tr><td style="padding:32px 40px">
-          <h1 style="margin:0 0 16px;font-size:24px;font-weight:bold;color:#111827">Hey ${recipientName}!</h1>
-          <p style="margin:0 0 16px;font-size:16px;line-height:1.6;color:#333">${groupName} is planning a ${gameName} session! Let us know when you're free ${weekDescription}.</p>
+          <h1 style="margin:0 0 16px;font-size:24px;font-weight:bold;color:#111827">Hey ${safeRecipientName}!</h1>
+          <p style="margin:0 0 16px;font-size:16px;line-height:1.6;color:#333">${safeGroupName} is planning a ${safeGameName} session! Let us know when you're free ${weekDescription}.</p>
           ${customBlock}
           <table width="100%" cellpadding="0" cellspacing="0" style="margin:24px 0;text-align:center">
             <tr><td align="center">
@@ -45,7 +52,7 @@ function buildInvitationHtml({ recipientName, groupName, gameName, weekDescripti
           <p style="margin:0 0 16px;font-size:16px;line-height:1.6;color:#333">Please respond by ${responseDeadline} so we can find a time that works for everyone.</p>
         </td></tr>
         <tr><td style="padding:20px 40px;border-top:1px solid #e5e7eb;text-align:center">
-          <p style="margin:0;font-size:12px;color:#6b7280">Sent by NextGameNight on behalf of ${groupName}</p>
+          <p style="margin:0;font-size:12px;color:#6b7280">Sent by NextGameNight on behalf of ${safeGroupName}</p>
         </td></tr>
       </table>
     </td></tr>
