@@ -143,36 +143,49 @@ const canReadEventScopedSurface = async (auth0UserId, eventId) => {
  * Pure function. Accepts either a plain object or a Sequelize instance
  * (calls .toJSON() if present). Returns a NEW object — does not mutate input.
  *
- * Omitted fields (per CONTEXT "PII stripping for game-only callers"):
- *   email, phone, calendar_connected, google_calendar_token,
- *   google_calendar_refresh_token, google_calendar_email,
- *   notification_preferences
- *
- * Preserved fields (everything else, including):
+ * ALLOW-LIST (BSEC-01 / D-03) — ONLY these fields are returned; everything
+ * else (incl. email, phone, calendar_connected, google_calendar_*,
+ * notification_preferences, and any future field such as is_platform_admin)
+ * is stripped by default:
  *   id, user_id, username, display_name, profile_picture_url, avatar_url,
  *   UserGroup association (role, joined_at) — INCLUDING when UserGroup is
- *   explicitly null (game-only signal for the frontend; null values are not
- *   stripped — only the PII fields above are).
+ *   explicitly null (the Phase 71.1 game-only signal for the frontend; the
+ *   allow-list preserves the key even when its value is null).
  *
- * Uses an omit list rather than a whitelist because unknown future fields
- * default to "kept" — a whitelist would be too brittle when models grow.
+ * Flipped from an omit-list to an allow-list so new User columns default to
+ * STRIPPED (fail-closed). Adding a field a future caller legitimately needs
+ * is a deliberate edit to STRIP_MEMBER_PII_ALLOWLIST below.
  *
  * @param {object|Model} memberRow - Plain object or Sequelize instance
  * @returns {object}
  */
+// BSEC-01 (D-03): allow-list, NOT omit-list. New User fields (e.g.
+// is_platform_admin) default to STRIPPED — only these explicitly-permitted
+// display/identity fields ever reach a game-only caller. UserGroup is
+// allow-listed and preserved even when explicitly null (the Phase 71.1
+// game-only signal). Adding a field a future caller needs is a deliberate
+// edit here, fail-closed by design.
+const STRIP_MEMBER_PII_ALLOWLIST = [
+  'id',
+  'user_id',
+  'username',
+  'display_name',
+  'profile_picture_url',
+  'avatar_url',
+  'UserGroup',
+];
+
 const stripMemberPII = (memberRow) => {
   if (!memberRow) return memberRow;
   const json = memberRow.toJSON ? memberRow.toJSON() : memberRow;
-  const {
-    email,
-    phone,
-    calendar_connected,
-    google_calendar_token,
-    google_calendar_refresh_token,
-    google_calendar_email,
-    notification_preferences,
-    ...safe
-  } = json;
+  const safe = {};
+  for (const key of STRIP_MEMBER_PII_ALLOWLIST) {
+    // Preserve allow-listed keys that are present, INCLUDING explicit null
+    // (UserGroup: null is the game-only signal — must not be dropped).
+    if (Object.prototype.hasOwnProperty.call(json, key)) {
+      safe[key] = json[key];
+    }
+  }
   return safe;
 };
 

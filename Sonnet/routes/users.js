@@ -24,8 +24,10 @@ router.get('/search/email/:email', validateUserSearch, async (req, res) => {
   try {
     const email = decodeURIComponent(req.params.email);
     
-    // First, search in our database
-    let user = await User.findOne({
+    // First, search in our database.
+    // BSEC-01 (D-03): withContactInfo — this is the self-profile lookup; it
+    // reads/returns the user's own email and reconciles it against Auth0.
+    let user = await User.scope('withContactInfo').findOne({
       where: { email: email }
     });
     
@@ -117,7 +119,9 @@ router.get('/:user_id', requireParamMatchesToken('user_id'), async (req, res) =>
     }
     // detectedTimezone is now either a validated IANA string OR null (absent/empty).
 
-    let user = await User.findOne({
+    // BSEC-01 (D-03): withContactInfo — self-gated own-profile read that
+    // returns email and reconciles it against the Auth0 token.
+    let user = await User.scope('withContactInfo').findOne({
       where: { user_id: req.params.user_id },
       include: [{ model: Group }]
     });
@@ -219,7 +223,8 @@ router.get('/:user_id', requireParamMatchesToken('user_id'), async (req, res) =>
       } catch (error) {
         // If creation fails (e.g., email already exists), try to find the user
         console.error('Error auto-creating user:', error.message);
-        user = await User.findOne({ where: { user_id: req.params.user_id } });
+        // BSEC-01 (D-03): withContactInfo — same self-profile read as above.
+        user = await User.scope('withContactInfo').findOne({ where: { user_id: req.params.user_id } });
         if (!user) {
           throw error; // Re-throw if we still can't find/create the user
         }
@@ -255,8 +260,9 @@ router.get('/:user_id', requireParamMatchesToken('user_id'), async (req, res) =>
             if (Object.keys(updateData).length > 0) {
               await user.update(updateData);
               console.log(`Fixed user ${user.user_id} with Management API data:`, updateData);
-              // Reload user to get updated data
-              user = await User.findOne({
+              // Reload user to get updated data.
+              // BSEC-01 (D-03): withContactInfo — own profile returned with email.
+              user = await User.scope('withContactInfo').findOne({
                 where: { user_id: req.params.user_id },
                 include: [{ model: Group }]
               });
@@ -433,8 +439,10 @@ router.post('/:user_id/refresh', async (req, res) => {
     if (req.params.user_id !== userId) {
       return res.status(403).json({ error: 'Forbidden: Cannot refresh other users\' info' });
     }
-    
-    let user = await User.findOne({ where: { user_id: userId } });
+
+    // BSEC-01 (D-03): withContactInfo — self-gated refresh that returns the
+    // user's own profile (incl. email) reconciled with Auth0.
+    let user = await User.scope('withContactInfo').findOne({ where: { user_id: userId } });
     
     try {
       // Fetch latest info from Auth0 Management API
@@ -517,7 +525,9 @@ router.patch('/:user_id/notification-preferences', async (req, res) => {
       return res.status(400).json({ error: 'At least one notification channel must be enabled' });
     }
 
-    const user = await User.findOne({ where: { user_id: userId } });
+    // BSEC-01 (D-03): withContactInfo — this path reads user.phone to send the
+    // CTIA welcome SMS; defaultScope would strip it.
+    const user = await User.scope('withContactInfo').findOne({ where: { user_id: userId } });
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
@@ -666,7 +676,8 @@ router.post('/:user_id/phone/verify', async (req, res) => {
       return res.status(400).json({ error: 'Code must be a string of exactly 6 digits' });
     }
 
-    const user = await User.findOne({ where: { user_id: userId } });
+    // BSEC-01 (D-03): withContactInfo — reads user.phone for Twilio verify.
+    const user = await User.scope('withContactInfo').findOne({ where: { user_id: userId } });
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }

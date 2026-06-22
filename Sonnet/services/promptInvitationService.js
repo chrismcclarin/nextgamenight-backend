@@ -100,7 +100,9 @@ async function notifyMembersOfPrompt(prompt, { selectedMemberIds, tokenExpiryHou
   }
   const memberships = await UserGroup.findAll({
     where: membershipWhere,
-    include: [{ model: User, required: true }],
+    // BSEC-01 (D-03): include the contact-info scope so user.email is present
+    // for the invitation send loop; defaultScope would strip it (Pitfall 4).
+    include: [{ model: User.scope('withContactInfo'), required: true }],
   });
 
   const weekDescription = prompt.week_identifier || 'this week';

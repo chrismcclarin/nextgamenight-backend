@@ -125,7 +125,9 @@ router.get('/:group_id/prompt-settings', async (req, res) => {
       where: { group_id, status: 'active' },
       include: [{
         model: User,
-        attributes: ['id', 'username', 'email'],
+        // BSEC-01 (D-03): email removed — username is allowNull:false so the
+        // email display-name fallback was dead; drop it to user_id instead.
+        attributes: ['id', 'username'],
       }],
     });
 
@@ -133,7 +135,7 @@ router.get('/:group_id/prompt-settings', async (req, res) => {
       id: ug.User?.id,
       user_id: ug.user_id,
       username: ug.User?.username,
-      display_name: ug.User?.username || ug.User?.email || ug.user_id,
+      display_name: ug.User?.username || ug.user_id,
     }));
 
     res.json({

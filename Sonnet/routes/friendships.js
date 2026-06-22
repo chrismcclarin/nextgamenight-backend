@@ -56,12 +56,14 @@ router.get('/', async (req, res) => {
         {
           model: User,
           as: 'Requester',
-          attributes: ['id', 'username', 'email', 'user_id'],
+          // BSEC-01 (D-03): email removed — a friend list must not expose other
+          // users' email addresses; username + user_id suffice for display.
+          attributes: ['id', 'username', 'user_id'],
         },
         {
           model: User,
           as: 'Addressee',
-          attributes: ['id', 'username', 'email', 'user_id'],
+          attributes: ['id', 'username', 'user_id'],
         },
       ],
       order: [['createdAt', 'DESC']],
@@ -99,7 +101,10 @@ router.get('/search', async (req, res) => {
 
     const user = await User.findOne({
       where: { email: email.toLowerCase() },
-      attributes: ['id', 'username', 'email', 'user_id'],
+      // BSEC-01 (D-03): email removed from the projection (the WHERE filter is
+      // unaffected). The searcher supplied the email; echoing it back is
+      // unnecessary — user_id + username are enough to send a friend request.
+      attributes: ['id', 'username', 'user_id'],
     });
 
     if (!user) {

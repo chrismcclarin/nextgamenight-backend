@@ -107,6 +107,15 @@ const User = sequelize.define('User', {
   },
 }, {
   timestamps: true,
+  // BSEC-01 / D-03: fail-closed PII default. email/phone are stripped from
+  // every default read; the 18 legitimate readers opt back in via
+  // .scope('withContactInfo') or .unscoped(). is_platform_admin stays
+  // reachable only via .unscoped()/explicit attributes (never serialized).
+  defaultScope: { attributes: { exclude: ['email', 'phone'] } },
+  scopes: {
+    // empty override = restores all attributes (incl. email/phone)
+    withContactInfo: {},
+  },
   indexes: [
     {
       fields: ['user_id']

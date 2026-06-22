@@ -59,7 +59,9 @@ router.get('/prompts/:promptId/respondents', verifyAuth0Token, async (req, res) 
       where: { group_id: prompt.group_id, status: 'active' },
       include: [{
         model: User,
-        attributes: ['user_id', 'username', 'email']
+        // BSEC-01 (D-03): email removed — the respondent list below only
+        // serializes username; email was fetched but never used.
+        attributes: ['user_id', 'username']
       }]
     });
 
@@ -186,8 +188,9 @@ router.post('/prompts/:promptId/remind/:userId', verifyAuth0Token, async (req, r
       return res.status(400).json({ error: 'User has already submitted their availability' });
     }
 
-    // 6. Get target user
-    const targetUser = await User.findOne({ where: { user_id: targetUserId } });
+    // 6. Get target user.
+    // BSEC-01 (D-03): withContactInfo — targetUser.email is read to send the reminder.
+    const targetUser = await User.scope('withContactInfo').findOne({ where: { user_id: targetUserId } });
     if (!targetUser) {
       return res.status(404).json({ error: 'User not found' });
     }

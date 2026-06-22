@@ -25,7 +25,8 @@ const formatEventWithCustomParticipants = (event) => {
   const regularParticipants = (eventData.EventParticipations || []).map(ep => ({
     user_id: ep.User?.id,
     username: ep.User?.username,
-    email: ep.User?.email,
+    // BSEC-01 (D-03): email removed from the participant roster serializer —
+    // it was leaking PII into every event response and serves no display use.
     score: ep.score,
     faction: ep.faction,
     is_new_player: ep.is_new_player,
@@ -303,7 +304,7 @@ router.get('/user/:user_id', requireParamMatchesToken('user_id'), async (req, re
         { model: User, as: 'PickedBy', attributes: ['id', 'username'] },
         {
           model: EventParticipation,
-          include: [{ model: User, attributes: ['id', 'username', 'user_id', 'email'] }]
+          include: [{ model: User, attributes: ['id', 'username', 'user_id'] }]
         }
       ],
       order: [['start_date', 'DESC']]
@@ -412,7 +413,7 @@ router.get('/:event_id', async (req, res) => {
         { model: User, as: 'PickedBy', attributes: ['id', 'username'] },
         {
           model: EventParticipation,
-          include: [{ model: User, attributes: ['id', 'username', 'user_id', 'email'] }]
+          include: [{ model: User, attributes: ['id', 'username', 'user_id'] }]
         }
       ]
     });
@@ -521,7 +522,7 @@ router.post('/', validateEventCreate, async (req, res) => {
         { model: User, as: 'PickedBy', attributes: ['id', 'username'] },
         {
           model: EventParticipation,
-          include: [{ model: User, attributes: ['id', 'username', 'user_id', 'email'] }]
+          include: [{ model: User, attributes: ['id', 'username', 'user_id'] }]
         }
       ]
     });
@@ -888,7 +889,7 @@ router.put('/:id', validateUUID('id'), validateEventUpdate, async (req, res) => 
         { model: User, as: 'PickedBy', attributes: ['id', 'username'] },
         {
           model: EventParticipation,
-          include: [{ model: User, attributes: ['id', 'username', 'user_id', 'email'] }]
+          include: [{ model: User, attributes: ['id', 'username', 'user_id'] }]
         }
       ]
     });
@@ -1227,8 +1228,10 @@ router.post('/join-game-by-token', async (req, res) => {
 
     (async () => {
       try {
-        // Refetch the user with all the fields we need for the email render
-        const fullUser = await User.findOne({ where: { user_id: userId } });
+        // Refetch the user with all the fields we need for the email render.
+        // BSEC-01 (D-03): withContactInfo — reads fullUser.email to send the
+        // game-join confirmation email.
+        const fullUser = await User.scope('withContactInfo').findOne({ where: { user_id: userId } });
         if (!fullUser?.email || fullUser.email.includes('@auth0.local') || fullUser.email.includes('@auth0')) {
           return; // No real email to send to
         }
