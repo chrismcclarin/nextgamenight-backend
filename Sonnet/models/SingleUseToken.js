@@ -78,6 +78,12 @@ const SingleUseToken = sequelize.define('SingleUseToken', {
     // Set on atomic consume.
   },
 }, {
+  // Explicit snake_case table name — the migration creates `single_use_tokens`,
+  // and prod runs migrations only (no sync). Without this, Sequelize pluralizes
+  // the model name to `SingleUseTokens`, so every query would hit a nonexistent
+  // table in prod (CR-01). Matches the repo convention (Feedback→feedback,
+  // EmailMetrics→email_metrics).
+  tableName: 'single_use_tokens',
   timestamps: true,
   indexes: [
     {
