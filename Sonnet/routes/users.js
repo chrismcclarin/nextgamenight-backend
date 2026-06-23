@@ -23,10 +23,12 @@ try {
 router.get('/search/email/:email', validateUserSearch, async (req, res) => {
   try {
     const email = decodeURIComponent(req.params.email);
-    
+
     // First, search in our database.
-    // BSEC-01 (D-03): withContactInfo — this is the self-profile lookup; it
-    // reads/returns the user's own email and reconciles it against Auth0.
+    // BSEC-01 (D-03 / WR-01): this is a CROSS-USER email search (friend lookup),
+    // NOT a self read. We use withContactInfo so the self-case below can return the
+    // caller's own full profile, but the cross-user response is projected down to
+    // identity fields only (see the projection before res.json) — never leak phone.
     let user = await User.scope('withContactInfo').findOne({
       where: { email: email }
     });
@@ -76,8 +78,20 @@ router.get('/search/email/:email', validateUserSearch, async (req, res) => {
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
-    
-    res.json(user);
+
+    // WR-01 (BSEC-01/D-03): only the caller's OWN row gets the full contact-info
+    // profile. For any other user, return identity fields plus the searched email
+    // (which the caller already supplied) — never phone or integration PII.
+    const isSelf = req.user?.user_id === user.user_id;
+    const payload = isSelf
+      ? user
+      : {
+          id: user.id,
+          user_id: user.user_id,
+          username: user.username,
+          email: user.email,
+        };
+    res.json(payload);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

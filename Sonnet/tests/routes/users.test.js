@@ -152,5 +152,43 @@ describe('User Routes', () => {
       expect(Array.isArray(response.body.Groups)).toBe(true);
     });
   });
+
+  describe('GET /api/users/search/email/:email (WR-01 — cross-user PII)', () => {
+    const enc = (e) => encodeURIComponent(e);
+
+    it('cross-user search returns identity + searched email but NEVER phone', async () => {
+      await User.create({
+        user_id: 'auth0|wr01-victim',
+        username: 'victim',
+        email: 'wr01-victim@example.com',
+        phone: '+15555550123',
+      });
+
+      const response = await request(makeApp('auth0|wr01-caller'))
+        .get(`/api/users/search/email/${enc('wr01-victim@example.com')}`)
+        .expect(200);
+
+      expect(response.body.user_id).toBe('auth0|wr01-victim');
+      expect(response.body.username).toBe('victim');
+      expect(response.body.email).toBe('wr01-victim@example.com'); // echoed (caller supplied it)
+      expect(response.body).not.toHaveProperty('phone'); // the real leak — must be gone
+    });
+
+    it('self search returns the full profile incl. phone', async () => {
+      await User.create({
+        user_id: 'auth0|wr01-self',
+        username: 'selfie',
+        email: 'wr01-self@example.com',
+        phone: '+15555559999',
+      });
+
+      const response = await request(makeApp('auth0|wr01-self'))
+        .get(`/api/users/search/email/${enc('wr01-self@example.com')}`)
+        .expect(200);
+
+      expect(response.body.user_id).toBe('auth0|wr01-self');
+      expect(response.body.phone).toBe('+15555559999'); // own row → full contact info
+    });
+  });
 });
 
