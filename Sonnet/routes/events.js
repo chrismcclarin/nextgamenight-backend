@@ -10,7 +10,7 @@ const googleCalendarService = require('../services/googleCalendarService');
 const emailService = require('../services/emailService');
 const icsService = require('../services/icsService');
 const notificationService = require('../services/notificationService');
-const { generateRsvpUrl } = require('./rsvp');
+const { generateRsvpUrl, mintRsvpBatch } = require('./rsvp');
 
 // MAIL-05 lifecycle constant: cancellation emails fire within 15 minutes
 // after start_time (covers the "oops, no one showed" case). After that
@@ -25,7 +25,8 @@ const formatEventWithCustomParticipants = (event) => {
   const regularParticipants = (eventData.EventParticipations || []).map(ep => ({
     user_id: ep.User?.id,
     username: ep.User?.username,
-    email: ep.User?.email,
+    // BSEC-01 (D-03): email removed from the participant roster serializer —
+    // it was leaking PII into every event response and serves no display use.
     score: ep.score,
     faction: ep.faction,
     is_new_player: ep.is_new_player,
@@ -91,6 +92,7 @@ const formatEventWithCustomParticipants = (event) => {
   };
 };
 const { validateEventCreate, validateEventUpdate, validateUUID } = require('../middleware/validators');
+const { requireParamMatchesToken } = require('../middleware/objectAuth');
 const {
   isOwnerOrAdmin,
   isActiveMember,
@@ -173,7 +175,12 @@ const attachRsvpSummaries = async (events) => {
 
 
 // Get all events for a user across all their groups
-router.get('/user/:user_id', async (req, res) => {
+// BSEC-01 (Task 1 audit, Rule 2 — same shape as BE-048): this READ was NOT
+// self-gated — only the auto-create branch checked the actor against the param,
+// so any authenticated user could read ANY user's full cross-group event list
+// (including participant emails). Add the object-level self-gate. The frontend
+// only calls this for the logged-in user (eventsAPI.getUserEvents on UserHome).
+router.get('/user/:user_id', requireParamMatchesToken('user_id'), async (req, res) => {
   try {
     let user = await User.findOne({ where: { user_id: req.params.user_id } });
     
@@ -297,7 +304,7 @@ router.get('/user/:user_id', async (req, res) => {
         { model: User, as: 'PickedBy', attributes: ['id', 'username'] },
         {
           model: EventParticipation,
-          include: [{ model: User, attributes: ['id', 'username', 'user_id', 'email'] }]
+          include: [{ model: User, attributes: ['id', 'username', 'user_id'] }]
         }
       ],
       order: [['start_date', 'DESC']]
@@ -320,15 +327,20 @@ router.get('/user/:user_id', async (req, res) => {
 // Get all events for a group
 router.get('/group/:group_id', async (req, res) => {
   try {
-    const { user_id } = req.query;
-    
-    if (user_id) {
-      const hasAccess = await isActiveMember(user_id, req.params.group_id);
-      if (!hasAccess) {
-        return res.status(403).json({ error: 'Access denied to this group' });
-      }
+    // BSEC-01 / BE-040: this was bypassable — membership was only checked IF a
+    // `req.query.user_id` was present, so omitting the param skipped the gate
+    // entirely (and trusted a client-supplied actor besides). Fix: derive the
+    // actor from the verified JWT (Auth0 STRING) and ALWAYS membership-check.
+    const callerAuth0Id = req.user?.user_id;
+    if (!callerAuth0Id) {
+      return res.status(401).json({ error: 'Unauthorized' });
     }
-    
+
+    const hasAccess = await isActiveMember(callerAuth0Id, req.params.group_id);
+    if (!hasAccess) {
+      return res.status(403).json({ error: 'Access denied to this group' });
+    }
+
     const events = await Event.findAll({
       where: { group_id: req.params.group_id },
       include: [
@@ -341,7 +353,8 @@ router.get('/group/:group_id', async (req, res) => {
         { model: User, as: 'PickedBy', attributes: ['id', 'username'] },
         {
           model: EventParticipation,
-          include: [{ model: User, attributes: ['id', 'username', 'user_id', 'email'] }]
+          // BSEC-01 / BE-040: drop `email` from the participation roster (PII leak).
+          include: [{ model: User, attributes: ['id', 'username', 'user_id'] }]
         }
       ],
       order: [['start_date', 'DESC']]
@@ -400,7 +413,7 @@ router.get('/:event_id', async (req, res) => {
         { model: User, as: 'PickedBy', attributes: ['id', 'username'] },
         {
           model: EventParticipation,
-          include: [{ model: User, attributes: ['id', 'username', 'user_id', 'email'] }]
+          include: [{ model: User, attributes: ['id', 'username', 'user_id'] }]
         }
       ]
     });
@@ -509,7 +522,7 @@ router.post('/', validateEventCreate, async (req, res) => {
         { model: User, as: 'PickedBy', attributes: ['id', 'username'] },
         {
           model: EventParticipation,
-          include: [{ model: User, attributes: ['id', 'username', 'user_id', 'email'] }]
+          include: [{ model: User, attributes: ['id', 'username', 'user_id'] }]
         }
       ]
     });
@@ -624,6 +637,21 @@ router.post('/', validateEventCreate, async (req, res) => {
             const frontendUrl = process.env.FRONTEND_URL || process.env.AUTH0_BASE_URL || 'http://localhost:3000';
             const eventUrl = `${frontendUrl}/gameDetail?event_id=${event.id}&group_id=${group_id}`;
             const ballotUrl = hasBallot ? `${eventUrl}#vote` : null;
+
+            // D-04 / BSEC-03: mint the three single-use RSVP rows (yes/maybe/no)
+            // per email-eligible recipient BEFORE the (synchronous) mapper builds
+            // the HMAC links. The row nonce IS the HMAC token, so the links the
+            // mapper generates are exactly the consumable rows. Best-effort:
+            // a mint failure must never block event creation.
+            await Promise.all(
+              recipients
+                .filter((u) => u._emailEligible && u.email)
+                .map((u) =>
+                  mintRsvpBatch(event.id, u.user_id).catch((err) =>
+                    console.error('Error minting RSVP single-use batch (non-fatal):', err.message)
+                  )
+                )
+            );
 
             const notifyPromises = notificationService.sendToMany(recipients, 'event_created', (user) => {
               const recipientTz = user.timezone || 'UTC';
@@ -861,7 +889,7 @@ router.put('/:id', validateUUID('id'), validateEventUpdate, async (req, res) => 
         { model: User, as: 'PickedBy', attributes: ['id', 'username'] },
         {
           model: EventParticipation,
-          include: [{ model: User, attributes: ['id', 'username', 'user_id', 'email'] }]
+          include: [{ model: User, attributes: ['id', 'username', 'user_id'] }]
         }
       ]
     });
@@ -920,6 +948,21 @@ router.put('/:id', validateUUID('id'), validateEventUpdate, async (req, res) => 
           const eventUrl = `${frontendUrl}/gameDetail?event_id=${event.id}&group_id=${event.group_id}`;
           const game = updatedEvent.Game || await Game.findByPk(event.game_id, { attributes: ['name'] });
           const group = await Group.findByPk(event.group_id, { attributes: ['name'] });
+
+          // D-04 / BSEC-03: re-mint the single-use RSVP batch for this date-change
+          // reminder. mintRsvpBatch revokes all prior active rsvp rows for each
+          // (user, event) before minting the new batch, so links from the OLD
+          // email stop working and only the newest batch is consumable.
+          await Promise.all(
+            updateRecipients
+              .filter((u) => u._emailEligible && u.email)
+              .map((u) =>
+                mintRsvpBatch(event.id, u.user_id).catch((err) =>
+                  console.error('Error re-minting RSVP single-use batch (non-fatal):', err.message)
+                )
+              )
+          );
+
           const notifyPromises = notificationService.sendToMany(updateRecipients, 'event_updated', (user) => {
             const recipientTz = user.timezone || 'UTC';
             const newEventDate = new Date(start_date);
@@ -1185,8 +1228,10 @@ router.post('/join-game-by-token', async (req, res) => {
 
     (async () => {
       try {
-        // Refetch the user with all the fields we need for the email render
-        const fullUser = await User.findOne({ where: { user_id: userId } });
+        // Refetch the user with all the fields we need for the email render.
+        // BSEC-01 (D-03): withContactInfo — reads fullUser.email to send the
+        // game-join confirmation email.
+        const fullUser = await User.scope('withContactInfo').findOne({ where: { user_id: userId } });
         if (!fullUser?.email || fullUser.email.includes('@auth0.local') || fullUser.email.includes('@auth0')) {
           return; // No real email to send to
         }

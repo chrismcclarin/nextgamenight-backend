@@ -1,10 +1,11 @@
 // routes/adminMetrics.js
 // GET /api/admin/metrics — aggregated monitoring dashboard endpoint
-// Protected by Auth0 token (any authenticated user, matching Bull Board policy)
+// Operator-only: gated by verifyAuth0Token + requirePlatformAdmin (D-02 / BSEC-02).
 const express = require('express');
 const router = express.Router();
 const { Op } = require('sequelize');
 const { verifyAuth0Token } = require('../middleware/auth0');
+const { requirePlatformAdmin } = require('../middleware/adminAuth');
 
 const {
   EmailMetrics,
@@ -27,7 +28,7 @@ function getQueues() {
  * Returns aggregated KPIs for monitoring dashboard
  * Covers: email deliverability, response rates, queue health, token failures
  */
-router.get('/admin/metrics', verifyAuth0Token, async (req, res) => {
+router.get('/admin/metrics', verifyAuth0Token, requirePlatformAdmin, async (req, res) => {
   try {
     const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000); // last 30 days
 
@@ -119,7 +120,7 @@ router.get('/admin/metrics', verifyAuth0Token, async (req, res) => {
  * check in promptWorker doesn't skip the job.
  * Body: { groupId, settingsId, timezone }
  */
-router.post('/admin/trigger-prompt-job', verifyAuth0Token, async (req, res) => {
+router.post('/admin/trigger-prompt-job', verifyAuth0Token, requirePlatformAdmin, async (req, res) => {
   const queues = getQueues();
   if (!queues) {
     return res.status(503).json({ error: 'Queue system not available' });

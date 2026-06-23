@@ -263,6 +263,7 @@ class EmailService {
    * @returns {{html: string, text: string}} Email content
    */
   generateNoConsensusEmailTemplate({ groupName, promptId, dashboardUrl }) {
+    const safeGroupName = this.escapeHtml(groupName);
     const html = `
 <!DOCTYPE html>
 <html>
@@ -282,7 +283,7 @@ class EmailService {
       <h1>No Consensus Reached</h1>
     </div>
     <div class="content">
-      <p>The availability poll for <strong>${groupName}</strong> has closed, but no time slot met the minimum participant threshold.</p>
+      <p>The availability poll for <strong>${safeGroupName}</strong> has closed, but no time slot met the minimum participant threshold.</p>
 
       <p>You may want to:</p>
       <ul>
@@ -335,6 +336,22 @@ Review suggestions: ${dashboardUrl}
       .replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;')
       .replace(/'/g, '&#39;');
+  }
+
+  /**
+   * Strip CR/LF (and stray control whitespace) from a string destined for a
+   * mail SUBJECT header. Prevents header injection (BSEC-04 / T-83-04): a
+   * subject containing "\r\nBcc: ..." would otherwise forge additional
+   * headers. Distinct from escapeHtml — this is for header context, not HTML
+   * body context, and is intentionally NOT an HTML escaper.
+   * @param {string} value - Untrusted subject string
+   * @returns {string} Single-line subject with CR/LF collapsed to spaces.
+   */
+  stripCrlf(value) {
+    if (value === null || value === undefined) return '';
+    return String(value)
+      .replace(/[\r\n]+/g, ' ')
+      .trim();
   }
 
   /**
@@ -440,7 +457,7 @@ Review suggestions: ${dashboardUrl}
       return `${dayLabel} at ${timeLabel}`;
     };
 
-    const subject = `${groupName || 'Your group'} - poll closed - schedule a session?`;
+    const subject = this.stripCrlf(`${groupName || 'Your group'} - poll closed - schedule a session?`);
 
     // Phase 71.2 / Plan 03 hotfix — collapse to ONE Schedule it? CTA. The
     // landing page (createEvent modal in /groupPlanning) renders a heatmap
@@ -551,6 +568,8 @@ This is an automated notification from Next Game Night.
    * @returns {{html: string, text: string}} Email content
    */
   generateGroupInviteEmailTemplate({ inviterName, groupName, memberCount, inviteUrl }) {
+    const safeInviterName = this.escapeHtml(inviterName);
+    const safeGroupName = this.escapeHtml(groupName);
     const html = `
 <!DOCTYPE html>
 <html>
@@ -571,7 +590,7 @@ This is an automated notification from Next Game Night.
       <h1>You're Invited!</h1>
     </div>
     <div class="content">
-      <p>Hey! <strong>${inviterName}</strong> invited you to join <strong>${groupName}</strong> on Next Game Night.</p>
+      <p>Hey! <strong>${safeInviterName}</strong> invited you to join <strong>${safeGroupName}</strong> on Next Game Night.</p>
 
       <p>The group has ${memberCount} member${memberCount !== 1 ? 's' : ''}.</p>
 
@@ -623,7 +642,7 @@ This is an automated notification from Next Game Night.
 
     return this.send({
       to: recipientEmail,
-      subject: `You're invited to join ${templateParams.groupName} on Next Game Night`,
+      subject: this.stripCrlf(`You're invited to join ${templateParams.groupName} on Next Game Night`),
       html,
       text,
       groupName: templateParams.groupName,
@@ -641,6 +660,14 @@ This is an automated notification from Next Game Night.
    */
   generateGameSessionEmailTemplate(eventData) {
     const { gameName, groupName, startDate, durationMinutes, location, comments, eventUrl, recipientName, rsvpUrls, ballotUrl, timezone } = eventData;
+
+    // HTML-escape all user-supplied strings before interpolating into the
+    // HTML body (BSEC-04 / T-83-03). Plain-text body below stays raw.
+    const safeRecipient = this.escapeHtml(recipientName || 'there');
+    const safeGroupName = this.escapeHtml(groupName);
+    const safeGameName = this.escapeHtml(gameName);
+    const safeLocation = this.escapeHtml(location);
+    const safeComments = this.escapeHtml(comments);
 
     // Format date + times in the recipient's timezone, 12h with TZ abbreviation.
     // Time formatting is centralized here (MAIL-04) — callers pass raw startDate
@@ -721,9 +748,9 @@ RSVP:
       <h1>New Game Session Scheduled!</h1>
     </div>
     <div class="content">
-      <p>Hi ${recipientName || 'there'},</p>
+      <p>Hi ${safeRecipient},</p>
 
-      <p>A new game session has been scheduled for your group <strong>${groupName}</strong>.</p>
+      <p>A new game session has been scheduled for your group <strong>${safeGroupName}</strong>.</p>
 
       ${rsvpButtonsHtml}
 
@@ -732,7 +759,7 @@ RSVP:
       <div class="event-details">
         <div class="event-detail-row">
           <span class="event-detail-label">Game:</span>
-          <span class="event-detail-value">${gameName}</span>
+          <span class="event-detail-value">${safeGameName}</span>
         </div>
         <div class="event-detail-row">
           <span class="event-detail-label">Date:</span>
@@ -751,13 +778,13 @@ RSVP:
         ${location ? `
         <div class="event-detail-row">
           <span class="event-detail-label">Location:</span>
-          <span class="event-detail-value">${location}</span>
+          <span class="event-detail-value">${safeLocation}</span>
         </div>
         ` : ''}
         ${comments ? `
         <div class="event-detail-row">
           <span class="event-detail-label">Notes:</span>
-          <span class="event-detail-value">${comments}</span>
+          <span class="event-detail-value">${safeComments}</span>
         </div>
         ` : ''}
       </div>
@@ -818,7 +845,7 @@ You can manage your notification preferences in your profile: ${this.frontendUrl
 
     return this.send({
       to: recipientEmail,
-      subject: `New Game Session: ${eventData.gameName} - ${eventData.groupName}`,
+      subject: this.stripCrlf(`New Game Session: ${eventData.gameName} - ${eventData.groupName}`),
       html,
       text,
       groupName: eventData.groupName
@@ -838,7 +865,7 @@ You can manage your notification preferences in your profile: ${this.frontendUrl
     const { html, text } = this.generateGameSessionEmailTemplate(eventData);
 
     return this.sendBatch(recipientList, {
-      subject: `New Game Session: ${eventData.gameName} - ${eventData.groupName}`,
+      subject: this.stripCrlf(`New Game Session: ${eventData.gameName} - ${eventData.groupName}`),
       html,
       text,
       groupName: eventData.groupName
@@ -863,6 +890,11 @@ You can manage your notification preferences in your profile: ${this.frontendUrl
    * @returns {{html: string, text: string}} Email content
    */
   generateDateChangeEmailTemplate({ gameName, groupName, newDate, durationMinutes, eventUrl, recipientName, rsvpUrls, timezone }) {
+    // HTML-escape user-supplied strings before HTML interpolation (BSEC-04).
+    const safeRecipient = this.escapeHtml(recipientName || 'there');
+    const safeGameName = this.escapeHtml(gameName);
+    const safeGroupName = this.escapeHtml(groupName);
+
     // Time formatting centralized here (MAIL-04) — callers pass raw newDate
     // + timezone instead of pre-formatted strings.
     const start = new Date(newDate);
@@ -923,16 +955,16 @@ RSVP (re-confirm your attendance):
       <h1>Date Changed</h1>
     </div>
     <div class="content">
-      <p>Hi ${recipientName || 'there'},</p>
+      <p>Hi ${safeRecipient},</p>
 
-      <p>The date for <strong>${gameName}</strong> in <strong>${groupName}</strong> has been updated.</p>
+      <p>The date for <strong>${safeGameName}</strong> in <strong>${safeGroupName}</strong> has been updated.</p>
 
       ${rsvpButtonsHtml}
 
       <div class="event-details">
         <div class="event-detail-row">
           <span class="event-detail-label">Game:</span>
-          <span class="event-detail-value">${gameName}</span>
+          <span class="event-detail-value">${safeGameName}</span>
         </div>
         <div class="event-detail-row">
           <span class="event-detail-label">New Date:</span>
@@ -1005,6 +1037,11 @@ You can manage your notification preferences in your profile: ${this.frontendUrl
   generateCancellationEmailTemplate({ gameName, groupName, eventDate, recipientName, groupUrl, timezone }) {
     const formattedDate = this.formatEventDate(eventDate, timezone);
 
+    // HTML-escape user-supplied strings before HTML interpolation (BSEC-04).
+    const safeRecipient = this.escapeHtml(recipientName || 'there');
+    const safeGameName = this.escapeHtml(gameName);
+    const safeGroupName = this.escapeHtml(groupName);
+
     const html = `
 <!DOCTYPE html>
 <html>
@@ -1029,14 +1066,14 @@ You can manage your notification preferences in your profile: ${this.frontendUrl
       <h1>Event Cancelled</h1>
     </div>
     <div class="content">
-      <p>Hi ${recipientName || 'there'},</p>
+      <p>Hi ${safeRecipient},</p>
 
-      <p><strong>${gameName}</strong> scheduled for <strong>${formattedDate}</strong> has been cancelled.</p>
+      <p><strong>${safeGameName}</strong> scheduled for <strong>${formattedDate}</strong> has been cancelled.</p>
 
       <div class="event-details">
         <div class="event-detail-row">
           <span class="event-detail-label">Game:</span>
-          <span class="event-detail-value" style="text-decoration: line-through;">${gameName}</span>
+          <span class="event-detail-value" style="text-decoration: line-through;">${safeGameName}</span>
         </div>
         <div class="event-detail-row">
           <span class="event-detail-label">Date:</span>
@@ -1044,7 +1081,7 @@ You can manage your notification preferences in your profile: ${this.frontendUrl
         </div>
         <div class="event-detail-row">
           <span class="event-detail-label">Group:</span>
-          <span class="event-detail-value">${groupName}</span>
+          <span class="event-detail-value">${safeGroupName}</span>
         </div>
       </div>
 
@@ -1139,9 +1176,16 @@ You can manage your notification preferences in your profile: ${this.frontendUrl
   }) {
     const formattedDate = this.formatEventDate(eventDate, timezone);
     const formattedTime = this.formatEventTime12h(eventDate, timezone);
-    const subject = `You're in: ${gameName} with ${groupName}`;
+    const subject = this.stripCrlf(`You're in: ${gameName} with ${groupName}`);
     const greetingName = recipientName || 'there';
     const host = hostName || groupName || 'your group';
+
+    // HTML-escape user-supplied strings before HTML interpolation (BSEC-04).
+    const safeGreeting = this.escapeHtml(greetingName);
+    const safeGameName = this.escapeHtml(gameName);
+    const safeGroupName = this.escapeHtml(groupName);
+    const safeHost = this.escapeHtml(host);
+    const safeLocation = this.escapeHtml(location);
 
     const html = `
 <!DOCTYPE html>
@@ -1167,12 +1211,12 @@ You can manage your notification preferences in your profile: ${this.frontendUrl
       <h1>You're in!</h1>
     </div>
     <div class="content">
-      <p>Hi ${greetingName}, you've joined <strong>${gameName}</strong> with <strong>${groupName}</strong>. Here are the details:</p>
+      <p>Hi ${safeGreeting}, you've joined <strong>${safeGameName}</strong> with <strong>${safeGroupName}</strong>. Here are the details:</p>
 
       <div class="event-details">
         <div class="event-detail-row">
           <span class="event-detail-label">Game:</span>
-          <span class="event-detail-value">${gameName}</span>
+          <span class="event-detail-value">${safeGameName}</span>
         </div>
         <div class="event-detail-row">
           <span class="event-detail-label">Date:</span>
@@ -1190,12 +1234,12 @@ You can manage your notification preferences in your profile: ${this.frontendUrl
         ` : ''}
         <div class="event-detail-row">
           <span class="event-detail-label">Host:</span>
-          <span class="event-detail-value">${host}</span>
+          <span class="event-detail-value">${safeHost}</span>
         </div>
         ${location ? `
         <div class="event-detail-row">
           <span class="event-detail-label">Location:</span>
-          <span class="event-detail-value">${location}</span>
+          <span class="event-detail-value">${safeLocation}</span>
         </div>
         ` : ''}
       </div>

@@ -401,3 +401,111 @@ describe('notificationService', () => {
     });
   });
 });
+
+// =============================================
+// BSEC-01 / D-03: User PII defaultScope + stripMemberPII allow-list
+// =============================================
+// These assert the durable fail-closed behavior added in 83-06:
+//   1) a default User read has NO email/phone
+//   2) a .scope('withContactInfo')/.unscoped() read HAS email/phone (so the
+//      notification path still gets contact info and emails/SMS still send)
+//   3) stripMemberPII returns ONLY allow-listed fields (new fields default to
+//      stripped — incl. is_platform_admin)
+// 1 & 2 are DB-backed (they exercise the Sequelize model scope). The global
+// tests/setup.js beforeAll requires a test DB, so these run in CI; locally
+// without Postgres the whole file is skipped by that gate.
+describe('BSEC-01 User PII defaultScope', () => {
+  const { User } = require('../../models');
+  const { stripMemberPII } = require('../../services/authorizationService');
+
+  const TEST_USER_ID = 'auth0|bsec01-pii-scope-test';
+  const TEST_EMAIL = 'bsec01-scope-test@example.com';
+  const TEST_PHONE = '+14155550199';
+
+  beforeAll(async () => {
+    await User.destroy({ where: { user_id: TEST_USER_ID } });
+    await User.create({
+      user_id: TEST_USER_ID,
+      username: 'bsec01-scope-test',
+      email: TEST_EMAIL,
+      phone: TEST_PHONE,
+      phone_verified: true,
+    });
+  });
+
+  afterAll(async () => {
+    await User.destroy({ where: { user_id: TEST_USER_ID } });
+  });
+
+  it('Test 1: a default User read has NO email/phone', async () => {
+    const row = await User.findOne({ where: { user_id: TEST_USER_ID } });
+    expect(row).not.toBeNull();
+    const json = row.toJSON();
+    expect(json).not.toHaveProperty('email');
+    expect(json).not.toHaveProperty('phone');
+    // identity fields still present
+    expect(json.user_id).toBe(TEST_USER_ID);
+    expect(json.username).toBe('bsec01-scope-test');
+  });
+
+  it('Test 2a: .scope("withContactInfo") restores email/phone', async () => {
+    const row = await User.scope('withContactInfo').findOne({ where: { user_id: TEST_USER_ID } });
+    expect(row.email).toBe(TEST_EMAIL);
+    expect(row.phone).toBe(TEST_PHONE);
+  });
+
+  it('Test 2b: .unscoped() also restores email/phone', async () => {
+    const row = await User.unscoped().findOne({ where: { user_id: TEST_USER_ID } });
+    expect(row.email).toBe(TEST_EMAIL);
+    expect(row.phone).toBe(TEST_PHONE);
+  });
+
+  it('Test 3: stripMemberPII returns ONLY allow-listed fields (new fields default to stripped)', () => {
+    const input = {
+      id: 'uuid-x',
+      user_id: 'auth0|x',
+      username: 'x',
+      display_name: 'X',
+      profile_picture_url: 'https://example.com/a.png',
+      avatar_url: 'https://example.com/b.png',
+      UserGroup: { role: 'member', joined_at: '2026-01-01T00:00:00Z' },
+      // PII + a brand-new field that must default to STRIPPED:
+      email: 'x@example.com',
+      phone: '+14155550000',
+      notification_preferences: { reminder: true },
+      is_platform_admin: true, // future field — must be stripped by the allow-list
+      some_future_secret: 'leak-me-if-omit-list',
+    };
+
+    const result = stripMemberPII(input);
+
+    // allow-listed fields preserved
+    expect(result.id).toBe('uuid-x');
+    expect(result.user_id).toBe('auth0|x');
+    expect(result.username).toBe('x');
+    expect(result.display_name).toBe('X');
+    expect(result.profile_picture_url).toBe('https://example.com/a.png');
+    expect(result.avatar_url).toBe('https://example.com/b.png');
+    expect(result.UserGroup).toEqual({ role: 'member', joined_at: '2026-01-01T00:00:00Z' });
+
+    // everything else stripped — INCLUDING fields not previously in the omit-list
+    expect(result).not.toHaveProperty('email');
+    expect(result).not.toHaveProperty('phone');
+    expect(result).not.toHaveProperty('notification_preferences');
+    expect(result).not.toHaveProperty('is_platform_admin');
+    expect(result).not.toHaveProperty('some_future_secret');
+  });
+
+  it('Test 3b: stripMemberPII preserves UserGroup even when explicitly null (game-only signal)', () => {
+    const result = stripMemberPII({
+      id: 'uuid-caller',
+      user_id: 'auth0|caller',
+      username: 'caller',
+      email: 'caller@example.com',
+      UserGroup: null,
+    });
+    expect(result).toHaveProperty('UserGroup');
+    expect(result.UserGroup).toBeNull();
+    expect(result).not.toHaveProperty('email');
+  });
+});

@@ -151,21 +151,27 @@ router.post('/', validateReviewCreate, async (req, res) => {
 // Delete a review
 router.delete('/:id', async (req, res) => {
   try {
-    const { user_id } = req.body;
-    
+    // BSEC-01 / BE-100: derive the actor from the verified JWT — NEVER from
+    // req.body.user_id (which any client can spoof to delete another user's
+    // review). Matches the POST handler's own pattern at :76.
+    const userId = req.user?.user_id;
+    if (!userId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
     const review = await GameReview.findByPk(req.params.id, {
       include: [{ model: User }]
     });
-    
+
     if (!review) {
       return res.status(404).json({ error: 'Review not found' });
     }
-    
-    // Verify user owns the review or has admin access
-    if (review.User.user_id !== user_id) {
+
+    // Verify the verified actor owns the review.
+    if (review.User.user_id !== userId) {
       return res.status(403).json({ error: 'Access denied' });
     }
-    
+
     await review.destroy();
     res.json({ message: 'Review deleted successfully' });
   } catch (error) {

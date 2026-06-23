@@ -16,6 +16,7 @@ const AvailabilityPrompt = require('./AvailabilityPrompt');
 const AvailabilityResponse = require('./AvailabilityResponse');
 const AvailabilitySuggestion = require('./AvailabilitySuggestion');
 const MagicToken = require('./MagicToken');
+const SingleUseToken = require('./SingleUseToken');
 const TokenAnalytics = require('./TokenAnalytics');
 const EmailMetrics = require('./EmailMetrics');
 const Feedback = require('./Feedback');
@@ -151,6 +152,11 @@ MagicToken.belongsTo(User, { foreignKey: 'user_id', targetKey: 'user_id' });
 AvailabilityPrompt.hasMany(MagicToken, { foreignKey: 'prompt_id' });
 MagicToken.belongsTo(AvailabilityPrompt, { foreignKey: 'prompt_id' });
 
+// Single-Use Tokens (One-to-Many from User) — OAuth state nonce + RSVP single-use
+// Note: Uses sourceKey/targetKey because user_id is STRING (Auth0 ID), not UUID
+User.hasMany(SingleUseToken, { foreignKey: 'user_id', sourceKey: 'user_id' });
+SingleUseToken.belongsTo(User, { foreignKey: 'user_id', targetKey: 'user_id' });
+
 // Friendships (Social Graph)
 // Note: Uses sourceKey/targetKey because requester_id/addressee_id are STRING (Auth0 ID), not UUID
 User.hasMany(Friendship, { as: 'SentFriendRequests', foreignKey: 'requester_id', sourceKey: 'user_id' });
@@ -217,6 +223,7 @@ module.exports = {
   AvailabilityResponse,
   AvailabilitySuggestion,
   MagicToken,
+  SingleUseToken,
   TokenAnalytics,
   EmailMetrics,
   Feedback,

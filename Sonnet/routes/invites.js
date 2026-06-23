@@ -208,8 +208,9 @@ router.get('/pending', async (req, res) => {
   try {
     const userId = req.user.user_id;
 
-    // Find user to get their email
-    const user = await User.findOne({ where: { user_id: userId } });
+    // Find user to get their email.
+    // BSEC-01 (D-03): withContactInfo — user.email is read below to match invites.
+    const user = await User.scope('withContactInfo').findOne({ where: { user_id: userId } });
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
@@ -280,8 +281,9 @@ router.post('/:invite_id/accept', async (req, res) => {
       return res.status(404).json({ error: 'Pending invite not found' });
     }
 
-    // Verify the authenticated user's email matches the invite
-    const user = await User.findOne({ where: { user_id: userId } });
+    // Verify the authenticated user's email matches the invite.
+    // BSEC-01 (D-03): withContactInfo — user.email is read for the match below.
+    const user = await User.scope('withContactInfo').findOne({ where: { user_id: userId } });
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
@@ -344,8 +346,9 @@ router.post('/:invite_id/decline', async (req, res) => {
       return res.status(404).json({ error: 'Pending invite not found' });
     }
 
-    // Verify the authenticated user's email matches
-    const user = await User.findOne({ where: { user_id: userId } });
+    // Verify the authenticated user's email matches.
+    // BSEC-01 (D-03): withContactInfo — user.email is read for the match below.
+    const user = await User.scope('withContactInfo').findOne({ where: { user_id: userId } });
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
@@ -395,8 +398,9 @@ router.post('/accept-by-token', async (req, res) => {
       return res.status(404).json({ error: 'Pending invite not found' });
     }
 
-    // Verify the authenticated user's email matches
-    const user = await User.findOne({ where: { user_id: userId } });
+    // Verify the authenticated user's email matches.
+    // BSEC-01 (D-03): withContactInfo — user.email is read for the match below.
+    const user = await User.scope('withContactInfo').findOne({ where: { user_id: userId } });
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }

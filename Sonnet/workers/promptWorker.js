@@ -164,7 +164,9 @@ const promptWorker = new Worker('prompts', async (job) => {
   const memberships = await UserGroup.findAll({
     where: membershipWhere,
     include: [{
-      model: User,
+      // BSEC-01 (D-03): withContactInfo — user.email is read in the prompt
+      // send loop; defaultScope would strip it and silently skip everyone.
+      model: User.scope('withContactInfo'),
       required: true
     }]
   });

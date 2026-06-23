@@ -171,7 +171,9 @@ async function convertSuggestionToEvent(suggestionId, creatorUserId, options = {
 
     let users = [];
     if (participantUserIds.length > 0) {
-      users = await User.findAll({
+      // BSEC-01 (D-03): withContactInfo — these users flow into
+      // sendConfirmationEmails which reads u.email to send confirmations.
+      users = await User.scope('withContactInfo').findAll({
         where: { user_id: participantUserIds },
         transaction
       });

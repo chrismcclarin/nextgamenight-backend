@@ -1,0 +1,155 @@
+# CI pipeline for the Nextgamenight BACKEND repo (chrismcclarin/nextgamenight-backend).
+#
+# REPO-TOPOLOGY (REVIEW R4 HIGH): the git repo ROOT is this directory
+# (periodictabletopbackend_v2/); the Express app lives in the `Sonnet/` SUBDIRECTORY.
+# GitHub Actions ONLY reads `.github/workflows/` at the repo ROOT — a workflow placed
+# under `Sonnet/.github/workflows/` is INVISIBLE and never runs (a silent false-green
+# that would disable the entire D-06 gate, both grep backstops, and the required-status
+# branch protection). Therefore this file lives at the repo root, and every app-touching
+# step sets `working-directory: Sonnet` with `cache-dependency-path: Sonnet/package-lock.json`.
+#
+# Two jobs (D-06 / BSEC-02):
+#   quality  — fast gate: install + three inverted grep backstops (D-01 / D-05 / BE-043)
+#   test     — slow gate (needs: quality): Jest/supertest against a Postgres service container
+name: CI
+
+on:
+  pull_request:
+    branches: [main] # the BE repo's default branch (NOT the docs-root `master`)
+  push:
+    branches-ignore: [main]
+
+jobs:
+  quality:
+    name: quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: Sonnet/package-lock.json # lockfile lives in the subdir
+
+      - name: Install dependencies
+        working-directory: Sonnet
+        run: npm ci
+
+      # ---- D-06 grep backstops --------------------------------------------------
+      # grep returns nonzero on NO MATCH (Pitfall 2), so capture with `|| true`, test
+      # for non-empty, and `exit 1` on match. Patterns are scoped NARROWLY (Pitfall 3)
+      # so they do NOT trip the ~25 legit `where: { user_id: req.params.user_id }`
+      # route-param lookups (those derive the actor separately from the verified JWT).
+
+      - name: "Grep gate — client-supplied id as DB authz subject (D-01 backstop / BSEC-01)"
+        working-directory: Sonnet
+        # Matches `where: { user_id: req.query.user_id }` / `req.body.user_id` — a
+        # CLIENT-CONTROLLED id used as the authz FILTER. Deliberately EXCLUDES
+        # `req.params.user_id`: that is route-positional (e.g. GET /users/:user_id),
+        # used legitimately for lookups across events.js/users.js/userGames.js, and
+        # is NOT the spoofable authz-subject class D-01 targets.
+        run: |
+          HITS=$(grep -rnE 'where:\s*\{\s*user_id:\s*req\.(query|body)\.user_id' routes/ || true)
+          if [ -n "$HITS" ]; then
+            echo "::error::Client-supplied id (req.query/req.body.user_id) used as a DB authz subject — derive the actor from the verified JWT (req.user.user_id) instead (D-01 / BSEC-01):"
+            echo "$HITS"
+            exit 1
+          fi
+          echo "D-01 backstop passed — no client-supplied id used as an authz subject."
+
+      - name: "Grep gate — invite_token leaked via findByPk (BE-043 / BSEC-01)"
+        working-directory: Sonnet
+        # Matches a findByPk(...) call that explicitly pulls back `invite_token`
+        # (the Group invite-token leak). The durable fix is a Group defaultScope
+        # excluding invite_token (83-05); this backstop catches a re-leak.
+        run: |
+          HITS=$(grep -rnE 'findByPk[^)]*invite_token' routes/ || true)
+          if [ -n "$HITS" ]; then
+            echo "::error::findByPk(...) returning invite_token — the invite token must not be selected into a roster/preview read (BE-043 / BSEC-01):"
+            echo "$HITS"
+            exit 1
+          fi
+          echo "BE-043 backstop passed — no findByPk returning invite_token."
+
+      - name: "Grep gate — mass-assignment via ...req.body (D-05 backstop / BSEC-01)"
+        working-directory: Sonnet
+        # Matches the `...req.body` spread that flows into Sequelize .create()/.update()
+        # sinks (mass-assignment). KNOWN PENDING: routes/games.js (POST / create) and
+        # routes/groupPromptSettings.js (JSONB schedule merge) still spread ...req.body
+        # and are fixed by later plans in THIS phase (D-05C) — until they land, this
+        # gate is RED on this branch by design (it IS the backstop catching the holes).
+        run: |
+          HITS=$(grep -rnE '\.\.\.req\.body' routes/ || true)
+          if [ -n "$HITS" ]; then
+            echo "::error::...req.body spread into a write sink (mass-assignment) — use an explicit Sequelize fields:[] allow-list / key allow-list instead (D-05 / BSEC-01):"
+            echo "$HITS"
+            exit 1
+          fi
+          echo "D-05 backstop passed — no ...req.body mass-assignment spread."
+
+  test:
+    name: test
+    needs: quality # D-06: the Jest suite only runs after the fast grep gate is green
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: boardgame_db
+        ports:
+          - 5432:5432
+        # Health-gate the container so DB steps never race the service coming up.
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      # DB connection — BOTH forms, so create-database.js (DB_* vars) and the runtime
+      # (DATABASE_URL) agree on the same Postgres service container.
+      DB_HOST: localhost
+      DB_PORT: 5432
+      DB_USER: postgres
+      DB_PASSWORD: password
+      DB_NAME: boardgame_db
+      DATABASE_URL: postgres://postgres:password@localhost:5432/boardgame_db
+      # Signs availability magic JWTs + RSVP HMAC links (services/magicTokenService,
+      # routes/rsvp.js). Throwaway CI-only value — must merely exist for boot.
+      MAGIC_TOKEN_SECRET: ci-throwaway-magic-token-secret-1f2e3d4c5b6a
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: Sonnet/package-lock.json
+
+      - name: Install dependencies
+        working-directory: Sonnet
+        run: npm ci
+
+      # NO migrate step (A5): the earliest migration assumes the "Users" table already
+      # exists and cannot run from an empty DB. Schema is built from the models instead:
+      # db:create provisions the database, seed runs sequelize.sync({ alter: true }).
+      - name: Create database
+        working-directory: Sonnet
+        run: npm run db:create
+
+      - name: Seed (sync({alter:true}) builds the schema from the models)
+        working-directory: Sonnet
+        run: npm run seed
+
+      - name: Jest / supertest suite
+        working-directory: Sonnet
+        run: npm test

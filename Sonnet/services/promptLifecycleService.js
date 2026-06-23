@@ -118,7 +118,8 @@ async function handlePromptClosed(prompt) {
     let recipient = null;
     if (prompt.created_by_user_id) {
       // Manual poll — recipient is the poll creator.
-      recipient = await User.findByPk(prompt.created_by_user_id);
+      // BSEC-01 (D-03): withContactInfo — recipient.email is read to send the email.
+      recipient = await User.scope('withContactInfo').findByPk(prompt.created_by_user_id);
     } else if (prompt.created_by_settings_id) {
       // Auto-prompt — recipient is the schedule creator, falling back to the
       // group owner if the settings row is gone or has NULL created_by_user_id
@@ -128,7 +129,8 @@ async function handlePromptClosed(prompt) {
       // and allowed.
       const settings = await GroupPromptSettings.findByPk(prompt.created_by_settings_id);
       if (settings && settings.created_by_user_id) {
-        recipient = await User.findByPk(settings.created_by_user_id);
+        // BSEC-01 (D-03): withContactInfo — recipient.email read below.
+        recipient = await User.scope('withContactInfo').findByPk(settings.created_by_user_id);
       } else {
         // Group-owner fallback — see INVESTIGATION.md step (d).
         const ownerUg = await UserGroup.findOne({
@@ -137,7 +139,8 @@ async function handlePromptClosed(prompt) {
         if (ownerUg && ownerUg.user_id) {
           // UserGroup.user_id is an Auth0 sub STRING, not a User.id UUID —
           // look up by user_id, NOT findByPk.
-          recipient = await User.findOne({ where: { user_id: ownerUg.user_id } });
+          // BSEC-01 (D-03): withContactInfo — recipient.email read below.
+          recipient = await User.scope('withContactInfo').findOne({ where: { user_id: ownerUg.user_id } });
         }
       }
     }

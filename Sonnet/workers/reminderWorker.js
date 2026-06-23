@@ -83,7 +83,9 @@ const reminderWorker = new Worker('reminders', async (job) => {
   const memberships = await UserGroup.findAll({
     where: { group_id: prompt.group_id, status: 'active' },
     include: [{
-      model: User,
+      // BSEC-01 (D-03): withContactInfo — user.email is read in the reminder
+      // send loop; defaultScope would strip it and silently skip everyone.
+      model: User.scope('withContactInfo'),
       where: { email_notifications_enabled: { [Op.ne]: false } },
       required: true
     }]

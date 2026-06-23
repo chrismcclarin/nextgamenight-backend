@@ -185,7 +185,9 @@ router.get('/user/:user_id', async (req, res) => {
       include: [
         {
           model: User,
-          attributes: ['id', 'username', 'user_id', 'email'],
+          // BSEC-01 / BE-043: drop `email` from this list-all read (PII leak).
+          // The durable safe-by-default fix is the User defaultScope (D-03 / 83-06).
+          attributes: ['id', 'username', 'user_id'],
           through: { where: { status: 'active' }, attributes: ['role', 'joined_at'] }
         },
         {
@@ -243,12 +245,33 @@ router.post('/', validateGroupCreate, async (req, res) => {
 // Get a single group by ID
 router.get('/:group_id', validateUUID('group_id'), async (req, res) => {
   try {
-    const group = await Group.findByPk(req.params.group_id);
-    
+    // BSEC-01 / BE-043: this was OPEN — any authenticated user could read any
+    // group's whole row INCLUDING `invite_token` (a join secret). Two fixes:
+    //   1) Object-level gate: the caller must be an active member of the group.
+    //   2) Stop the `invite_token` leak — now handled durably by the
+    //      `Group.defaultScope` excluding `invite_token` (83-06, BSEC-01),
+    //      which supersedes the per-query exclude 83-05 applied here. The
+    //      default read below is fail-closed; the membership GATE remains the
+    //      load-bearing authz fix.
+    const callerAuth0Id = req.user?.user_id;
+    if (!callerAuth0Id) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const { group_id } = req.params;
+
+    const hasAccess = await isActiveMember(callerAuth0Id, group_id);
+    if (!hasAccess) {
+      return res.status(403).json({ error: 'Access denied to this group' });
+    }
+
+    // defaultScope already excludes invite_token (safe-by-default).
+    const group = await Group.findByPk(group_id);
+
     if (!group) {
       return res.status(404).json({ error: 'Group not found' });
     }
-    
+
     res.json(group);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -285,7 +308,10 @@ router.get('/:group_id/users', async (req, res) => {
     const group = await Group.findByPk(group_id, {
       include: [{
         model: User,
-        attributes: ['id', 'username', 'user_id', 'email'],
+        // BSEC-01 (D-03): email removed — the member-caller branch returns this
+        // roster raw (group.Users), so email here leaked PII to group members.
+        // The game-only branch already strips PII via stripMemberPII.
+        attributes: ['id', 'username', 'user_id'],
         through: { where: { status: 'active' }, attributes: ['role', 'joined_at'] },
       }],
     });
@@ -362,14 +388,22 @@ router.get('/:group_id/users', async (req, res) => {
   }
 });
 
-// Add user to group
+// Add user to group (owner/admin only — BE-044)
 router.post('/:group_id/users', async (req, res) => {
   try {
     const { user_id } = req.body;
-    
+
+    // BE-044 (BSEC-01): gate behind owner/admin. Without this any authenticated
+    // caller could add arbitrary users to any group (object-level authz hole).
+    const callerAuth0Id = req.user?.user_id;
+    const hasPermission = await isOwnerOrAdmin(callerAuth0Id, req.params.group_id);
+    if (!hasPermission) {
+      return res.status(403).json({ error: 'Only owners and admins can add members to a group' });
+    }
+
     const user = await User.findOne({ where: { user_id } });
     const group = await Group.findByPk(req.params.group_id);
-    
+
     if (!user || !group) {
       return res.status(404).json({ error: 'User or Group not found' });
     }
@@ -468,7 +502,13 @@ router.get('/:group_id/invite-token', async (req, res) => {
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    const group = await Group.findByPk(group_id);
+    // BSEC-01 (BE-043): withInviteToken — load-bearing token-stability fix.
+    // The defaultScope excludes invite_token, so a default read would leave
+    // group.invite_token undefined, making `if (!group.invite_token)` ALWAYS
+    // true → the token would regenerate on every QR view (invalidating prior
+    // links). The scope populates the real column so we only generate when
+    // genuinely absent, and so res.json serializes the actual token.
+    const group = await Group.scope('withInviteToken').findByPk(group_id);
     if (!group) {
       return res.status(404).json({ error: 'Group not found' });
     }
@@ -505,7 +545,9 @@ router.post('/:group_id/reset-invite-token', async (req, res) => {
       return res.status(403).json({ error: 'Only owners and admins can reset the invite token' });
     }
 
-    const group = await Group.findByPk(group_id);
+    // BSEC-01 (BE-043): withInviteToken — read the row with invite_token so the
+    // rotated value is set on a fully-hydrated instance and serialized back.
+    const group = await Group.scope('withInviteToken').findByPk(group_id);
     if (!group) {
       return res.status(404).json({ error: 'Group not found' });
     }

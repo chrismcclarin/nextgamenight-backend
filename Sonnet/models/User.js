@@ -72,6 +72,16 @@ const User = sequelize.define('User', {
     allowNull: false,
     defaultValue: false,
   },
+  // Platform-admin entitlement (D-02 / BSEC-02). DB-only, in the sms_enabled
+  // mold: never written by code, never serialized, never settable via
+  // ...req.body. Seeded true for the operator's own row by the migration;
+  // defaults false (fail-safe). Read via .unscoped() + explicit attributes in
+  // requirePlatformAdmin. Distinct from group-level UserGroup.role (owner/admin).
+  is_platform_admin: {
+    type: DataTypes.BOOLEAN,
+    allowNull: false,
+    defaultValue: false,
+  },
   phone_verified: {
     type: DataTypes.BOOLEAN,
     allowNull: false,
@@ -97,6 +107,15 @@ const User = sequelize.define('User', {
   },
 }, {
   timestamps: true,
+  // BSEC-01 / D-03: fail-closed PII default. email/phone are stripped from
+  // every default read; the 18 legitimate readers opt back in via
+  // .scope('withContactInfo') or .unscoped(). is_platform_admin stays
+  // reachable only via .unscoped()/explicit attributes (never serialized).
+  defaultScope: { attributes: { exclude: ['email', 'phone'] } },
+  scopes: {
+    // empty override = restores all attributes (incl. email/phone)
+    withContactInfo: {},
+  },
   indexes: [
     {
       fields: ['user_id']

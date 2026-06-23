@@ -519,7 +519,9 @@ class AvailabilityService {
             availableMembers.push({
               user_id: member.user_id,
               username: member.username,
-              email: member.email,
+              // BSEC-01 (D-03): email removed from the availability heatmap
+              // response — it leaked members' emails to every viewer. The
+              // include still fetches email for internal calendar matching.
             });
           }
         });
