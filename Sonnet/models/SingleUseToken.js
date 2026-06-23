@@ -21,7 +21,11 @@ const SingleUseToken = sequelize.define('SingleUseToken', {
   nonce: {
     type: DataTypes.STRING,
     allowNull: false,
-    unique: true,
+    // Uniqueness is declared ONCE, via the named `single_use_tokens_nonce_unique`
+    // index below — NOT also as a column-level `unique: true`. Declaring both made
+    // sync({force:true}) try to create two unique constraints on `nonce`, which
+    // collides ("relation single_use_tokens_nonce_unique already exists") in the
+    // Jest harness. The named index is the single source of truth.
     // OAuth: crypto.randomBytes(32).base64url server-stored nonce.
     // RSVP: the HMAC token string (the signature layer stays; the row adds exp + single-use).
   },
