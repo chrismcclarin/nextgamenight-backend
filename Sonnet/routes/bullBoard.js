@@ -5,13 +5,17 @@ const { BullMQAdapter } = require('@bull-board/api/bullMQAdapter');
 const { ExpressAdapter } = require('@bull-board/express');
 const { verifyAuth0Token } = require('../middleware/auth0');
 const { requirePlatformAdmin } = require('../middleware/adminAuth');
-const { promptQueue, deadlineQueue, reminderQueue, gcalSyncQueue } = require('../queues');
 
 /**
  * Mount Bull Board dashboard with Auth0 protection
  * @param {Express.Application} app - Express app instance
  */
 function mountBullBoard(app) {
+  // Lazy require (BTEST-04 / review HIGH-3): destructuring queues fires the
+  // queues/index.js getter (which connects Redis). Keep it inside this function
+  // so requiring the route module never connects at import.
+  const { promptQueue, deadlineQueue, reminderQueue, gcalSyncQueue } = require('../queues');
+
   // Create server adapter for Express
   const serverAdapter = new ExpressAdapter();
   serverAdapter.setBasePath('/admin/queues');

@@ -21,7 +21,11 @@
 //     DELETE request, double-fired RSVP change) don't create duplicate jobs.
 
 const { EventParticipation } = require('../models');
-const { gcalSyncQueue } = require('../queues');
+// NOTE (BTEST-04 / round-3 MEDIUM-2): the `{ gcalSyncQueue }` destructure is
+// intentionally NOT at module top. The queues/index.js getter fires on property
+// access, so a module-top destructure here would open a Redis connection at this
+// service's import time. Both enqueue functions below require the queue LAZILY
+// inside their own body so importing the service never connects Redis.
 
 /**
  * Enqueue per-attendee GCal cleanup jobs for an event being cancelled or
@@ -59,6 +63,8 @@ async function enqueueCleanupJobsForEvent({ eventId }) {
       continue;
     }
     try {
+      // Lazy require (BTEST-04): resolve the queue at call time, not import time.
+      const { gcalSyncQueue } = require('../queues');
       await gcalSyncQueue.add(
         'cleanup',
         {
@@ -105,6 +111,10 @@ async function enqueueCleanupJobForAttendee({
     return { enqueued: 0, skipped: 1 };
   }
   try {
+    // Lazy require (BTEST-04 / round-3 MEDIUM-2): this is the function the
+    // plan-04 ring's real-producer test drives — it MUST resolve gcalSyncQueue
+    // from its own in-function require, not a removed module-top const.
+    const { gcalSyncQueue } = require('../queues');
     await gcalSyncQueue.add(
       'cleanup',
       { eventId, eventParticipationId, userId, googleCalendarEventId },

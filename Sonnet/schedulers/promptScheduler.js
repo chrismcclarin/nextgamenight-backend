@@ -7,7 +7,12 @@
 // legacy top-level columns (schedule_day_of_week, schedule_time) are unused
 // and remain NULL on every row. This scheduler reads ONLY from the nested
 // array and registers one BullMQ scheduler per active nested schedule.
-const { promptQueue } = require('../queues');
+// NOTE (BTEST-04 / round-3 MEDIUM): the `{ promptQueue }` destructure is
+// intentionally NOT at module top. This module sits on the prod boot path
+// (server.js -> routes/groupPromptSettings.js -> promptScheduler), so a
+// module-top destructure would fire the queues/index.js getter and connect
+// Redis at app import. Each function that touches promptQueue requires it
+// lazily inside its own body.
 const { GroupPromptSettings } = require('../models');
 const { recordRun } = require('../services/schedulerHealthService');
 
@@ -71,6 +76,8 @@ async function upsertSinglePromptScheduler(settings, schedule) {
   const schedulerId = buildSchedulerId(settings.id, schedule.id);
   const tz = schedule.schedule_timezone || settings.schedule_timezone || 'UTC';
 
+  // Lazy require (BTEST-04): resolve the queue at call time, not import time.
+  const { promptQueue } = require('../queues');
   await promptQueue.upsertJobScheduler(schedulerId, {
     pattern: cronPattern,
     tz
@@ -154,6 +161,8 @@ async function syncPromptSchedulesToQueue() {
     // namespace so we don't accidentally clobber other queues' schedulers.
     let reconciled = 0;
     try {
+      // Lazy require (BTEST-04): resolve the queue at call time, not import time.
+      const { promptQueue } = require('../queues');
       // Page through up to 1000 schedulers — should be more than enough; if a
       // single Redis ever holds more than that we can revisit pagination.
       const existing = await promptQueue.getJobSchedulers(0, 999, true);
@@ -197,6 +206,8 @@ async function removePromptScheduler(settingsId, scheduleId) {
   }
   const schedulerId = buildSchedulerId(settingsId, scheduleId);
   try {
+    // Lazy require (BTEST-04): resolve the queue at call time, not import time.
+    const { promptQueue } = require('../queues');
     await promptQueue.removeJobScheduler(schedulerId);
     console.log(`[PromptScheduler] Removed scheduler ${schedulerId}`);
     return true;

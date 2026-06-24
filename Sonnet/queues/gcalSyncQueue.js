@@ -14,22 +14,41 @@
 // and we don't want ghost entries lingering for the duration of three
 // 10s+ backoffs. removeOnFail=false keeps failed jobs visible in Bull
 // Board for ops debugging (matches existing queues).
+//
+// Lazy connection + queue construction (BTEST-04 / D-03 part 1). See
+// reminderQueue.js for the rationale. Connects on first use, not at require.
 const { Queue } = require('bullmq');
 const Redis = require('ioredis');
 
-const connection = new Redis(process.env.REDIS_URL || 'redis://localhost:6379', {
-  maxRetriesPerRequest: null, // REQUIRED for BullMQ blocking commands
-  enableReadyCheck: false
-});
+let _connection;
+let _queue;
 
-const gcalSyncQueue = new Queue('gcal-sync', {
-  connection,
-  defaultJobOptions: {
-    attempts: 3,                                    // CONTEXT D-RETRY: 3 retries
-    backoff: { type: 'exponential', delay: 1000 }, // CONTEXT D-RETRY: 1s -> 2s -> 4s pattern
-    removeOnComplete: 1000,                         // matches existing queues
-    removeOnFail: false                             // Keep all failed jobs for debugging
+function getConnection() {
+  if (!_connection) {
+    _connection = new Redis(process.env.REDIS_URL || 'redis://localhost:6379', {
+      maxRetriesPerRequest: null, // REQUIRED for BullMQ blocking commands
+      enableReadyCheck: false
+    });
+    // round-2 MEDIUM: no-op error listener so a dead-port construction does not
+    // emit an unhandled 'error' event Node throws.
+    _connection.on('error', () => {});
   }
-});
+  return _connection;
+}
 
-module.exports = gcalSyncQueue;
+function getQueue() {
+  if (!_queue) {
+    _queue = new Queue('gcal-sync', {
+      connection: getConnection(),
+      defaultJobOptions: {
+        attempts: 3,                                    // CONTEXT D-RETRY: 3 retries
+        backoff: { type: 'exponential', delay: 1000 }, // CONTEXT D-RETRY: 1s -> 2s -> 4s pattern
+        removeOnComplete: 1000,                         // matches existing queues
+        removeOnFail: false                             // Keep all failed jobs for debugging
+      }
+    });
+  }
+  return _queue;
+}
+
+module.exports = { getQueue, getConnection };
