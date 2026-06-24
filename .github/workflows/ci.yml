@@ -111,6 +111,20 @@ jobs:
           --health-timeout 5s
           --health-retries 5
 
+      # BTEST-04 / D-03 part 2: throwaway Redis service for the real-Redis
+      # integration ring (npm run test:integration). Mirrors the postgres pin +
+      # health-gate above. Pinned to the official redis:7 tag (T-83.1-06 supply-chain
+      # mitigation). Reachable only on localhost within the job; destroyed at job end.
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     env:
       # DB connection — BOTH forms, so create-database.js (DB_* vars) and the runtime
       # (DATABASE_URL) agree on the same Postgres service container.
@@ -123,6 +137,10 @@ jobs:
       # Signs availability magic JWTs + RSVP HMAC links (services/magicTokenService,
       # routes/rsvp.js). Throwaway CI-only value — must merely exist for boot.
       MAGIC_TOKEN_SECRET: ci-throwaway-magic-token-secret-1f2e3d4c5b6a
+      # BTEST-04 / D-03 part 2: the lazy BullMQ queue connections resolve REDIS_URL
+      # to the redis:7 service container above. Only the integration ring actually
+      # connects (npm test stays Redis-free via testPathIgnorePatterns).
+      REDIS_URL: redis://localhost:6379
 
     steps:
       - name: Checkout
@@ -150,6 +168,15 @@ jobs:
         working-directory: Sonnet
         run: npm run seed
 
+      # `npm test` is the unit+DB suite ONLY — Redis is NOT required here (the
+      # integration ring is excluded via testPathIgnorePatterns in jest.config.js).
       - name: Jest / supertest suite
         working-directory: Sonnet
         run: npm test
+
+      # BTEST-04 / D-03 part 2: the real-Redis integration ring (enqueue -> real
+      # worker -> assert side-effect) runs as a SEPARATE invocation against the
+      # redis:7 service. The test job is green only if BOTH this and `npm test` pass.
+      - name: Integration ring (real-Redis queues)
+        working-directory: Sonnet
+        run: npm run test:integration
