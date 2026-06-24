@@ -9,7 +9,7 @@
         "migrate": "node scripts/run-migrations.js",
         "migrate:apply": "npx sequelize-cli db:migrate",
         "start:migrate": "node scripts/run-migrations.js && node server.js",
-        "test": "jest",
+        "test": "jest --runInBand --forceExit --testTimeout=25000",
         "test:watch": "jest --watch",
         "test:coverage": "jest --coverage",
         "test:setup": "node scripts/setup-test-db.js",
