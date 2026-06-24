@@ -90,6 +90,67 @@ jobs:
           fi
           echo "D-05 backstop passed — no ...req.body mass-assignment spread."
 
+      # ---- 83.1 structural test-hygiene gates (D-01 / D-04 / BTEST-01/02) -------
+      # These enforce the de-poisoned green state from Phase 83.1: no test may
+      # re-introduce a destructive force-sync or a stray sequelize.close(), and the
+      # skip count may only DECREASE (the milestone ratchet to zero). They EXCLUDE
+      # the two legitimate harness files (tests/globalSetup.js owns the one-time
+      # schema sync({force}) + its parent-process close; tests/globalTeardown.js
+      # owns the connection lifecycle close) and FILTER comment lines, so they do
+      # not self-flag the harness or their own explanatory prose.
+
+      - name: "Grep gate — destructive force-sync in tests (D-01 / BTEST-01)"
+        working-directory: Sonnet
+        # Fail if any tests/ file OTHER THAN globalSetup.js contains an uncommented
+        # sequelize.sync({force...}) (with or without the space after `{`). globalSetup.js
+        # is the ONE legitimate one-time schema build (parent process, guarded) and is
+        # excluded — mirroring its close-gate exclusion below.
+        run: |
+          HITS=$(grep -rnE --include='*.js' 'sync\(\{ ?force' tests/ | grep -v 'tests/globalSetup.js' | grep -vE '^[^:]+:[0-9]+:\s*//' || true)
+          if [ -n "$HITS" ]; then
+            echo "::error::Destructive sequelize.sync({force}) in a test file (drops every table) — the schema is built ONCE in tests/globalSetup.js; per-test isolation is the global beforeEach TRUNCATE (D-01 / BTEST-01):"
+            echo "$HITS"
+            exit 1
+          fi
+          echo "Force-sync gate passed — no destructive force-sync outside globalSetup.js."
+
+      - name: "Grep gate — stray sequelize.close() in tests (D-01 / BTEST-02)"
+        working-directory: Sonnet
+        # Fail if any tests/ file OTHER THAN the two harness files contains an
+        # uncommented sequelize.close(). BOTH globalSetup.js (closes its own
+        # parent-process connection after the schema build) and globalTeardown.js
+        # (defensively closes any straggler) legitimately close the connection and
+        # live under tests/, so they MUST be excluded — otherwise this gate reds the
+        # quality job and, because `test` is `needs: quality`, blocks the test job
+        # entirely (DoD impossible). Comment lines are filtered explicitly.
+        run: |
+          HITS=$(grep -rnE 'sequelize\.close' tests/ | grep -vE ':\s*//' | grep -vE 'tests/globalSetup\.js|tests/globalTeardown\.js' || true)
+          if [ -n "$HITS" ]; then
+            echo "::error::sequelize.close() in a test file kills the shared serial connection for every later test — connection lifecycle is owned solely by tests/globalSetup.js + tests/globalTeardown.js (D-01 / BTEST-02):"
+            echo "$HITS"
+            exit 1
+          fi
+          echo "Close gate passed — no stray sequelize.close() outside the harness."
+
+      - name: "Skip-count ratchet — skips may only decrease (D-04)"
+        working-directory: Sonnet
+        # Count REAL skip tags (the `// SKIP(<plan>)` defer convention), NOT bare
+        # `SKIP(` substrings, and fail if the current count EXCEEDS the committed
+        # baseline. Skips only go DOWN — each future BE phase un-skips the tests
+        # tagged for it; the count MUST hit 0 when v2.0 closes. The baseline lives
+        # in tests/.skip-baseline (currently 5: the SKIP(87) lists deferrals owned
+        # by Phase 87 Data Integrity).
+        run: |
+          BASELINE=$(cat tests/.skip-baseline)
+          CURRENT=$(grep -rhoE '//\s*SKIP\(' tests/ | wc -l | tr -d ' ')
+          echo "Skip ratchet: baseline=$BASELINE current=$CURRENT"
+          if [ "$CURRENT" -gt "$BASELINE" ]; then
+            echo "::error::Skip count rose from $BASELINE (tests/.skip-baseline) to $CURRENT. Skips only go down — un-skip a test or, if a NEW defer is unavoidable, tag it // SKIP(<owning-plan>) AND lower the baseline only when its owner lands. Current SKIP tags:"
+            grep -rnE '//\s*SKIP\(' tests/
+            exit 1
+          fi
+          echo "Skip ratchet passed — skip count ($CURRENT) is at or below baseline ($BASELINE)."
+
   test:
     name: test
     needs: quality # D-06: the Jest suite only runs after the fast grep gate is green
