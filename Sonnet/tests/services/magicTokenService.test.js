@@ -198,13 +198,7 @@ describe('magicTokenService', () => {
       expect(result.reason).toBe('invalid_token');
     });
 
-    // SKIP(83.1-05): validateToken only increments usage_count when called with
-    // { consume: true }; this test calls validateToken(token) without it and
-    // asserts usage_count === 1. Plan 05 owns the {consume:true} assertion fix
-    // (it updates either the service's default or this test's call site). This
-    // plan (01) only owns the DB-isolation harness + beforeAll->beforeEach
-    // conversion. Un-skip + fix is plan 05's DoD line.
-    it.skip('updates usage tracking on successful validation', async () => {
+    it('updates usage tracking on successful validation', async () => {
       const token = await generateToken(testUser, testPrompt);
       const decoded = jwt.decode(token);
 
@@ -213,8 +207,12 @@ describe('magicTokenService', () => {
       expect(beforeRecord.usage_count).toBe(0);
       expect(beforeRecord.last_used_at).toBeNull();
 
-      // Validate token
-      await validateToken(token);
+      // usage_count only increments when the caller opts into consumption.
+      // validateToken(token, formLoadedAt, { consume }) — magicTokenService.js:81/107.
+      // The increment-on-consume design is intentional (Open Q2 RESOLVED), so the
+      // test must pass { consume: true } rather than expecting a bare validate to
+      // mutate usage_count.
+      await validateToken(token, null, { consume: true });
 
       // Check updated record
       const afterRecord = await MagicToken.findOne({ where: { token_id: decoded.jti } });

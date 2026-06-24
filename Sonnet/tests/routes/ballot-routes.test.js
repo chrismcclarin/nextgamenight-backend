@@ -96,22 +96,12 @@ describe('Server mounts ballot routes', () => {
   });
 });
 
-describe('Frontend ballotAPI client', () => {
-  it('should have ballotAPI export in api.js', () => {
-    const fs = require('fs');
-    const path = require('path');
-    const apiCode = fs.readFileSync(
-      path.join(__dirname, '../../../../periodictabletop/src/lib/api.js'),
-      'utf-8'
-    );
-    expect(apiCode).toContain('ballotAPI');
-    expect(apiCode).toContain('getBallot');
-    expect(apiCode).toContain('setBallotOptions');
-    expect(apiCode).toContain('updateBallotOptions');
-    expect(apiCode).toContain('toggleVote');
-    expect(apiCode).toContain('resolveTie');
-  });
-});
+// NOTE: the former 'Frontend ballotAPI client' describe block read a FRONTEND
+// lib file in a DIFFERENT repo (the poly-repo split). That file is absent on a
+// clean backend checkout, so the assertion threw ENOENT and reddened the suite
+// in CI. Backend tests stay in the backend repo; the frontend client surface is
+// the frontend repo's concern. Block removed (cross-repo coupling, not a
+// backend-greening fix).
 
 // POLL-06 (Phase 71-03): gate-coverage tests on the vote handler.
 // Verifies the belt-and-suspenders gate is structurally present in

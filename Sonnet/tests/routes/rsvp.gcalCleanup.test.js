@@ -29,6 +29,8 @@ const mockEventBringDestroy = jest.fn();
 const mockEventFindByPk = jest.fn();
 const mockUserFindOne = jest.fn();
 const mockEventParticipationFindOne = jest.fn();
+const mockSingleUseTokenConsumeByNonce = jest.fn();
+const mockSingleUseTokenUpdate = jest.fn();
 
 jest.mock('../../models', () => ({
   EventRsvp: {
@@ -49,6 +51,14 @@ jest.mock('../../models', () => ({
   Group: {},
   EventParticipation: {
     findOne: (...args) => mockEventParticipationFindOne(...args),
+  },
+  // BSEC-03 single-use gate: the GET /respond magic-link path atomically
+  // consumes the matching SingleUseToken row by nonce. Without this mock the
+  // route hit `SingleUseToken.consumeByNonce` undefined -> 500 (NOT a Redis
+  // issue) and every magic-link test returned 500 instead of 200.
+  SingleUseToken: {
+    consumeByNonce: (...args) => mockSingleUseTokenConsumeByNonce(...args),
+    update: (...args) => mockSingleUseTokenUpdate(...args),
   },
 }));
 
@@ -315,6 +325,16 @@ describe('POST /api/rsvp/ — Phase 75 / Plan 04 GCal cleanup dispatch', () => {
 describe('GET /api/rsvp/respond — Phase 75 / Plan 04 GCal cleanup dispatch', () => {
   function magicLinkUrl(status) {
     const token = generateRsvpToken(TEST_EVENT_ID, TEST_USER_ID_AUTH0, status);
+    // BSEC-03 single-use gate: the route consumes the nonce and validates it
+    // against (purpose, event_id, user_id, rsvp_status). Return the matching
+    // active row so the link is accepted (no email_batch_id -> no revoke fan-out).
+    mockSingleUseTokenConsumeByNonce.mockResolvedValueOnce({
+      purpose: 'rsvp',
+      event_id: TEST_EVENT_ID,
+      user_id: TEST_USER_ID_AUTH0,
+      rsvp_status: status,
+      email_batch_id: null,
+    });
     return `/api/rsvp/respond?token=${token}&e=${TEST_EVENT_ID}&u=${encodeURIComponent(TEST_USER_ID_AUTH0)}&s=${status}`;
   }
 
