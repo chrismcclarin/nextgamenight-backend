@@ -73,9 +73,9 @@ describe('Group leave cascade (Phase 71.1-02)', () => {
     await Game.destroy({ where: { is_custom: true, name: 'CascadeTestGame' } });
   }
 
-  beforeAll(async () => {
-    await sequelize.sync();
-  });
+  // Schema is built once by the plan-01 globalSetup (D-02); a per-suite
+  // sequelize.sync() is redundant here and a stray no-arg sync can race the
+  // harness, so it has been removed (owned by plan 83.1-03).
 
   // Note: do NOT call sequelize.close() in afterAll — tests/setup.js owns the
   // shared connection lifecycle. Closing here would break other test files

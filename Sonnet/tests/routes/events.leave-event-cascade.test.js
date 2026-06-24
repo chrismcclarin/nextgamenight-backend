@@ -79,9 +79,9 @@ describe('Leave-event cascade (Phase 71.1-02)', () => {
     await Game.destroy({ where: { is_custom: true, name: 'LeaveEvtCascadeGame' } });
   }
 
-  beforeAll(async () => {
-    await sequelize.sync();
-  });
+  // Schema is built once by the plan-01 globalSetup (D-02); a per-suite
+  // sequelize.sync() is redundant here and a stray no-arg sync can race the
+  // harness, so it has been removed (owned by plan 83.1-03).
 
   beforeEach(async () => {
     await clearAll();

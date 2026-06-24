@@ -2,101 +2,78 @@
 const request = require('supertest');
 const express = require('express');
 const eventRoutes = require('../../routes/events');
-const { Event, Game, User, Group, EventParticipation, UserGroup, sequelize } = require('../../models');
+const { Event, Game, User, Group, EventParticipation, UserGroup } = require('../../models');
+const { makeUser, makeGroup, addToGroup } = require('../factories');
 
-// Create test app
-const app = express();
-app.use(express.json());
-app.use('/api/events', eventRoutes);
+// The event routes derive the actor from req.user (BE-040/BE-044 / BSEC-01
+// default-deny authz, Phase 83) and always membership-check. Build a per-test
+// app that injects req.user ahead of the router (mirrors authStub.js + the
+// leave-cascade suites). Without it every handler short-circuits at 401.
+function makeApp(actor) {
+  const app = express();
+  app.use(express.json());
+  app.use((req, _res, next) => {
+    req.user = actor ? { user_id: actor.user_id, email: actor.email } : undefined;
+    next();
+  });
+  app.use('/api/events', eventRoutes);
+  return app;
+}
 
 describe('Event Routes', () => {
   let testUser1, testUser2, testGroup, testGame;
 
-  // Setup test data before all tests
-  beforeAll(async () => {
-    testUser1 = await User.create({
-      user_id: 'test-user-events-1',
-      username: 'testuser1',
-      email: 'test1@example.com'
-    });
+  // Seed in beforeEach so fixtures survive the global per-test TRUNCATE
+  // (plan-01 isolation harness). Connection lifecycle is owned by
+  // tests/globalTeardown.js — this suite never calls sequelize.close().
+  // testUser1 is the group OWNER (passes member + owner/admin gates);
+  // testUser2 is a non-member (used for the 403 path).
+  beforeEach(async () => {
+    testUser1 = await makeUser({ user_id: 'test-user-events-1', username: 'testuser1' });
+    testUser2 = await makeUser({ user_id: 'test-user-events-2', username: 'testuser2' });
 
-    testUser2 = await User.create({
-      user_id: 'test-user-events-2',
-      username: 'testuser2',
-      email: 'test2@example.com'
-    });
-
-    testGroup = await Group.create({
-      group_id: 'test-group-events-1',
-      name: 'Test Group'
-    });
+    testGroup = await makeGroup({ group_id: 'test-group-events-1', name: 'Test Group' });
 
     testGame = await Game.create({
       name: 'Test Game',
       is_custom: true
     });
 
-    // Add user1 to group
-    await UserGroup.create({
-      user_id: testUser1.id,
-      group_id: testGroup.id
-    });
-  });
-
-  // Note: We don't clean up before each test to allow tests to build on each other
-  // Each test creates its own data
-
-  afterAll(async () => {
-    await EventParticipation.destroy({ where: {} });
-    await Event.destroy({ where: {} });
-    await UserGroup.destroy({ where: {} });
-    await Group.destroy({ where: {} });
-    await User.destroy({ where: {} });
-    await Game.destroy({ where: {} });
-    await sequelize.close();
+    // testUser1 is the owner of the group (Auth0 string user_id via factory).
+    await addToGroup(testUser1, testGroup, 'owner');
   });
 
   describe('GET /api/events/group/:group_id', () => {
-    it('should get all events for a group', async () => {
-      // Create event for this test
-      const event = await Event.create({
+    it('should get all events for a group (member access)', async () => {
+      await Event.create({
         group_id: testGroup.id,
         game_id: testGame.id,
         start_date: new Date(),
         status: 'completed'
       });
 
-      const response = await request(app)
+      const response = await request(makeApp(testUser1))
         .get(`/api/events/group/${testGroup.id}`)
         .expect(200);
 
       expect(Array.isArray(response.body)).toBe(true);
-      // Clean up
-      await Event.destroy({ where: { id: event.id } });
     });
 
-    it('should return 403 if user_id provided but user not in group', async () => {
-      const response = await request(app)
-        .get(`/api/events/group/${testGroup.id}?user_id=${testUser2.user_id}`)
+    it('should return 403 if actor not in group', async () => {
+      const response = await request(makeApp(testUser2))
+        .get(`/api/events/group/${testGroup.id}`)
         .expect(403);
 
       expect(response.body).toHaveProperty('error');
       expect(response.body.error).toBe('Access denied to this group');
     });
 
-    it('should return events if user_id provided and user is in group', async () => {
-      const event = await Event.create({
-        group_id: testGroup.id,
-        game_id: testGame.id,
-        start_date: new Date(),
-        status: 'completed'
-      });
+    it('should return 401 if unauthenticated', async () => {
+      const response = await request(makeApp(null))
+        .get(`/api/events/group/${testGroup.id}`)
+        .expect(401);
 
-      const response = await request(app)
-        .get(`/api/events/group/${testGroup.id}?user_id=${testUser1.user_id}`)
-        .expect(200);
-
-      expect(Array.isArray(response.body)).toBe(true);
+      expect(response.body.error).toBe('Unauthorized');
     });
   });
 
@@ -109,7 +86,7 @@ describe('Event Routes', () => {
         duration_minutes: 60
       };
 
-      const response = await request(app)
+      const response = await request(makeApp(testUser1))
         .post('/api/events')
         .send(eventData)
         .expect(200);
@@ -117,9 +94,6 @@ describe('Event Routes', () => {
       expect(response.body).toHaveProperty('id');
       expect(response.body.group_id).toBe(testGroup.id);
       expect(response.body.game_id).toBe(testGame.id);
-      
-      // Clean up
-      await Event.destroy({ where: { id: response.body.id } });
     });
 
     it('should create event with participants', async () => {
@@ -129,6 +103,7 @@ describe('Event Routes', () => {
         start_date: new Date().toISOString(),
         participants: [
           {
+            // EventParticipation.user_id is a UUID (User.id) — correct to use .id here.
             user_id: testUser1.id,
             score: 100,
             placement: 1
@@ -136,7 +111,7 @@ describe('Event Routes', () => {
         ]
       };
 
-      const response = await request(app)
+      const response = await request(makeApp(testUser1))
         .post('/api/events')
         .send(eventData)
         .expect(200);
@@ -145,11 +120,18 @@ describe('Event Routes', () => {
       expect(response.body.EventParticipations.length).toBe(1);
     });
 
-    it('should return 500 if required fields are missing', async () => {
-      const response = await request(app)
+    it('should return 403 if actor not a member of the group', async () => {
+      const eventData = {
+        group_id: testGroup.id,
+        game_id: testGame.id,
+        start_date: new Date().toISOString(),
+        duration_minutes: 60
+      };
+
+      const response = await request(makeApp(testUser2))
         .post('/api/events')
-        .send({})
-        .expect(500);
+        .send(eventData)
+        .expect(403);
 
       expect(response.body).toHaveProperty('error');
     });
@@ -169,7 +151,7 @@ describe('Event Routes', () => {
         comments: 'Updated comment'
       };
 
-      const response = await request(app)
+      const response = await request(makeApp(testUser1))
         .put(`/api/events/${event.id}`)
         .send(updateData)
         .expect(200);
@@ -188,32 +170,33 @@ describe('Event Routes', () => {
 
       await EventParticipation.create({
         event_id: event.id,
-        user_id: testUser1.id,
+        user_id: testUser1.id, // EventParticipation.user_id is UUID — correct.
         score: 50
       });
 
       const updateData = {
         participants: [
           {
-            user_id: testUser1.id,
+            user_id: testUser1.id, // UUID — correct.
             score: 100,
             placement: 1
           }
         ]
       };
 
-      const response = await request(app)
+      const response = await request(makeApp(testUser1))
         .put(`/api/events/${event.id}`)
         .send(updateData)
         .expect(200);
 
       expect(response.body.EventParticipations.length).toBe(1);
-      expect(response.body.EventParticipations[0].score).toBe(100);
+      // score is DECIMAL(10,2); pg/Sequelize serializes it as a string.
+      expect(Number(response.body.EventParticipations[0].score)).toBe(100);
     });
 
     it('should return 404 if event not found', async () => {
       const fakeId = '00000000-0000-0000-0000-000000000000';
-      const response = await request(app)
+      const response = await request(makeApp(testUser1))
         .put(`/api/events/${fakeId}`)
         .send({ duration_minutes: 120 })
         .expect(404);
@@ -231,7 +214,7 @@ describe('Event Routes', () => {
         status: 'completed'
       });
 
-      const response = await request(app)
+      const response = await request(makeApp(testUser1))
         .delete(`/api/events/${event.id}`)
         .expect(200);
 
@@ -252,11 +235,11 @@ describe('Event Routes', () => {
 
       await EventParticipation.create({
         event_id: event.id,
-        user_id: testUser1.id,
+        user_id: testUser1.id, // UUID — correct.
         score: 100
       });
 
-      await request(app)
+      await request(makeApp(testUser1))
         .delete(`/api/events/${event.id}`)
         .expect(200);
 
@@ -269,7 +252,7 @@ describe('Event Routes', () => {
 
     it('should return 404 if event not found', async () => {
       const fakeId = '00000000-0000-0000-0000-000000000000';
-      const response = await request(app)
+      const response = await request(makeApp(testUser1))
         .delete(`/api/events/${fakeId}`)
         .expect(404);
 
@@ -277,4 +260,3 @@ describe('Event Routes', () => {
     });
   });
 });
-
