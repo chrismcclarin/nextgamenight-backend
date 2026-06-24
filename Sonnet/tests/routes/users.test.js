@@ -28,9 +28,8 @@ describe('User Routes', () => {
     await Group.destroy({ where: {} });
   });
 
-  afterAll(async () => {
-    await sequelize.close();
-  });
+  // NOTE: no afterAll(sequelize.close()) — connection lifecycle is owned by
+  // tests/globalTeardown.js (BTEST-02).
 
   describe('POST /api/users (self-upsert — BE-049)', () => {
     it('should create the authenticated user from the verified JWT', async () => {

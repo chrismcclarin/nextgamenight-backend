@@ -17,22 +17,14 @@ const { SingleUseToken, User, sequelize } = require('../../models');
 const TEST_USER_ID = 'auth0|single-use-test';
 
 describe('SingleUseToken atomic single-use consume', () => {
-  beforeAll(async () => {
-    await sequelize.sync({ force: true });
-    // single_use_tokens.user_id has a FK to Users.user_id — seed the referenced
-    // user, or every mint fails the foreign-key constraint.
+  // Schema built once by tests/globalSetup.js; global beforeEach TRUNCATEs all
+  // tables. single_use_tokens.user_id has a FK to Users.user_id — seed the
+  // referenced user per-test (beforeEach), or every mint fails the FK constraint.
+  beforeEach(async () => {
     await User.findOrCreate({
       where: { user_id: TEST_USER_ID },
       defaults: { user_id: TEST_USER_ID, username: 'single-use-test', email: 'single-use-test@example.com' },
     });
-  });
-
-  afterAll(async () => {
-    await sequelize.close();
-  });
-
-  beforeEach(async () => {
-    await SingleUseToken.destroy({ where: {} });
   });
 
   function newNonce() {

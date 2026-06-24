@@ -34,20 +34,9 @@ describe('BSEC-01 Group invite_token defaultScope + stability', () => {
   let owner;
   let group;
 
-  const cleanup = async () => {
-    // UserGroup.group_id is a UUID (Group.id), so we must resolve the group's
-    // UUID by its string group_id before deleting its memberships.
-    const existing = await Group.findOne({ where: { group_id: 'bsec01-invite-group' } });
-    if (existing) {
-      await UserGroup.destroy({ where: { group_id: existing.id } });
-      await Group.destroy({ where: { id: existing.id } });
-    }
-    await User.destroy({ where: { user_id: 'auth0|bsec01-invite-owner' } });
-  };
-
-  beforeAll(async () => {
-    await cleanup();
-
+  // Schema built once by tests/globalSetup.js; the global beforeEach TRUNCATEs
+  // all tables, so the owner/group/membership must be seeded per-test.
+  beforeEach(async () => {
     owner = await User.create({
       user_id: 'auth0|bsec01-invite-owner',
       username: 'invite-owner',
@@ -65,14 +54,7 @@ describe('BSEC-01 Group invite_token defaultScope + stability', () => {
       role: 'owner',
       status: 'active',
     });
-  });
 
-  afterAll(async () => {
-    await cleanup();
-    await sequelize.close();
-  });
-
-  beforeEach(() => {
     currentActor = owner.user_id;
   });
 
@@ -91,6 +73,11 @@ describe('BSEC-01 Group invite_token defaultScope + stability', () => {
   });
 
   it('Test 2b: .unscoped() read includes invite_token', async () => {
+    // Ensure a token exists first via the lazy-generate endpoint. (Previously
+    // this test relied on Test 2a's token leaking across the shared beforeAll
+    // fixture; under per-test TRUNCATE each test gets a fresh group, so we must
+    // generate the token within this test.)
+    await request(app).get(`/api/groups/${group.id}/invite-token`).expect(200);
     const row = await Group.unscoped().findByPk(group.id);
     expect(row.invite_token).toBeTruthy();
   });

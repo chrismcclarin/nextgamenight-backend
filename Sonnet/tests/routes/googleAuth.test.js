@@ -53,17 +53,10 @@ app.use((req, _res, next) => {
 app.use('/api/auth', googleAuthRoutes);
 
 describe('Google OAuth single-use nonce state (D-04 / BSEC-03)', () => {
-  beforeAll(async () => {
-    await sequelize.sync({ force: true });
-    await User.create({ user_id: 'auth0|gauth-test-user', username: 'GAuth Tester', email: 'gauth@test.com' });
-  });
-
-  afterAll(async () => {
-    await sequelize.close();
-  });
-
+  // Schema built once by tests/globalSetup.js; global beforeEach TRUNCATEs all
+  // tables, so the User fixture must be seeded per-test (beforeEach).
   beforeEach(async () => {
-    await SingleUseToken.destroy({ where: {} });
+    await User.create({ user_id: 'auth0|gauth-test-user', username: 'GAuth Tester', email: 'gauth@test.com' });
     mockGetToken.mockReset();
     mockGenerateAuthUrl.mockClear();
   });

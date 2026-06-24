@@ -23,8 +23,10 @@ const {
 describe('All-unavailable deadline processing', () => {
   let testGroup, testPrompt, testUsers;
 
-  beforeAll(async () => {
-    await sequelize.sync({ force: true });
+  beforeEach(async () => {
+    // Schema is built once by tests/globalSetup.js; the global beforeEach in
+    // tests/setup.js TRUNCATEs all tables before each test, so this seed must run
+    // in beforeEach (not beforeAll) to survive the per-test wipe.
 
     // Mock emailService.send to avoid real email calls
     jest.spyOn(require('../../services/emailService'), 'send').mockResolvedValue({ success: true });

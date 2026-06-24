@@ -32,9 +32,9 @@ app.use('/api/availability-responses', availabilityResponseRoutes);
 describe('Concurrent availability response submissions', () => {
   let testUser, testGroup, testPrompt, validJwt, tokenId;
 
-  beforeAll(async () => {
-    await sequelize.sync({ force: true });
-
+  beforeEach(async () => {
+    // Seed in beforeEach so the rows survive the global per-test TRUNCATE
+    // (schema is built once by tests/globalSetup.js).
     testUser = await User.create({
       user_id: 'auth0|concurrent-submit-user',
       username: 'Concurrent Submit User',

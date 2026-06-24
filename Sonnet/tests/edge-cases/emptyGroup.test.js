@@ -15,8 +15,9 @@ const { Group, AvailabilityPrompt, AvailabilityResponse, AvailabilitySuggestion,
 describe('Empty group aggregation handling', () => {
   let testGroup, testPrompt;
 
-  beforeAll(async () => {
-    await sequelize.sync({ force: true });
+  beforeEach(async () => {
+    // Seed in beforeEach so the rows survive the global per-test TRUNCATE
+    // (schema is built once by tests/globalSetup.js).
 
     // Create a group with no members
     testGroup = await Group.create({

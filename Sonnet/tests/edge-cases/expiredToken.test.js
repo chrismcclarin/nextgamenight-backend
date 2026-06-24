@@ -17,9 +17,9 @@ const { User, Group, AvailabilityPrompt, MagicToken, sequelize } = require('../.
 describe('Expired magic token handling', () => {
   let testUser, testGroup, testPrompt;
 
-  beforeAll(async () => {
-    await sequelize.sync({ force: true });
-
+  beforeEach(async () => {
+    // Seed in beforeEach so the rows survive the global per-test TRUNCATE
+    // (schema is built once by tests/globalSetup.js).
     testUser = await User.create({
       user_id: 'auth0|expired-token-test',
       username: 'Expired Token Test User',

@@ -50,9 +50,8 @@ describe('GET /api/users/:user_id — auto-create timezone persistence (TZ-01)',
     await Group.destroy({ where: {} });
   });
 
-  afterAll(async () => {
-    await sequelize.close();
-  });
+  // NOTE: no afterAll(sequelize.close()) — connection lifecycle is owned by
+  // tests/globalTeardown.js (BTEST-02).
 
   it('persists a valid IANA timezone on first creation when supplied as query param', async () => {
     const userId = 'auth0|tz-create-1';
