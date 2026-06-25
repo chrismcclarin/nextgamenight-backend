@@ -36,9 +36,15 @@ for (const [name, mod] of queueExports) {
   });
 }
 
-// `connection` historically exposed the shared Redis connection for
-// monitoring/admin. Resolve it lazily from the reminderQueue module's
-// connection so no Redis connects at import.
+// `connection` historically exposed a DEDICATED admin/monitoring Redis
+// connection (separate from the queues). It is now intentionally an ALIAS of the
+// reminderQueue module's connection, resolved lazily so no Redis connects at
+// import (WR-01). The pre-refactor connection's resilience/observability —
+// retryStrategy (exp backoff, 20s cap) + error logging — now lives on each
+// queue's getConnection(), so the alias retains that behavior. Trade-off: there
+// is no longer a connection distinct from the producers, so quitting one affects
+// the other. No current consumer reads this export, so the collapse is safe; if a
+// future admin tool needs an isolated connection, build a dedicated lazy one here.
 Object.defineProperty(module.exports, 'connection', {
   get: () => require('./reminderQueue').getConnection(),
   enumerable: true,

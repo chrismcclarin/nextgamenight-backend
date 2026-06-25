@@ -12,8 +12,18 @@
 // repo's "mock-a-boundary / No DB, no Redis" convention
 // (tests/routes/rsvp.gcalCleanup.test.js, tests/services/gcalCleanupService.test.js).
 
+// WR-03: mirror the full Queue surface that prod consumers actually call so a suite
+// activating this mock exercises a faithful double, not a divergent one:
+//  - add (enqueue assertions)
+//  - getJobCounts (routes/adminMetrics.js)
+//  - upsertJobScheduler / getJobSchedulers / removeJobScheduler (schedulers/promptScheduler.js)
+//  - close (teardown)
 const stubQueue = () => ({
   add: jest.fn().mockResolvedValue({ id: 'mock-job' }),
+  getJobCounts: jest.fn().mockResolvedValue({}),
+  upsertJobScheduler: jest.fn().mockResolvedValue({}),
+  getJobSchedulers: jest.fn().mockResolvedValue([]),
+  removeJobScheduler: jest.fn().mockResolvedValue(undefined),
   close: jest.fn(),
 });
 
