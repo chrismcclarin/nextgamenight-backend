@@ -57,22 +57,14 @@ describe('RSVP single-use magic links (D-04 / BSEC-03)', () => {
   let testGame;
   let futureEvent;
 
-  beforeAll(async () => {
-    await sequelize.sync({ force: true });
-
+  // NOTE: schema is built once by tests/globalSetup.js; the global beforeEach in
+  // tests/setup.js TRUNCATEs every table before each test. The FK parents
+  // (User/Group/Game) MUST be re-seeded in beforeEach ABOVE the Event create, or
+  // the per-test wipe leaves futureEvent's FK targets missing from test 2 onward.
+  beforeEach(async () => {
     await User.create({ user_id: USER_ID, username: 'RSVP Tester', email: 'rsvp@test.com' });
     testGroup = await Group.create({ name: 'RSVP Group', group_id: 'rsvp-test-group-001' });
     testGame = await Game.create({ name: 'Test Game' });
-  });
-
-  afterAll(async () => {
-    await sequelize.close();
-  });
-
-  beforeEach(async () => {
-    await SingleUseToken.destroy({ where: {} });
-    await EventRsvp.destroy({ where: {} });
-    await Event.destroy({ where: {} });
 
     futureEvent = await Event.create({
       group_id: testGroup.id,

@@ -60,9 +60,8 @@ describe('GET /api/users/:user_id — null-timezone backfill (TZ-01)', () => {
     mockSentryCaptureException.mockClear();
   });
 
-  afterAll(async () => {
-    await sequelize.close();
-  });
+  // NOTE: no afterAll(sequelize.close()) — connection lifecycle is owned by
+  // tests/globalTeardown.js (BTEST-02).
 
   it('backfills timezone when user exists with timezone=null and valid TZ supplied', async () => {
     const userId = 'auth0|tz-backfill-1';

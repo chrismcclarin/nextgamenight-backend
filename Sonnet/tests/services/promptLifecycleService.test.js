@@ -6,16 +6,33 @@
 // and the LOCKED recipient resolution rule (D-ADAPT-05 + D-SCHEMA-06).
 
 // Mock models module before requiring the service.
-jest.mock('../../models', () => ({
-  AvailabilityPrompt: { findByPk: jest.fn() },
-  AvailabilityResponse: { count: jest.fn(), findAll: jest.fn() },
-  AvailabilitySuggestion: { findAll: jest.fn() },
-  UserGroup: { count: jest.fn(), findOne: jest.fn() },
-  Group: { findByPk: jest.fn() },
-  GroupPromptSettings: { findByPk: jest.fn() },
-  User: { findByPk: jest.fn(), findOne: jest.fn() },
-  Game: { findByPk: jest.fn() },
-}));
+jest.mock('../../models', () => {
+  // BSEC-01 / D-03: the service resolves the email recipient via
+  // `User.scope('withContactInfo').findByPk(...)` (promptLifecycleService.js:122/133)
+  // and `User.scope('withContactInfo').findOne(...)` (L143). The scope was added
+  // by the PII-defaultScope work 83-06 shipped. The mock's User must be CHAINABLE:
+  // `User.scope(...)` returns an object whose findByPk/findOne are the SAME jest.fns
+  // the tests configure via `User.findByPk.mockImplementation(...)`, so the existing
+  // setups AND `expect(User.findByPk).toHaveBeenCalledWith(...)` assertions stay valid.
+  // Without this, `User.scope` is undefined -> throws -> handlePromptClosed swallows it
+  // at L234 -> the email never dispatches (the dominant cause of the 6 failing tests).
+  const userFindByPk = jest.fn();
+  const userFindOne = jest.fn();
+  return {
+    AvailabilityPrompt: { findByPk: jest.fn() },
+    AvailabilityResponse: { count: jest.fn(), findAll: jest.fn() },
+    AvailabilitySuggestion: { findAll: jest.fn() },
+    UserGroup: { count: jest.fn(), findOne: jest.fn() },
+    Group: { findByPk: jest.fn() },
+    GroupPromptSettings: { findByPk: jest.fn() },
+    User: {
+      findByPk: userFindByPk,
+      findOne: userFindOne,
+      scope: jest.fn(() => ({ findByPk: userFindByPk, findOne: userFindOne })),
+    },
+    Game: { findByPk: jest.fn() },
+  };
+});
 
 // We deliberately do NOT mock generatePollClosedEmailTemplate so Tests 8/9
 // can assert on real HTML output. send() is mocked so we never call Resend.
@@ -439,17 +456,22 @@ describe('emailService.generatePollClosedEmailTemplate', () => {
     expect(result).toHaveProperty('subject');
     expect(result.html).toContain('Tabletop Crew');
     expect(result.html).toContain('Catan');
-    expect(result.html).toContain('Schedule it?');
-    // CTA URL contains the deep-link query params expected by createEvent.js.
-    expect(result.html).toContain('prefillDate=');
-    expect(result.html).toContain('prefillTime=');
+    // Canonical CTA (Phase 71.2 / Plan 03 hotfix, emailService.js:462-483):
+    // the template was collapsed to ONE "Schedule a session" CTA that deep-links
+    // to /groupPlanning with group_id + prompt_id (the modal renders a heatmap
+    // restricted to this poll, so per-slot prefillDate/prefillTime are no longer
+    // emitted). The old "Schedule it?" + prefillDate/prefillTime assertions were
+    // stale relative to the shipped single-CTA design — current output is canonical.
+    expect(result.html).toContain('Schedule a session');
+    expect(result.html).toContain('prompt_id=prompt-uuid-1');
+    expect(result.html).toContain('group_id=group-uuid-1');
     expect(result.subject).toContain('Tabletop Crew');
   });
 
-  it('Test 9: multi-tie template renders all slots with separate CTAs ordered by suggested_start ASC', () => {
+  it('Test 9: multi-tie template sorts slots ASC and previews the earliest tied slot under one CTA', () => {
     const earlier = new Date('2026-05-10T18:00:00Z');
     const later = new Date('2026-05-12T19:00:00Z');
-    // Provide ties NOT in chronological order — template must sort.
+    // Provide ties NOT in chronological order — template must sort (emailService.js:403).
     const result = realEmailService.generatePollClosedEmailTemplate({
       recipientName: 'Bob',
       groupName: 'Tabletop Crew',
@@ -464,15 +486,16 @@ describe('emailService.generatePollClosedEmailTemplate', () => {
       timezone: 'UTC',
     });
 
-    // Earlier slot's prefillDate should appear before the later one in the HTML
-    // (renders in chronological order, with multiple CTAs).
-    const earlierIso = earlier.toISOString().slice(0, 10);
-    const laterIso = later.toISOString().slice(0, 10);
-    expect(result.html).toContain(earlierIso);
-    expect(result.html).toContain(laterIso);
-    expect(result.html.indexOf(earlierIso)).toBeLessThan(result.html.indexOf(laterIso));
-    // At least one Schedule it? CTA per slot.
-    const ctaMatches = result.html.match(/Schedule it\?/g) || [];
-    expect(ctaMatches.length).toBeGreaterThanOrEqual(2);
+    // Canonical single-CTA design (Plan 03 hotfix): the template no longer renders
+    // one CTA per slot with bare ISO dates. It sorts the ties chronologically and
+    // previews the EARLIEST tied slot (sortedSlots[0]) in human-readable form, with
+    // a "N times tied for best — top: ..." line and a single CTA. The old per-slot
+    // ISO-date ordering assertion was stale relative to the shipped design.
+    expect(result.html).toContain('2 times tied for best');
+    // The previewed top slot is the EARLIER one, rendered in human-readable form.
+    expect(result.html).toContain('May 10'); // earlier slot's day label (UTC tz)
+    // Exactly one collapsed CTA.
+    const ctaMatches = result.html.match(/Schedule a session/g) || [];
+    expect(ctaMatches.length).toBe(1);
   });
 });

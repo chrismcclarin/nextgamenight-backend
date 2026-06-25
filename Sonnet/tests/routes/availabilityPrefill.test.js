@@ -42,8 +42,14 @@ describe('POST /api/availability-prefill/gcal', () => {
   let testPrompt;
   let connectedToken;
 
-  beforeAll(async () => {
-    await sequelize.sync({ force: true });
+  // Schema built once by tests/globalSetup.js; the global beforeEach TRUNCATEs
+  // all tables before each test. These /gcal fixtures MUST be re-seeded in this
+  // describe-local beforeEach (NOT beforeAll) or they are wiped before the 2nd
+  // test of this block (round-3 MEDIUM-3). The sync({force}) is gone — globalSetup
+  // owns the schema build.
+  beforeEach(async () => {
+    googleCalendarService.getBusyTimesForDateRange.mockReset();
+    googleCalendarService.getBusyTimesForDateRange.mockResolvedValue([]);
 
     connectedUser = await User.create({
       user_id: 'auth0|prefill-connected',
@@ -76,16 +82,6 @@ describe('POST /api/availability-prefill/gcal', () => {
     });
 
     connectedToken = await generateToken(connectedUser, testPrompt);
-  });
-
-  // NOTE: sequelize.close() moved to the trailing top-level afterAll so it
-  // runs AFTER the CHKIN-06 /saved describe block below. Closing here would
-  // tear down the connection mid-suite.
-
-  beforeEach(async () => {
-    googleCalendarService.getBusyTimesForDateRange.mockReset();
-    googleCalendarService.getBusyTimesForDateRange.mockResolvedValue([]);
-    await TokenAnalytics.destroy({ where: {} });
   });
 
   // ------------------------------------------------------------------
@@ -319,9 +315,12 @@ describe('POST /api/availability-prefill/saved', () => {
   let overrideToken;
   let emptyToken;
 
-  beforeAll(async () => {
-    // Reuse the schema from the /gcal describe (sequelize.sync was already
-    // run with force:true in beforeAll above; we just append new rows).
+  // Schema built once by tests/globalSetup.js; the global beforeEach TRUNCATEs
+  // all tables, so the /saved fixtures must be re-seeded per-test (beforeEach),
+  // not beforeAll (round-3 MEDIUM-3).
+  beforeEach(async () => {
+    await TokenAnalytics.destroy({ where: {} });
+
     recurringUser = await User.create({
       user_id: 'auth0|prefill-saved-recurring',
       username: 'Saved Recurring',
@@ -401,10 +400,6 @@ describe('POST /api/availability-prefill/saved', () => {
     recurringToken = await generateToken(recurringUser, testPrompt);
     overrideToken = await generateToken(overrideUser, testPrompt);
     emptyToken = await generateToken(emptyUser, testPrompt);
-  });
-
-  beforeEach(async () => {
-    await TokenAnalytics.destroy({ where: {} });
   });
 
   // ------------------------------------------------------------------
@@ -604,7 +599,6 @@ describe('POST /api/availability-prefill/saved', () => {
   });
 });
 
-// Top-level teardown — runs after BOTH the /gcal and /saved describes.
-afterAll(async () => {
-  await sequelize.close();
-});
+// NOTE: no sequelize.close() here — the connection lifecycle is owned solely by
+// tests/globalTeardown.js (BTEST-02). Closing mid-run kills the shared
+// connection for every later serial suite.

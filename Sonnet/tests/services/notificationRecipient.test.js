@@ -27,14 +27,12 @@ describe('Notification recipient resolution — non-empty email (D-03 / Pitfall 
     phone: '+15555550123',
   };
 
-  beforeAll(async () => {
-    await User.destroy({ where: { user_id: RECIPIENT.user_id } });
+  // Schema built once by tests/globalSetup.js; the global beforeEach TRUNCATEs
+  // all tables, so the RECIPIENT user must be seeded per-test (the three tests
+  // below all read it back). No sequelize.close() here — the connection
+  // lifecycle is owned by tests/globalTeardown.js (BTEST-02).
+  beforeEach(async () => {
     await User.create(RECIPIENT);
-  });
-
-  afterAll(async () => {
-    await User.destroy({ where: { user_id: RECIPIENT.user_id } });
-    await sequelize.close();
   });
 
   // The core Pitfall-4 assertion: the real reader path returns a non-empty

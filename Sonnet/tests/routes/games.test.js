@@ -17,9 +17,8 @@ describe('Game Routes', () => {
     await Game.destroy({ where: {} });
   });
 
-  afterAll(async () => {
-    await sequelize.close();
-  });
+  // NOTE: no afterAll(sequelize.close()) — connection lifecycle is owned by
+  // tests/globalTeardown.js (BTEST-02).
 
   describe('GET /api/games', () => {
     it('should get all games', async () => {

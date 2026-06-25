@@ -15,6 +15,17 @@
 // — mirroring how the migration UPDATE seeds the operator's row.
 const request = require('supertest');
 const express = require('express');
+
+// The adminMetrics router internally mounts verifyAuth0Token ahead of
+// requirePlatformAdmin (routes/adminMetrics.js:31). Without this pass-through
+// the seeded-admin request hits a REAL Auth0 token check and gets 401 instead
+// of reaching the handler (200). We neutralize ONLY the Auth0-token layer; the
+// real requirePlatformAdmin gate from middleware/adminAuth is left intact (this
+// suite exists to exercise that gate).
+jest.mock('../../middleware/auth0', () => ({
+  verifyAuth0Token: (req, _res, next) => next(),
+}));
+
 const { stubAuth } = require('../helpers/authStub');
 const { requirePlatformAdmin } = require('../../middleware/adminAuth');
 const adminMetricsRoutes = require('../../routes/adminMetrics');
@@ -35,7 +46,13 @@ function buildApp(stubUser) {
 describe('requirePlatformAdmin gate on /api/admin/metrics (BSEC-02)', () => {
   let adminUser, nonAdminUser;
 
-  beforeAll(async () => {
+  // Seed per-test (NOT once-per-suite): the global tests/setup.js beforeEach
+  // TRUNCATEs every table before each test, which would wipe a once-per-suite
+  // seed and leave requirePlatformAdmin's DB lookup with no is_platform_admin
+  // row -> the seeded-admin->200 test would 403. Jest runs the global setup.js
+  // hook BEFORE this block-local one, so this re-seed lands on the freshly
+  // truncated, schema-intact DB. (Deferred to plan 05 by plan 01 L172.)
+  beforeEach(async () => {
     const ts = Date.now();
 
     nonAdminUser = await User.create({
@@ -57,6 +74,8 @@ describe('requirePlatformAdmin gate on /api/admin/metrics (BSEC-02)', () => {
     );
   });
 
+  // afterAll destroy is redundant under the per-test TRUNCATE (each test starts
+  // from an empty DB) but kept as harmless belt-and-suspenders cleanup.
   afterAll(async () => {
     if (adminUser) await adminUser.destroy();
     if (nonAdminUser) await nonAdminUser.destroy();

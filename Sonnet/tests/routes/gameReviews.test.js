@@ -2,73 +2,53 @@
 const request = require('supertest');
 const express = require('express');
 const gameReviewRoutes = require('../../routes/gameReviews');
-const { GameReview, User, Group, Game, UserGroup, sequelize } = require('../../models');
+const { GameReview, User, Group, Game } = require('../../models');
+const { makeUser, makeGroup, addToGroup } = require('../factories');
 
-// Create test app
-const app = express();
-app.use(express.json());
-app.use('/api/game-reviews', gameReviewRoutes);
+// POST and DELETE derive the actor from req.user (BSEC-01 / BE-100 default-deny
+// authz, Phase 83). GET routes use req.query.user_id for the access check.
+// Build a per-test app that injects req.user ahead of the router; pass null for
+// the unauthenticated case.
+function makeApp(actor) {
+  const app = express();
+  app.use(express.json());
+  app.use((req, _res, next) => {
+    req.user = actor ? { user_id: actor.user_id, email: actor.email } : undefined;
+    next();
+  });
+  app.use('/api/game-reviews', gameReviewRoutes);
+  return app;
+}
 
 describe('GameReview Routes', () => {
   let testUser1, testUser2, testGroup, testGame;
 
-  // Setup test data before all tests
-  beforeAll(async () => {
-    const timestamp = Date.now();
-    testUser1 = await User.create({
-      user_id: `test-user-reviews-1-${timestamp}`,
-      username: `testuser1-${timestamp}`,
-      email: `test1-${timestamp}@example.com`
-    });
-
-    testUser2 = await User.create({
-      user_id: `test-user-reviews-2-${timestamp}`,
-      username: `testuser2-${timestamp}`,
-      email: `test2-${timestamp}@example.com`
-    });
-
-    testGroup = await Group.create({
-      group_id: `test-group-reviews-1-${timestamp}`,
-      name: 'Test Group'
-    });
-
-    testGame = await Game.create({
-      name: 'Test Game',
-      is_custom: true
-    });
-
-    // Add user1 to group
-    await UserGroup.create({
-      user_id: testUser1.id,
-      group_id: testGroup.id
-    });
-  });
-
-  // Clean up database before each test
+  // Seed in beforeEach so fixtures survive the global per-test TRUNCATE
+  // (plan-01 isolation harness). Connection lifecycle is owned by
+  // tests/globalTeardown.js — this suite never calls sequelize.close().
+  // testUser1 is a member of the group; testUser2 is a non-member.
+  // NOTE: GameReview.rating validates 0-5 (middleware/validators.js:247-250).
   beforeEach(async () => {
-    await GameReview.destroy({ where: {} });
-  });
+    testUser1 = await makeUser({ username: 'testuser1' });
+    testUser2 = await makeUser({ username: 'testuser2' });
+    testGroup = await makeGroup({ name: 'Test Group' });
+    testGame = await Game.create({ name: 'Test Game', is_custom: true });
 
-  afterAll(async () => {
-    await GameReview.destroy({ where: {} });
-    await UserGroup.destroy({ where: {} });
-    await Group.destroy({ where: {} });
-    await User.destroy({ where: {} });
-    await Game.destroy({ where: {} });
-    await sequelize.close();
+    // Add user1 to group (Auth0 string user_id via factory).
+    await addToGroup(testUser1, testGroup);
   });
 
   describe('GET /api/game-reviews/game/:game_id/group/:group_id', () => {
     it('should get reviews for a game in a group', async () => {
       await GameReview.create({
-        user_id: testUser1.id,
+        user_id: testUser1.id, // GameReview.user_id is UUID — correct.
         group_id: testGroup.id,
         game_id: testGame.id,
-        rating: 8,
+        rating: 4,
         review_text: 'Great game!'
       });
 
-      const response = await request(app)
+      const response = await request(makeApp(testUser1))
         .get(`/api/game-reviews/game/${testGame.id}/group/${testGroup.id}`)
         .expect(200);
 
@@ -80,23 +60,18 @@ describe('GameReview Routes', () => {
     });
 
     it('should return empty array if no reviews exist', async () => {
-      const newGame = await Game.create({
-        name: 'New Game',
-        is_custom: true
-      });
+      const newGame = await Game.create({ name: 'New Game', is_custom: true });
 
-      const response = await request(app)
+      const response = await request(makeApp(testUser1))
         .get(`/api/game-reviews/game/${newGame.id}/group/${testGroup.id}`)
         .expect(200);
 
       expect(Array.isArray(response.body)).toBe(true);
       expect(response.body.length).toBe(0);
-
-      await Game.destroy({ where: { id: newGame.id } });
     });
 
     it('should return 403 if user_id provided but user not in group', async () => {
-      const response = await request(app)
+      const response = await request(makeApp(testUser1))
         .get(`/api/game-reviews/game/${testGame.id}/group/${testGroup.id}?user_id=${testUser2.user_id}`)
         .expect(403);
 
@@ -108,10 +83,10 @@ describe('GameReview Routes', () => {
         user_id: testUser1.id,
         group_id: testGroup.id,
         game_id: testGame.id,
-        rating: 9
+        rating: 4.5
       });
 
-      const response = await request(app)
+      const response = await request(makeApp(testUser1))
         .get(`/api/game-reviews/game/${testGame.id}/group/${testGroup.id}?user_id=${testUser1.user_id}`)
         .expect(200);
 
@@ -119,8 +94,8 @@ describe('GameReview Routes', () => {
     });
 
     it('should handle database errors gracefully', async () => {
-      // Test with invalid UUID format
-      const response = await request(app)
+      // Invalid UUID format triggers a DB query error.
+      const response = await request(makeApp(testUser1))
         .get(`/api/game-reviews/game/invalid-id/group/${testGroup.id}`)
         .expect(500);
 
@@ -134,11 +109,11 @@ describe('GameReview Routes', () => {
         user_id: testUser1.id,
         group_id: testGroup.id,
         game_id: testGame.id,
-        rating: 9,
+        rating: 4.5,
         review_text: 'Amazing game!'
       });
 
-      const response = await request(app)
+      const response = await request(makeApp(testUser1))
         .get(`/api/game-reviews/user/${testUser1.user_id}/group/${testGroup.id}`)
         .expect(200);
 
@@ -150,30 +125,19 @@ describe('GameReview Routes', () => {
     });
 
     it('should return empty array if user has no reviews', async () => {
-      const newUser = await User.create({
-        user_id: `test-user-reviews-new-${Date.now()}`,
-        username: `newuser-${Date.now()}`,
-        email: `newuser-${Date.now()}@example.com`
-      });
+      const newUser = await makeUser({ username: 'newuser' });
+      await addToGroup(newUser, testGroup);
 
-      await UserGroup.create({
-        user_id: newUser.id,
-        group_id: testGroup.id
-      });
-
-      const response = await request(app)
+      const response = await request(makeApp(newUser))
         .get(`/api/game-reviews/user/${newUser.user_id}/group/${testGroup.id}`)
         .expect(200);
 
       expect(Array.isArray(response.body)).toBe(true);
       expect(response.body.length).toBe(0);
-
-      await UserGroup.destroy({ where: { user_id: newUser.id } });
-      await User.destroy({ where: { id: newUser.id } });
     });
 
     it('should return 403 if user_id provided but user not in group', async () => {
-      const response = await request(app)
+      const response = await request(makeApp(testUser1))
         .get(`/api/game-reviews/user/${testUser1.user_id}/group/${testGroup.id}?user_id=${testUser2.user_id}`)
         .expect(403);
 
@@ -181,7 +145,7 @@ describe('GameReview Routes', () => {
     });
 
     it('should return 404 if user not found', async () => {
-      const response = await request(app)
+      const response = await request(makeApp(testUser1))
         .get(`/api/game-reviews/user/non-existent-user/group/${testGroup.id}`)
         .expect(404);
 
@@ -189,7 +153,7 @@ describe('GameReview Routes', () => {
     });
 
     it('should allow access if user_id provided and user is in group', async () => {
-      const response = await request(app)
+      const response = await request(makeApp(testUser1))
         .get(`/api/game-reviews/user/${testUser1.user_id}/group/${testGroup.id}?user_id=${testUser1.user_id}`)
         .expect(200);
 
@@ -197,8 +161,7 @@ describe('GameReview Routes', () => {
     });
 
     it('should handle database errors when fetching reviews', async () => {
-      // Test error handling path
-      const response = await request(app)
+      const response = await request(makeApp(testUser1))
         .get(`/api/game-reviews/user/${testUser1.user_id}/group/invalid-uuid`)
         .expect(500);
 
@@ -209,110 +172,102 @@ describe('GameReview Routes', () => {
   describe('POST /api/game-reviews', () => {
     it('should create a new review', async () => {
       const reviewData = {
-        user_id: testUser1.user_id,
         group_id: testGroup.id,
         game_id: testGame.id,
-        rating: 8,
+        rating: 4,
         review_text: 'Excellent game!',
         is_recommended: true
       };
 
-      const response = await request(app)
+      const response = await request(makeApp(testUser1))
         .post('/api/game-reviews')
         .send(reviewData)
         .expect(200);
 
       expect(response.body).toHaveProperty('id');
-      expect(response.body.rating).toBe(reviewData.rating);
+      expect(Number(response.body.rating)).toBe(4);
       expect(response.body.review_text).toBe(reviewData.review_text);
     });
 
     it('should update existing review if one already exists', async () => {
-      const existingReview = await GameReview.create({
+      await GameReview.create({
         user_id: testUser1.id,
         group_id: testGroup.id,
         game_id: testGame.id,
-        rating: 7
+        rating: 3.5
       });
 
       const updateData = {
-        user_id: testUser1.user_id,
         group_id: testGroup.id,
         game_id: testGame.id,
-        rating: 9,
+        rating: 4.5,
         review_text: 'Updated review'
       };
 
-      const response = await request(app)
+      const response = await request(makeApp(testUser1))
         .post('/api/game-reviews')
         .send(updateData)
         .expect(200);
 
-      expect(response.body.rating).toBe(9);
+      expect(Number(response.body.rating)).toBe(4.5);
       expect(response.body.review_text).toBe('Updated review');
     });
 
     it('should return 403 if user not in group', async () => {
       const reviewData = {
-        user_id: testUser2.user_id,
         group_id: testGroup.id,
         game_id: testGame.id,
-        rating: 8
+        rating: 4
       };
 
-      const response = await request(app)
+      const response = await request(makeApp(testUser2))
         .post('/api/game-reviews')
         .send(reviewData)
         .expect(403);
 
-      expect(response.body.error).toBe('Access denied to this group');
+      expect(response.body.error).toBe('Pending members cannot perform this action');
     });
 
-    it('should return 403 if user not found (access check happens first)', async () => {
+    it('should return 401 if unauthenticated', async () => {
       const reviewData = {
-        user_id: 'non-existent-user',
         group_id: testGroup.id,
         game_id: testGame.id,
-        rating: 8
+        rating: 4
       };
 
-      // The verifyUserInGroup check happens first, which returns false for non-existent user
-      // This triggers 403 before the user lookup
-      const response = await request(app)
+      const response = await request(makeApp(null))
         .post('/api/game-reviews')
         .send(reviewData)
-        .expect(403);
+        .expect(401);
 
-      expect(response.body.error).toBe('Access denied to this group');
+      expect(response.body.error).toBe('Unauthorized');
     });
 
     it('should create review with only rating', async () => {
       const reviewData = {
-        user_id: testUser1.user_id,
         group_id: testGroup.id,
         game_id: testGame.id,
-        rating: 7
+        rating: 3.5
       };
 
-      const response = await request(app)
+      const response = await request(makeApp(testUser1))
         .post('/api/game-reviews')
         .send(reviewData)
         .expect(200);
 
       expect(response.body).toHaveProperty('id');
-      expect(response.body.rating).toBe(7);
+      expect(Number(response.body.rating)).toBe(3.5);
       expect(response.body.review_text).toBeNull();
     });
 
     it('should create review with only review_text', async () => {
       const reviewData = {
-        user_id: testUser1.user_id,
         group_id: testGroup.id,
         game_id: testGame.id,
         review_text: 'Great game without rating'
       };
 
-      const response = await request(app)
+      const response = await request(makeApp(testUser1))
         .post('/api/game-reviews')
         .send(reviewData)
         .expect(200);
@@ -323,14 +278,13 @@ describe('GameReview Routes', () => {
 
     it('should create review with is_recommended flag', async () => {
       const reviewData = {
-        user_id: testUser1.user_id,
         group_id: testGroup.id,
         game_id: testGame.id,
-        rating: 9,
+        rating: 4.5,
         is_recommended: true
       };
 
-      const response = await request(app)
+      const response = await request(makeApp(testUser1))
         .post('/api/game-reviews')
         .send(reviewData)
         .expect(200);
@@ -338,45 +292,43 @@ describe('GameReview Routes', () => {
       expect(response.body.is_recommended).toBe(true);
     });
 
-    it('should handle validation errors for rating out of range', async () => {
+    it('should return 400 for rating out of range', async () => {
       const reviewData = {
-        user_id: testUser1.user_id,
         group_id: testGroup.id,
         game_id: testGame.id,
-        rating: 11 // Invalid: should be 1-10
+        rating: 11 // Invalid: validator allows 0-5
       };
 
-      const response = await request(app)
+      const response = await request(makeApp(testUser1))
         .post('/api/game-reviews')
         .send(reviewData)
-        .expect(500);
+        .expect(400);
 
       expect(response.body).toHaveProperty('error');
     });
 
-    it('should handle missing required fields', async () => {
+    it('should return 400 for missing required fields', async () => {
       const reviewData = {
-        user_id: testUser1.user_id,
-        // Missing group_id and game_id
+        // Missing group_id and game_id (both required UUIDs by the validator)
+        rating: 4
       };
 
-      const response = await request(app)
+      const response = await request(makeApp(testUser1))
         .post('/api/game-reviews')
         .send(reviewData)
-        .expect(500);
+        .expect(400);
 
       expect(response.body).toHaveProperty('error');
     });
 
     it('should include User and Game in response', async () => {
       const reviewData = {
-        user_id: testUser1.user_id,
         group_id: testGroup.id,
         game_id: testGame.id,
-        rating: 8
+        rating: 4
       };
 
-      const response = await request(app)
+      const response = await request(makeApp(testUser1))
         .post('/api/game-reviews')
         .send(reviewData)
         .expect(200);
@@ -387,18 +339,17 @@ describe('GameReview Routes', () => {
       expect(response.body.Game).toHaveProperty('name');
     });
 
-    it('should handle database errors when creating review', async () => {
+    it('should return 400 for invalid group_id format', async () => {
       const reviewData = {
-        user_id: testUser1.user_id,
         group_id: 'invalid-uuid',
         game_id: testGame.id,
-        rating: 8
+        rating: 4
       };
 
-      const response = await request(app)
+      const response = await request(makeApp(testUser1))
         .post('/api/game-reviews')
         .send(reviewData)
-        .expect(500);
+        .expect(400);
 
       expect(response.body).toHaveProperty('error');
     });
@@ -410,17 +361,15 @@ describe('GameReview Routes', () => {
         user_id: testUser1.id,
         group_id: testGroup.id,
         game_id: testGame.id,
-        rating: 8
+        rating: 4
       });
 
-      const response = await request(app)
+      const response = await request(makeApp(testUser1))
         .delete(`/api/game-reviews/${review.id}`)
-        .send({ user_id: testUser1.user_id })
         .expect(200);
 
       expect(response.body.message).toBe('Review deleted successfully');
 
-      // Verify review is deleted
       const deletedReview = await GameReview.findByPk(review.id);
       expect(deletedReview).toBeNull();
     });
@@ -430,12 +379,11 @@ describe('GameReview Routes', () => {
         user_id: testUser1.id,
         group_id: testGroup.id,
         game_id: testGame.id,
-        rating: 8
+        rating: 4
       });
 
-      const response = await request(app)
+      const response = await request(makeApp(testUser2))
         .delete(`/api/game-reviews/${review.id}`)
-        .send({ user_id: testUser2.user_id })
         .expect(403);
 
       expect(response.body.error).toBe('Access denied');
@@ -443,54 +391,34 @@ describe('GameReview Routes', () => {
 
     it('should return 404 if review not found', async () => {
       const fakeId = '00000000-0000-0000-0000-000000000000';
-      const response = await request(app)
+      const response = await request(makeApp(testUser1))
         .delete(`/api/game-reviews/${fakeId}`)
-        .send({ user_id: testUser1.user_id })
         .expect(404);
 
       expect(response.body.error).toBe('Review not found');
     });
 
-    it('should return 403 if user_id is missing in request body', async () => {
+    it('should return 401 if unauthenticated', async () => {
       const review = await GameReview.create({
         user_id: testUser1.id,
         group_id: testGroup.id,
         game_id: testGame.id,
-        rating: 8
+        rating: 4
       });
 
-      // When user_id is undefined, the check review.User.user_id !== user_id evaluates to true
-      // because undefined !== testUser1.user_id, so it returns 403
-      const response = await request(app)
+      const response = await request(makeApp(null))
         .delete(`/api/game-reviews/${review.id}`)
-        .send({})
-        .expect(403);
+        .expect(401);
 
-      expect(response.body.error).toBe('Access denied');
-
-      // Clean up
-      await GameReview.destroy({ where: { id: review.id } });
+      expect(response.body.error).toBe('Unauthorized');
     });
 
     it('should handle invalid UUID format gracefully', async () => {
-      const response = await request(app)
+      const response = await request(makeApp(testUser1))
         .delete('/api/game-reviews/invalid-uuid')
-        .send({ user_id: testUser1.user_id })
-        .expect(500);
-
-      expect(response.body).toHaveProperty('error');
-    });
-
-    it('should handle database errors when deleting review', async () => {
-      // Test with invalid UUID format to trigger database error
-      // Invalid UUID format will cause a database query error
-      const response = await request(app)
-        .delete('/api/game-reviews/not-a-valid-uuid-format')
-        .send({ user_id: testUser1.user_id })
         .expect(500);
 
       expect(response.body).toHaveProperty('error');
     });
   });
 });
-

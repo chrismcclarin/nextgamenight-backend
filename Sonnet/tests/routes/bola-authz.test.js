@@ -43,7 +43,9 @@ describe('BOLA cross-actor 403 regression (Plan 83-05)', () => {
   let owner, attacker, group, game;
   const ts = Date.now();
 
-  beforeAll(async () => {
+  // Schema built once by tests/globalSetup.js; the global beforeEach TRUNCATEs
+  // all tables, so the actors/group/game must be seeded per-test.
+  beforeEach(async () => {
     owner = await User.create({
       user_id: `bola-owner-${ts}`, username: `owner-${ts}`, email: `owner-${ts}@example.com`,
     });
@@ -54,18 +56,6 @@ describe('BOLA cross-actor 403 regression (Plan 83-05)', () => {
     game = await Game.create({ name: `BOLA Game ${ts}`, is_custom: true });
     // owner is an active member; attacker is NOT (Auth0-string user_id — matches isActiveMember).
     await UserGroup.create({ user_id: owner.user_id, group_id: group.id, role: 'owner', status: 'active' });
-  });
-
-  afterAll(async () => {
-    await EventParticipation.destroy({ where: {} });
-    await Event.destroy({ where: {} });
-    await GameReview.destroy({ where: {} });
-    await Feedback.destroy({ where: {} });
-    await UserGroup.destroy({ where: {} });
-    await Group.destroy({ where: {} });
-    await Game.destroy({ where: {} });
-    await User.destroy({ where: {} });
-    await sequelize.close();
   });
 
   // ---- Test 1: gameReviews DELETE — cross-actor spoof → 403 (BE-100) ----------

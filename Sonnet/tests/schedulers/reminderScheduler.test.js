@@ -370,13 +370,17 @@ describe('reminderScheduler', () => {
     test('formats same-day events beyond 6 hours', () => {
       const now = new Date('2026-03-29T08:00:00Z');
       const event = new Date('2026-03-29T19:00:00Z');
-      expect(formatTimeUntil(event, now)).toBe('today at 7 PM');
+      // Canonical output: the service renders HH:MM with timeZoneName:'short'
+      // (schedulers/reminderScheduler.js:41-46, comment L36 "today at HH:MM TZ").
+      // The "7 PM" (no minutes, no TZ) assertion was stale.
+      expect(formatTimeUntil(event, now)).toBe('today at 7:00 PM UTC');
     });
 
     test('formats next-day events', () => {
       const now = new Date('2026-03-29T22:00:00Z');
       const event = new Date('2026-03-30T07:30:00Z');
-      expect(formatTimeUntil(event, now)).toBe('tomorrow at 7:30 AM');
+      // Canonical output includes the short timezone name (UTC by default).
+      expect(formatTimeUntil(event, now)).toBe('tomorrow at 7:30 AM UTC');
     });
   });
 });

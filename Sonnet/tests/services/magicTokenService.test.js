@@ -17,10 +17,11 @@ const { MagicToken, User, AvailabilityPrompt, Group, sequelize } = require('../.
 describe('magicTokenService', () => {
   let testUser, testGroup, testPrompt;
 
-  beforeAll(async () => {
-    // Sync database in test mode
-    await sequelize.sync({ force: true });
-
+  // Schema built once by tests/globalSetup.js; the global beforeEach TRUNCATEs
+  // all tables, so the user/group/prompt fixtures must be seeded per-test.
+  // (NOTE: the {consume:true} assertion fix is owned by plan 05; this plan only
+  // removes the force-sync + close and converts the seed to beforeEach.)
+  beforeEach(async () => {
     // Create test user
     // Note: User model has 'username' not 'name'. Service uses 'name || username' for display.
     testUser = await User.create({
@@ -43,10 +44,6 @@ describe('magicTokenService', () => {
       status: 'active',
       week_identifier: '2026-W05'
     });
-  });
-
-  afterAll(async () => {
-    await sequelize.close();
   });
 
   describe('generateToken', () => {
@@ -210,8 +207,12 @@ describe('magicTokenService', () => {
       expect(beforeRecord.usage_count).toBe(0);
       expect(beforeRecord.last_used_at).toBeNull();
 
-      // Validate token
-      await validateToken(token);
+      // usage_count only increments when the caller opts into consumption.
+      // validateToken(token, formLoadedAt, { consume }) — magicTokenService.js:81/107.
+      // The increment-on-consume design is intentional (Open Q2 RESOLVED), so the
+      // test must pass { consume: true } rather than expecting a bare validate to
+      // mutate usage_count.
+      await validateToken(token, null, { consume: true });
 
       // Check updated record
       const afterRecord = await MagicToken.findOne({ where: { token_id: decoded.jti } });

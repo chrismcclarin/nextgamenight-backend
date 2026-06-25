@@ -4,7 +4,7 @@ const express = require('express');
 const crypto = require('crypto');
 const { Op } = require('sequelize');
 const sequelize = require('../config/database');
-const { Group, User, UserGroup, GroupInvite } = require('../models');
+const { Group, User, UserGroup, GroupInvite, Friendship } = require('../models');
 const { body, validationResult } = require('express-validator');
 const emailService = require('../services/emailService');
 
@@ -58,12 +58,22 @@ router.get('/info/:token', async (req, res) => {
 });
 
 // ============================================
-// POST /send - Send a group invite by email
+// POST /send - Send a group invite by email OR by friend_user_id
+//
+// Two paths:
+//   1) email: classic open invite (anyone-by-email).
+//   2) friend_user_id: invite an existing friend WITHOUT the client ever
+//      handling the friend's email. The email is resolved server-side, behind
+//      an accepted-friendship gate. This preserves the Phase 83-06 PII
+//      default-deny (friend emails never cross the client boundary) while
+//      restoring the friend-invite UX.
 // ============================================
 router.post(
   '/send',
   [
-    body('email').isEmail().normalizeEmail().withMessage('Valid email is required'),
+    // Either `email` or `friend_user_id` must be present (enforced below).
+    body('email').optional().isEmail().normalizeEmail().withMessage('Valid email is required'),
+    body('friend_user_id').optional().isString().trim().notEmpty().withMessage('friend_user_id must be a non-empty string'),
     body('group_id').isUUID().withMessage('Valid group_id is required'),
   ],
   async (req, res) => {
@@ -74,14 +84,65 @@ router.post(
         return res.status(400).json({ errors: errors.array() });
       }
 
-      const { email, group_id } = req.body;
+      const { email, friend_user_id, group_id } = req.body;
       const userId = req.user.user_id;
-      const normalizedEmail = email.toLowerCase();
 
-      // Permission check: Only owner or admin can invite
+      // Exactly one of email / friend_user_id must identify the invitee.
+      if (!email && !friend_user_id) {
+        return res
+          .status(400)
+          .json({ error: 'Either email or friend_user_id is required' });
+      }
+
+      // WR-01: authorize FIRST. Only an owner/admin may invite, and checking this
+      // before any friendship/user lookup keeps unauthorized callers off the
+      // friend-resolution path entirely (no oracle surface for non-members).
       const hasPermission = await isOwnerOrAdmin(userId, group_id);
       if (!hasPermission) {
         return res.status(403).json({ error: 'Only group owners and admins can send invites' });
+      }
+
+      let normalizedEmail;
+
+      if (friend_user_id) {
+        // WR-02: you cannot invite yourself via the friend path. There is no
+        // self-friendship row so this is implicitly blocked, but guard explicitly.
+        if (friend_user_id === userId) {
+          return res.status(400).json({ error: "You can't invite yourself" });
+        }
+
+        // friend_user_id path takes precedence over email.
+        // 1) Gate on an ACCEPTED friendship between the requester and the
+        //    target (bidirectional). This prevents using the endpoint as an
+        //    email/membership oracle for arbitrary user_ids.
+        const friendship = await Friendship.findOne({
+          where: {
+            status: 'accepted',
+            [Op.or]: [
+              { requester_id: userId, addressee_id: friend_user_id },
+              { requester_id: friend_user_id, addressee_id: userId },
+            ],
+          },
+        });
+
+        if (!friendship) {
+          return res
+            .status(403)
+            .json({ error: 'You can only invite your friends this way' });
+        }
+
+        // 2) Resolve the friend's email SERVER-SIDE only (never returned to client).
+        const friendUser = await User.scope('withContactInfo').findOne({
+          where: { user_id: friend_user_id },
+        });
+
+        if (!friendUser || !friendUser.email) {
+          return res.status(404).json({ error: 'Friend not found' });
+        }
+
+        normalizedEmail = friendUser.email.toLowerCase();
+      } else {
+        normalizedEmail = email.toLowerCase();
       }
 
       // Verify group exists

@@ -16,8 +16,11 @@
 // token validation will fail server-side).
 
 const crypto = require('crypto');
-const { User, Group, Event, AvailabilityPrompt, sequelize } = require('../models');
+const { User, Group, UserGroup, Friendship, SingleUseToken, Event, AvailabilityPrompt, sequelize } = require('../models');
 const { generateToken } = require('../services/magicTokenService');
+
+// RSVP single-use link lifetime — mirrors routes/rsvp.js RSVP_TOKEN_TTL_MS (30d).
+const RSVP_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 // Mirrors routes/rsvp.js generateRsvpToken EXACTLY (same payload + HMAC).
 // Inlined rather than required: pulling in the route module drags rate
@@ -67,10 +70,68 @@ async function main() {
   const rsvpToken = generateRsvpToken(event.id, alice.user_id, 'yes');
   const rsvpPath = `/rsvp/${rsvpToken}?e=${event.id}&u=${encodeURIComponent(alice.user_id)}&s=yes`;
 
+  // 83-04 single-use gate: GET /rsvp/respond consumes a pre-existing active
+  // SingleUseToken row by nonce. Mint the three-row batch (yes/maybe/no) exactly
+  // as routes/rsvp.js mintRsvpBatch does, so the journey's ?s=yes link is
+  // consumable once (the e2e DB is freshly seeded per CI run). Without this the
+  // RSVP journey lands on the ERROR state and never renders "You're in!".
+  const rsvpBatchId = crypto.randomUUID();
+  const rsvpExpiresAt = new Date(Date.now() + RSVP_TOKEN_TTL_MS);
+  await SingleUseToken.bulkCreate(
+    ['yes', 'maybe', 'no'].map((status) => ({
+      nonce: generateRsvpToken(event.id, alice.user_id, status),
+      user_id: alice.user_id,
+      purpose: 'rsvp',
+      event_id: event.id,
+      email_batch_id: rsvpBatchId,
+      rsvp_status: status,
+      status: 'active',
+      expires_at: rsvpExpiresAt,
+      used_at: null,
+    })),
+    // Idempotent on re-run: the nonce is deterministic + UNIQUE, so UPSERT
+    // (reactivate) rather than collide — mirrors routes/rsvp.js mintRsvpBatch.
+    { updateOnDuplicate: ['email_batch_id', 'rsvp_status', 'status', 'expires_at', 'used_at', 'updatedAt'] }
+  );
+
+  // Invite-to-group journey fixture: Alice must own a group, and have an accepted
+  // friend who is NOT in that group (so the friends-screen checkbox is enabled and
+  // the invite has a valid target). Seed data creates no friendships, so build one.
+  // group_id is NOT NULL + unique with no default — must be supplied. Key the
+  // WHERE on it (kebab-case, like seed-sample-data) so re-runs are idempotent.
+  const [inviteGroup] = await Group.findOrCreate({
+    where: { group_id: 'e2e-invite-group' },
+    defaults: { group_id: 'e2e-invite-group', name: 'E2E Invite Group' },
+  });
+  await UserGroup.findOrCreate({
+    where: { user_id: alice.user_id, group_id: inviteGroup.id },
+    defaults: { user_id: alice.user_id, group_id: inviteGroup.id, role: 'owner', status: 'active' },
+  });
+
+  // Pick a seeded friend (Bob) who is NOT a member of the invite group.
+  const friend = await User.findOne({ where: { username: 'Bob' } });
+  if (!friend) {
+    throw new Error('Seed data missing (Bob) — run seed-sample-data.js first');
+  }
+  // The invite resolves the friend's email server-side (User.scope withContactInfo);
+  // guarantee Bob has one so /invites/send does not 404 on a null email.
+  if (!friend.email) {
+    await friend.update({ email: 'e2e-invite-friend@example.com' });
+  }
+  // Accepted, bidirectional friendship Alice <-> Bob.
+  await Friendship.findOrCreate({
+    where: { requester_id: alice.user_id, addressee_id: friend.user_id },
+    defaults: { requester_id: alice.user_id, addressee_id: friend.user_id, status: 'accepted' },
+  });
+  // Make sure Bob is NOT in the invite group (so the friend checkbox stays enabled).
+  await UserGroup.destroy({ where: { user_id: friend.user_id, group_id: inviteGroup.id } });
+
   console.log(`E2E_FIXTURES_JSON=${JSON.stringify({
     group_id: group.id,
     availability_token: availabilityToken,
     rsvp_path: rsvpPath,
+    invite_group_name: inviteGroup.name,
+    invite_friend_name: friend.username,
   })}`);
 
   await sequelize.close();

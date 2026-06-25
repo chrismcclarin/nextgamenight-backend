@@ -422,7 +422,13 @@ describe('BSEC-01 User PII defaultScope', () => {
   const TEST_EMAIL = 'bsec01-scope-test@example.com';
   const TEST_PHONE = '+14155550199';
 
-  beforeAll(async () => {
+  // beforeEach (not beforeAll): the global tests/setup.js beforeEach TRUNCATEs
+  // every table before each test. A beforeAll seed would be wiped before Test 1,
+  // so the BSEC-01 User must be re-created per-test. Jest runs the global
+  // setup.js beforeEach BEFORE this block-local one, so this seed lands on the
+  // freshly truncated, schema-intact DB — exactly what we want. (This orphaned
+  // DB suite was owned by no sibling plan; plan 05 takes it.)
+  beforeEach(async () => {
     await User.destroy({ where: { user_id: TEST_USER_ID } });
     await User.create({
       user_id: TEST_USER_ID,
@@ -433,6 +439,8 @@ describe('BSEC-01 User PII defaultScope', () => {
     });
   });
 
+  // Redundant under the per-test TRUNCATE (each test starts empty) but kept as
+  // harmless belt-and-suspenders cleanup.
   afterAll(async () => {
     await User.destroy({ where: { user_id: TEST_USER_ID } });
   });

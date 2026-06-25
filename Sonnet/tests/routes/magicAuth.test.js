@@ -25,10 +25,9 @@ app.use('/api/magic-auth', magicAuthRoutes);
 describe('Magic Auth API', () => {
   let testUser, testGroup, testPrompt, validToken;
 
-  beforeAll(async () => {
-    // Sync database in test mode
-    await sequelize.sync({ force: true });
-
+  // Schema is built once by tests/globalSetup.js; the global beforeEach
+  // TRUNCATEs all tables, so the fixtures must be seeded per-test (beforeEach).
+  beforeEach(async () => {
     // Create test fixtures
     testUser = await User.create({
       user_id: 'auth0|magic-api-test',
@@ -51,15 +50,6 @@ describe('Magic Auth API', () => {
 
     // Generate a valid token for tests
     validToken = await generateToken(testUser, testPrompt);
-  });
-
-  afterAll(async () => {
-    await sequelize.close();
-  });
-
-  beforeEach(async () => {
-    // Clear analytics between tests for isolation
-    await TokenAnalytics.destroy({ where: {} });
   });
 
   describe('POST /api/magic-auth/validate', () => {
