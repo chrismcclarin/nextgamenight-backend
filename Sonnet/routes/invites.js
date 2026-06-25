@@ -73,7 +73,7 @@ router.post(
   [
     // Either `email` or `friend_user_id` must be present (enforced below).
     body('email').optional().isEmail().normalizeEmail().withMessage('Valid email is required'),
-    body('friend_user_id').optional().isString().withMessage('friend_user_id must be a string'),
+    body('friend_user_id').optional().isString().trim().notEmpty().withMessage('friend_user_id must be a non-empty string'),
     body('group_id').isUUID().withMessage('Valid group_id is required'),
   ],
   async (req, res) => {
@@ -94,9 +94,23 @@ router.post(
           .json({ error: 'Either email or friend_user_id is required' });
       }
 
+      // WR-01: authorize FIRST. Only an owner/admin may invite, and checking this
+      // before any friendship/user lookup keeps unauthorized callers off the
+      // friend-resolution path entirely (no oracle surface for non-members).
+      const hasPermission = await isOwnerOrAdmin(userId, group_id);
+      if (!hasPermission) {
+        return res.status(403).json({ error: 'Only group owners and admins can send invites' });
+      }
+
       let normalizedEmail;
 
       if (friend_user_id) {
+        // WR-02: you cannot invite yourself via the friend path. There is no
+        // self-friendship row so this is implicitly blocked, but guard explicitly.
+        if (friend_user_id === userId) {
+          return res.status(400).json({ error: "You can't invite yourself" });
+        }
+
         // friend_user_id path takes precedence over email.
         // 1) Gate on an ACCEPTED friendship between the requester and the
         //    target (bidirectional). This prevents using the endpoint as an
@@ -129,12 +143,6 @@ router.post(
         normalizedEmail = friendUser.email.toLowerCase();
       } else {
         normalizedEmail = email.toLowerCase();
-      }
-
-      // Permission check: Only owner or admin can invite
-      const hasPermission = await isOwnerOrAdmin(userId, group_id);
-      if (!hasPermission) {
-        return res.status(403).json({ error: 'Only group owners and admins can send invites' });
       }
 
       // Verify group exists

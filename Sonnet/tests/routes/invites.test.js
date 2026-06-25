@@ -156,4 +156,94 @@ describe('POST /invites/send — friend_user_id path (83.2 INVITE-01)', () => {
 
     expect(res.body.error).toMatch(/required/i);
   });
+
+  it('(e) non-owner/admin caller is blocked even WITH an accepted friendship → 403 (authorize-first, WR-01)', async () => {
+    // An outsider who is genuinely friends with `friend` but is NOT an
+    // owner/admin of the group. The permission gate runs BEFORE the friendship
+    // lookup, so they are rejected on permission, not friendship.
+    const outsider = await User.create({
+      user_id: 'auth0|invite-outsider',
+      username: 'invite-outsider',
+      email: 'invite-outsider@example.com',
+    });
+    await Friendship.create({
+      requester_id: outsider.user_id,
+      addressee_id: friend.user_id,
+      status: 'accepted',
+    });
+    currentActor = outsider.user_id;
+
+    const res = await request(app)
+      .post('/api/invites/send')
+      .send({ group_id: group.id, friend_user_id: friend.user_id })
+      .expect(403);
+
+    expect(res.body.error).toMatch(/owners and admins/i);
+
+    // Nothing created.
+    const count = await GroupInvite.count({ where: { group_id: group.id } });
+    expect(count).toBe(0);
+  });
+
+  it('(f) friend already an active member → 409 (friend path reuses the member guard, IN-03)', async () => {
+    await Friendship.create({
+      requester_id: owner.user_id,
+      addressee_id: friend.user_id,
+      status: 'accepted',
+    });
+    await UserGroup.create({
+      user_id: friend.user_id,
+      group_id: group.id,
+      role: 'member',
+      status: 'active',
+    });
+
+    const res = await request(app)
+      .post('/api/invites/send')
+      .send({ group_id: group.id, friend_user_id: friend.user_id })
+      .expect(409);
+
+    expect(res.body.error).toMatch(/already a member/i);
+  });
+
+  it('(g) friend already has a pending invite → 409 (friend path reuses the pending guard, IN-03)', async () => {
+    await Friendship.create({
+      requester_id: owner.user_id,
+      addressee_id: friend.user_id,
+      status: 'accepted',
+    });
+    await GroupInvite.create({
+      group_id: group.id,
+      invited_email: friend.email.toLowerCase(),
+      invited_by: owner.user_id,
+      token: 'pre-existing-pending-token',
+      status: 'pending',
+    });
+
+    const res = await request(app)
+      .post('/api/invites/send')
+      .send({ group_id: group.id, friend_user_id: friend.user_id })
+      .expect(409);
+
+    expect(res.body.error).toMatch(/pending invite/i);
+  });
+
+  it('(h) a user cannot invite themselves via friend_user_id → 400 (WR-02)', async () => {
+    const res = await request(app)
+      .post('/api/invites/send')
+      .send({ group_id: group.id, friend_user_id: owner.user_id })
+      .expect(400);
+
+    expect(res.body.error).toMatch(/yourself/i);
+
+    const count = await GroupInvite.count({ where: { group_id: group.id } });
+    expect(count).toBe(0);
+  });
+
+  it('(i) an empty-string friend_user_id is rejected → 400 (WR-03)', async () => {
+    await request(app)
+      .post('/api/invites/send')
+      .send({ group_id: group.id, friend_user_id: '' })
+      .expect(400);
+  });
 });
