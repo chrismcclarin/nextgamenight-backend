@@ -4,7 +4,7 @@ const express = require('express');
 const crypto = require('crypto');
 const { Op } = require('sequelize');
 const sequelize = require('../config/database');
-const { Group, User, UserGroup, GroupInvite, Friendship } = require('../models');
+const { Group, User, UserGroup, GroupInvite, Friendship, Event, EventParticipation } = require('../models');
 const { body, validationResult } = require('express-validator');
 const emailService = require('../services/emailService');
 
@@ -71,9 +71,11 @@ router.get('/info/:token', async (req, res) => {
 router.post(
   '/send',
   [
-    // Either `email` or `friend_user_id` must be present (enforced below).
+    // Exactly one of `email` / `friend_user_id` / `participant_user_id` must be
+    // present — the count is enforced in the handler (see inviteeSelectors).
     body('email').optional().isEmail().normalizeEmail().withMessage('Valid email is required'),
     body('friend_user_id').optional().isString().trim().notEmpty().withMessage('friend_user_id must be a non-empty string'),
+    body('participant_user_id').optional().isUUID().withMessage('participant_user_id must be a valid User id'),
     body('group_id').isUUID().withMessage('Valid group_id is required'),
   ],
   async (req, res) => {
@@ -84,14 +86,23 @@ router.post(
         return res.status(400).json({ errors: errors.array() });
       }
 
-      const { email, friend_user_id, group_id } = req.body;
+      const { email, friend_user_id, participant_user_id, group_id } = req.body;
       const userId = req.user.user_id;
 
-      // Exactly one of email / friend_user_id must identify the invitee.
-      if (!email && !friend_user_id) {
+      // Exactly one invitee selector must be supplied. Rejecting ambiguous
+      // multi-selector payloads (rather than silently applying precedence) keeps
+      // the authorized path unambiguous — each selector carries its own authz
+      // gate (friendship / group-event participation / open-email).
+      const inviteeSelectors = [email, friend_user_id, participant_user_id].filter(Boolean);
+      if (inviteeSelectors.length === 0) {
         return res
           .status(400)
-          .json({ error: 'Either email or friend_user_id is required' });
+          .json({ error: 'An invitee is required: provide exactly one of email, friend_user_id, or participant_user_id' });
+      }
+      if (inviteeSelectors.length > 1) {
+        return res
+          .status(400)
+          .json({ error: 'Provide only one of email, friend_user_id, or participant_user_id' });
       }
 
       // WR-01: authorize FIRST. Only an owner/admin may invite, and checking this
@@ -141,6 +152,43 @@ router.post(
         }
 
         normalizedEmail = friendUser.email.toLowerCase();
+      } else if (participant_user_id) {
+        // participant_user_id path — invite a guest who played in one of this
+        // group's events to join the group (e.g. the game-detail guest-invite
+        // affordance, restored after 83-06 stripped participant emails from the
+        // client). `participant_user_id` is a User.id UUID (matches
+        // EventParticipation.user_id), NOT an Auth0 user_id string.
+        //
+        // 1) Bound the path to actual participants of THIS group's events. Like
+        //    the friendship gate above, this stops the endpoint being an
+        //    email/existence oracle for arbitrary User ids — only people the
+        //    owner/admin already shares a group event with are resolvable here.
+        const isGroupEventParticipant = await EventParticipation.findOne({
+          where: { user_id: participant_user_id },
+          include: [{ model: Event, where: { group_id }, attributes: [], required: true }],
+          attributes: ['id'],
+        });
+
+        if (!isGroupEventParticipant) {
+          return res
+            .status(403)
+            .json({ error: "You can only invite this group's event participants this way" });
+        }
+
+        // 2) Resolve the participant's email SERVER-SIDE only (never returned to
+        //    the client) — preserves the 83-06 PII default-deny.
+        const participantUser = await User.scope('withContactInfo').findByPk(participant_user_id);
+
+        if (!participantUser || !participantUser.email) {
+          return res.status(404).json({ error: 'Participant not found' });
+        }
+
+        // 3) Block self-invite (the participant is the requester themselves).
+        if (participantUser.user_id === userId) {
+          return res.status(400).json({ error: "You can't invite yourself" });
+        }
+
+        normalizedEmail = participantUser.email.toLowerCase();
       } else {
         normalizedEmail = email.toLowerCase();
       }

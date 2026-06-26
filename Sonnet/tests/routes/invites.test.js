@@ -16,7 +16,7 @@
 const request = require('supertest');
 const express = require('express');
 const invitesRoutes = require('../../routes/invites');
-const { Group, User, UserGroup, GroupInvite, Friendship } = require('../../models');
+const { Group, User, UserGroup, GroupInvite, Friendship, Event, EventParticipation } = require('../../models');
 
 // Harness: inject a verified req.user before the router (mirrors the real
 // verifyAuth0Token middleware that server.js mounts). Vary per-test via the
@@ -245,5 +245,221 @@ describe('POST /invites/send — friend_user_id path (83.2 INVITE-01)', () => {
       .post('/api/invites/send')
       .send({ group_id: group.id, friend_user_id: '' })
       .expect(400);
+  });
+});
+
+// SEAM-01 (83.3 cross-phase audit): POST /invites/send gains a
+// `participant_user_id` path so an owner/admin can invite a guest who played in
+// one of the group's events to join the group. Restores the game-detail
+// guest-invite affordance that broke when 83-06 stripped participant emails from
+// the client. Email is resolved SERVER-SIDE; the path is BOUND to actual
+// group-event participants so it isn't an existence/email oracle for arbitrary
+// User ids. NOTE: participant_user_id is a User.id UUID (= EventParticipation.user_id).
+describe('POST /invites/send — participant_user_id path (83.3 SEAM-01)', () => {
+  let owner;
+  let guest;
+  let group;
+  let event;
+
+  beforeEach(async () => {
+    owner = await User.create({
+      user_id: 'auth0|seam01-owner',
+      username: 'seam01-owner',
+      email: 'seam01-owner@example.com',
+    });
+
+    guest = await User.create({
+      user_id: 'auth0|seam01-guest',
+      username: 'seam01-guest',
+      email: 'seam01-guest@example.com',
+    });
+
+    group = await Group.create({
+      group_id: 'seam01-test-group',
+      name: 'Seam01 Test Group',
+    });
+
+    await UserGroup.create({
+      user_id: owner.user_id,
+      group_id: group.id,
+      role: 'owner',
+      status: 'active',
+    });
+
+    event = await Event.create({
+      group_id: group.id,
+      start_date: new Date('2026-01-01T18:00:00Z'),
+    });
+
+    // The guest played in the group's event (keyed on User.id UUID).
+    await EventParticipation.create({
+      event_id: event.id,
+      user_id: guest.id,
+      is_guest: true,
+    });
+
+    currentActor = owner.user_id;
+  });
+
+  it('(a) invite-by-participant_user_id succeeds, creates a pending invite, and returns NO email', async () => {
+    const res = await request(app)
+      .post('/api/invites/send')
+      .send({ group_id: group.id, participant_user_id: guest.id })
+      .expect(201);
+
+    expect(res.body.success).toBe(true);
+    expect(res.body.invite_id).toBeTruthy();
+
+    // No PII leak: the resolved guest email must not appear in the response.
+    const bodyStr = JSON.stringify(res.body);
+    expect(bodyStr).not.toContain(guest.email);
+    expect(res.body).not.toHaveProperty('invited_email');
+
+    const invite = await GroupInvite.findOne({
+      where: { group_id: group.id, status: 'pending' },
+    });
+    expect(invite).not.toBeNull();
+    expect(invite.invited_email.toLowerCase()).toBe(guest.email.toLowerCase());
+
+    // The success path must also create the guest's UserGroup row as 'invited'
+    // (the core mutation — keyed on the Auth0 string user_id).
+    const ug = await UserGroup.findOne({
+      where: { user_id: guest.user_id, group_id: group.id },
+    });
+    expect(ug).not.toBeNull();
+    expect(ug.status).toBe('invited');
+    expect(ug.role).toBe('member');
+  });
+
+  it('(b) a User who is NOT a participant of this group\'s events → 403 (no oracle)', async () => {
+    const stranger = await User.create({
+      user_id: 'auth0|seam01-stranger',
+      username: 'seam01-stranger',
+      email: 'seam01-stranger@example.com',
+    });
+
+    const res = await request(app)
+      .post('/api/invites/send')
+      .send({ group_id: group.id, participant_user_id: stranger.id })
+      .expect(403);
+
+    expect(res.body.error).toMatch(/participant/i);
+    const count = await GroupInvite.count({ where: { group_id: group.id } });
+    expect(count).toBe(0);
+  });
+
+  it('(c) participation in a DIFFERENT group\'s event does not grant access → 403', async () => {
+    const otherGroup = await Group.create({
+      group_id: 'seam01-other-group',
+      name: 'Seam01 Other Group',
+    });
+    const otherEvent = await Event.create({
+      group_id: otherGroup.id,
+      start_date: new Date('2026-02-01T18:00:00Z'),
+    });
+    const otherGuest = await User.create({
+      user_id: 'auth0|seam01-otherguest',
+      username: 'seam01-otherguest',
+      email: 'seam01-otherguest@example.com',
+    });
+    await EventParticipation.create({
+      event_id: otherEvent.id,
+      user_id: otherGuest.id,
+      is_guest: true,
+    });
+
+    // otherGuest participated in otherGroup's event, but we're inviting to `group`.
+    await request(app)
+      .post('/api/invites/send')
+      .send({ group_id: group.id, participant_user_id: otherGuest.id })
+      .expect(403);
+  });
+
+  it('(d) non-owner/admin caller is blocked → 403 (authorize-first)', async () => {
+    const randomMember = await User.create({
+      user_id: 'auth0|seam01-member',
+      username: 'seam01-member',
+      email: 'seam01-member@example.com',
+    });
+    await UserGroup.create({
+      user_id: randomMember.user_id,
+      group_id: group.id,
+      role: 'member',
+      status: 'active',
+    });
+    currentActor = randomMember.user_id;
+
+    await request(app)
+      .post('/api/invites/send')
+      .send({ group_id: group.id, participant_user_id: guest.id })
+      .expect(403);
+  });
+
+  it('(e) guest already has a pending invite → 409 (reuses the pending guard)', async () => {
+    await GroupInvite.create({
+      group_id: group.id,
+      invited_email: guest.email.toLowerCase(),
+      invited_by: owner.user_id,
+      token: 'seam01-existing-token',
+      status: 'pending',
+    });
+
+    const res = await request(app)
+      .post('/api/invites/send')
+      .send({ group_id: group.id, participant_user_id: guest.id })
+      .expect(409);
+
+    expect(res.body.error).toMatch(/pending invite/i);
+  });
+
+  it('(f) a non-UUID participant_user_id is rejected → 400', async () => {
+    await request(app)
+      .post('/api/invites/send')
+      .send({ group_id: group.id, participant_user_id: 'not-a-uuid' })
+      .expect(400);
+  });
+
+  it('(g) participant already an active member → 409 (reuses the member guard)', async () => {
+    await UserGroup.create({
+      user_id: guest.user_id,
+      group_id: group.id,
+      role: 'member',
+      status: 'active',
+    });
+
+    const res = await request(app)
+      .post('/api/invites/send')
+      .send({ group_id: group.id, participant_user_id: guest.id })
+      .expect(409);
+
+    expect(res.body.error).toMatch(/already a member/i);
+  });
+
+  it('(h) a user cannot invite themselves via participant_user_id → 400 (self-guard)', async () => {
+    // The owner is also a participant in the group's event, so the bound-check
+    // passes and execution reaches the self-guard.
+    await EventParticipation.create({
+      event_id: event.id,
+      user_id: owner.id,
+    });
+
+    const res = await request(app)
+      .post('/api/invites/send')
+      .send({ group_id: group.id, participant_user_id: owner.id })
+      .expect(400);
+
+    expect(res.body.error).toMatch(/yourself/i);
+
+    const count = await GroupInvite.count({ where: { group_id: group.id } });
+    expect(count).toBe(0);
+  });
+
+  it('(i) sending more than one invitee selector → 400 (no silent precedence)', async () => {
+    const res = await request(app)
+      .post('/api/invites/send')
+      .send({ group_id: group.id, participant_user_id: guest.id, email: 'someone@example.com' })
+      .expect(400);
+
+    expect(res.body.error).toMatch(/only one/i);
   });
 });
