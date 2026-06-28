@@ -59,8 +59,10 @@ describe('Magic Auth API', () => {
         .send({});
 
       expect(res.status).toBe(400);
+      expect(res.body.code).toBe('token_invalid');
       expect(res.body.error).toBe('Token is required');
-      expect(res.body.action).toBe('request_new');
+      expect(res.body.error).toBe(res.body.message); // legacy alias (= message)
+      expect(res.body.details.action).toBe('request_new'); // action moved under details
     });
 
     it('returns valid response with user info for valid token', async () => {
@@ -84,9 +86,10 @@ describe('Magic Auth API', () => {
         .post('/api/magic-auth/validate')
         .send({ token: 'not.a.valid.token' });
 
-      expect(res.status).toBe(400);
-      expect(res.body.error).toBe('This link is no longer valid.');
-      expect(res.body.action).toBe('request_new');
+      expect(res.status).toBe(400); // status STAYS 400 (token_invalid anchored to 400)
+      expect(res.body.code).toBe('token_invalid');
+      expect(res.body.error).toBe(res.body.message); // one generic message, no per-reason prose
+      expect(res.body.details.action).toBe('request_new');
     });
 
     it('tracks successful validation attempt in analytics', async () => {
@@ -140,9 +143,10 @@ describe('Magic Auth API', () => {
         .post('/api/magic-auth/validate')
         .send({ token: newToken });
 
-      expect(res.status).toBe(400);
-      expect(res.body.error).toBe('This link is no longer valid.');
-      expect(res.body.action).toBe('request_new');
+      expect(res.status).toBe(400); // status STAYS 400 (token_invalid anchored to 400)
+      expect(res.body.code).toBe('token_invalid');
+      expect(res.body.error).toBe(res.body.message); // generic message identical across reject reasons
+      expect(res.body.details.action).toBe('request_new');
     });
 
     it('tracks revoked token validation attempt', async () => {
