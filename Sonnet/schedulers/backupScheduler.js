@@ -5,6 +5,19 @@ const { execFile } = require('child_process');
 const path = require('path');
 const { recordRun } = require('../services/schedulerHealthService');
 
+// Optional Sentry integration (Phase 85 / BAPI-02). DSN-gated require mirrors
+// workers/deadlineWorker.js so the swallowed backup failure escalates in
+// production. Purely additive: the recordRun telemetry and the
+// `return { sent: 0, skipped: 1 }` below are byte-for-byte unchanged.
+let Sentry = null;
+if (process.env.SENTRY_DSN) {
+  try {
+    Sentry = require('@sentry/node');
+  } catch (err) {
+    console.warn('[backupScheduler] Sentry not available:', err.message);
+  }
+}
+
 // Weekly schedule: Sunday at 2am UTC
 const BACKUP_SCHEDULE = '0 2 * * 0';
 
@@ -49,6 +62,7 @@ const backupJob = cron.schedule(BACKUP_SCHEDULE, async () => {
         // just want a zero-output record so the anomaly detector can fire if
         // backups stay broken (note: backup is NOT in SWEEP_JOBS).
         console.error(`[${new Date().toISOString()}] Scheduled backup failed:`, err.message);
+        if (Sentry) Sentry.captureException(err, { tags: { job: 'backup' } });
         return { sent: 0, skipped: 1 };
       }
     });
