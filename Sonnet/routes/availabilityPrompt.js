@@ -17,6 +17,7 @@ const {
 } = require('../models');
 const emailService = require('../services/emailService');
 const { scheduleReminders, scheduleDeadlineJob } = require('../services/reminderService');
+const { sendError } = require('../utils/errors');
 
 /**
  * GET /api/prompts/:promptId/respondents
@@ -176,10 +177,9 @@ router.post('/prompts/:promptId/remind/:userId', verifyAuth0Token, async (req, r
       const hoursSince = (Date.now() - new Date(response.last_reminded_at)) / (1000 * 60 * 60);
       if (hoursSince < 24) {
         const nextAvailable = new Date(new Date(response.last_reminded_at).getTime() + 24 * 60 * 60 * 1000);
-        return res.status(429).json({
-          error: 'Cannot remind user more than once per 24 hours',
-          next_reminder_available: nextAvailable.toISOString()
-        });
+        // Anchored at 429 (A1, verified current wire status). next_reminder_available
+        // moves under details; call-site emission inside the existing try/catch (Pitfall 1).
+        return sendError(res, 'reminder_cooldown', { next_reminder_available: nextAvailable.toISOString() });
       }
     }
 
