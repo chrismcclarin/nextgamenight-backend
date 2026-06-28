@@ -2,6 +2,7 @@
 // Auth0 JWT verification middleware
 const jwt = require('jsonwebtoken');
 const jwksClient = require('jwks-rsa');
+const { sendError } = require('../utils/errors');
 
 // Check for required environment variables
 if (!process.env.AUTH0_DOMAIN) {
@@ -37,13 +38,15 @@ const verifyAuth0Token = (req, res, next) => {
   const authHeader = req.headers.authorization;
   
   if (!authHeader) {
-    return res.status(401).json({ error: 'No authorization header provided' });
+    // Status STAYS 401 (Pitfall 2). One generic 'unauthorized' message across all
+    // three reject paths — no header/format/token enumeration (ASVS V2, T-85-08).
+    return sendError(res, 'unauthorized');
   }
 
   // Extract token (format: "Bearer <token>")
   const parts = authHeader.split(' ');
   if (parts.length !== 2 || parts[0] !== 'Bearer') {
-    return res.status(401).json({ error: 'Invalid authorization header format. Expected: Bearer <token>' });
+    return sendError(res, 'unauthorized');
   }
 
   const token = parts[1];
@@ -71,7 +74,9 @@ const verifyAuth0Token = (req, res, next) => {
         } else {
           console.error('JWT verification failed');
         }
-        return res.status(401).json({ error: 'Invalid or expired token' });
+        // Call-site emit (Pitfall 1: never a bare async/callback throw). Status
+        // STAYS 401; generic 'unauthorized' prose — no token-state enumeration.
+        return sendError(res, 'unauthorized');
       }
 
       // Attach user info to request object
