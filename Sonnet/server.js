@@ -4,6 +4,7 @@ const cors = require('cors');
 const helmet = require('helmet');
 const { sequelize } = require('./models');
 const { buildAllowedOrigins } = require('./config/allowedOrigins');
+const { formatEnvelope } = require('./utils/errors');
 
 // Global error handlers to prevent crashes from unhandled promise rejections
 process.on('unhandledRejection', (reason, promise) => {
@@ -96,11 +97,6 @@ if (process.env.NODE_ENV === 'production') {
     }
     next();
   });
-}
-
-// Sentry request handler (must be before other middleware)
-if (Sentry) {
-  app.use(Sentry.Handlers.requestHandler());
 }
 
 // Security Middleware
@@ -356,24 +352,29 @@ app.get('/health', (req, res) => {
   res.json({ status: 'OK', message: 'Server is running' });
 });
 
-// Sentry error handler (must be after all routes, before error handler)
-if (Sentry) {
-  app.use(Sentry.Handlers.errorHandler());
-}
-
-// Global error handler (catch-all for unhandled errors)
+// Global error handler (catch-all for unhandled errors).
+// Formats any thrown / next(err) error via the canonical envelope (BAPI-01) and
+// escalates ONLY 5xx to Sentry (DSN-gated, BAPI-02) — no double-capture, no over-capture.
+// NOTE: the legacy v7-style Sentry request/error handler blocks were removed — that API is
+// undefined in @sentry/node 8.55.0 and crashed boot when SENTRY_DSN was set (Pitfall 3). The
+// v8 express-error-handler setup is intentionally NOT added here (it would re-introduce
+// double-capture; deferred to Phase 91).
 app.use((err, req, res, next) => {
-  // Log error to Sentry if available
-  if (Sentry) {
-    Sentry.captureException(err);
+  const { httpStatus, body } = formatEnvelope(err);
+
+  // Escalate ONLY 5xx, route-PATTERN tagged (never req.originalUrl — it carries
+  // path-embedded PII like emails/player_names; ASVS V7). req.route may be unpopulated
+  // in the global handler, hence the 'unmatched' fallback.
+  if (Sentry && httpStatus >= 500) {
+    Sentry.captureException(err, {
+      tags: {
+        route: (req.route && ((req.baseUrl || '') + req.route.path)) || 'unmatched',
+        method: req.method,
+      },
+    });
   }
-  
-  // Don't expose error details in production
-  const message = process.env.NODE_ENV === 'production' 
-    ? 'An internal error occurred' 
-    : err.message;
-  
-  res.status(err.status || 500).json({ error: message });
+
+  res.status(httpStatus).json(body);
 });
 
 // Initialize database and start server
