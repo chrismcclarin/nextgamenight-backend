@@ -1,19 +1,21 @@
 // middleware/validators.js
 // Input validation middleware using express-validator
 const { body, param, query, validationResult, matchedData } = require('express-validator');
+const { sendError } = require('../utils/errors');
 
 // Middleware to check validation results
 const validate = (req, res, next) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
-    return res.status(400).json({
-      error: 'Validation failed',
-      errors: errors.array().map(err => ({
-        field: err.path || err.param,
-        message: err.msg,
-        value: err.value
-      }))
-    });
+    const fieldErrors = errors.array().map(err => ({
+      field: err.path || err.param,
+      message: err.msg,
+      value: err.value
+    }));
+    // Pass the OBJECT { errors } so the central serializer (utils/errors.js)
+    // mirrors the field errors to BOTH details.errors[] AND a top-level
+    // errors[] legacy alias (the live FE api.ts:148 reads top-level errors[]).
+    return sendError(res, 'validation', { errors: fieldErrors });
   }
   next();
 };
@@ -34,16 +36,16 @@ const validate = (req, res, next) => {
 const validateStrict = (req, res, next) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
-    return res.status(400).json({
-      error: 'Validation failed',
-      errors: errors.array().map(err => ({
-        field: err.path || err.param,
-        message: err.msg,
-        value: err.value
-      }))
-    });
+    const fieldErrors = errors.array().map(err => ({
+      field: err.path || err.param,
+      message: err.msg,
+      value: err.value
+    }));
+    return sendError(res, 'validation', { errors: fieldErrors });
   }
   // Strip any body key not declared by a validator on this route.
+  // CRITICAL (BSEC-01 mass-assignment guard, Pitfall 5): this PASS-branch
+  // matchedData strip is preserved VERBATIM — only the reject branch changed.
   req.body = matchedData(req, { onlyValidData: true, locations: ['body'] });
   next();
 };
