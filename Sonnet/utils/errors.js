@@ -71,7 +71,11 @@ function formatEnvelope(codeOrErr, details, messageOverride) {
     httpStatus = (codeOrErr && (codeOrErr.httpStatus || codeOrErr.status)) || 500;
     // (c) always emit generic registry prose, never err.message/stack.
     message = ERROR_REGISTRY[code] ? ERROR_REGISTRY[code].message : ERROR_REGISTRY.internal.message;
-    det = details !== undefined ? details : (codeOrErr && codeOrErr.details);
+    // (d) use ONLY the explicit details ARGUMENT — never fall back to codeOrErr.details.
+    //     A thrown library/driver error can carry a `.details` property (e.g. validation
+    //     internals, driver metadata); reflecting it would leak it onto the public envelope
+    //     (ASVS V7 — code/message are already gated above, details must be too).
+    det = details;
   }
 
   if (messageOverride) message = messageOverride;

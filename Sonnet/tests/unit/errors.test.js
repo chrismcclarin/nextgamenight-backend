@@ -160,6 +160,13 @@ describe('formatEnvelope — internal safety + unknown-Error branch (ASVS V7)', 
     const { httpStatus } = formatEnvelope(Object.assign(new Error('too big'), { httpStatus: 413 }));
     expect(httpStatus).toBe(413);
   });
+
+  test('does NOT reflect a thrown err.details onto the public envelope (ASVS V7)', () => {
+    const { body } = formatEnvelope(Object.assign(new Error('x'), { details: { secret: 1 } }));
+    // The unknown-Error branch uses ONLY the explicit details argument (absent here),
+    // so raw err.details must not surface on the wire.
+    expect(body.details).toBeUndefined();
+  });
 });
 
 describe('sendError', () => {
