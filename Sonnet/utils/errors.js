@@ -25,6 +25,11 @@ const ERROR_REGISTRY = Object.freeze({
   rate_limited:            { httpStatus: 429, message: 'Too many requests, please try again later.' },
   unauthorized:            { httpStatus: 401, message: 'Authentication required' },
   token_invalid:           { httpStatus: 400, message: 'This link is no longer valid.' }, // magic-token reject is 400 today
+  // not_found (404) and forbidden (403) are registered as FORWARD-COMPAT (Phase 86+) and are
+  // not yet emitted by any live chokepoint per decision D-03 (convert-when-touched). Their
+  // presence here is intentional, not a gap — a future reader should not read it as one.
+  // (The sendSafeError <500 status->code map references them only as hardening; no live caller
+  // hits that branch with 403/404 today.)
   not_found:               { httpStatus: 404, message: 'Resource not found' },
   forbidden:               { httpStatus: 403, message: 'You do not have permission to perform this action' },
   prompt_deadline_expired: { httpStatus: 400, message: 'The deadline for this availability prompt has passed.' },
