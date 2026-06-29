@@ -76,6 +76,8 @@ describe('POST /api/prompts/:promptId/remind/:userId — <24h cooldown envelope'
     await AvailabilityResponse.create({
       prompt_id: prompt.id,
       user_id: target.user_id,
+      user_timezone: 'America/New_York', // NOT-NULL on the model
+      submitted_at: new Date(),          // NOT-NULL on the model
       last_reminded_at: new Date(),
     });
   });
