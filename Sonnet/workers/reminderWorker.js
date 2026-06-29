@@ -209,12 +209,29 @@ const reminderWorker = new Worker('reminders', async (job) => {
   concurrency: 2 // Lower concurrency for reminders to avoid email rate limits
 });
 
-reminderWorker.on('failed', (job, err) => {
-  console.error(`[ReminderWorker] Job ${job.id} failed:`, err.message);
-});
+/**
+ * BullMQ `failed` event hook — also exported so tests can assert the
+ * Sentry escalation path without invoking the real Worker/Redis.
+ *
+ * @param {object} job - BullMQ job (may be undefined in some failure modes)
+ * @param {Error} err
+ */
+function handleJobFailed(job, err) {
+  console.error(`[ReminderWorker] Job ${job && job.id} failed:`, err && err.message);
+
+  // Escalate to Sentry so async job failures aren't silent (DSN-gated).
+  if (Sentry) {
+    Sentry.captureException(err, {
+      tags: { worker: 'reminder', job_id: job && job.id }
+    });
+  }
+}
+
+reminderWorker.on('failed', handleJobFailed);
 
 reminderWorker.on('completed', (job, result) => {
   console.log(`[ReminderWorker] Job ${job.id} completed:`, result);
 });
 
 module.exports = reminderWorker;
+module.exports.handleJobFailed = handleJobFailed;

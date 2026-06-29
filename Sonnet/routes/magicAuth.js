@@ -7,6 +7,7 @@ const { Op } = require('sequelize');
 const { validateToken } = require('../services/magicTokenService');
 const { magicTokenLimiter } = require('../middleware/rateLimiter');
 const { trackValidation, extractTokenId } = require('../services/tokenAnalyticsService');
+const { sendError } = require('../utils/errors');
 const { User, UserAvailability, AvailabilityPrompt, GroupPromptSettings } = require('../models');
 
 // Phase 81 Plan 03 Task 4 — compute the upcoming-Monday UTC date string
@@ -89,10 +90,9 @@ router.post('/validate', magicTokenLimiter, async (req, res) => {
     const { token, formLoadedAt } = req.body;
 
     if (!token) {
-      return res.status(400).json({
-        error: 'Token is required',
-        action: 'request_new'
-      });
+      // Status STAYS 400 (Pitfall 2 — token_invalid is anchored to 400, not 401).
+      // `action` moves under details; call-site emit (never a bare async throw).
+      return sendError(res, 'token_invalid', { action: 'request_new' }, 'Token is required');
     }
 
     const result = await validateToken(token, formLoadedAt, { consume: false });
@@ -107,12 +107,9 @@ router.post('/validate', magicTokenLimiter, async (req, res) => {
         userAgent: req.get('user-agent')
       });
 
-      // All failures get same generic message (security)
-      // Rate limiter counts this as failure (non-2xx response)
-      return res.status(400).json({
-        error: 'This link is no longer valid.',
-        action: 'request_new'
-      });
+      // All failures get same generic message (security, ASVS V2 / T-85-03 —
+      // no per-reason prose). Status STAYS 400; `action` under details.
+      return sendError(res, 'token_invalid', { action: 'request_new' });
     }
 
     // Track successful validation (fire-and-forget)

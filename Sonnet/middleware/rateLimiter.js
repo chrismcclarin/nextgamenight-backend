@@ -1,6 +1,13 @@
 // middleware/rateLimiter.js
 // Rate limiting middleware to prevent abuse and DDoS attacks
 const rateLimit = require('express-rate-limit');
+const { formatEnvelope } = require('../utils/errors');
+
+// Build a rate_limited envelope BODY for a limiter's `message` option. Keeps the
+// stable wire code `rate_limited` (429) while letting each limiter keep its own
+// human-readable prose via a messageOverride. The serializer also emits the
+// legacy `error` (= message) alias the FE still reads.
+const rateLimitedBody = (message) => formatEnvelope('rate_limited', undefined, message).body;
 
 // Adjust rate limits based on environment
 const isDevelopment = process.env.NODE_ENV !== 'production';
@@ -13,9 +20,7 @@ const FEEDBACK_LIMIT = isDevelopment ? 20 : 5;
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: API_LIMIT, // Limit each IP to API_LIMIT requests per windowMs
-  message: {
-    error: 'Too many requests from this IP, please try again later.',
-  },
+  message: rateLimitedBody('Too many requests from this IP, please try again later.'),
   standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
   legacyHeaders: false, // Disable the `X-RateLimit-*` headers
   // Skip rate limiting for localhost in development
@@ -26,9 +31,7 @@ const apiLimiter = rateLimit({
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: AUTH_LIMIT, // Limit each IP to AUTH_LIMIT requests per windowMs
-  message: {
-    error: 'Too many authentication attempts, please try again later.',
-  },
+  message: rateLimitedBody('Too many authentication attempts, please try again later.'),
   skipSuccessfulRequests: true, // Don't count successful requests
   skip: (req) => isDevelopment && (req.ip === '127.0.0.1' || req.ip === '::1' || req.ip === '::ffff:127.0.0.1'),
 });
@@ -37,9 +40,7 @@ const authLimiter = rateLimit({
 const feedbackLimiter = rateLimit({
   windowMs: 60 * 60 * 1000, // 1 hour
   max: FEEDBACK_LIMIT, // Limit each IP to FEEDBACK_LIMIT feedback submissions per hour
-  message: {
-    error: 'Too many feedback submissions, please try again later.',
-  },
+  message: rateLimitedBody('Too many feedback submissions, please try again later.'),
   skip: (req) => isDevelopment && (req.ip === '127.0.0.1' || req.ip === '::1' || req.ip === '::ffff:127.0.0.1'),
 });
 
@@ -47,9 +48,7 @@ const feedbackLimiter = rateLimit({
 const strictLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: WRITE_LIMIT, // Limit each IP to WRITE_LIMIT write operations per 15 minutes
-  message: {
-    error: 'Too many write operations, please try again later.',
-  },
+  message: rateLimitedBody('Too many write operations, please try again later.'),
   skip: (req) => isDevelopment && (req.ip === '127.0.0.1' || req.ip === '::1' || req.ip === '::ffff:127.0.0.1'),
 });
 
@@ -71,9 +70,7 @@ const magicTokenLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,      // 15 minutes
   max: MAGIC_TOKEN_LIMIT,
   skipSuccessfulRequests: true,   // Only count failures
-  message: {
-    error: 'Too many attempts. Please try again later.',
-  },
+  message: rateLimitedBody('Too many attempts. Please try again later.'),
   standardHeaders: true,
   legacyHeaders: false,
   // Key by normalized IP + first 16 chars of token (prevents brute force across tokens)

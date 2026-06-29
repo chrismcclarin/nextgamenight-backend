@@ -5,6 +5,18 @@ const emailService = require('./emailService');
 const smsService = require('./smsService');
 const { SentNotification } = require('../models');
 
+// Optional Sentry integration (Phase 85 / BAPI-02). DSN-gated require mirrors
+// workers/deadlineWorker.js so swallowed send failures escalate in production
+// without changing the existing console.error + swallow behavior (additive only).
+let Sentry = null;
+if (process.env.SENTRY_DSN) {
+  try {
+    Sentry = require('@sentry/node');
+  } catch (err) {
+    console.warn('[NotificationService] Sentry not available:', err.message);
+  }
+}
+
 class NotificationService {
   constructor() {
     this.emailService = emailService;
@@ -73,6 +85,7 @@ class NotificationService {
         results.email = await this.emailService.send(payload.emailParams);
       } catch (error) {
         console.error(`[NotificationService] Email send failed for type=${type}:`, error.message);
+        if (Sentry) Sentry.captureException(error, { tags: { service: 'notification', channel: 'email', type } });
         results.email = { success: false, error: error.message };
       }
     }
@@ -87,6 +100,7 @@ class NotificationService {
         });
       } catch (error) {
         console.error(`[NotificationService] SMS send failed for type=${type}:`, error.message);
+        if (Sentry) Sentry.captureException(error, { tags: { service: 'notification', channel: 'sms', type } });
         results.sms = { success: false, error: error.message };
       }
     }

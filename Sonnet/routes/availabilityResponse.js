@@ -8,6 +8,7 @@ const { UniqueConstraintError } = require('sequelize');
 const { validateToken } = require('../services/magicTokenService');
 const { AvailabilityPrompt, AvailabilityResponse } = require('../models');
 const { magicTokenLimiter } = require('../middleware/rateLimiter');
+const { sendError } = require('../utils/errors');
 
 /**
  * POST /api/availability-responses
@@ -88,24 +89,20 @@ router.post('/', magicTokenLimiter, async (req, res) => {
     const prompt = await AvailabilityPrompt.findByPk(promptId);
 
     if (!prompt) {
-      return res.status(400).json({
-        error: 'This availability prompt no longer exists.',
-        action: 'request_new'
-      });
+      // Anchored at 400 (A2): prompt-not-exists is a token/lifecycle reject, NOT a 404.
+      // Reuse the prompt_closed code (same 400 status) with the original prose preserved
+      // and `action` carried under details for the FE's request-new flow.
+      return sendError(res, 'prompt_closed', { action: 'request_new' }, 'This availability prompt no longer exists.');
     }
 
     if (prompt.status !== 'active') {
-      return res.status(400).json({
-        error: 'This availability prompt is no longer accepting responses.'
-      });
+      return sendError(res, 'prompt_closed');
     }
 
     // 4. Check if deadline has passed
     const now = new Date();
     if (prompt.deadline && new Date(prompt.deadline) < now) {
-      return res.status(400).json({
-        error: 'The deadline for this availability prompt has passed.'
-      });
+      return sendError(res, 'prompt_deadline_expired');
     }
 
     // 5. Upsert availability response

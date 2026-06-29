@@ -10,6 +10,16 @@ jest.mock('../../services/smsService', () => ({
   send: jest.fn()
 }));
 
+// Phase 85 / Plan 06 (BAPI-02): mock @sentry/node and force SENTRY_DSN BEFORE
+// requiring notificationService so its DSN-gated Sentry require resolves to this
+// mock — lets the additive-capture describe assert captureException fired.
+// (virtual: @sentry/node need not be installed for the unit-config run.)
+const mockCaptureException = jest.fn();
+jest.mock('@sentry/node', () => ({
+  captureException: (...args) => mockCaptureException(...args),
+}), { virtual: true });
+process.env.SENTRY_DSN = 'https://fake@sentry.io/85';
+
 const notificationService = require('../../services/notificationService');
 const emailService = require('../../services/emailService');
 const smsService = require('../../services/smsService');
@@ -399,6 +409,96 @@ describe('notificationService', () => {
       const results = await notificationService.sendToMany([], 'event_created', () => ({}));
       expect(results).toEqual([]);
     });
+  });
+});
+
+// =============================================
+// Phase 85 / Plan 06 (BAPI-02): additive Sentry capture on send failures
+// =============================================
+// DB-FREE — run in isolation via:
+//   npx jest --config jest.unit.config.js \
+//     --testMatch '**/tests/services/notificationService.test.js' \
+//     -t 'additive Sentry capture' --forceExit
+// (the -t filter excludes the DB-backed BSEC-01 block below, which needs Postgres.)
+// Asserts the swallowed email/SMS send failures now escalate to Sentry WITHOUT
+// changing the existing console.error + swallow (no throw; error still in results).
+describe('additive Sentry capture (Phase 85/06 BAPI-02)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('email send failure: captures to Sentry (channel:email tag) AND still swallows (no throw)', async () => {
+    const user = {
+      email_notifications_enabled: true,
+      sms_enabled: false,
+      phone: null,
+      notification_preferences: null,
+    };
+    const err = new Error('Resend 500');
+    emailService.send.mockRejectedValue(err);
+
+    const payload = {
+      emailParams: { to: 'user@test.com', subject: 'Test', html: '<p>hi</p>' },
+      data: {},
+    };
+
+    // Must NOT throw (swallow preserved)
+    const results = await notificationService.send(user, 'event_confirmation', payload);
+
+    // Additive capture fired with the documented tags
+    expect(mockCaptureException).toHaveBeenCalledTimes(1);
+    expect(mockCaptureException).toHaveBeenCalledWith(err, {
+      tags: { service: 'notification', channel: 'email', type: 'event_confirmation' },
+    });
+    // Existing behavior unchanged: error surfaced in results, sms untouched
+    expect(results.email).toEqual({ success: false, error: 'Resend 500' });
+    expect(results.sms).toBeNull();
+  });
+
+  it('SMS send failure: captures to Sentry (channel:sms tag) AND still swallows (no throw)', async () => {
+    const user = {
+      email_notifications_enabled: false,
+      sms_enabled: true,
+      phone: '+14155551234',
+      phone_verified: true,
+      notification_preferences: { reminder: { sms: true } },
+    };
+    const err = new Error('Twilio 429');
+    smsService.send.mockRejectedValue(err);
+
+    const payload = {
+      emailParams: { to: 'user@test.com', subject: 'Test', html: '<p>hi</p>' },
+      data: { gameName: 'Catan' },
+    };
+
+    const results = await notificationService.send(user, 'reminder', payload);
+
+    expect(mockCaptureException).toHaveBeenCalledTimes(1);
+    expect(mockCaptureException).toHaveBeenCalledWith(err, {
+      tags: { service: 'notification', channel: 'sms', type: 'reminder' },
+    });
+    expect(results.sms).toEqual({ success: false, error: 'Twilio 429' });
+    expect(results.email).toBeNull();
+  });
+
+  it('successful send does NOT call captureException (capture is failure-only)', async () => {
+    const user = {
+      email_notifications_enabled: true,
+      sms_enabled: false,
+      phone: null,
+      notification_preferences: null,
+    };
+    emailService.send.mockResolvedValue({ success: true, id: 'msg_ok' });
+
+    const payload = {
+      emailParams: { to: 'user@test.com', subject: 'Test', html: '<p>hi</p>' },
+      data: {},
+    };
+
+    const results = await notificationService.send(user, 'event_confirmation', payload);
+
+    expect(mockCaptureException).not.toHaveBeenCalled();
+    expect(results.email).toEqual({ success: true, id: 'msg_ok' });
   });
 });
 

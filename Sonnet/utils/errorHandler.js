@@ -1,6 +1,20 @@
 // utils/errorHandler.js
 // Utility functions for safe error handling in production
 
+const { formatEnvelope } = require('./errors');
+
+// Optional Sentry integration — DSN-gated, mirrors workers/deadlineWorker.js.
+// Required lazily behind the SENTRY_DSN gate so non-DSN environments (and DB-free
+// unit tests that do NOT set the DSN) never pull @sentry/node into the graph.
+let Sentry = null;
+if (process.env.SENTRY_DSN) {
+  try {
+    Sentry = require('@sentry/node');
+  } catch (err) {
+    console.warn('[errorHandler] Sentry not available:', err.message);
+  }
+}
+
 /**
  * Get a safe error message for client responses
  * In production, don't expose internal error details
@@ -10,7 +24,7 @@ function getSafeErrorMessage(error, defaultMessage = 'An error occurred') {
     // In development, show full error details
     return error.message || defaultMessage;
   }
-  
+
   // In production, return generic message
   // Log full error server-side for debugging
   console.error('Error details (server-side only):', {
@@ -18,21 +32,59 @@ function getSafeErrorMessage(error, defaultMessage = 'An error occurred') {
     name: error.name,
     stack: error.stack
   });
-  
+
   return defaultMessage;
 }
 
 /**
- * Send a safe error response
+ * Send a safe error response.
+ *
+ * Emits the canonical error envelope (BAPI-01) instead of a bare `{ error }`:
+ *   - 5xx -> formatEnvelope('internal', ..., <safe message>) so the body carries
+ *     code:'internal', the prod-safe message, and the `error` legacy alias. Production
+ *     NEVER serializes raw err.message/stack (getSafeErrorMessage governs the prose; ASVS V7).
+ *   - <500 -> wrap the same safe message as an envelope with a generic ad-hoc code
+ *     (no FE-contract code invented for these direct-response sites).
+ *
+ * Because sendSafeError responds DIRECTLY (it never calls next()), it owns its own
+ * observability escalation: a DSN-gated Sentry.captureException for 5xx ONLY, tagged with
+ * the low-cardinality route PATTERN (req.route.path + baseUrl) — NEVER req.originalUrl, which
+ * carries path-embedded PII like emails (routes/users.js:23) / player_names (ASVS V7). This
+ * does not double-fire with the global handler because the response is already sent here.
  */
 function sendSafeError(res, statusCode, error, defaultMessage = 'An error occurred') {
-  const message = getSafeErrorMessage(error, defaultMessage);
-  res.status(statusCode).json({ error: message });
+  const safeMessage = getSafeErrorMessage(error, defaultMessage);
+
+  let body;
+  if (statusCode >= 500) {
+    ({ body } = formatEnvelope('internal', undefined, safeMessage));
+
+    // 5xx-only DSN-gated escalation, route-PATTERN tagged (never originalUrl — ASVS V7).
+    if (Sentry) {
+      const req = res && res.req;
+      Sentry.captureException(error, {
+        tags: {
+          route: (req && req.route && ((req.baseUrl || '') + req.route.path)) || 'unmatched',
+          method: req && req.method,
+        },
+      });
+    }
+  } else {
+    // <500: route through the single serializer (Req-1) so we NEVER emit an off-registry
+    // code. Map the status to its registered code; fall back to a non-retryable registered
+    // code for any other <500 status. All live callers use 5xx today, so the fallback is
+    // hardening, not a behavior change. The prod-safe message is still passed as the
+    // messageOverride (never leak raw err.message). We ignore formatEnvelope's httpStatus
+    // and keep the caller's statusCode on the response below.
+    const STATUS_REGISTRY_CODE = { 401: 'unauthorized', 403: 'forbidden', 404: 'not_found', 429: 'rate_limited' };
+    const registryCode = STATUS_REGISTRY_CODE[statusCode] || 'forbidden';
+    ({ body } = formatEnvelope(registryCode, undefined, safeMessage));
+  }
+
+  res.status(statusCode).json(body);
 }
 
 module.exports = {
   getSafeErrorMessage,
   sendSafeError
 };
-
-

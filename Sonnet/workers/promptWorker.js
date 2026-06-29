@@ -242,12 +242,29 @@ const promptWorker = new Worker('prompts', async (job) => {
   concurrency: 3 // Process up to 3 prompt jobs simultaneously
 });
 
-promptWorker.on('failed', (job, err) => {
-  console.error(`[PromptWorker] Job ${job.id} failed:`, err.message);
-});
+/**
+ * BullMQ `failed` event hook — also exported so tests can assert the
+ * Sentry escalation path without invoking the real Worker/Redis.
+ *
+ * @param {object} job - BullMQ job (may be undefined in some failure modes)
+ * @param {Error} err
+ */
+function handleJobFailed(job, err) {
+  console.error(`[PromptWorker] Job ${job && job.id} failed:`, err && err.message);
+
+  // Escalate to Sentry so async job failures aren't silent (DSN-gated).
+  if (Sentry) {
+    Sentry.captureException(err, {
+      tags: { worker: 'prompt', job_id: job && job.id }
+    });
+  }
+}
+
+promptWorker.on('failed', handleJobFailed);
 
 promptWorker.on('completed', (job, result) => {
   console.log(`[PromptWorker] Job ${job.id} completed:`, result);
 });
 
 module.exports = promptWorker;
+module.exports.handleJobFailed = handleJobFailed;
