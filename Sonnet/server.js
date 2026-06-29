@@ -362,6 +362,13 @@ app.get('/health', (req, res) => {
 app.use((err, req, res, next) => {
   const { httpStatus, body } = formatEnvelope(err);
 
+  // Always surface 5xx to server stdout regardless of SENTRY_DSN, so an uncaught
+  // 500 is never silently swallowed in environments without Sentry configured.
+  // This is independent of (and runs before) the DSN-gated Sentry escalation below.
+  if (httpStatus >= 500) {
+    console.error(err);
+  }
+
   // Escalate ONLY 5xx, route-PATTERN tagged (never req.originalUrl — it carries
   // path-embedded PII like emails/player_names; ASVS V7). req.route may be unpopulated
   // in the global handler, hence the 'unmatched' fallback.
