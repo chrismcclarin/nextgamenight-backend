@@ -179,7 +179,15 @@ router.post('/prompts/:promptId/remind/:userId', verifyAuth0Token, async (req, r
         const nextAvailable = new Date(new Date(response.last_reminded_at).getTime() + 24 * 60 * 60 * 1000);
         // Anchored at 429 (A1, verified current wire status). next_reminder_available
         // moves under details; call-site emission inside the existing try/catch (Pitfall 1).
-        return sendError(res, 'reminder_cooldown', { next_reminder_available: nextAvailable.toISOString() });
+        // Preserve the ORIGINAL prose via messageOverride: the live FE special-cases
+        // err.message.includes('24 hours') (ResponseDashboard.js:72). Keeping the exact wire
+        // message stable keeps that FE branch working through the 85->86 window.
+        return sendError(
+          res,
+          'reminder_cooldown',
+          { next_reminder_available: nextAvailable.toISOString() },
+          'Cannot remind user more than once per 24 hours'
+        );
       }
     }
 
