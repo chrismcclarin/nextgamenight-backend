@@ -7,10 +7,12 @@ const { sendError } = require('../utils/errors');
 const validate = (req, res, next) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
+    // Emit { field, message } ONLY — do NOT reflect err.value back to the client.
+    // The live FE reads only err.message/err.field (never err.value), so dropping the
+    // submitted input value is FE-safe and avoids echoing user input on the wire.
     const fieldErrors = errors.array().map(err => ({
       field: err.path || err.param,
-      message: err.msg,
-      value: err.value
+      message: err.msg
     }));
     // Pass the OBJECT { errors } so the central serializer (utils/errors.js)
     // mirrors the field errors to BOTH details.errors[] AND a top-level
@@ -36,10 +38,10 @@ const validate = (req, res, next) => {
 const validateStrict = (req, res, next) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
+    // Emit { field, message } ONLY — do NOT reflect err.value (see `validate` above).
     const fieldErrors = errors.array().map(err => ({
       field: err.path || err.param,
-      message: err.msg,
-      value: err.value
+      message: err.msg
     }));
     return sendError(res, 'validation', { errors: fieldErrors });
   }

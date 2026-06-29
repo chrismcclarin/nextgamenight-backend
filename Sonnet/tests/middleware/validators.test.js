@@ -39,6 +39,8 @@ describe('validate middleware -> validation envelope (dual-emit)', () => {
     expect(res.body.errors.length).toBeGreaterThan(0);
     expect(res.body.errors[0].field).toBe('name');
     expect(res.body.errors[0].message).toBe('Name must be at least 3 characters');
+    // The submitted input value is NOT reflected back to the client (no echo of user input).
+    expect(res.body.errors[0]).not.toHaveProperty('value');
 
     // details.errors[] mirrors the top-level errors[] (dual-emit from serializer).
     expect(res.body.details.errors).toEqual(res.body.errors);
