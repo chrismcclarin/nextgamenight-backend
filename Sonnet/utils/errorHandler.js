@@ -70,8 +70,15 @@ function sendSafeError(res, statusCode, error, defaultMessage = 'An error occurr
       });
     }
   } else {
-    // <500: keep the prod-safe message but still wrap it as an envelope. Generic code only.
-    body = { code: 'error', message: safeMessage, error: safeMessage };
+    // <500: route through the single serializer (Req-1) so we NEVER emit an off-registry
+    // code. Map the status to its registered code; fall back to a non-retryable registered
+    // code for any other <500 status. All live callers use 5xx today, so the fallback is
+    // hardening, not a behavior change. The prod-safe message is still passed as the
+    // messageOverride (never leak raw err.message). We ignore formatEnvelope's httpStatus
+    // and keep the caller's statusCode on the response below.
+    const STATUS_REGISTRY_CODE = { 401: 'unauthorized', 403: 'forbidden', 404: 'not_found', 429: 'rate_limited' };
+    const registryCode = STATUS_REGISTRY_CODE[statusCode] || 'forbidden';
+    ({ body } = formatEnvelope(registryCode, undefined, safeMessage));
   }
 
   res.status(statusCode).json(body);

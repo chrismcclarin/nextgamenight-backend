@@ -87,4 +87,15 @@ describe('sendSafeError — envelope + 5xx escalation (BAPI-01/BAPI-02)', () => 
     expect(res.body.code).toBeDefined();
     expect(res.body.error).toBe(res.body.message);
   });
+
+  test('<500 routes through the registry — returns a REGISTERED code, never off-registry "error"', () => {
+    const res = makeRes(PII_REQ);
+    sendSafeError(res, 403, new Error('nope'), 'Forbidden');
+
+    expect(res.statusCode).toBe(403);           // caller status preserved
+    expect(res.body.code).toBe('forbidden');    // registered code, NOT the old ad-hoc 'error'
+    expect(res.body.code).not.toBe('error');
+    expect(res.body.error).toBe(res.body.message); // legacy alias intact
+    expect(res.body.message).toBe('Forbidden');    // prod-safe message preserved via override
+  });
 });
