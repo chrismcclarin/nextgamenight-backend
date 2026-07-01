@@ -16,6 +16,7 @@ const request = require('supertest');
 const express = require('express');
 const rateLimit = require('express-rate-limit');
 const { formatEnvelope } = require('../../utils/errors');
+const { magicTokenLimiter } = require('../../middleware/rateLimiter');
 
 describe('rate_limited envelope (429)', () => {
   it('formatEnvelope(\'rate_limited\') builds a rate_limited body with the error alias', () => {
@@ -51,5 +52,79 @@ describe('rate_limited envelope (429)', () => {
     expect(second.status).toBe(429);
     expect(second.body.code).toBe('rate_limited');
     expect(second.body.error).toBe(second.body.message);
+  });
+});
+
+// -----------------------------------------------------------------------------
+// Phase 86 / T-86-07 regression: under `trust proxy = 1` the magicTokenLimiter
+// keys on the REAL per-client IP (the single edge-appended, right-most
+// X-Forwarded-For value) and CANNOT be defeated by a client-supplied spoofed
+// X-Forwarded-For. A forged left-most XFF entry does NOT grant a fresh allowance.
+//
+// DB-free, no Redis, no network. Run in isolation per the backend-suite gotcha:
+//   npm test -- tests/middleware/rateLimiter.test.js
+// -----------------------------------------------------------------------------
+describe('magicTokenLimiter spoof-safety under trust proxy = 1 (T-86-07)', () => {
+  // Distinctive token + IPs so this test never shares a MemoryStore bucket with
+  // any other test that touches magicTokenLimiter. Token prefix = first 16 chars.
+  const TOKEN = 'spoofsafe-regres-AAAAAAAAAAAAAAAA'; // prefix: 'spoofsafe-regres'
+  const REAL_IP = '10.77.0.5';
+  const OTHER_REAL_IP = '10.77.0.9';
+
+  function buildApp() {
+    const app = express();
+    app.set('trust proxy', 1); // mirror server.js — trust ONLY the edge hop
+    app.use(express.json());
+    // req.ip echo (proves the trust-proxy resolution itself).
+    app.get('/whoami', (req, res) => res.json({ ip: req.ip }));
+    // A FAILED magic-token attempt (401). magicTokenLimiter has
+    // skipSuccessfulRequests:true, so only failures accrue toward the limit.
+    app.post('/magic', magicTokenLimiter, (req, res) =>
+      res.status(401).json({ ok: false })
+    );
+    return app;
+  }
+
+  it('req.ip is the edge-appended (right-most) XFF value, NOT the forged left-most one', async () => {
+    const app = buildApp();
+    const res = await request(app)
+      .get('/whoami')
+      .set('X-Forwarded-For', `6.6.6.6, ${REAL_IP}`);
+    expect(res.status).toBe(200);
+    // trust proxy = 1 trusts exactly the one edge hop → right-most value wins;
+    // the attacker-controlled '6.6.6.6' prefix is ignored.
+    expect(res.body.ip).toBe(REAL_IP);
+    expect(res.body.ip).not.toBe('6.6.6.6');
+  });
+
+  it('rotating a forged X-Forwarded-For prefix does NOT earn fresh magic-token allowance', async () => {
+    const app = buildApp();
+
+    // Hammer failed attempts from the SAME real client IP but a DIFFERENT forged
+    // XFF prefix each time + the SAME token. If the forged prefix could shift the
+    // key, each request would land in a fresh bucket and NEVER 429. Because the
+    // limiter keys on the trusted real IP + token prefix, the shared bucket must
+    // exhaust. 60 > both the prod (5) and dev (50) MAGIC_TOKEN_LIMIT.
+    let saw429 = false;
+    for (let i = 0; i < 60; i++) {
+      const res = await request(app)
+        .post('/magic')
+        .set('X-Forwarded-For', `9.9.${i}.1, ${REAL_IP}`) // rotating forged prefix
+        .send({ token: TOKEN });
+      if (res.status === 429) {
+        saw429 = true;
+        break;
+      }
+      expect(res.status).toBe(401); // pre-limit responses are the failed attempt
+    }
+    expect(saw429).toBe(true);
+
+    // Control: a DIFFERENT real client IP (same token) is a DIFFERENT bucket —
+    // it must NOT already be rate-limited, proving keying is per real client IP.
+    const control = await request(app)
+      .post('/magic')
+      .set('X-Forwarded-For', `9.9.9.9, ${OTHER_REAL_IP}`)
+      .send({ token: TOKEN });
+    expect(control.status).toBe(401);
   });
 });

@@ -11,7 +11,21 @@ const rateLimitedBody = (message) => formatEnvelope('rate_limited', undefined, m
 
 // Adjust rate limits based on environment
 const isDevelopment = process.env.NODE_ENV !== 'production';
-const API_LIMIT = isDevelopment ? 1000 : 300; // 300 reads per 15 min in production
+
+// API_LIMIT — global apiLimiter ceiling (IP-keyed, mounted PRE-auth at server.js).
+//
+// INTERIM raise (Phase 86 / T-86-07): the Phase-86 BFF makes ALL authenticated
+// traffic originate from ONE Vercel egress IP, so this IP-keyed limiter collapses
+// into a single shared bucket for the entire authenticated userbase. The old
+// per-user budget of 300/15min would 429-storm the moment the BFF ships. Raise the
+// production ceiling to ~ the old per-user budget (300) x a conservative ~100
+// concurrent-active-user launch estimate = 30000/15min. This still bounds gross
+// abuse (a single scraper cannot exceed 30k/15min) while absorbing normal shared-IP
+// load. The DURABLE per-client/per-user fix (real-client-IP resolution or Auth0-sub
+// identity keying via a NEW post-auth limiter) is DEFERRED to Phase 91 / BOPS-02 —
+// see .planning/deferred/phase-91.md — after which this ceiling should be lowered
+// back to a per-client-appropriate value. Dev is unaffected (no BFF egress sharing).
+const API_LIMIT = isDevelopment ? 1000 : 30000;
 const WRITE_LIMIT = isDevelopment ? 500 : 100;
 const AUTH_LIMIT = isDevelopment ? 50 : 5;
 const FEEDBACK_LIMIT = isDevelopment ? 20 : 5;
