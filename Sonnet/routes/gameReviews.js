@@ -39,15 +39,20 @@ router.get('/game/:game_id/group/:group_id', async (req, res) => {
 router.get('/user/:user_id/group/:group_id', async (req, res) => {
   try {
     const { user_id: target_user_id, group_id } = req.params;
-    const { user_id } = req.query;
-    
-    if (user_id) {
-      const hasAccess = await isActiveMember(user_id, group_id);
-      if (!hasAccess) {
-        return res.status(403).json({ error: 'Access denied to this group' });
-      }
+
+    // Authorize on the VERIFIED caller (req.user), not a client-supplied ?user_id.
+    // The FE dropped the spoofable ?user_id query param (FSEC-02), so the old
+    // `if (user_id)` gate no longer fired — leaving this endpoint with zero
+    // authorization. Enforce group membership unconditionally on the token identity.
+    const callerId = req.user?.user_id;
+    if (!callerId) {
+      return res.status(401).json({ error: 'Unauthorized' });
     }
-    
+    const hasAccess = await isActiveMember(callerId, group_id);
+    if (!hasAccess) {
+      return res.status(403).json({ error: 'Access denied to this group' });
+    }
+
     const targetUser = await User.findOne({ where: { user_id: target_user_id } });
     if (!targetUser) {
       return res.status(404).json({ error: 'User not found' });

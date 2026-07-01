@@ -78,9 +78,21 @@ const { reminderJob } = require('./schedulers/reminderScheduler');
 const app = express();
 const PORT = process.env.PORT || 4000;
 
-// Trust proxy - required for Railway and other platforms that use reverse proxies
-// Set to 1 to trust only the first proxy (Railway's reverse proxy)
-// This is more secure than 'true' which trusts all proxies
+// Trust proxy - required for Railway and other platforms that use reverse proxies.
+// Set to 1 to trust ONLY the immediate Railway edge hop. This is spoof-safe: the
+// backend never trusts a client-supplied X-Forwarded-For beyond that single hop,
+// so a client CANNOT forge their IP to defeat magicTokenLimiter on the direct
+// public (magic-link) path. More secure than 'true' (which trusts all proxies).
+//
+// DEFERRED — Phase 91 / BOPS-02 (T-86-07): under the Phase-86 BFF, ALL
+// AUTHENTICATED traffic now originates from one Vercel egress IP, so the global
+// IP-keyed apiLimiter collapses into a single shared bucket for the whole
+// authenticated userbase. The DURABLE fix (real-client-IP resolution via a
+// pinned multi-hop trust chain / X-Forwarded-For, or per-user identity keying)
+// is intentionally NOT done here: bumping the hop count to trust the BFF hop
+// would let an attacker spoof X-Forwarded-For at hop=2 to defeat magicTokenLimiter
+// on the direct path. Interim guard = keep trust proxy = 1 (spoof-safe) + raise
+// the apiLimiter ceiling (middleware/rateLimiter.js). See .planning/deferred/phase-91.md.
 app.set('trust proxy', 1);
 
 // HTTPS Enforcement (for production)
