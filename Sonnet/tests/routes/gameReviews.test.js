@@ -6,7 +6,10 @@ const { GameReview, User, Group, Game } = require('../../models');
 const { makeUser, makeGroup, addToGroup } = require('../factories');
 
 // POST and DELETE derive the actor from req.user (BSEC-01 / BE-100 default-deny
-// authz, Phase 83). GET routes use req.query.user_id for the access check.
+// authz, Phase 83). The GET /user/:user_id/group/:group_id route also authorizes
+// on the verified req.user (Phase 86 code-review fix — it previously keyed the
+// membership check on a spoofable ?user_id). The GET /game/:game_id/group/:group_id
+// route still uses the optional ?user_id check.
 // Build a per-test app that injects req.user ahead of the router; pass null for
 // the unauthenticated case.
 function makeApp(actor) {
@@ -136,9 +139,13 @@ describe('GameReview Routes', () => {
       expect(response.body.length).toBe(0);
     });
 
-    it('should return 403 if user_id provided but user not in group', async () => {
-      const response = await request(makeApp(testUser1))
-        .get(`/api/game-reviews/user/${testUser1.user_id}/group/${testGroup.id}?user_id=${testUser2.user_id}`)
+    it('should return 403 if the CALLER is not a member of the group', async () => {
+      // Phase 86 code-review fix: authorization is on the VERIFIED caller
+      // (req.user.user_id), NOT a client-supplied ?user_id. testUser2 is a
+      // non-member, so even requesting a member's reviews is denied — and no
+      // ?user_id is passed, proving the gate no longer depends on it.
+      const response = await request(makeApp(testUser2))
+        .get(`/api/game-reviews/user/${testUser1.user_id}/group/${testGroup.id}`)
         .expect(403);
 
       expect(response.body.error).toBe('Access denied to this group');
@@ -152,9 +159,10 @@ describe('GameReview Routes', () => {
       expect(response.body.error).toBe('User not found');
     });
 
-    it('should allow access if user_id provided and user is in group', async () => {
+    it('should allow access when the caller is a member of the group', async () => {
+      // Member caller, no ?user_id needed — authz is on req.user.
       const response = await request(makeApp(testUser1))
-        .get(`/api/game-reviews/user/${testUser1.user_id}/group/${testGroup.id}?user_id=${testUser1.user_id}`)
+        .get(`/api/game-reviews/user/${testUser1.user_id}/group/${testGroup.id}`)
         .expect(200);
 
       expect(Array.isArray(response.body)).toBe(true);
