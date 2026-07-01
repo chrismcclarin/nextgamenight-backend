@@ -26,7 +26,21 @@ const isDevelopment = process.env.NODE_ENV !== 'production';
 // see .planning/deferred/phase-91.md — after which this ceiling should be lowered
 // back to a per-client-appropriate value. Dev is unaffected (no BFF egress sharing).
 const API_LIMIT = isDevelopment ? 1000 : 30000;
-const WRITE_LIMIT = isDevelopment ? 500 : 100;
+// WRITE_LIMIT — strictLimiter/writeOperationLimiter ceiling (IP-keyed, mounted on
+// every authenticated write route group at server.js).
+//
+// INTERIM raise (Phase 86 / T-86-07, same rationale as API_LIMIT above): under the
+// Phase-86 BFF, ALL authenticated writes (POST/PUT/PATCH/DELETE) also originate from
+// ONE Vercel egress IP, so this IP-keyed limiter collapses into a single shared
+// bucket for the entire authenticated userbase. The old per-user budget of 100/15min
+// would 429-storm every user's writes the moment the BFF ships. Raise the production
+// ceiling to ~ the old per-user write budget (100) x a conservative ~100 concurrent-
+// active-user launch estimate = 10000/15min. This still bounds gross write abuse while
+// absorbing normal shared-IP write load. The DURABLE per-user keying fix (Auth0-sub
+// keyGenerator on a post-auth limiter) is DEFERRED to Phase 91 / BOPS-02 — see
+// .planning/deferred/phase-91.md — after which this ceiling should be lowered back to
+// a per-client-appropriate value. Dev is unaffected (no BFF egress sharing).
+const WRITE_LIMIT = isDevelopment ? 500 : 10000;
 const AUTH_LIMIT = isDevelopment ? 50 : 5;
 const FEEDBACK_LIMIT = isDevelopment ? 20 : 5;
 

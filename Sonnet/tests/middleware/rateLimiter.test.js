@@ -128,3 +128,57 @@ describe('magicTokenLimiter spoof-safety under trust proxy = 1 (T-86-07)', () =>
     expect(control.status).toBe(401);
   });
 });
+
+// -----------------------------------------------------------------------------
+// Phase 86 code-review HIGH regression: the BFF collapses ALL authenticated
+// writes onto ONE Vercel egress IP, so the IP-keyed writeOperationLimiter became
+// a single shared bucket for the whole userbase. The read limiter was raised
+// (API_LIMIT 300 -> 30000) but the WRITE limiter was left at the old per-user
+// 100/15min — which would 429-storm every user's writes under the BFF. The
+// interim mitigation raises the PRODUCTION WRITE_LIMIT to a shared-IP-appropriate
+// ceiling (10000/15min). This test asserts a representative shared-IP write burst
+// ABOVE the old 100 ceiling is NOT globally throttled. Guards against reverting
+// WRITE_LIMIT to the per-user value before the Phase 91 / BOPS-02 per-user keying
+// lands.
+//
+// DB-free, no Redis, no network. Run in isolation per the backend-suite gotcha:
+//   npm test -- tests/middleware/rateLimiter.test.js
+// -----------------------------------------------------------------------------
+describe('writeOperationLimiter shared-IP ceiling under the BFF (Phase 86 HIGH)', () => {
+  // Load the limiter with NODE_ENV=production so WRITE_LIMIT is the raised prod
+  // ceiling (not the dev value) AND the localhost skip is inactive (prod skips no
+  // IP), letting us drive the limiter behaviorally from the test client.
+  function loadProdWriteLimiter() {
+    const prev = process.env.NODE_ENV;
+    let writeOperationLimiter;
+    jest.isolateModules(() => {
+      process.env.NODE_ENV = 'production';
+      ({ writeOperationLimiter } = require('../../middleware/rateLimiter'));
+    });
+    process.env.NODE_ENV = prev;
+    return writeOperationLimiter;
+  }
+
+  it('does NOT 429 a shared-IP write burst above the OLD 100/15min ceiling', async () => {
+    const writeOperationLimiter = loadProdWriteLimiter();
+    const app = express();
+    app.set('trust proxy', 1); // mirror server.js — resolve the real edge-hop IP
+    app.use(express.json());
+    app.post('/w', writeOperationLimiter, (req, res) => res.json({ ok: true }));
+
+    // 110 writes (> the old prod WRITE_LIMIT of 100) from ONE shared egress IP,
+    // simulating the BFF collapse. Under the old 100 ceiling, request #101 would
+    // 429; under the raised 10000 ceiling every one must pass.
+    const SHARED_EGRESS_IP = '10.88.0.7';
+    let saw429 = false;
+    for (let i = 0; i < 110; i++) {
+      const res = await request(app)
+        .post('/w')
+        .set('X-Forwarded-For', SHARED_EGRESS_IP)
+        .send({ n: i });
+      if (res.status === 429) { saw429 = true; break; }
+      expect(res.status).toBe(200);
+    }
+    expect(saw429).toBe(false);
+  });
+});
