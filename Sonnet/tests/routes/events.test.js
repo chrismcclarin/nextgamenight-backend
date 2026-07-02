@@ -2,8 +2,14 @@
 const request = require('supertest');
 const express = require('express');
 const eventRoutes = require('../../routes/events');
-const { Event, Game, User, Group, EventParticipation, UserGroup } = require('../../models');
+const { Event, Game, User, Group, EventParticipation, UserGroup, sequelize } = require('../../models');
 const { makeUser, makeGroup, addToGroup } = require('../factories');
+const { QueryTypes } = require('sequelize');
+// Phase 87 (BINT-02): the migration under test — used by the preclean unit test
+// to exercise the real orphan-DELETE + guarded ADD CONSTRAINT on a raw connection.
+const epUserFkMigration = require('../../migrations/20260701000002-add-eventparticipation-user-fk');
+
+const EP_FK_NAME = 'eventparticipations_user_id_fkey';
 
 // The event routes derive the actor from req.user (BE-040/BE-044 / BSEC-01
 // default-deny authz, Phase 83) and always membership-check. Build a per-test
@@ -258,5 +264,134 @@ describe('Event Routes', () => {
 
       expect(response.body.error).toBe('Event not found');
     });
+  });
+});
+
+// Phase 87 (BINT-02, D-01/D-02/D-06): EventParticipation.user_id protective FK
+// → Users.id (UUID PK) with ON DELETE CASCADE. Verifies the sync-side FK
+// (rejection + cascade) and the migration-side orphan preclean.
+//
+// The model-level FK builds on the sync() test DB (models/EventParticipation.js),
+// so the rejection/cascade tests are real DB-level assertions here. The orphan
+// preclean, however, is CIRCULAR to test end-to-end against the synced schema:
+// once the FK exists you CANNOT seed an orphan (the FK rejects it) and the
+// migration's ADD CONSTRAINT is a guarded no-op. So the preclean is covered by
+// dropping the FK, seeding dirty rows on a raw connection, and running the real
+// migration up() (preclean DELETE + guarded re-ADD). Real dirty-data end-to-end
+// coverage is the PR CI Postgres `migrate:apply` run (VALIDATION Manual-Only).
+describe('EventParticipation.user_id → Users.id FK (Phase 87 BINT-02)', () => {
+  let user;
+  let event;
+
+  beforeEach(async () => {
+    user = await makeUser({ user_id: 'auth0|ep-fk-owner', username: 'ep-fk-owner' });
+    const group = await makeGroup({ group_id: 'group-ep-fk', name: 'EP FK Group' });
+    const game = await Game.create({ name: 'EP FK Game', is_custom: true });
+    event = await Event.create({
+      group_id: group.id,
+      game_id: game.id,
+      start_date: new Date(),
+      status: 'scheduled',
+    });
+  });
+
+  it('rejects an EventParticipation whose user_id is a non-existent Users.id (FK violation)', async () => {
+    const orphanUserId = '11111111-1111-1111-1111-111111111111';
+    await expect(
+      EventParticipation.create({
+        event_id: event.id,
+        user_id: orphanUserId, // no such Users.id
+        score: 10,
+      })
+    ).rejects.toThrow(); // SequelizeForeignKeyConstraintError from the DB-level FK
+  });
+
+  it('cascades: deleting a User removes their EventParticipation rows (ON DELETE CASCADE)', async () => {
+    const ep = await EventParticipation.create({
+      event_id: event.id,
+      user_id: user.id, // valid UUID Users.id
+      score: 42,
+    });
+    expect(ep.id).toBeTruthy();
+
+    // Delete the user; the DB-level ON DELETE CASCADE must remove the EP row.
+    await user.destroy();
+
+    const survivors = await EventParticipation.findAll({ where: { id: ep.id } });
+    expect(survivors.length).toBe(0);
+  });
+
+  it('migration preclean DELETEs only orphan EventParticipation rows, valid rows survive, then re-adds the FK', async () => {
+    const qi = sequelize.getQueryInterface();
+
+    // Discover the ACTUAL FK constraint(s) on EventParticipations. On the sync()
+    // test DB the FK is named "EventParticipations_user_id_fkey" (Sequelize
+    // preserves table case), NOT the lowercase "eventparticipations_user_id_fkey"
+    // the migration uses in prod — the two names live in separate environments,
+    // so they never collide. We must drop the sync-built one by its real name to
+    // seed a dirty (orphan) row. try/finally always restores a working FK for
+    // subsequent serial suites (--runInBand; schema is built once per run).
+    const preExistingFks = await sequelize.query(
+      `SELECT conname FROM pg_constraint
+       WHERE conrelid = '"EventParticipations"'::regclass AND contype = 'f'
+         AND conname LIKE '%user_id%'`,
+      { type: QueryTypes.SELECT }
+    );
+    for (const { conname } of preExistingFks) {
+      await sequelize.query(
+        `ALTER TABLE "EventParticipations" DROP CONSTRAINT IF EXISTS "${conname}"`
+      );
+    }
+
+    try {
+      // Seed 1 VALID EP (real user) + 1 ORPHAN EP (random non-existent user_id).
+      // Raw INSERT bypasses model FK metadata (moot here anyway — constraint dropped).
+      const validEp = await EventParticipation.create({
+        event_id: event.id,
+        user_id: user.id,
+        score: 1,
+      });
+      const orphanUserId = '22222222-2222-2222-2222-222222222222';
+      const orphanId = require('crypto').randomUUID();
+      // Raw INSERT (id generated in JS to avoid any DB uuid-extension dependency).
+      await sequelize.query(
+        `INSERT INTO "EventParticipations" (id, event_id, user_id, is_new_player, is_guest, "createdAt", "updatedAt")
+         VALUES (:id, :event_id, :user_id, false, false, NOW(), NOW())`,
+        { replacements: { id: orphanId, event_id: event.id, user_id: orphanUserId }, type: QueryTypes.INSERT }
+      );
+
+      // Sanity: both rows present before preclean.
+      const before = await EventParticipation.count();
+      expect(before).toBe(2);
+
+      // Run the REAL migration up(): orphan preclean DELETE + guarded ADD CONSTRAINT.
+      await epUserFkMigration.up(qi);
+
+      // Orphan gone, valid survives.
+      const orphanSurvivors = await EventParticipation.findAll({ where: { id: orphanId } });
+      expect(orphanSurvivors.length).toBe(0);
+      const validSurvivors = await EventParticipation.findAll({ where: { id: validEp.id } });
+      expect(validSurvivors.length).toBe(1);
+
+      // FK re-added by the migration → constraint present again.
+      const constraint = await sequelize.query(
+        `SELECT 1 FROM pg_constraint WHERE conname = :name`,
+        { replacements: { name: EP_FK_NAME }, type: QueryTypes.SELECT }
+      );
+      expect(constraint.length).toBe(1);
+    } finally {
+      // Guarantee the FK exists for the rest of the run even if an assertion threw.
+      const stillThere = await sequelize.query(
+        `SELECT 1 FROM pg_constraint WHERE conname = :name`,
+        { replacements: { name: EP_FK_NAME }, type: QueryTypes.SELECT }
+      );
+      if (stillThere.length === 0) {
+        await sequelize.query(
+          `ALTER TABLE "EventParticipations"
+             ADD CONSTRAINT "${EP_FK_NAME}"
+             FOREIGN KEY (user_id) REFERENCES "Users"(id) ON DELETE CASCADE`
+        );
+      }
+    }
   });
 });
