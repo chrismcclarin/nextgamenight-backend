@@ -37,6 +37,7 @@ const express = require('express');
 
 const availabilityPromptRoutes = require('../../routes/availabilityPrompt');
 const { AvailabilityPrompt, AvailabilityResponse } = require('../../models');
+const emailService = require('../../services/emailService');
 const { makeUser, makeGroup, addToGroup } = require('../factories');
 
 function makeApp(actor) {
@@ -94,5 +95,74 @@ describe('POST /api/prompts/:promptId/remind/:userId — <24h cooldown envelope'
     expect(res.body.error).toBe(res.body.message); // legacy alias
     // fix C: the wire message must retain '24 hours' for the live FE branch.
     expect(res.body.message).toContain('24 hours');
+  });
+});
+
+// Phase 87 (WR-04): a concurrent/duplicate admin remind that races the
+// placeholder AvailabilityResponse.create must degrade to a success (re-find +
+// update last_reminded_at), never a 500. A real DB race is not reproducible in a
+// single-threaded test, so we force it: step 4's findOne sees no row (the create
+// branch is taken), the create throws a SequelizeUniqueConstraintError (the
+// concurrent create won the row), and the absorb's re-find returns the racing row.
+describe('POST /api/prompts/:promptId/remind/:userId — concurrent-duplicate absorb (WR-04)', () => {
+  let owner;
+  let target;
+  let group;
+  let prompt;
+
+  beforeEach(async () => {
+    owner = await makeUser({ username: 'remind-absorb-owner' });
+    target = await makeUser({ username: 'remind-absorb-target' });
+    group = await makeGroup({ name: 'Remind Absorb Group' });
+    await addToGroup(owner, group, 'owner');
+    await addToGroup(target, group, 'member');
+
+    prompt = await AvailabilityPrompt.create({
+      group_id: group.id,
+      prompt_date: new Date(),
+      deadline: new Date(Date.now() + 72 * 60 * 60 * 1000),
+      status: 'active',
+      week_identifier: '2026-W27',
+    });
+
+    // Email must succeed so the handler reaches step 9 (the write branch).
+    jest.spyOn(emailService, 'send').mockResolvedValue({ success: true });
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  it('degrades a duplicate placeholder create into a success (re-find + update)', async () => {
+    // The racing row that the concurrent request already inserted.
+    const raceRow = { update: jest.fn().mockResolvedValue(undefined) };
+
+    // Step 4 sees no row (create branch); the absorb re-find returns the racer.
+    const findOneSpy = jest
+      .spyOn(AvailabilityResponse, 'findOne')
+      .mockResolvedValueOnce(null)      // step 4 cooldown/submitted check
+      .mockResolvedValueOnce(raceRow);  // absorb re-find
+
+    // The placeholder create loses the race → unique-index violation.
+    const uniqueErr = new Error('duplicate key value violates unique constraint');
+    uniqueErr.name = 'SequelizeUniqueConstraintError';
+    const createSpy = jest
+      .spyOn(AvailabilityResponse, 'create')
+      .mockRejectedValueOnce(uniqueErr);
+
+    const res = await request(makeApp(owner))
+      .post(`/api/prompts/${prompt.id}/remind/${encodeURIComponent(target.user_id)}`)
+      .send({});
+
+    // Absorbed: success, not a 500.
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+
+    // The racing row was re-found and stamped with last_reminded_at (exactly one
+    // row survives — the unique index guarantees the second insert never lands).
+    expect(createSpy).toHaveBeenCalledTimes(1);
+    expect(findOneSpy).toHaveBeenCalledTimes(2);
+    expect(raceRow.update).toHaveBeenCalledTimes(1);
+    expect(raceRow.update.mock.calls[0][0]).toHaveProperty('last_reminded_at');
   });
 });

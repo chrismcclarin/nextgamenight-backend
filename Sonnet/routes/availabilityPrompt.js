@@ -248,15 +248,38 @@ router.post('/prompts/:promptId/remind/:userId', verifyAuth0Token, async (req, r
     if (response) {
       await response.update({ last_reminded_at: new Date() });
     } else {
-      // Create a placeholder response record to track reminder
-      await AvailabilityResponse.create({
-        prompt_id: promptId,
-        user_id: targetUserId,
-        time_slots: [],
-        user_timezone: 'UTC',
-        submitted_at: null, // Not submitted yet
-        last_reminded_at: new Date()
-      });
+      // Create a placeholder response record to track reminder.
+      // Phase 87 (WR-04): absorb a concurrent-duplicate create. Two admin
+      // reminds that both pass the "no response row" branch race to insert the
+      // placeholder; the loser hits the (prompt_id, user_id) unique index. Mirror
+      // the in-file absorb check (err.name === 'SequelizeUniqueConstraintError',
+      // used at the prompt-create path) and the rsvp.js re-find-and-update analog:
+      // degrade the racing create to a success instead of a 500.
+      try {
+        await AvailabilityResponse.create({
+          prompt_id: promptId,
+          user_id: targetUserId,
+          time_slots: [],
+          user_timezone: 'UTC',
+          submitted_at: null, // Not submitted yet
+          last_reminded_at: new Date()
+        });
+      } catch (err) {
+        if (err.name === 'SequelizeUniqueConstraintError') {
+          // Concurrent create won the race — re-find the racing row and stamp
+          // last_reminded_at on it so the double-click degrades to success.
+          const raceRow = await AvailabilityResponse.findOne({
+            where: { prompt_id: promptId, user_id: targetUserId }
+          });
+          if (raceRow) {
+            await raceRow.update({ last_reminded_at: new Date() });
+          } else {
+            throw err; // Unexpected state — re-throw
+          }
+        } else {
+          throw err;
+        }
+      }
     }
 
     res.json({
