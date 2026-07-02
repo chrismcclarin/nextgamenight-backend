@@ -3,7 +3,7 @@
 const { Worker } = require('bullmq');
 const Redis = require('ioredis');
 const { AvailabilityPrompt, AvailabilityResponse, UserGroup, User, Group, GroupPromptSettings } = require('../models');
-const { Op } = require('sequelize');
+const { Op, UniqueConstraintError } = require('sequelize');
 const emailService = require('../services/emailService');
 const notificationService = require('../services/notificationService');
 const magicTokenService = require('../services/magicTokenService');
@@ -53,9 +53,44 @@ const connection = new Redis(process.env.REDIS_URL || 'redis://localhost:6379', 
 
 const MAX_REMINDERS_PER_USER = 2;
 
-const reminderWorker = new Worker('reminders', async (job) => {
+/**
+ * Reminder job handler — extracted from the inline anonymous Worker callback so
+ * it is directly unit-testable (double-invokable in a test without a live
+ * BullMQ/Redis runtime). Exported as `module.exports.processReminderJob`.
+ *
+ * Idempotency (T-87-12): the DB claim is moved BEFORE the email side effect
+ * (D-04 claim-then-send). For each eligible non-responder we advance
+ * reminder_count from the immediately-prior value to THIS reminder's expected
+ * value with an atomic conditional UPDATE, and only send if we won exactly one
+ * row. A same-job BullMQ retry after a crash finds the row already at the
+ * expected value, claims 0 rows, and skips the send — so a retry never
+ * double-sends the same reminder. The MAX_REMINDERS_PER_USER cap remains as an
+ * additional cumulative ceiling on top of the per-reminder claim.
+ *
+ * @param {import('bullmq').Job} job
+ */
+async function processReminderJob(job) {
   const { promptId, reminderType, groupId } = job.data;
   console.log(`[ReminderWorker] Processing ${reminderType} reminder for prompt ${promptId}`);
+
+  // Derive the expected post-claim reminder_count for THIS reminder from the
+  // job's reminderType. The scheduler only ever emits the literal strings
+  // '50-percent' and '90-percent' (services/reminderService.js:36,50):
+  //   '50-percent' → 1st reminder  → expected reminder_count 1
+  //   '90-percent' → 2nd/final     → expected reminder_count 2
+  // NOTE: 'final' is ONLY a human display label (see reminderLabel below), it is
+  // NEVER a reminderType value — the claim must NOT be keyed off it (mapping the
+  // 90-percent reminder to expected=1 would make its claim WHERE count=0 miss the
+  // already-advanced row and silently never send).
+  let expectedCount;
+  if (reminderType === '50-percent') {
+    expectedCount = 1;
+  } else if (reminderType === '90-percent') {
+    expectedCount = 2;
+  } else {
+    console.warn(`[ReminderWorker] Unknown reminderType "${reminderType}" for prompt ${promptId}; skipping`);
+    return { skipped: true, reason: 'unknown_reminder_type' };
+  }
 
   // Verify prompt is still active
   const prompt = await AvailabilityPrompt.findByPk(promptId);
@@ -129,7 +164,7 @@ const reminderWorker = new Worker('reminders', async (job) => {
       continue;
     }
 
-    // Check reminder count (max 2 per prompt per user)
+    // Check reminder count (max 2 per prompt per user) — cumulative ceiling.
     let existingResponse = await AvailabilityResponse.findOne({
       where: { prompt_id: promptId, user_id: userId }
     });
@@ -137,6 +172,63 @@ const reminderWorker = new Worker('reminders', async (job) => {
     const reminderCount = existingResponse?.reminder_count || 0;
     if (reminderCount >= MAX_REMINDERS_PER_USER) {
       console.log(`[ReminderWorker] User ${userId} already received ${reminderCount} reminders, skipping`);
+      skipped++;
+      continue;
+    }
+
+    // CLAIM-BEFORE-SEND (T-87-12, D-04). Expected-prior-value claim keyed to
+    // THIS specific reminder: advance reminder_count :expected-1 → :expected
+    // with an atomic conditional UPDATE and only send if we won exactly one
+    // row. A same-job retry finds the row already at :expected (WHERE
+    // reminder_count = :expected-1 matches 0 rows) and skips — never
+    // double-sending. This is schema-free (no new sent_* columns / migration):
+    // the predicate rides the existing reminder_count column.
+    let claimed = false;
+    if (existingResponse) {
+      const [claimCount] = await AvailabilityResponse.update(
+        { reminder_count: expectedCount, last_reminded_at: new Date() },
+        { where: { prompt_id: promptId, user_id: userId, reminder_count: expectedCount - 1 } }
+      );
+      claimed = claimCount === 1;
+    } else {
+      // No prior row — create the placeholder AT this reminder's expected value
+      // (1 for 50-percent, 2 for 90-percent), NOT unconditionally 1. A
+      // 90-percent no-row placeholder created at 2 means a same-job retry
+      // re-finds the row at 2 (>= MAX) and never double-sends. submitted_at
+      // stays null: this is a not-yet-submitted placeholder, so it must not
+      // count as a response (consensus + respondedUserIds filter submitted_at
+      // != null). (Requires the submitted_at NULL-able schema fix shipped in
+      // this plan.)
+      try {
+        await AvailabilityResponse.create({
+          prompt_id: promptId,
+          user_id: userId,
+          time_slots: [],
+          user_timezone: 'UTC',
+          submitted_at: null, // Not submitted yet - this is a placeholder
+          last_reminded_at: new Date(),
+          reminder_count: expectedCount
+        });
+        claimed = true;
+      } catch (createErr) {
+        if (createErr instanceof UniqueConstraintError) {
+          // A concurrent worker inserted the row first — re-apply the same
+          // expected-prior-value claim so we don't double-send.
+          const [claimCount] = await AvailabilityResponse.update(
+            { reminder_count: expectedCount, last_reminded_at: new Date() },
+            { where: { prompt_id: promptId, user_id: userId, reminder_count: expectedCount - 1 } }
+          );
+          claimed = claimCount === 1;
+        } else {
+          throw createErr;
+        }
+      }
+    }
+
+    if (!claimed) {
+      // Retry / concurrent double-fire: this reminder was already claimed by a
+      // prior (possibly crashed-then-retried) invocation. Skip the send.
+      console.log(`[ReminderWorker] Reminder ${reminderType} for user ${userId} already claimed (row not at ${expectedCount - 1}); skipping send`);
       skipped++;
       continue;
     }
@@ -173,24 +265,8 @@ const reminderWorker = new Worker('reminders', async (job) => {
         emailType: 'reminder'
       });
 
-      // Track reminder (upsert to create or update placeholder record)
-      if (existingResponse) {
-        await existingResponse.update({
-          last_reminded_at: new Date(),
-          reminder_count: reminderCount + 1
-        });
-      } else {
-        await AvailabilityResponse.create({
-          prompt_id: promptId,
-          user_id: userId,
-          time_slots: [],
-          user_timezone: 'UTC',
-          submitted_at: null, // Not submitted yet - this is a placeholder
-          last_reminded_at: new Date(),
-          reminder_count: 1
-        });
-      }
-
+      // reminder_count / last_reminded_at were already advanced by the
+      // claim-before-send step above (D-04) — no post-send tracking here.
       remindersSent++;
       if (Sentry) {
         Sentry.metrics.count('reminder_email.sent', 1, {
@@ -204,7 +280,9 @@ const reminderWorker = new Worker('reminders', async (job) => {
 
   console.log(`[ReminderWorker] Sent ${remindersSent} reminders, skipped ${skipped} (max reached)`);
   return { promptId, reminderType, remindersSent, skipped };
-}, {
+}
+
+const reminderWorker = new Worker('reminders', processReminderJob, {
   connection,
   concurrency: 2 // Lower concurrency for reminders to avoid email rate limits
 });
@@ -235,3 +313,6 @@ reminderWorker.on('completed', (job, result) => {
 
 module.exports = reminderWorker;
 module.exports.handleJobFailed = handleJobFailed;
+// Exported for unit tests: the extracted handler is double-invokable without a
+// live BullMQ/Redis runtime so the claim-before-send idempotency can be proven.
+module.exports.processReminderJob = processReminderJob;
