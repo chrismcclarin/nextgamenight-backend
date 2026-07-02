@@ -71,8 +71,12 @@ Event.belongsToMany(User, { through: EventParticipation, foreignKey: 'event_id' 
 // Direct associations for easier queries
 Event.hasMany(EventParticipation, { foreignKey: 'event_id' });
 EventParticipation.belongsTo(Event, { foreignKey: 'event_id' });
-User.hasMany(EventParticipation, { foreignKey: 'user_id' });
-EventParticipation.belongsTo(User, { foreignKey: 'user_id' });
+// Phase 87 (BINT-02): onDelete CASCADE for association-level clarity, matching
+// the column-level FK in models/EventParticipation.js and the SET NULL precedent
+// on the Creator associations below. Deleting a User cascades away their
+// EventParticipation rows.
+User.hasMany(EventParticipation, { foreignKey: 'user_id', onDelete: 'CASCADE' });
+EventParticipation.belongsTo(User, { foreignKey: 'user_id', onDelete: 'CASCADE' });
 
 
 // Winner and Picker associations
