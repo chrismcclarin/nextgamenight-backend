@@ -2,7 +2,7 @@
 // RSVP CRUD API endpoints for event responses (yes/no/maybe)
 const express = require('express');
 const crypto = require('crypto');
-const { Op } = require('sequelize');
+const { Op, UniqueConstraintError } = require('sequelize');
 const { EventRsvp, EventBring, Event, User, Game, Group, EventParticipation, SingleUseToken } = require('../models');
 const { validateRsvpCreate } = require('../middleware/validators');
 const { verifyAuth0Token } = require('../middleware/auth0');
@@ -377,14 +377,38 @@ router.post('/', verifyAuth0Token, validateRsvpCreate, async (req, res) => {
       await existing.update({ status, note: note || null });
       rsvp = existing;
     } else {
-      // Create new RSVP
-      rsvp = await EventRsvp.create({
-        event_id,
-        user_id: userId,
-        status,
-        note: note || null,
-      });
-      isCreate = true;
+      // Create new RSVP. Phase 87 / BINT-01 (T-87-06): a concurrent first-RSVP
+      // for the same (event_id, user_id) can win the race between our findOne
+      // above and this create, violating EventRsvp's unique index. Absorb the
+      // UniqueConstraintError -> re-find + update, degrading a double-click to
+      // success (200) instead of a 500. NOT Model.upsert: the handler needs the
+      // create-vs-update distinction (isCreate) and oldStatus (captured above)
+      // for the yes->no GCal-cleanup dispatch, both of which upsert would hide.
+      try {
+        rsvp = await EventRsvp.create({
+          event_id,
+          user_id: userId,
+          status,
+          note: note || null,
+        });
+        isCreate = true;
+      } catch (createErr) {
+        if (createErr instanceof UniqueConstraintError) {
+          // Concurrent create won the race — treat as an update, not a create.
+          const raceRow = await EventRsvp.findOne({
+            where: { event_id, user_id: userId },
+          });
+          if (raceRow) {
+            await raceRow.update({ status, note: note || null });
+            rsvp = raceRow;
+            isCreate = false;
+          } else {
+            throw createErr; // Unexpected state — re-throw
+          }
+        } else {
+          throw createErr;
+        }
+      }
     }
 
     // Hard-delete bring commitments when RSVP changes to 'no' or 'maybe'
