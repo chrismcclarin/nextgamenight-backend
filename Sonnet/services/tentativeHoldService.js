@@ -2,12 +2,65 @@
 // Orchestrates tentative calendar holds for top availability suggestions
 // Creates holds during voting period, cleans up when event is confirmed
 
+const crypto = require('crypto');
 const { Op } = require('sequelize');
 const { AvailabilitySuggestion, AvailabilityPrompt, User, Group, Game } = require('../models');
 const googleCalendarService = require('./googleCalendarService');
 
 // Environment configuration
 const TENTATIVE_HOLD_LIMIT = parseInt(process.env.TENTATIVE_HOLD_LIMIT || '3', 10);
+
+// Phase 87 / BINT-01 (D-04): RFC-4648 extended-hex ("base32hex") alphabet.
+// This is EXACTLY Google Calendar's allowed event-id charset (0-9a-v), so ids
+// encoded with it are always valid GCal ids without further sanitisation.
+const BASE32HEX_ALPHABET = '0123456789abcdefghijklmnopqrstuv';
+
+/**
+ * Encode a Buffer to a base32hex string (RFC-4648 extended hex, no padding).
+ * @param {Buffer} buffer
+ * @returns {string} base32hex-encoded string
+ */
+function base32hexEncode(buffer) {
+  let bits = 0;
+  let value = 0;
+  let output = '';
+
+  for (let i = 0; i < buffer.length; i++) {
+    value = (value << 8) | buffer[i];
+    bits += 8;
+    while (bits >= 5) {
+      output += BASE32HEX_ALPHABET[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+  }
+
+  if (bits > 0) {
+    output += BASE32HEX_ALPHABET[(value << (5 - bits)) & 31];
+  }
+
+  return output;
+}
+
+/**
+ * Phase 87 / BINT-01 (D-04): compute a DETERMINISTIC Google Calendar event id
+ * for a (suggestion, user) pair. Stable across retries so re-creating a hold
+ * reuses the same id (GCal returns 409 => idempotent success) and cleanup can
+ * always recompute the id even if the stored map is missing/partial.
+ *
+ * Result = 'h' + base32hex(sha256("hold-<suggestionId>-<userId>")).slice(0,40)
+ * => ~41 chars, all within GCal's charset (0-9a-v), length >= 5.
+ *
+ * @param {string} suggestionId
+ * @param {string} userId
+ * @returns {string} deterministic base32hex GCal event id
+ */
+function deterministicHoldId(suggestionId, userId) {
+  const digest = crypto
+    .createHash('sha256')
+    .update(`hold-${suggestionId}-${userId}`)
+    .digest();
+  return 'h' + base32hexEncode(digest).slice(0, 40);
+}
 
 /**
  * Format a Date object to ISO 8601 datetime string for Google Calendar API
@@ -111,12 +164,17 @@ async function createHoldsForTopSuggestions(promptId, options = {}) {
       // Create holds for each user
       for (const user of users) {
         try {
+          // Phase 87 / BINT-01: deterministic client-supplied id makes the create
+          // idempotent — a retry reuses the same id and GCal returns 409-as-success.
+          const holdId = deterministicHoldId(suggestion.id, user.user_id);
+
           const eventData = {
             groupName: prompt.Group?.name || 'Game Group',
             gameName: prompt.Game?.name || 'Game Night',
             startDateTime: formatDateTimeISO(suggestion.suggested_start),
             endDateTime: formatDateTimeISO(suggestion.suggested_end),
-            timezone: user.timezone || 'UTC'
+            timezone: user.timezone || 'UTC',
+            id: holdId
           };
 
           const calendarEvent = await googleCalendarService.createTentativeHold(
@@ -125,9 +183,20 @@ async function createHoldsForTopSuggestions(promptId, options = {}) {
             user.google_calendar_refresh_token
           );
 
-          // Track the hold
-          suggestionResult.userHoldIds[user.user_id] = calendarEvent.id;
+          // Track the hold. Use the deterministic id we supplied (identical to
+          // calendarEvent.id on both fresh-create and the _duplicate 409 path).
+          suggestionResult.userHoldIds[user.user_id] = holdId;
           suggestionResult.holdsCreated++;
+
+          // Phase 87 / BINT-01: PERSIST INCREMENTALLY inside the loop so every id
+          // is written to the DB as it is created. If a later user's create fails
+          // (or the job is retried), no hold is left created-but-untracked.
+          await suggestion.update({
+            tentative_calendar_event_ids: {
+              ...(suggestion.tentative_calendar_event_ids || {}),
+              [user.user_id]: holdId
+            }
+          });
 
           // Update user's token if it was refreshed
           if (calendarEvent._new_access_token) {
@@ -137,14 +206,15 @@ async function createHoldsForTopSuggestions(promptId, options = {}) {
             );
           }
         } catch (error) {
+          // Only genuine (non-409) failures land here — 409 duplicates are
+          // resolved as success inside googleCalendarService.createTentativeHold.
           console.error(`Failed to create tentative hold for user ${user.user_id}:`, error.message);
           suggestionResult.holdsFailed++;
         }
       }
 
-      // Store hold IDs on suggestion
+      // Ids were persisted incrementally above; here we only tally the outcome.
       if (Object.keys(suggestionResult.userHoldIds).length > 0) {
-        await suggestion.update({ tentative_calendar_event_ids: suggestionResult.userHoldIds });
         result.successCount++;
       } else if (suggestionResult.holdsFailed > 0) {
         result.failureCount++;
@@ -185,9 +255,20 @@ async function cleanupHoldsOnEventCreation(suggestionId, promptId) {
     }
 
     for (const suggestion of suggestions) {
-      const holdIds = suggestion.tentative_calendar_event_ids;
+      // Phase 87 / BINT-01: reap by the stored id map FIRST, then RECOMPUTE the
+      // deterministic id for any participant missing from the stored map. This is a
+      // backstop so a hold that was created on GCal but not yet persisted (crash /
+      // partial failure between events.insert and suggestion.update) is still reaped.
+      const storedIds = suggestion.tentative_calendar_event_ids || {};
+      const participantUserIds = suggestion.participant_user_ids || [];
+      const holdIds = { ...storedIds };
+      for (const userId of participantUserIds) {
+        if (!holdIds[userId]) {
+          holdIds[userId] = deterministicHoldId(suggestion.id, userId);
+        }
+      }
 
-      if (!holdIds || Object.keys(holdIds).length === 0) {
+      if (Object.keys(holdIds).length === 0) {
         continue;
       }
 
@@ -238,5 +319,7 @@ module.exports = {
   cleanupHoldsOnEventCreation,
   // Export for testing
   formatDateTimeISO,
+  deterministicHoldId,
+  base32hexEncode,
   TENTATIVE_HOLD_LIMIT
 };
