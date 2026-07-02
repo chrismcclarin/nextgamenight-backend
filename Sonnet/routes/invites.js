@@ -13,6 +13,64 @@ const { isOwnerOrAdmin } = require('../services/authorizationService');
 const router = express.Router();
 
 // ============================================
+// Shared transactional invite-accept body (SPEC Req 2 / D-03).
+//
+// BOTH accept routes — id-based POST /:invite_id/accept AND token-based
+// POST /accept-by-token (the primary email-link flow) — delegate to this ONE
+// helper so a single atomic code path exists and neither route can drift out of
+// atomicity later. The three writes (invite status flip + UserGroup activation)
+// run in ONE managed sequelize.transaction(): on any failure after the status
+// flip, the whole thing rolls back — an invite can never be left 'accepted'
+// without an active UserGroup membership.
+//
+// Gotcha (RESEARCH Pitfall 3): findOrCreate opens its own savepoint if not given
+// the transaction. `{ transaction: t }` MUST be threaded through EVERY nested
+// write, including findOrCreate's options — omitting it silently escapes the txn
+// and reintroduces the half-commit this plan forbids.
+//
+// Callers own their OWN pre-checks/authorization (existence, expiry, email match
+// on the verified req.user.user_id) BEFORE invoking this helper.
+async function acceptInviteTransactional(invite, user) {
+  const t = await sequelize.transaction();
+  try {
+    // Write 1: flip invite status
+    await invite.update(
+      { status: 'accepted', accepted_at: new Date() },
+      { transaction: t }
+    );
+
+    // Write 2: create-or-find the membership row (transaction: t MANDATORY)
+    const [userGroup, created] = await UserGroup.findOrCreate({
+      where: {
+        user_id: user.user_id,
+        group_id: invite.group_id,
+      },
+      defaults: {
+        user_id: user.user_id,
+        group_id: invite.group_id,
+        role: 'member',
+        status: 'active',
+        joined_at: new Date(),
+      },
+      transaction: t,
+    });
+
+    // Write 3: if the membership row already existed, activate it
+    if (!created) {
+      await userGroup.update(
+        { role: 'member', status: 'active', joined_at: new Date() },
+        { transaction: t }
+      );
+    }
+
+    await t.commit();
+  } catch (error) {
+    await t.rollback();
+    throw error;
+  }
+}
+
+// ============================================
 // GET /info/:token - Public endpoint (no auth)
 // Returns invite details for pre-login display
 // Note: This route is mounted separately in server.js BEFORE auth middleware
@@ -401,35 +459,8 @@ router.post('/:invite_id/accept', async (req, res) => {
       return res.status(403).json({ error: 'This invite is not for you' });
     }
 
-    // Update invite status
-    await invite.update({
-      status: 'accepted',
-      accepted_at: new Date(),
-    });
-
-    // Create or update UserGroup
-    const [userGroup, created] = await UserGroup.findOrCreate({
-      where: {
-        user_id: user.user_id,
-        group_id: invite.group_id,
-      },
-      defaults: {
-        user_id: user.user_id,
-        group_id: invite.group_id,
-        role: 'member',
-        status: 'active',
-        joined_at: new Date(),
-      },
-    });
-
-    // If found (already existed), update status to active
-    if (!created) {
-      await userGroup.update({
-        role: 'member',
-        status: 'active',
-        joined_at: new Date(),
-      });
-    }
+    // Atomic three-write flow (status flip + UserGroup activation) — see helper.
+    await acceptInviteTransactional(invite, user);
 
     res.json({ success: true, group_id: invite.group_id });
   } catch (error) {
@@ -518,34 +549,9 @@ router.post('/accept-by-token', async (req, res) => {
       return res.status(403).json({ error: 'This invite is not for you' });
     }
 
-    // Update invite status
-    await invite.update({
-      status: 'accepted',
-      accepted_at: new Date(),
-    });
-
-    // Create or update UserGroup
-    const [userGroup, created] = await UserGroup.findOrCreate({
-      where: {
-        user_id: user.user_id,
-        group_id: invite.group_id,
-      },
-      defaults: {
-        user_id: user.user_id,
-        group_id: invite.group_id,
-        role: 'member',
-        status: 'active',
-        joined_at: new Date(),
-      },
-    });
-
-    if (!created) {
-      await userGroup.update({
-        role: 'member',
-        status: 'active',
-        joined_at: new Date(),
-      });
-    }
+    // Atomic three-write flow (status flip + UserGroup activation) — same shared
+    // helper as the id-based route, so this PRIMARY email-link path is atomic too.
+    await acceptInviteTransactional(invite, user);
 
     res.json({ success: true, group_id: invite.group_id });
   } catch (error) {
