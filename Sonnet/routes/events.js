@@ -506,6 +506,13 @@ router.post('/', validateEventCreate, async (req, res) => {
           game_id: opt.game_id || null,
           game_name: opt.game_name.trim(),
           display_order: index,
+          // Phase 87 (BINT-01, T-87-04): stamp the ballot creator from the
+          // verified Auth0 sub (Phase 83 default-deny) — NEVER a client-supplied
+          // id. This is the REAL production ballot-creation path (the FE births
+          // every ballot via POST /events with embedded ballot_options), so
+          // without this every ballot is created_by=NULL and the "creator can
+          // replace/wipe" branch of Req 7 is dead in production.
+          created_by: req.user.user_id,
         }));
         await EventBallotOption.bulkCreate(optionRows);
         event.ballot_status = 'open';
