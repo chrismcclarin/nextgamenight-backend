@@ -1,7 +1,7 @@
 // routes/friendships.js
 // Friendship CRUD routes: list, search, request, accept, decline, remove
 const express = require('express');
-const { Op } = require('sequelize');
+const { Op, UniqueConstraintError } = require('sequelize');
 const { User, Friendship } = require('../models');
 const { body, validationResult } = require('express-validator');
 
@@ -177,14 +177,41 @@ router.post(
         }
       }
 
-      // No existing row: create new friendship request
-      const friendship = await Friendship.create({
-        requester_id: userId,
-        addressee_id: addressee_user_id,
-        status: 'pending',
-      });
+      // No existing row: create new friendship request. Phase 87 / BINT-01
+      // (T-87-07): a concurrent duplicate request can win the race between the
+      // findOne pre-check above and this create, violating the Friendship
+      // functional unique index (LEAST/GREATEST canonical requester/addressee
+      // key — migration-only, absent from the model). Absorb the
+      // UniqueConstraintError -> re-find the winning row and return the SAME
+      // success shape the happy path returns, so a double-submit degrades to
+      // success (exactly one row) instead of a 500. Canonical keying unchanged.
+      try {
+        const friendship = await Friendship.create({
+          requester_id: userId,
+          addressee_id: addressee_user_id,
+          status: 'pending',
+        });
 
-      res.status(201).json(friendship);
+        return res.status(201).json(friendship);
+      } catch (createErr) {
+        if (createErr instanceof UniqueConstraintError) {
+          // Concurrent duplicate won the race — re-find and return the winner
+          // with a byte-identical response shape (a serialized Friendship row).
+          const raceRow = await Friendship.findOne({
+            where: {
+              [Op.or]: [
+                { requester_id: userId, addressee_id: addressee_user_id },
+                { requester_id: addressee_user_id, addressee_id: userId },
+              ],
+            },
+          });
+          if (raceRow) {
+            return res.status(201).json(raceRow);
+          }
+          throw createErr; // Unexpected state — re-throw
+        }
+        throw createErr;
+      }
     } catch (error) {
       console.error('Error sending friend request:', error);
       res.status(500).json({ error: 'Internal server error' });
