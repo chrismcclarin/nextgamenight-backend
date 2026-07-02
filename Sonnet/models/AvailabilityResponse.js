@@ -43,9 +43,15 @@ const AvailabilityResponse = sequelize.define('AvailabilityResponse', {
   },
   submitted_at: {
     type: DataTypes.DATE,  // TIMESTAMP WITH TIME ZONE
-    allowNull: false,
-    // When the user submitted their response
-    // Different from createdAt if user updates response
+    allowNull: true,
+    // When the user submitted their response (NULL = not yet submitted).
+    // Different from createdAt if user updates response.
+    // Phase 87 / BINT-01: reminderWorker persists a not-yet-submitted PLACEHOLDER
+    // row (submitted_at NULL) as its claim-before-send record. This column MUST be
+    // nullable for that placeholder to persist; every "responded" query already
+    // filters on `submitted_at != null`, so a NULL placeholder is correctly
+    // excluded from consensus/response counts. See migration
+    // 20260701000001-make-availability-response-submitted-at-nullable.js.
   },
   magic_token_used: {
     type: DataTypes.STRING,
