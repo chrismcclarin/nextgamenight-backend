@@ -272,6 +272,12 @@ async function cleanupHoldsOnEventCreation(suggestionId, promptId) {
         continue;
       }
 
+      // Phase 87 (WR-05): track holds whose GCal delete FAILED for this
+      // suggestion so we can retain their ids instead of nulling the whole map.
+      // A silently-nulled map would orphan the failed hold forever (no later
+      // cleanup pass could find its id to reap it).
+      const retainedIds = {};
+
       // For each user with a hold, delete it
       for (const [userId, calendarEventId] of Object.entries(holdIds)) {
         const user = await User.findOne({
@@ -290,10 +296,12 @@ async function cleanupHoldsOnEventCreation(suggestionId, promptId) {
               result.deleted++;
             } else {
               result.failed++;
+              retainedIds[userId] = calendarEventId;
             }
           } catch (error) {
             console.error(`Failed to delete tentative hold ${calendarEventId}:`, error.message);
             result.failed++;
+            retainedIds[userId] = calendarEventId;
           }
         } else {
           // User doesn't have calendar token anymore - consider it cleaned up
@@ -301,8 +309,14 @@ async function cleanupHoldsOnEventCreation(suggestionId, promptId) {
         }
       }
 
-      // Clear the hold IDs from the suggestion
-      await suggestion.update({ tentative_calendar_event_ids: null });
+      // Phase 87 (WR-05): only null the map on FULL success for this suggestion.
+      // If any delete failed, retain the failed ids so a later cleanup pass can
+      // still reap them (successfully-deleted ids are dropped from the retained map).
+      if (Object.keys(retainedIds).length === 0) {
+        await suggestion.update({ tentative_calendar_event_ids: null });
+      } else {
+        await suggestion.update({ tentative_calendar_event_ids: retainedIds });
+      }
     }
 
     console.log(`Cleaned up tentative holds: ${result.deleted} deleted, ${result.failed} failed`);

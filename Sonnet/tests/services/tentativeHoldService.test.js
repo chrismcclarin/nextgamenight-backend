@@ -186,3 +186,47 @@ describe('cleanupHoldsOnEventCreation — recompute backstop (no orphans)', () =
     expect(result.failed).toBe(0);
   });
 });
+
+// Phase 87 (WR-05): on PARTIAL failure the failed hold-id is RETAINED (the map
+// is not nulled) so a later cleanup pass can still reap the orphaned hold.
+describe('cleanupHoldsOnEventCreation — retain failed hold-ids on partial failure (WR-05)', () => {
+  test('one failed + one successful delete → map retains the failed id (not nulled)', async () => {
+    const suggestion = makeSuggestion({ tentative_calendar_event_ids: null });
+    AvailabilitySuggestion.findAll.mockResolvedValue([suggestion]);
+    User.findOne.mockImplementation(async ({ where }) => makeUser(where.user_id));
+
+    const failId = deterministicHoldId('sug-1', 'user-1');
+    const okId = deterministicHoldId('sug-1', 'user-2');
+    googleCalendarService.deleteTentativeHold.mockImplementation(async (calendarEventId) => {
+      if (calendarEventId === failId) return false; // user-1 delete fails
+      return true; // user-2 delete succeeds
+    });
+
+    const result = await service.cleanupHoldsOnEventCreation('sug-1', 'prompt-1');
+
+    // Counts unchanged: one succeeded, one failed.
+    expect(result.deleted).toBe(1);
+    expect(result.failed).toBeGreaterThanOrEqual(1);
+
+    // The map was NOT nulled — the failed id survives for a subsequent reap,
+    // the successfully-deleted id is dropped.
+    const lastUpdate =
+      suggestion.update.mock.calls[suggestion.update.mock.calls.length - 1][0];
+    expect(lastUpdate.tentative_calendar_event_ids).not.toBeNull();
+    expect(lastUpdate.tentative_calendar_event_ids).toEqual({ 'user-1': failId });
+    expect(lastUpdate.tentative_calendar_event_ids[okId]).toBeUndefined();
+  });
+
+  test('all-success path still nulls the map', async () => {
+    const suggestion = makeSuggestion({ tentative_calendar_event_ids: null });
+    AvailabilitySuggestion.findAll.mockResolvedValue([suggestion]);
+    User.findOne.mockImplementation(async ({ where }) => makeUser(where.user_id));
+    googleCalendarService.deleteTentativeHold.mockResolvedValue(true);
+
+    await service.cleanupHoldsOnEventCreation('sug-1', 'prompt-1');
+
+    const lastUpdate =
+      suggestion.update.mock.calls[suggestion.update.mock.calls.length - 1][0];
+    expect(lastUpdate).toEqual({ tentative_calendar_event_ids: null });
+  });
+});
