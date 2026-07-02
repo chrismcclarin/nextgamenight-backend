@@ -27,6 +27,7 @@
 // D-ADAPT-03 invariant: this service NEVER writes to GroupPromptSettings —
 // closing an auto-prompt MUST NOT cancel the parent recurring schedule.
 
+const { Op } = require('sequelize');
 const {
   AvailabilityPrompt,
   AvailabilityResponse,
@@ -54,25 +55,47 @@ async function checkConsensusAndClose(promptId) {
     if (!prompt) {
       return { closed: false, respondedCount: 0, totalActive: 0, reason: 'not_found' };
     }
-    if (prompt.status === 'closed' || prompt.status === 'converted') {
-      return { closed: false, respondedCount: 0, totalActive: 0, reason: 'already_closed' };
-    }
 
     // Count distinct active group members and submitted responses.
     const totalActive = await UserGroup.count({
       where: { group_id: prompt.group_id, status: 'active' },
     });
     const respondedCount = await AvailabilityResponse.count({
-      where: { prompt_id: promptId, submitted_at: { [require('sequelize').Op.ne]: null } },
+      where: { prompt_id: promptId, submitted_at: { [Op.ne]: null } },
     });
 
     if (totalActive === 0 || respondedCount < totalActive) {
       return { closed: false, respondedCount, totalActive };
     }
 
-    // Consensus reached → close the prompt and run side-effects.
-    await prompt.update({ status: 'closed' });
-    await handlePromptClosed(prompt);
+    // Consensus reached → CLAIM-then-send (T-87-11, D-04). Replace the old
+    // read-status-then-update TOCTOU with a single atomic conditional UPDATE:
+    // only the caller whose UPDATE actually flips status active→closed (exactly
+    // one row) is allowed to run the close side-effects (email). A concurrent
+    // close (consensus race, PATCH-close, deadline) or a BullMQ/handler retry
+    // finds the row already closed/converted, claims 0 rows, and MUST NOT
+    // re-send. The email is a side effect AFTER the claim is won, never before.
+    const [affectedCount, rows] = await AvailabilityPrompt.update(
+      { status: 'closed' },
+      {
+        where: { id: promptId, status: { [Op.notIn]: ['closed', 'converted'] } },
+        returning: true,
+      }
+    );
+
+    if (affectedCount === 0) {
+      // Lost the race — someone else already closed/converted this prompt.
+      // Do NOT emit a second close-notification email.
+      return { closed: false, respondedCount, totalActive, reason: 'already_closed' };
+    }
+
+    // Won the claim → run the close side-effects on the freshly-updated row.
+    // NOTE: a bare `update(...).returning` row carries only table columns, not
+    // eager-loaded associations. handlePromptClosed reads only plain columns
+    // (id, group_id, created_by_user_id, created_by_settings_id, game_id) and
+    // re-queries every association itself, so the RETURNING row is sufficient
+    // and no re-fetch-with-include is required here.
+    await handlePromptClosed(rows[0]);
     return { closed: true, respondedCount, totalActive };
   } catch (err) {
     console.error('[promptLifecycle] checkConsensusAndClose error:', err.message);

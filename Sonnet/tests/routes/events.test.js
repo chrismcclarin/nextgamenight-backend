@@ -2,8 +2,14 @@
 const request = require('supertest');
 const express = require('express');
 const eventRoutes = require('../../routes/events');
-const { Event, Game, User, Group, EventParticipation, UserGroup } = require('../../models');
+const { Event, Game, User, Group, EventParticipation, EventRsvp, EventBallotOption, UserGroup, sequelize } = require('../../models');
 const { makeUser, makeGroup, addToGroup } = require('../factories');
+const { QueryTypes } = require('sequelize');
+// Phase 87 (BINT-02): the migration under test — used by the preclean unit test
+// to exercise the real orphan-DELETE + guarded ADD CONSTRAINT on a raw connection.
+const epUserFkMigration = require('../../migrations/20260701000002-add-eventparticipation-user-fk');
+
+const EP_FK_NAME = 'eventparticipations_user_id_fkey';
 
 // The event routes derive the actor from req.user (BE-040/BE-044 / BSEC-01
 // default-deny authz, Phase 83) and always membership-check. Build a per-test
@@ -135,6 +141,97 @@ describe('Event Routes', () => {
 
       expect(response.body).toHaveProperty('error');
     });
+
+    // Phase 87 (T-87-08-01): the multi-write set is one managed transaction.
+    it('rolls back the whole write set (0 Event rows) when a mid-write fails', async () => {
+      // Force EventParticipation.bulkCreate — the SECOND write, after Event.create
+      // — to throw inside the transaction. The managed transaction must roll the
+      // Event.create back, leaving zero persisted rows for this attempt.
+      const spy = jest
+        .spyOn(EventParticipation, 'bulkCreate')
+        .mockRejectedValueOnce(new Error('forced mid-write failure'));
+
+      const before = await Event.count({ where: { group_id: testGroup.id } });
+
+      const response = await request(makeApp(testUser1))
+        .post('/api/events')
+        .send({
+          group_id: testGroup.id,
+          game_id: testGame.id,
+          start_date: new Date().toISOString(),
+          participants: [{ user_id: testUser1.id, score: 10, placement: 1 }],
+        })
+        .expect(500);
+
+      expect(response.body).toHaveProperty('error');
+
+      // No orphaned Event row survived the rollback.
+      const after = await Event.count({ where: { group_id: testGroup.id } });
+      expect(after).toBe(before);
+
+      spy.mockRestore();
+    });
+
+    // Phase 87 (T-87-08-01): ballot_options are de-duped by game_name before
+    // bulkCreate so the (event_id, game_name) unique index cannot 500.
+    it('de-dups ballot_options by game_name (one row per name, no 500)', async () => {
+      const response = await request(makeApp(testUser1))
+        .post('/api/events')
+        .send({
+          group_id: testGroup.id,
+          game_id: testGame.id,
+          start_date: new Date().toISOString(),
+          rsvp_deadline: new Date(Date.now() + 86400000).toISOString(),
+          // Two "Catan" entries + one "Wingspan": the duplicate collapses to a
+          // single row; the ballot still materializes (>= 2 distinct names).
+          ballot_options: [
+            { game_name: 'Catan' },
+            { game_name: 'Catan' },
+            { game_name: 'Wingspan' },
+          ],
+        })
+        .expect(200);
+
+      expect(response.body).toHaveProperty('id');
+
+      const catanRows = await EventBallotOption.findAll({
+        where: { event_id: response.body.id, game_name: 'Catan' },
+      });
+      expect(catanRows.length).toBe(1); // exactly one row for the duplicated name
+
+      const allRows = await EventBallotOption.findAll({
+        where: { event_id: response.body.id },
+      });
+      expect(allRows.length).toBe(2); // Catan (de-duped) + Wingspan
+    });
+
+    // Phase 87 (adversarial review #6/#7): a caller-supplied >=2 ballot that
+    // collapses to <2 DISTINCT trimmed names must be rejected LOUDLY (400)
+    // BEFORE any write — never silently create a ballot-less event + 200.
+    it('rejects a ballot that de-dups below 2 distinct game_names (400, no event created)', async () => {
+      const before = await Event.count({ where: { group_id: testGroup.id } });
+
+      const response = await request(makeApp(testUser1))
+        .post('/api/events')
+        .send({
+          group_id: testGroup.id,
+          game_id: testGame.id,
+          start_date: new Date().toISOString(),
+          rsvp_deadline: new Date(Date.now() + 86400000).toISOString(),
+          // Two entries, same trimmed name → 1 distinct → below the 2 minimum.
+          ballot_options: [
+            { game_name: 'Catan' },
+            { game_name: '  Catan  ' },
+          ],
+        })
+        .expect(400);
+
+      expect(response.body.error).toMatch(/at least 2 distinct/i);
+
+      // Validation runs before Event.create — no ballot-less event persisted.
+      const after = await Event.count({ where: { group_id: testGroup.id } });
+      expect(after).toBe(before);
+    });
   });
 
   describe('PUT /api/events/:id', () => {
@@ -258,5 +355,172 @@ describe('Event Routes', () => {
 
       expect(response.body.error).toBe('Event not found');
     });
+
+    // Phase 87 (T-87-08-02): the three destroys are one managed transaction.
+    it('rolls back the whole delete set when a mid-delete fails (event + children survive)', async () => {
+      const event = await Event.create({
+        group_id: testGroup.id,
+        game_id: testGame.id,
+        start_date: new Date(),
+        status: 'completed',
+      });
+      const ep = await EventParticipation.create({
+        event_id: event.id,
+        user_id: testUser1.id, // UUID — correct.
+        score: 100,
+      });
+
+      // Force EventParticipation.destroy — the SECOND destroy, after
+      // EventRsvp.destroy — to throw inside the transaction. The managed
+      // transaction must roll back so the Event row and its children survive.
+      const spy = jest
+        .spyOn(EventParticipation, 'destroy')
+        .mockRejectedValueOnce(new Error('forced mid-delete failure'));
+
+      const response = await request(makeApp(testUser1))
+        .delete(`/api/events/${event.id}`)
+        .expect(500);
+
+      expect(response.body).toHaveProperty('error');
+
+      spy.mockRestore();
+
+      // Event row survived the rollback.
+      const survivingEvent = await Event.findByPk(event.id);
+      expect(survivingEvent).not.toBeNull();
+
+      // Child participation survived too (no partial delete).
+      const survivingEp = await EventParticipation.findByPk(ep.id);
+      expect(survivingEp).not.toBeNull();
+    });
+  });
+});
+
+// Phase 87 (BINT-02, D-01/D-02/D-06): EventParticipation.user_id protective FK
+// → Users.id (UUID PK) with ON DELETE CASCADE. Verifies the sync-side FK
+// (rejection + cascade) and the migration-side orphan preclean.
+//
+// The model-level FK builds on the sync() test DB (models/EventParticipation.js),
+// so the rejection/cascade tests are real DB-level assertions here. The orphan
+// preclean, however, is CIRCULAR to test end-to-end against the synced schema:
+// once the FK exists you CANNOT seed an orphan (the FK rejects it) and the
+// migration's ADD CONSTRAINT is a guarded no-op. So the preclean is covered by
+// dropping the FK, seeding dirty rows on a raw connection, and running the real
+// migration up() (preclean DELETE + guarded re-ADD). Real dirty-data end-to-end
+// coverage is the PR CI Postgres `migrate:apply` run (VALIDATION Manual-Only).
+describe('EventParticipation.user_id → Users.id FK (Phase 87 BINT-02)', () => {
+  let user;
+  let event;
+
+  beforeEach(async () => {
+    user = await makeUser({ user_id: 'auth0|ep-fk-owner', username: 'ep-fk-owner' });
+    const group = await makeGroup({ group_id: 'group-ep-fk', name: 'EP FK Group' });
+    const game = await Game.create({ name: 'EP FK Game', is_custom: true });
+    event = await Event.create({
+      group_id: group.id,
+      game_id: game.id,
+      start_date: new Date(),
+      status: 'scheduled',
+    });
+  });
+
+  it('rejects an EventParticipation whose user_id is a non-existent Users.id (FK violation)', async () => {
+    const orphanUserId = '11111111-1111-1111-1111-111111111111';
+    await expect(
+      EventParticipation.create({
+        event_id: event.id,
+        user_id: orphanUserId, // no such Users.id
+        score: 10,
+      })
+    ).rejects.toThrow(); // SequelizeForeignKeyConstraintError from the DB-level FK
+  });
+
+  it('cascades: deleting a User removes their EventParticipation rows (ON DELETE CASCADE)', async () => {
+    const ep = await EventParticipation.create({
+      event_id: event.id,
+      user_id: user.id, // valid UUID Users.id
+      score: 42,
+    });
+    expect(ep.id).toBeTruthy();
+
+    // Delete the user; the DB-level ON DELETE CASCADE must remove the EP row.
+    await user.destroy();
+
+    const survivors = await EventParticipation.findAll({ where: { id: ep.id } });
+    expect(survivors.length).toBe(0);
+  });
+
+  it('migration preclean DELETEs only orphan EventParticipation rows, valid rows survive, then re-adds the FK', async () => {
+    const qi = sequelize.getQueryInterface();
+
+    // Discover the ACTUAL FK constraint(s) on EventParticipations. On the sync()
+    // test DB the FK is named "EventParticipations_user_id_fkey" (Sequelize
+    // preserves table case), NOT the lowercase "eventparticipations_user_id_fkey"
+    // the migration uses in prod — the two names live in separate environments,
+    // so they never collide. We must drop the sync-built one by its real name to
+    // seed a dirty (orphan) row. try/finally always restores a working FK for
+    // subsequent serial suites (--runInBand; schema is built once per run).
+    const preExistingFks = await sequelize.query(
+      `SELECT conname FROM pg_constraint
+       WHERE conrelid = '"EventParticipations"'::regclass AND contype = 'f'
+         AND conname LIKE '%user_id%'`,
+      { type: QueryTypes.SELECT }
+    );
+    for (const { conname } of preExistingFks) {
+      await sequelize.query(
+        `ALTER TABLE "EventParticipations" DROP CONSTRAINT IF EXISTS "${conname}"`
+      );
+    }
+
+    try {
+      // Seed 1 VALID EP (real user) + 1 ORPHAN EP (random non-existent user_id).
+      // Raw INSERT bypasses model FK metadata (moot here anyway — constraint dropped).
+      const validEp = await EventParticipation.create({
+        event_id: event.id,
+        user_id: user.id,
+        score: 1,
+      });
+      const orphanUserId = '22222222-2222-2222-2222-222222222222';
+      const orphanId = require('crypto').randomUUID();
+      // Raw INSERT (id generated in JS to avoid any DB uuid-extension dependency).
+      await sequelize.query(
+        `INSERT INTO "EventParticipations" (id, event_id, user_id, is_new_player, is_guest, "createdAt", "updatedAt")
+         VALUES (:id, :event_id, :user_id, false, false, NOW(), NOW())`,
+        { replacements: { id: orphanId, event_id: event.id, user_id: orphanUserId }, type: QueryTypes.INSERT }
+      );
+
+      // Sanity: both rows present before preclean.
+      const before = await EventParticipation.count();
+      expect(before).toBe(2);
+
+      // Run the REAL migration up(): orphan preclean DELETE + guarded ADD CONSTRAINT.
+      await epUserFkMigration.up(qi);
+
+      // Orphan gone, valid survives.
+      const orphanSurvivors = await EventParticipation.findAll({ where: { id: orphanId } });
+      expect(orphanSurvivors.length).toBe(0);
+      const validSurvivors = await EventParticipation.findAll({ where: { id: validEp.id } });
+      expect(validSurvivors.length).toBe(1);
+
+      // FK re-added by the migration → constraint present again.
+      const constraint = await sequelize.query(
+        `SELECT 1 FROM pg_constraint WHERE conname = :name`,
+        { replacements: { name: EP_FK_NAME }, type: QueryTypes.SELECT }
+      );
+      expect(constraint.length).toBe(1);
+    } finally {
+      // Guarantee the FK exists for the rest of the run even if an assertion threw.
+      const stillThere = await sequelize.query(
+        `SELECT 1 FROM pg_constraint WHERE conname = :name`,
+        { replacements: { name: EP_FK_NAME }, type: QueryTypes.SELECT }
+      );
+      if (stillThere.length === 0) {
+        await sequelize.query(
+          `ALTER TABLE "EventParticipations"
+             ADD CONSTRAINT "${EP_FK_NAME}"
+             FOREIGN KEY (user_id) REFERENCES "Users"(id) ON DELETE CASCADE`
+        );
+      }
+    }
   });
 });

@@ -1,13 +1,14 @@
 // routes/ballot.js
 // Ballot CRUD API endpoints for game voting on events
 const express = require('express');
-const { Op } = require('sequelize');
+const { Op, UniqueConstraintError } = require('sequelize');
 const {
   Event,
   EventBallotOption,
   EventBallotVote,
   EventRsvp,
   Game,
+  sequelize,
 } = require('../models');
 const { validateBallotOptions, validateBallotVote } = require('../middleware/validators');
 const {
@@ -210,19 +211,42 @@ router.post('/:eventId/options', validateBallotOptions, async (req, res) => {
       return res.status(404).json({ error: 'Event not found' });
     }
 
-    // Verify user is at least a full member (pending members cannot create ballot options)
-    const isMember = await isMemberOrHigher(userId, event.group_id);
-    if (!isMember) {
-      return res.status(403).json({ error: 'Pending members cannot create ballot options', required_role: 'member' });
-    }
-
     // Require rsvp_deadline
     if (!event.rsvp_deadline) {
       return res.status(400).json({ error: 'Event must have an RSVP deadline to create a ballot' });
     }
 
-    // Delete existing options (CASCADE deletes votes)
-    await EventBallotOption.destroy({ where: { event_id: eventId } });
+    // Phase 87 (T-87-01): read the ballot's current creator BEFORE any destroy
+    // so we can enforce creator-based replace/wipe authz AND preserve the
+    // original creator on replace.
+    const existing = await EventBallotOption.findOne({
+      where: { event_id: eventId },
+      attributes: ['created_by'],
+    });
+
+    // Authz on the verified Auth0 sub (Phase 83 default-deny — never a
+    // client-supplied id). isCreator REQUIRES current membership too, so a
+    // creator later removed from the group cannot replace/wipe (EoP fix).
+    const isAdmin = await isOwnerOrAdmin(userId, event.group_id);
+    const isMember = await isMemberOrHigher(userId, event.group_id);
+    const isCreator = !!existing && existing.created_by !== null && existing.created_by === userId;
+
+    if (existing) {
+      // Replacing/wiping an existing ballot: creator (still a member) OR
+      // owner/admin. Legacy created_by IS NULL → isCreator false → owner/admin
+      // only (D-05).
+      if (!(isAdmin || (isCreator && isMember))) {
+        return res.status(403).json({ error: 'Only the ballot creator or a group owner/admin can replace or wipe ballot options' });
+      }
+    } else if (!isMember) {
+      // First-ever creation: keep the existing member-or-higher gate.
+      return res.status(403).json({ error: 'Pending members cannot create ballot options', required_role: 'member' });
+    }
+
+    // Preserve the ballot's original creator on replace; stamp the actor on
+    // first-ever creation. An owner/admin edit must NOT overwrite created_by
+    // with the editor's id (#8).
+    const preservedCreator = existing?.created_by ?? userId;
 
     // BulkCreate new options
     const optionRows = options.map((opt, index) => ({
@@ -230,14 +254,25 @@ router.post('/:eventId/options', validateBallotOptions, async (req, res) => {
       game_id: opt.game_id || null,
       game_name: opt.game_name,
       display_order: index,
+      created_by: preservedCreator,
     }));
 
-    const created = await EventBallotOption.bulkCreate(optionRows);
-
-    // Set ballot_status to open
-    if (event.ballot_status !== 'open') {
-      event.ballot_status = 'open';
-      await event.save();
+    // Atomic replace (T-87-02): destroy + bulkCreate (+ status flip) in ONE
+    // managed transaction so a mid-op failure rolls back → no zero-option
+    // ballot. destroy CASCADE-deletes votes on removed options.
+    const t = await sequelize.transaction();
+    let created;
+    try {
+      await EventBallotOption.destroy({ where: { event_id: eventId }, transaction: t });
+      created = await EventBallotOption.bulkCreate(optionRows, { transaction: t });
+      if (event.ballot_status !== 'open') {
+        event.ballot_status = 'open';
+        await event.save({ transaction: t });
+      }
+      await t.commit();
+    } catch (txErr) {
+      await t.rollback();
+      throw txErr;
     }
 
     return res.status(201).json({
@@ -275,14 +310,37 @@ router.put('/:eventId/options', validateBallotOptions, async (req, res) => {
       return res.status(400).json({ error: 'Cannot update options on a closed ballot' });
     }
 
-    // Verify user is at least a full member (pending members cannot update ballot options)
+    // Phase 87 (T-87-01): read the ballot's current creator BEFORE any destroy
+    // so we can enforce creator-based replace/wipe authz AND preserve the
+    // original creator on replace.
+    const existing = await EventBallotOption.findOne({
+      where: { event_id: eventId },
+      attributes: ['created_by'],
+    });
+
+    // Authz on the verified Auth0 sub (Phase 83 default-deny — never a
+    // client-supplied id). isCreator REQUIRES current membership too, so a
+    // creator later removed from the group cannot replace/wipe (EoP fix).
+    const isAdmin = await isOwnerOrAdmin(userId, event.group_id);
     const isMember = await isMemberOrHigher(userId, event.group_id);
-    if (!isMember) {
+    const isCreator = !!existing && existing.created_by !== null && existing.created_by === userId;
+
+    if (existing) {
+      // Replacing/wiping an existing ballot: creator (still a member) OR
+      // owner/admin. Legacy created_by IS NULL → isCreator false → owner/admin
+      // only (D-05).
+      if (!(isAdmin || (isCreator && isMember))) {
+        return res.status(403).json({ error: 'Only the ballot creator or a group owner/admin can replace or wipe ballot options' });
+      }
+    } else if (!isMember) {
+      // No existing options: keep the existing member-or-higher gate.
       return res.status(403).json({ error: 'Pending members cannot update ballot options', required_role: 'member' });
     }
 
-    // Delete all existing options (CASCADE deletes votes on removed options)
-    await EventBallotOption.destroy({ where: { event_id: eventId } });
+    // Preserve the ballot's original creator on replace; stamp the actor if
+    // there were no existing options. An owner/admin edit must NOT overwrite
+    // created_by with the editor's id (#8).
+    const preservedCreator = existing?.created_by ?? userId;
 
     // BulkCreate replacement options
     const optionRows = options.map((opt, index) => ({
@@ -290,9 +348,22 @@ router.put('/:eventId/options', validateBallotOptions, async (req, res) => {
       game_id: opt.game_id || null,
       game_name: opt.game_name,
       display_order: index,
+      created_by: preservedCreator,
     }));
 
-    const created = await EventBallotOption.bulkCreate(optionRows);
+    // Atomic replace (T-87-02): destroy + bulkCreate in ONE managed
+    // transaction so a mid-op failure rolls back → no zero-option ballot.
+    // destroy CASCADE-deletes votes on removed options.
+    const t = await sequelize.transaction();
+    let created;
+    try {
+      await EventBallotOption.destroy({ where: { event_id: eventId }, transaction: t });
+      created = await EventBallotOption.bulkCreate(optionRows, { transaction: t });
+      await t.commit();
+    } catch (txErr) {
+      await t.rollback();
+      throw txErr;
+    }
 
     return res.json({
       ballot_status: 'open',
@@ -375,7 +446,17 @@ router.post('/:eventId/vote', validateBallotVote, async (req, res) => {
       return res.json({ voted: false });
     }
 
-    await EventBallotVote.create({ option_id, user_id: userId });
+    // Phase 87 (T-87-03): absorb the (option_id, user_id) unique-constraint
+    // race. A concurrent duplicate double-click already created the row → the
+    // vote is idempotently "on"; return success instead of 500.
+    try {
+      await EventBallotVote.create({ option_id, user_id: userId });
+    } catch (voteErr) {
+      if (voteErr instanceof UniqueConstraintError) {
+        return res.json({ voted: true });
+      }
+      throw voteErr;
+    }
     return res.json({ voted: true });
   } catch (error) {
     console.error('Error toggling vote:', error.message);

@@ -19,7 +19,11 @@ jest.mock('../../models', () => {
   const userFindByPk = jest.fn();
   const userFindOne = jest.fn();
   return {
-    AvailabilityPrompt: { findByPk: jest.fn() },
+    // Phase 87 / BINT-01: checkConsensusAndClose now closes via an atomic
+    // conditional UPDATE (AvailabilityPrompt.update(..., { returning: true }))
+    // instead of a prompt-instance update, so the static `update` must be mocked.
+    // It resolves the Postgres shape [affectedCount, rows].
+    AvailabilityPrompt: { findByPk: jest.fn(), update: jest.fn() },
     AvailabilityResponse: { count: jest.fn(), findAll: jest.fn() },
     AvailabilitySuggestion: { findAll: jest.fn() },
     UserGroup: { count: jest.fn(), findOne: jest.fn() },
@@ -111,6 +115,8 @@ describe('promptLifecycleService.checkConsensusAndClose', () => {
       created_by_user_id: 'user-uuid-creator',
     });
     AvailabilityPrompt.findByPk.mockResolvedValue(prompt);
+    // Atomic claim wins: [affectedCount=1, rows=[closedPrompt]].
+    AvailabilityPrompt.update.mockResolvedValue([1, [{ ...prompt, status: 'closed' }]]);
     UserGroup.count.mockResolvedValue(3);
     AvailabilityResponse.count.mockResolvedValue(3);
     User.findByPk.mockResolvedValue({
@@ -128,20 +134,30 @@ describe('promptLifecycleService.checkConsensusAndClose', () => {
     const result = await lifecycleService.checkConsensusAndClose('prompt-uuid-1');
 
     expect(result.closed).toBe(true);
-    expect(prompt.update).toHaveBeenCalledWith({ status: 'closed' });
-    expect(prompt.status).toBe('closed');
+    // Close is an atomic conditional UPDATE gated on status not-closed/converted.
+    expect(AvailabilityPrompt.update).toHaveBeenCalledWith(
+      { status: 'closed' },
+      expect.objectContaining({ returning: true })
+    );
     expect(emailService.send).toHaveBeenCalledTimes(1);
   });
 
-  it('Test 3: returns closed=false reason=already_closed without re-sending email when prompt already closed', async () => {
-    const prompt = makePromptMock({ status: 'closed' });
+  it('Test 3: lost the atomic close race (0 rows claimed) → already_closed, no re-send', async () => {
+    // Consensus is reached (counts full) but the atomic conditional UPDATE flips
+    // 0 rows because a concurrent path (PATCH-close / deadline / other consensus
+    // caller) already closed the prompt. The close-notification email MUST NOT
+    // fire a second time.
+    const prompt = makePromptMock({ created_by_user_id: 'user-uuid-creator' });
     AvailabilityPrompt.findByPk.mockResolvedValue(prompt);
+    UserGroup.count.mockResolvedValue(3);
+    AvailabilityResponse.count.mockResolvedValue(3);
+    // Claim lost: [affectedCount=0, rows=[]].
+    AvailabilityPrompt.update.mockResolvedValue([0, []]);
 
     const result = await lifecycleService.checkConsensusAndClose('prompt-uuid-1');
 
     expect(result.closed).toBe(false);
     expect(result.reason).toBe('already_closed');
-    expect(prompt.update).not.toHaveBeenCalled();
     expect(emailService.send).not.toHaveBeenCalled();
   });
 });
@@ -364,6 +380,7 @@ describe('end-to-end close-trigger wiring', () => {
       created_by_user_id: 'user-uuid-creator',
     });
     AvailabilityPrompt.findByPk.mockResolvedValue(prompt);
+    AvailabilityPrompt.update.mockResolvedValue([1, [{ ...prompt, status: 'closed' }]]);
     UserGroup.count.mockResolvedValue(3);
     AvailabilityResponse.count.mockResolvedValue(3);
     User.findByPk.mockResolvedValue({
@@ -381,7 +398,6 @@ describe('end-to-end close-trigger wiring', () => {
     const result = await lifecycleService.checkConsensusAndClose('prompt-uuid-1');
 
     expect(result.closed).toBe(true);
-    expect(prompt.status).toBe('closed');
     expect(emailService.send).toHaveBeenCalledTimes(1);
     expect(emailService.send.mock.calls[0][0].subject).toMatch(/closed/i);
     expect(emailService.send.mock.calls[0][0].emailType).toBe('availability_prompt');

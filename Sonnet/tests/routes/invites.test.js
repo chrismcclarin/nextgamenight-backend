@@ -463,3 +463,95 @@ describe('POST /invites/send — participant_user_id path (83.3 SEAM-01)', () =>
     expect(res.body.error).toMatch(/only one/i);
   });
 });
+
+// BINT-01 (Phase 87-02, SPEC Req 2 / D-03): the invite-accept flow flips the
+// invite status AND activates the UserGroup membership in ONE managed
+// transaction. A failure AFTER the status flip but DURING UserGroup activation
+// must roll back everything — no invite may be left 'accepted' without an active
+// UserGroup membership. This must hold on BOTH accept routes: the id-based
+// POST /:invite_id/accept AND the token-based POST /accept-by-token (the primary
+// email-link path). We force the failure by making UserGroup.findOrCreate reject
+// once, then assert the invite rolled back to 'pending' and no active membership
+// exists. The token-path test is what proves the shared transactional helper is
+// actually wired into accept-by-token, not just the id-based handler.
+describe('POST invite-accept — atomicity rollback on BOTH paths (87-02 BINT-01)', () => {
+  let inviter;
+  let invitee;
+  let group;
+  let invite;
+
+  beforeEach(async () => {
+    // invited_by carries a FK to Users.user_id — seed a real inviter row.
+    inviter = await User.create({
+      user_id: 'auth0|bint01-inviter',
+      username: 'bint01-inviter',
+      email: 'bint01-inviter@example.com',
+    });
+
+    invitee = await User.create({
+      user_id: 'auth0|bint01-invitee',
+      username: 'bint01-invitee',
+      email: 'bint01-invitee@example.com',
+    });
+
+    group = await Group.create({
+      group_id: 'bint01-test-group',
+      name: 'BINT01 Test Group',
+    });
+
+    invite = await GroupInvite.create({
+      group_id: group.id,
+      invited_email: invitee.email.toLowerCase(),
+      invited_by: inviter.user_id,
+      token: 'bint01-accept-token',
+      status: 'pending',
+    });
+
+    currentActor = invitee.user_id;
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  it('(id-based) a failure during UserGroup activation rolls back the status flip → invite stays pending, no active membership', async () => {
+    // Force the SECOND write (membership) to fail AFTER the status flip.
+    jest
+      .spyOn(UserGroup, 'findOrCreate')
+      .mockRejectedValueOnce(new Error('simulated UserGroup failure'));
+
+    await request(app)
+      .post(`/api/invites/${invite.id}/accept`)
+      .send({})
+      .expect(500);
+
+    // The invite must NOT be left 'accepted' — the txn rolled back.
+    const reloaded = await GroupInvite.findByPk(invite.id);
+    expect(reloaded.status).toBe('pending');
+
+    // And no active UserGroup membership was created for (user, group).
+    const activeMembership = await UserGroup.findOne({
+      where: { user_id: invitee.user_id, group_id: group.id, status: 'active' },
+    });
+    expect(activeMembership).toBeNull();
+  });
+
+  it('(accept-by-token) a failure during UserGroup activation rolls back the status flip → invite stays pending, no active membership', async () => {
+    jest
+      .spyOn(UserGroup, 'findOrCreate')
+      .mockRejectedValueOnce(new Error('simulated UserGroup failure'));
+
+    await request(app)
+      .post('/api/invites/accept-by-token')
+      .send({ token: invite.token })
+      .expect(500);
+
+    const reloaded = await GroupInvite.findByPk(invite.id);
+    expect(reloaded.status).toBe('pending');
+
+    const activeMembership = await UserGroup.findOne({
+      where: { user_id: invitee.user_id, group_id: group.id, status: 'active' },
+    });
+    expect(activeMembership).toBeNull();
+  });
+});

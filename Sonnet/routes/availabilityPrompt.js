@@ -248,15 +248,38 @@ router.post('/prompts/:promptId/remind/:userId', verifyAuth0Token, async (req, r
     if (response) {
       await response.update({ last_reminded_at: new Date() });
     } else {
-      // Create a placeholder response record to track reminder
-      await AvailabilityResponse.create({
-        prompt_id: promptId,
-        user_id: targetUserId,
-        time_slots: [],
-        user_timezone: 'UTC',
-        submitted_at: null, // Not submitted yet
-        last_reminded_at: new Date()
-      });
+      // Create a placeholder response record to track reminder.
+      // Phase 87 (WR-04): absorb a concurrent-duplicate create. Two admin
+      // reminds that both pass the "no response row" branch race to insert the
+      // placeholder; the loser hits the (prompt_id, user_id) unique index. Mirror
+      // the in-file absorb check (err.name === 'SequelizeUniqueConstraintError',
+      // used at the prompt-create path) and the rsvp.js re-find-and-update analog:
+      // degrade the racing create to a success instead of a 500.
+      try {
+        await AvailabilityResponse.create({
+          prompt_id: promptId,
+          user_id: targetUserId,
+          time_slots: [],
+          user_timezone: 'UTC',
+          submitted_at: null, // Not submitted yet
+          last_reminded_at: new Date()
+        });
+      } catch (err) {
+        if (err.name === 'SequelizeUniqueConstraintError') {
+          // Concurrent create won the race — re-find the racing row and stamp
+          // last_reminded_at on it so the double-click degrades to success.
+          const raceRow = await AvailabilityResponse.findOne({
+            where: { prompt_id: promptId, user_id: targetUserId }
+          });
+          if (raceRow) {
+            await raceRow.update({ last_reminded_at: new Date() });
+          } else {
+            throw err; // Unexpected state — re-throw
+          }
+        } else {
+          throw err;
+        }
+      }
     }
 
     res.json({
@@ -510,20 +533,41 @@ router.patch('/availability-prompts/:id/close', verifyAuth0Token, async (req, re
       return res.status(403).json({ error: 'Only the poll creator or a group admin can close this poll' });
     }
 
-    await prompt.update({ status: 'closed' });
+    // Phase 87 / BINT-01 (T-87-11): CLAIM-then-send. This manual PATCH-close is
+    // the same double-close vector guarded in promptLifecycleService — two
+    // concurrent close requests (or a client retry) both pass the status check
+    // above, so the actual close MUST be an atomic conditional UPDATE. Only the
+    // request whose UPDATE flips exactly one row (active→closed) is allowed to
+    // dispatch the close-notification email; a loser claims 0 rows and returns
+    // 409 without re-sending.
+    const [affectedCount, rows] = await AvailabilityPrompt.update(
+      { status: 'closed' },
+      {
+        where: { id, status: { [Op.notIn]: ['closed', 'converted'] } },
+        returning: true,
+      }
+    );
+
+    if (affectedCount === 0) {
+      // Lost the race (or already terminal) — re-read for an accurate label.
+      const current = await AvailabilityPrompt.findByPk(id);
+      return res.status(409).json({ error: `Poll is already ${current ? current.status : 'closed'}` });
+    }
+
+    const closedPrompt = rows[0];
 
     // Phase 71.2 / D-ADAPT-04: dispatch close-notification email + Schedule it?
     // CTA via the unified lifecycle service. Best-effort — close already
     // committed, errors here are non-fatal.
     try {
       const lifecycleService = require('../services/promptLifecycleService');
-      await lifecycleService.handlePromptClosed(prompt);
+      await lifecycleService.handlePromptClosed(closedPrompt);
     } catch (notifyErr) {
       console.error('[availabilityPrompt] close-notification dispatch failed (non-fatal):', notifyErr.message);
     }
 
     // can_close is now false for everyone (D-CLOSE-04 — closed is final).
-    res.json({ success: true, prompt, can_close: false });
+    res.json({ success: true, prompt: closedPrompt, can_close: false });
   } catch (error) {
     console.error('Error closing prompt:', error);
     res.status(500).json({ error: 'Failed to close prompt' });

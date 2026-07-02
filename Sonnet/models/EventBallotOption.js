@@ -35,6 +35,15 @@ const EventBallotOption = sequelize.define('EventBallotOption', {
     allowNull: false,
     defaultValue: 0,
   },
+  // Phase 87 (BINT-01, D-05): Auth0 sub of the ballot's creator, stamped at
+  // creation time (POST /events materialization or the ballot.js option route).
+  // NULLABLE with NO backfill — legacy rows created before this column stay
+  // NULL and fall through to owner/admin-only replace/wipe authz. Matches the
+  // user_id string convention on EventRsvp/EventBallotVote.
+  created_by: {
+    type: DataTypes.STRING,
+    allowNull: true,
+  },
 }, {
   timestamps: true,
   indexes: [
