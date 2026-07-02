@@ -176,18 +176,24 @@ async function processReminderJob(job) {
       continue;
     }
 
-    // CLAIM-BEFORE-SEND (T-87-12, D-04). Expected-prior-value claim keyed to
-    // THIS specific reminder: advance reminder_count :expected-1 → :expected
-    // with an atomic conditional UPDATE and only send if we won exactly one
-    // row. A same-job retry finds the row already at :expected (WHERE
-    // reminder_count = :expected-1 matches 0 rows) and skips — never
-    // double-sending. This is schema-free (no new sent_* columns / migration):
-    // the predicate rides the existing reminder_count column.
+    // CLAIM-BEFORE-SEND (T-87-12, D-04). Monotonic-below-target claim keyed to
+    // THIS specific reminder: advance reminder_count → :expected with an atomic
+    // conditional UPDATE guarded by `reminder_count < :expected`, and only send
+    // if we won exactly one row. A same-job retry finds the row already at
+    // :expected (WHERE reminder_count < :expected matches 0 rows) and skips —
+    // never double-sending — and the MAX(2) ceiling holds because :expected is
+    // capped at 2. Using `< :expected` (not `= :expected-1`) also correctly
+    // claims a row stuck below the prior rung — e.g. a 90-percent job (expected
+    // 2) reaching a genuine non-responder whose row is still at 0 because the
+    // admin manual-remind placeholder seeded it at 0 and the 50-percent job
+    // never advanced it (adversarial review #2). This is schema-free (no new
+    // sent_* columns / migration): the predicate rides the existing
+    // reminder_count column.
     let claimed = false;
     if (existingResponse) {
       const [claimCount] = await AvailabilityResponse.update(
         { reminder_count: expectedCount, last_reminded_at: new Date() },
-        { where: { prompt_id: promptId, user_id: userId, reminder_count: expectedCount - 1 } }
+        { where: { prompt_id: promptId, user_id: userId, reminder_count: { [Op.lt]: expectedCount } } }
       );
       claimed = claimCount === 1;
     } else {
@@ -216,7 +222,7 @@ async function processReminderJob(job) {
           // expected-prior-value claim so we don't double-send.
           const [claimCount] = await AvailabilityResponse.update(
             { reminder_count: expectedCount, last_reminded_at: new Date() },
-            { where: { prompt_id: promptId, user_id: userId, reminder_count: expectedCount - 1 } }
+            { where: { prompt_id: promptId, user_id: userId, reminder_count: { [Op.lt]: expectedCount } } }
           );
           claimed = claimCount === 1;
         } else {
@@ -228,7 +234,7 @@ async function processReminderJob(job) {
     if (!claimed) {
       // Retry / concurrent double-fire: this reminder was already claimed by a
       // prior (possibly crashed-then-retried) invocation. Skip the send.
-      console.log(`[ReminderWorker] Reminder ${reminderType} for user ${userId} already claimed (row not at ${expectedCount - 1}); skipping send`);
+      console.log(`[ReminderWorker] Reminder ${reminderType} for user ${userId} already claimed (row not below ${expectedCount}); skipping send`);
       skipped++;
       continue;
     }

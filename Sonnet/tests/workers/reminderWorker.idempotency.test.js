@@ -150,4 +150,33 @@ describe('reminderWorker.processReminderJob same-reminder idempotency (BINT-01 /
     // re-finds the row at MAX and never double-sends.
     expect(row.reminder_count).toBe(2);
   });
+
+  // Phase 87 (adversarial review #2): a genuine non-responder can have a row
+  // stuck at reminder_count 0 (the admin manual-remind endpoint seeds a
+  // placeholder at the model default 0, and if the 50-percent job never
+  // advanced that user, 90% is the first worker to reach it). The OLD
+  // exact-prior-value claim (WHERE reminder_count = expected-1 = 1) matched 0
+  // rows on a count-0 row → silently skipped the final reminder. The monotonic
+  // `< expected` claim advances it 0→2 and sends exactly once, still MAX-safe.
+  it('90-percent, row STUCK at 0: two invocations → exactly ONE send, reminder_count → 2', async () => {
+    const { group, prompt } = await seedActivePromptAndMember();
+    // Placeholder seeded at 0 (as the admin manual-remind route does) and never
+    // advanced by the 50-percent job.
+    await AvailabilityResponse.create({
+      prompt_id: prompt.id,
+      user_id: USER_SUB,
+      time_slots: [],
+      user_timezone: 'UTC',
+      submitted_at: null,
+      reminder_count: 0,
+    });
+
+    const job = jobFor(prompt.id, '90-percent', group.id);
+    await processReminderJob(job);
+    await processReminderJob(job); // same-job retry
+
+    expect(emailService.send).toHaveBeenCalledTimes(1);
+    const row = await reminderRow(prompt.id);
+    expect(row.reminder_count).toBe(2);
+  });
 });
