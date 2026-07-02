@@ -204,6 +204,34 @@ describe('Event Routes', () => {
       });
       expect(allRows.length).toBe(2); // Catan (de-duped) + Wingspan
     });
+
+    // Phase 87 (adversarial review #6/#7): a caller-supplied >=2 ballot that
+    // collapses to <2 DISTINCT trimmed names must be rejected LOUDLY (400)
+    // BEFORE any write — never silently create a ballot-less event + 200.
+    it('rejects a ballot that de-dups below 2 distinct game_names (400, no event created)', async () => {
+      const before = await Event.count({ where: { group_id: testGroup.id } });
+
+      const response = await request(makeApp(testUser1))
+        .post('/api/events')
+        .send({
+          group_id: testGroup.id,
+          game_id: testGame.id,
+          start_date: new Date().toISOString(),
+          rsvp_deadline: new Date(Date.now() + 86400000).toISOString(),
+          // Two entries, same trimmed name → 1 distinct → below the 2 minimum.
+          ballot_options: [
+            { game_name: 'Catan' },
+            { game_name: '  Catan  ' },
+          ],
+        })
+        .expect(400);
+
+      expect(response.body.error).toMatch(/at least 2 distinct/i);
+
+      // Validation runs before Event.create — no ballot-less event persisted.
+      const after = await Event.count({ where: { group_id: testGroup.id } });
+      expect(after).toBe(before);
+    });
   });
 
   describe('PUT /api/events/:id', () => {

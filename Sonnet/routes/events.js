@@ -460,6 +460,25 @@ router.post('/', validateEventCreate, async (req, res) => {
       return res.status(403).json({ error: 'Pending members cannot perform this action', required_role: 'member' });
     }
 
+    // Phase 87 (adversarial review #6/#7): a caller-supplied ballot (>=2 options
+    // + a deadline) must resolve to >=2 DISTINCT non-empty trimmed game_names.
+    // The in-transaction de-dup below drops duplicates; if that would collapse
+    // the ballot below 2 we must reject LOUDLY here, BEFORE creating anything —
+    // otherwise the event is created with no ballot and the route still returns
+    // 201, which the FE treats as full success, so the intended ballot vanishes
+    // with no signal. This validates before the write set so no ballot-less
+    // event is ever persisted for this input.
+    if (Array.isArray(ballot_options) && ballot_options.length >= 2 && rsvp_deadline) {
+      const distinctBallotNames = new Set(
+        ballot_options
+          .filter(o => o.game_name && o.game_name.trim())
+          .map(o => o.game_name.trim())
+      );
+      if (distinctBallotNames.size < 2) {
+        return res.status(400).json({ error: 'Ballot options must have at least 2 distinct game names' });
+      }
+    }
+
     // Phase 87 (BINT-01, T-87-08-01): wrap the multi-write set — Event.create,
     // EventParticipation.bulkCreate, and the ballot-materialization block — in
     // ONE managed transaction (the in-file form already used at the participant-
