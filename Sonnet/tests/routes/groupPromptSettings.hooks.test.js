@@ -25,10 +25,15 @@ const mockSettingsUpdate = jest.fn();
 const mockGameFindByPk = jest.fn();
 const mockGameFindAll = jest.fn();
 const mockUserGroupFindAll = jest.fn();
+const mockUserFindOne = jest.fn();
+// BINT-01: the route now serializes the JSONB read-modify-write inside a
+// sequelize.transaction() with a FOR UPDATE row lock. Expose a mock sequelize
+// with a transaction() factory so the mocked-models harness keeps working.
+const mockSequelizeTransaction = jest.fn();
 
 jest.mock('../../models', () => ({
   Group: { findByPk: (...a) => mockGroupFindByPk(...a) },
-  User: {},
+  User: { findOne: (...a) => mockUserFindOne(...a) },
   UserGroup: { findAll: (...a) => mockUserGroupFindAll(...a) },
   GroupPromptSettings: {
     findOne: (...a) => mockSettingsFindOne(...a),
@@ -38,7 +43,8 @@ jest.mock('../../models', () => ({
     findByPk: (...a) => mockGameFindByPk(...a),
     findAll: (...a) => mockGameFindAll(...a)
   },
-  Event: {} // referenced inside the GET route, never invoked here
+  Event: {}, // referenced inside the GET route, never invoked here
+  sequelize: { transaction: (...a) => mockSequelizeTransaction(...a) }
 }));
 
 const express = require('express');
@@ -65,6 +71,16 @@ describe('groupPromptSettings on-write BullMQ hooks', () => {
     mockRemove.mockResolvedValue(true);
 
     mockGroupFindByPk.mockResolvedValue({ id: 'group-1', name: 'Test Group' });
+    mockUserFindOne.mockResolvedValue({ id: 'user-uuid-1', user_id: 'auth0|test-user' });
+
+    // Default transaction mock: a no-op tx that tracks commit/rollback state.
+    mockSequelizeTransaction.mockImplementation(async () => {
+      const tx = { LOCK: { UPDATE: 'UPDATE' }, finished: undefined };
+      tx.commit = jest.fn(async () => { tx.finished = 'commit'; });
+      tx.rollback = jest.fn(async () => { tx.finished = 'rollback'; });
+      return tx;
+    });
+
     app = makeApp();
   });
 
@@ -414,6 +430,102 @@ describe('groupPromptSettings on-write BullMQ hooks', () => {
 
       expect(mockRemove).toHaveBeenCalledWith('settings-1', 'sched-1');
       expect(mockUpsertSingle).not.toHaveBeenCalled();
+    });
+  });
+
+  // BINT-01 (T-87-09): two admins adding schedules at the same time must BOTH
+  // persist — the classic JSONB read-modify-write lost-update. The route guards
+  // this with SELECT ... FOR UPDATE inside a transaction. This test emulates the
+  // row lock with an async mutex acquired by findOne({ lock }) and released on
+  // commit/rollback, plus a stateful store the route reads and writes back. With
+  // the lock the second writer reads the first writer's committed state (both
+  // persist); without it the two writers would clobber each other.
+  //
+  // NOTE: real serialization verification happens on PR CI Postgres — this is the
+  // mocked-harness proxy that proves the route acquires+holds+releases the lock
+  // across the whole read-modify-write and writes the whole recomputed array.
+  describe('concurrent schedule adds (BINT-01 no-lost-update)', () => {
+    test('two concurrent schedule adds both persist (no clobber)', async () => {
+      // Server-side persisted state (emulates the settings row JSONB column),
+      // seeded with one existing schedule.
+      const store = {
+        template_config: {
+          schedules: [{ id: 'seed', schedule_day_of_week: 0, schedule_time: '10:00', is_active: true }]
+        }
+      };
+
+      // Async mutex emulating a Postgres FOR UPDATE row lock: only one
+      // transaction may hold the settings row at a time.
+      let locked = false;
+      const waiters = [];
+      const acquire = () => new Promise((resolve) => {
+        const attempt = () => {
+          if (!locked) { locked = true; resolve(); }
+          else { waiters.push(attempt); }
+        };
+        attempt();
+      });
+      const release = () => {
+        locked = false;
+        const next = waiters.shift();
+        if (next) next();
+      };
+
+      // transaction() releases the mutex on commit/rollback.
+      mockSequelizeTransaction.mockImplementation(async () => {
+        const tx = { LOCK: { UPDATE: 'UPDATE' }, finished: undefined, _released: false };
+        const doRelease = () => { if (!tx._released) { tx._released = true; release(); } };
+        tx.commit = jest.fn(async () => { tx.finished = 'commit'; doRelease(); });
+        tx.rollback = jest.fn(async () => { tx.finished = 'rollback'; doRelease(); });
+        return tx;
+      });
+
+      // findOne WITH a lock option acquires the mutex (SELECT ... FOR UPDATE)
+      // before returning a row snapshot; update() writes the whole recomputed
+      // template_config back to the shared store.
+      mockSettingsFindOne.mockImplementation(async (opts) => {
+        if (opts && opts.lock) {
+          await acquire();
+        }
+        const row = {
+          id: 'settings-1',
+          group_id: 'group-1',
+          is_active: true,
+          schedule_timezone: 'UTC',
+          // snapshot of currently-persisted state
+          template_config: {
+            ...store.template_config,
+            schedules: [...store.template_config.schedules]
+          },
+          update: async (values) => {
+            store.template_config = values.template_config;
+            return row;
+          }
+        };
+        return row;
+      });
+
+      const addReq = (time) => request(app)
+        .post('/api/groups/group-1/prompt-settings/schedules')
+        .send({
+          schedule_day_of_week: 3,
+          schedule_time: time,
+          schedule_timezone: 'UTC',
+          template_name: `template-${time}`
+        });
+
+      const [r1, r2] = await Promise.all([addReq('11:00'), addReq('12:00')]);
+
+      expect(r1.status).toBe(201);
+      expect(r2.status).toBe(201);
+
+      // Re-fetch: the final persisted array must contain the seed + BOTH adds.
+      const finalSchedules = store.template_config.schedules;
+      expect(finalSchedules).toHaveLength(3);
+      const times = finalSchedules.map((s) => s.schedule_time);
+      expect(times).toContain('11:00');
+      expect(times).toContain('12:00');
+      expect(times).toContain('10:00'); // seed survived
     });
   });
 });
