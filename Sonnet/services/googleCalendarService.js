@@ -434,7 +434,15 @@ class GoogleCalendarService {
   /**
    * Create a tentative calendar hold for a user
    * Tentative events show as "tentative" on the calendar and don't send notifications
-   * @param {Object} eventData - Event data (groupName, gameName, startDateTime, endDateTime, timezone)
+   *
+   * Phase 87 / BINT-01 (D-04): the caller MAY supply `eventData.id` — a deterministic,
+   * client-supplied Google Calendar event id (base32hex charset `0-9a-v`, length 5-1024).
+   * When present it is threaded into `events.insert` so retries are idempotent: GCal
+   * returns HTTP 409 for a duplicate id, which we treat as SUCCESS ({ id, _duplicate: true })
+   * because the hold already exists. When `eventData.id` is absent, behaviour is unchanged
+   * (GCal auto-generates the id) so existing callers keep working.
+   *
+   * @param {Object} eventData - Event data (groupName, gameName, startDateTime, endDateTime, timezone, [id])
    * @param {string} accessToken - User's Google OAuth access token
    * @param {string} refreshToken - User's Google OAuth refresh token (optional, for auto-refresh)
    * @returns {Promise<Object>} Created calendar event with id
@@ -478,14 +486,33 @@ class GoogleCalendarService {
         }
       };
 
+      // Phase 87 / BINT-01: thread a caller-supplied deterministic id (when provided)
+      // into the request body so retries reuse the same GCal event id and return 409.
+      const requestBody = { ...calendarEvent };
+      if (eventData.id) {
+        requestBody.id = eventData.id;
+      }
+
       const response = await calendar.events.insert({
         calendarId: 'primary',
-        resource: calendarEvent,
+        requestBody,
         sendUpdates: 'none'          // Don't notify for tentative holds
       });
 
       return response.data;
     } catch (error) {
+      // Phase 87 / BINT-01 (A1 verified empirically on googleapis 169 / gaxios 7.1.3):
+      // a duplicate client-supplied id returns HTTP 409. On gaxios 7.x the numeric
+      // status lives on `error.status` and `error.response.status` (NOT `error.code`,
+      // which is only set from a network-level cause). We match all three for
+      // cross-version safety. A 409 means the hold already exists => idempotent success.
+      // SECURITY: log ONLY the status/code — never the full error object or headers
+      // (the request carries the Google OAuth bearer token in its headers).
+      if (eventData.id && (error.code === 409 || error.status === 409 || error.response?.status === 409)) {
+        console.log(`Tentative hold ${eventData.id} already exists (409 duplicate) - treating as idempotent success`);
+        return { id: eventData.id, _duplicate: true };
+      }
+
       // If token expired and we have a refresh token, try to refresh and retry
       if (error.code === 401 && refreshToken) {
         try {
