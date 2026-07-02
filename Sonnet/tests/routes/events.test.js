@@ -2,7 +2,7 @@
 const request = require('supertest');
 const express = require('express');
 const eventRoutes = require('../../routes/events');
-const { Event, Game, User, Group, EventParticipation, UserGroup, sequelize } = require('../../models');
+const { Event, Game, User, Group, EventParticipation, EventRsvp, EventBallotOption, UserGroup, sequelize } = require('../../models');
 const { makeUser, makeGroup, addToGroup } = require('../factories');
 const { QueryTypes } = require('sequelize');
 // Phase 87 (BINT-02): the migration under test — used by the preclean unit test
@@ -141,6 +141,69 @@ describe('Event Routes', () => {
 
       expect(response.body).toHaveProperty('error');
     });
+
+    // Phase 87 (T-87-08-01): the multi-write set is one managed transaction.
+    it('rolls back the whole write set (0 Event rows) when a mid-write fails', async () => {
+      // Force EventParticipation.bulkCreate — the SECOND write, after Event.create
+      // — to throw inside the transaction. The managed transaction must roll the
+      // Event.create back, leaving zero persisted rows for this attempt.
+      const spy = jest
+        .spyOn(EventParticipation, 'bulkCreate')
+        .mockRejectedValueOnce(new Error('forced mid-write failure'));
+
+      const before = await Event.count({ where: { group_id: testGroup.id } });
+
+      const response = await request(makeApp(testUser1))
+        .post('/api/events')
+        .send({
+          group_id: testGroup.id,
+          game_id: testGame.id,
+          start_date: new Date().toISOString(),
+          participants: [{ user_id: testUser1.id, score: 10, placement: 1 }],
+        })
+        .expect(500);
+
+      expect(response.body).toHaveProperty('error');
+
+      // No orphaned Event row survived the rollback.
+      const after = await Event.count({ where: { group_id: testGroup.id } });
+      expect(after).toBe(before);
+
+      spy.mockRestore();
+    });
+
+    // Phase 87 (T-87-08-01): ballot_options are de-duped by game_name before
+    // bulkCreate so the (event_id, game_name) unique index cannot 500.
+    it('de-dups ballot_options by game_name (one row per name, no 500)', async () => {
+      const response = await request(makeApp(testUser1))
+        .post('/api/events')
+        .send({
+          group_id: testGroup.id,
+          game_id: testGame.id,
+          start_date: new Date().toISOString(),
+          rsvp_deadline: new Date(Date.now() + 86400000).toISOString(),
+          // Two "Catan" entries + one "Wingspan": the duplicate collapses to a
+          // single row; the ballot still materializes (>= 2 distinct names).
+          ballot_options: [
+            { game_name: 'Catan' },
+            { game_name: 'Catan' },
+            { game_name: 'Wingspan' },
+          ],
+        })
+        .expect(200);
+
+      expect(response.body).toHaveProperty('id');
+
+      const catanRows = await EventBallotOption.findAll({
+        where: { event_id: response.body.id, game_name: 'Catan' },
+      });
+      expect(catanRows.length).toBe(1); // exactly one row for the duplicated name
+
+      const allRows = await EventBallotOption.findAll({
+        where: { event_id: response.body.id },
+      });
+      expect(allRows.length).toBe(2); // Catan (de-duped) + Wingspan
+    });
   });
 
   describe('PUT /api/events/:id', () => {
@@ -263,6 +326,44 @@ describe('Event Routes', () => {
         .expect(404);
 
       expect(response.body.error).toBe('Event not found');
+    });
+
+    // Phase 87 (T-87-08-02): the three destroys are one managed transaction.
+    it('rolls back the whole delete set when a mid-delete fails (event + children survive)', async () => {
+      const event = await Event.create({
+        group_id: testGroup.id,
+        game_id: testGame.id,
+        start_date: new Date(),
+        status: 'completed',
+      });
+      const ep = await EventParticipation.create({
+        event_id: event.id,
+        user_id: testUser1.id, // UUID — correct.
+        score: 100,
+      });
+
+      // Force EventParticipation.destroy — the SECOND destroy, after
+      // EventRsvp.destroy — to throw inside the transaction. The managed
+      // transaction must roll back so the Event row and its children survive.
+      const spy = jest
+        .spyOn(EventParticipation, 'destroy')
+        .mockRejectedValueOnce(new Error('forced mid-delete failure'));
+
+      const response = await request(makeApp(testUser1))
+        .delete(`/api/events/${event.id}`)
+        .expect(500);
+
+      expect(response.body).toHaveProperty('error');
+
+      spy.mockRestore();
+
+      // Event row survived the rollback.
+      const survivingEvent = await Event.findByPk(event.id);
+      expect(survivingEvent).not.toBeNull();
+
+      // Child participation survived too (no partial delete).
+      const survivingEp = await EventParticipation.findByPk(ep.id);
+      expect(survivingEp).not.toBeNull();
     });
   });
 });

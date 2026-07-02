@@ -460,66 +460,90 @@ router.post('/', validateEventCreate, async (req, res) => {
       return res.status(403).json({ error: 'Pending members cannot perform this action', required_role: 'member' });
     }
 
-    const event = await Event.create({
-      group_id,
-      game_id,
-      start_date,
-      duration_minutes,
-      winner_id,
-      picked_by_id,
-      winner_name: winner_name || null,
-      picked_by_name: picked_by_name || null,
-      custom_participants: custom_participants || [],
-      is_group_win,
-      comments,
-      status: 'completed',
-      rsvp_deadline: rsvp_deadline || null,
-      ballot_status: null
-    });
-    
-    // Create participations for group members (with user_id)
-    if (participants && participants.length > 0) {
-      const participationData = participants
-        .filter(p => p.user_id) // Only include participants with user_id
-        .map(p => ({
-          event_id: event.id,
-          user_id: p.user_id,
-          score: p.score,
-          faction: p.faction,
-          is_new_player: p.is_new_player || false,
-          placement: p.placement
-        }));
-      
-      if (participationData.length > 0) {
-        await EventParticipation.bulkCreate(participationData);
-      }
-    }
-
-    // Create ballot options atomically with the event (if provided)
-    // This ensures ballot exists BEFORE notifications fire
+    // Phase 87 (BINT-01, T-87-08-01): wrap the multi-write set — Event.create,
+    // EventParticipation.bulkCreate, and the ballot-materialization block — in
+    // ONE managed transaction (the in-file form already used at the participant-
+    // swap and self-removal paths). A mid-write failure (e.g. a duplicate ballot
+    // game_name hitting the (event_id, game_name) unique index, or a participant
+    // user_id that violates the Plan-07 FK) now rolls the whole write back → no
+    // orphaned Event row. The read-only re-fetch + response stay OUTSIDE (post-commit).
+    let event;
     let hasBallot = false;
-    if (ballot_options && Array.isArray(ballot_options) && ballot_options.length >= 2 && rsvp_deadline) {
-      const validOptions = ballot_options.filter(o => o.game_name && o.game_name.trim());
-      if (validOptions.length >= 2) {
-        const optionRows = validOptions.map((opt, index) => ({
-          event_id: event.id,
-          game_id: opt.game_id || null,
-          game_name: opt.game_name.trim(),
-          display_order: index,
-          // Phase 87 (BINT-01, T-87-04): stamp the ballot creator from the
-          // verified Auth0 sub (Phase 83 default-deny) — NEVER a client-supplied
-          // id. This is the REAL production ballot-creation path (the FE births
-          // every ballot via POST /events with embedded ballot_options), so
-          // without this every ballot is created_by=NULL and the "creator can
-          // replace/wipe" branch of Req 7 is dead in production.
-          created_by: req.user.user_id,
-        }));
-        await EventBallotOption.bulkCreate(optionRows);
-        event.ballot_status = 'open';
-        await event.save();
-        hasBallot = true;
+    await sequelize.transaction(async (t) => {
+      event = await Event.create({
+        group_id,
+        game_id,
+        start_date,
+        duration_minutes,
+        winner_id,
+        picked_by_id,
+        winner_name: winner_name || null,
+        picked_by_name: picked_by_name || null,
+        custom_participants: custom_participants || [],
+        is_group_win,
+        comments,
+        status: 'completed',
+        rsvp_deadline: rsvp_deadline || null,
+        ballot_status: null
+      }, { transaction: t });
+
+      // Create participations for group members (with user_id)
+      if (participants && participants.length > 0) {
+        const participationData = participants
+          .filter(p => p.user_id) // Only include participants with user_id
+          .map(p => ({
+            event_id: event.id,
+            user_id: p.user_id,
+            score: p.score,
+            faction: p.faction,
+            is_new_player: p.is_new_player || false,
+            placement: p.placement
+          }));
+
+        if (participationData.length > 0) {
+          await EventParticipation.bulkCreate(participationData, { transaction: t });
+        }
       }
-    }
+
+      // Create ballot options atomically with the event (if provided)
+      // This ensures ballot exists BEFORE notifications fire
+      if (ballot_options && Array.isArray(ballot_options) && ballot_options.length >= 2 && rsvp_deadline) {
+        const validOptions = ballot_options.filter(o => o.game_name && o.game_name.trim());
+
+        // Phase 87 (T-87-08-01): DE-DUPLICATE by trimmed game_name (keep first
+        // occurrence) BEFORE building optionRows so the (event_id, game_name)
+        // unique index cannot be weaponized into a mid-transaction 500. Preserve
+        // display_order sequencing over the de-duped list.
+        const seenNames = new Set();
+        const dedupedOptions = [];
+        for (const opt of validOptions) {
+          const key = opt.game_name.trim();
+          if (seenNames.has(key)) continue;
+          seenNames.add(key);
+          dedupedOptions.push(opt);
+        }
+
+        if (dedupedOptions.length >= 2) {
+          const optionRows = dedupedOptions.map((opt, index) => ({
+            event_id: event.id,
+            game_id: opt.game_id || null,
+            game_name: opt.game_name.trim(),
+            display_order: index,
+            // Phase 87 (BINT-01, T-87-04): stamp the ballot creator from the
+            // verified Auth0 sub (Phase 83 default-deny) — NEVER a client-supplied
+            // id. This is the REAL production ballot-creation path (the FE births
+            // every ballot via POST /events with embedded ballot_options), so
+            // without this every ballot is created_by=NULL and the "creator can
+            // replace/wipe" branch of Req 7 is dead in production.
+            created_by: req.user.user_id,
+          }));
+          await EventBallotOption.bulkCreate(optionRows, { transaction: t });
+          event.ballot_status = 'open';
+          await event.save({ transaction: t });
+          hasBallot = true;
+        }
+      }
+    });
 
     // Fetch complete event data
     const completeEvent = await Event.findByPk(event.id, {
@@ -1591,14 +1615,24 @@ router.delete('/:id', async (req, res) => {
       console.error('[events:delete] GCal cleanup enqueue failed (non-fatal):', gcalEnqueueErr.message);
     }
 
-    // Delete RSVPs for this event
-    await EventRsvp.destroy({ where: { event_id: event.id } });
+    // Phase 87 (BINT-01, T-87-08-02): wrap the three destructive writes in ONE
+    // managed transaction so a partial-delete failure cannot leave a half-deleted
+    // event graph (e.g. RSVPs gone but the Event row surviving). The pre-delete
+    // notification fanout, EventAuditLog write, and GCal cleanup enqueue above
+    // stay best-effort OUTSIDE this transaction (they each have their own
+    // non-fatal try/catch and must not be rolled back — the GCal enqueue in
+    // particular must run BEFORE the participation destroy since it reads
+    // google_calendar_event_id off those rows).
+    await sequelize.transaction(async (t) => {
+      // Delete RSVPs for this event
+      await EventRsvp.destroy({ where: { event_id: event.id }, transaction: t });
 
-    // Delete participations
-    await EventParticipation.destroy({ where: { event_id: event.id } });
+      // Delete participations
+      await EventParticipation.destroy({ where: { event_id: event.id }, transaction: t });
 
-    // Delete event
-    await event.destroy();
+      // Delete event
+      await event.destroy({ transaction: t });
+    });
 
     res.json({ message: 'Event deleted successfully' });
   } catch (error) {
