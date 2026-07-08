@@ -11,12 +11,22 @@
 //
 // WHY THIS NEEDS A "PRE-MIGRATION" SCHEMA (legacy-provisioning spec):
 //   The test DB is built ONCE by tests/globalSetup.js via sync({force:true}) from the
-//   MODELS — which already declare the *_uuid columns + FKs. So a naive `up` would find
-//   everything present and backfill nothing. To exercise a real migration, each scenario
-//   first runs the migration's own `down(queryInterface)`, which DROPs the *_uuid column
-//   (Postgres auto-drops the sync-built FK + uuid indexes that depend on it). That returns
-//   the table to its TRUE pre-migration shape: old Auth0-string column(s) present, no
-//   *_uuid column. Rows are then seeded via RAW INSERT on the old string columns (the
+//   MODELS. Phase 87.1 Plan 09 REMOVED the old Auth0-string columns from those models, so
+//   the sync-built schema now has ONLY the *_uuid columns + FKs (the POST-migration shape)
+//   and NO old string columns at all. To exercise a real migration, each scenario must
+//   provision TRUE pre-migration shape ITSELF — it may NOT rely on the model-derived
+//   schema for any pre-migration column:
+//     1. run the migration's own `down(queryInterface)`, which DROPs the *_uuid column
+//        (Postgres auto-drops the sync-built FK + uuid indexes that depend on it);
+//     2. provisionLegacyColumns() then ADDs the old Auth0-string column(s) back via raw
+//        SQL — because Plan 09 deleted them from the model, sync() no longer builds them,
+//        so WITHOUT this step the raw seed INSERT (and the migration's own backfill UPDATE
+//        + DROP NOT NULL, which reference the old column) would throw "column does not
+//        exist" and the authoritative backfill/orphan/idempotency proof would go red.
+//   The two steps together yield TRUE pre-migration shape: old string column(s) present,
+//   *_uuid column ABSENT. Because down() dropped *_uuid, the migration's guarded ADD COLUMN
+//   + backfill path DEMONSTRABLY EXECUTES on `up` (it does not short-circuit on an
+//   already-present *_uuid). Rows are seeded via RAW INSERT on the old string columns (the
 //   Sequelize model can't be used — it would emit the now-absent *_uuid column). Parent
 //   rows (Users/Groups/Events/Games/BallotOptions) are created via models since their
 //   schema is untouched. Finally `up` runs and we assert against the real backfill/orphan
@@ -39,6 +49,13 @@ const {
   Game,
   Event,
   EventBallotOption,
+  UserGroup,
+  EventRsvp,
+  EventBring,
+  EventBallotVote,
+  SentNotification,
+  GroupInvite,
+  Friendship,
 } = require('../../models');
 
 const migrations = {
@@ -55,6 +72,19 @@ const uuid = () => crypto.randomUUID();
 const qi = () => sequelize.getQueryInterface();
 
 // --- low-level helpers -------------------------------------------------------
+
+/**
+ * Provision the pre-migration legacy Auth0-string column(s) that Plan 09 removed from the
+ * models. The sync()-built schema no longer has them, so after the migration's down() drops
+ * the *_uuid column (+FK+indexes) we ADD the old string column(s) back here to reach TRUE
+ * pre-migration shape. Nullable VARCHAR is sufficient — the harness raw-seeds the Auth0
+ * strings and the migration's backfill/DROP-NOT-NULL steps only need the column to EXIST.
+ */
+async function provisionLegacyColumns(table, columns) {
+  for (const col of columns) {
+    await sequelize.query(`ALTER TABLE "${table}" ADD COLUMN IF NOT EXISTS "${col}" VARCHAR`);
+  }
+}
 
 /** Raw INSERT (bypasses the model so we can seed pre-migration string-only rows). */
 async function insertRow(table, cols) {
@@ -118,8 +148,9 @@ const orphanKey = () => `auth0|orphan-${uuid()}`; // no matching Users row
 // Shared CASCADE scenario: one matched row backfills, one orphan row is DELETEd,
 // second `up` is a no-op. Used by the 5 single-user CASCADE tables.
 // -----------------------------------------------------------------------------
-async function runCascadeScenario({ migration, table, uuidCol, matchedUser, seedMatched, seedOrphan }) {
-  await migration.down(qi()); // establish pre-migration schema
+async function runCascadeScenario({ migration, table, uuidCol, matchedUser, seedMatched, seedOrphan, legacyCols = ['user_id'] }) {
+  await migration.down(qi()); // drop the *_uuid column + its FK + uuid indexes
+  await provisionLegacyColumns(table, legacyCols); // re-add the Plan-09-removed old string col(s)
 
   const matchedId = await seedMatched();
   const orphanId = await seedOrphan();
@@ -262,7 +293,8 @@ describe('Phase 87.1 UUID re-key migrations — backfill / orphan / idempotency'
       const inviter = await aUser();
       const group = await aGroup();
 
-      await migration.down(qi());
+      await migration.down(qi()); // drop invited_by_uuid + its FK
+      await provisionLegacyColumns('GroupInvites', ['invited_by']); // re-add Plan-09-removed old col
 
       const matchedId = await insertRow('GroupInvites', {
         id: uuid(), group_id: group.id, invited_email: `m-${uuid()}@example.com`,
@@ -300,7 +332,8 @@ describe('Phase 87.1 UUID re-key migrations — backfill / orphan / idempotency'
       const addressee = await aUser();
       const realThird = await aUser();
 
-      await migration.down(qi());
+      await migration.down(qi()); // drop requester_uuid/addressee_uuid + FKs + functional index
+      await provisionLegacyColumns('Friendships', ['requester_id', 'addressee_id']); // re-add old cols
 
       // matched pair — both endpoints resolve
       const matchedId = await insertRow('Friendships', {
@@ -335,6 +368,115 @@ describe('Phase 87.1 UUID re-key migrations — backfill / orphan / idempotency'
       expect(m2.req).toBe(requester.id);
       expect(m2.addr).toBe(addressee.id);
       expect(deletedCount(logs2)).toBe(0);
+    });
+  });
+});
+
+// =============================================================================
+// Cross-cutting integrity: UUID unique-index enforcement + CASCADE backstop (D-06).
+//
+// These run AFTER the migration-replay describe above, which is LOAD-BEARING for the
+// Friendship functional-pair assertion: the LEAST/GREATEST unique index
+// (`friendships_pair_unique_uuid`) is created ONLY by the friendship migration's up()
+// (it is NOT a model/sync index), and the Friendship scenario above runs that up().
+// The 4 composite unique indexes ARE model/sync-built. tests/setup.js truncates ROWS
+// (not schema) per-test, so every constraint/index persists across these tests; each
+// test seeds fresh via the models (writing *_uuid only — the Plan 09 shape).
+// =============================================================================
+describe('Phase 87.1 UUID integrity — unique-index enforcement + CASCADE backstop', () => {
+  describe('duplicate-insert rejected per UUID unique index (T-87.1-12)', () => {
+    it('UserGroup (user_uuid, group_id) rejects a duplicate membership', async () => {
+      const user = await aUser();
+      const group = await aGroup();
+      await UserGroup.create({ user_uuid: user.id, group_id: group.id, role: 'member', status: 'active' });
+      await expect(
+        UserGroup.create({ user_uuid: user.id, group_id: group.id, role: 'member', status: 'active' })
+      ).rejects.toThrow();
+    });
+
+    it('EventRsvp (event_id, user_uuid) rejects a duplicate RSVP', async () => {
+      const user = await aUser();
+      const event = await anEvent(await aGroup());
+      await EventRsvp.create({ event_id: event.id, user_uuid: user.id, status: 'yes' });
+      await expect(
+        EventRsvp.create({ event_id: event.id, user_uuid: user.id, status: 'no' })
+      ).rejects.toThrow();
+    });
+
+    it('EventBallotVote (option_id, user_uuid) rejects a duplicate vote', async () => {
+      const user = await aUser();
+      const event = await anEvent(await aGroup());
+      const option = await aBallotOption(event);
+      await EventBallotVote.create({ option_id: option.id, user_uuid: user.id });
+      await expect(
+        EventBallotVote.create({ option_id: option.id, user_uuid: user.id })
+      ).rejects.toThrow();
+    });
+
+    it('EventBring (event_id, user_uuid, game_id) rejects a duplicate bring', async () => {
+      const user = await aUser();
+      const event = await anEvent(await aGroup());
+      const game = await aGame();
+      await EventBring.create({ event_id: event.id, user_uuid: user.id, game_id: game.id });
+      await expect(
+        EventBring.create({ event_id: event.id, user_uuid: user.id, game_id: game.id })
+      ).rejects.toThrow();
+    });
+
+    it('Friendship LEAST/GREATEST functional pair rejects a REVERSED-endpoint duplicate', async () => {
+      // The pair (A,B) and (B,A) collapse to the same LEAST/GREATEST canonical key,
+      // so the reversed insert must violate friendships_pair_unique_uuid.
+      const a = await aUser();
+      const b = await aUser();
+      await Friendship.create({ requester_uuid: a.id, addressee_uuid: b.id, status: 'pending' });
+      await expect(
+        Friendship.create({ requester_uuid: b.id, addressee_uuid: a.id, status: 'pending' })
+      ).rejects.toThrow();
+    });
+  });
+
+  describe('CASCADE integrity on a Users-row delete (D-06 backstop)', () => {
+    it('deletes the 6 CASCADE tables\' child rows and NULLs GroupInvite.invited_by_uuid', async () => {
+      const user = await aUser();
+      const group = await aGroup();
+      const event = await anEvent(group);
+      const game = await aGame();
+      const option = await aBallotOption(event);
+      const friend = await aUser();
+
+      // Seed one child row in each of the 6 CASCADE tables tied to `user`.
+      await UserGroup.create({ user_uuid: user.id, group_id: group.id, role: 'member', status: 'active' });
+      await EventRsvp.create({ event_id: event.id, user_uuid: user.id, status: 'yes' });
+      await EventBring.create({ event_id: event.id, user_uuid: user.id, game_id: game.id });
+      await EventBallotVote.create({ option_id: option.id, user_uuid: user.id });
+      await SentNotification.create({
+        user_uuid: user.id, event_id: event.id, phone: '+15555559001',
+        channel: 'sms', notification_type: 'event_created', sent_at: now(),
+      });
+      await Friendship.create({ requester_uuid: user.id, addressee_uuid: friend.id, status: 'accepted' });
+
+      // GroupInvite references `user` via the NULLABLE invited_by_uuid (D-04, SET NULL).
+      const invite = await GroupInvite.create({
+        group_id: group.id, invited_email: `cascade-${uuid()}@example.com`,
+        invited_by_uuid: user.id, token: `tok-${uuid()}`, status: 'pending',
+      });
+
+      // Delete the parent Users row — Postgres FKs fire ON DELETE CASCADE / SET NULL.
+      await user.destroy();
+
+      // The 6 CASCADE tables' rows are gone.
+      expect(await UserGroup.count({ where: { user_uuid: user.id } })).toBe(0);
+      expect(await EventRsvp.count({ where: { user_uuid: user.id } })).toBe(0);
+      expect(await EventBring.count({ where: { user_uuid: user.id } })).toBe(0);
+      expect(await EventBallotVote.count({ where: { user_uuid: user.id } })).toBe(0);
+      expect(await SentNotification.count({ where: { user_uuid: user.id } })).toBe(0);
+      expect(await Friendship.count({ where: { requester_uuid: user.id } })).toBe(0);
+
+      // GroupInvite row is PRESERVED with invited_by_uuid SET NULL (a pending invite
+      // outlives its inviter's account).
+      const inviteAfter = await GroupInvite.findByPk(invite.id);
+      expect(inviteAfter).not.toBeNull();
+      expect(inviteAfter.invited_by_uuid).toBeNull();
     });
   });
 });
