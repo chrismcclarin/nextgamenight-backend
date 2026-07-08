@@ -34,24 +34,24 @@ const sequelize = require('../config/database');
 
 // Define associations
 // Users ↔ Groups (Many-to-Many)
-// Note: UserGroup.user_id is STRING (Auth0 user_id), not UUID (Users.id)
-// So we need to specify sourceKey/targetKey to use Users.user_id instead of Users.id
-User.belongsToMany(Group, { 
-  through: UserGroup, 
-  foreignKey: 'user_id', // Column in UserGroup that references User
-  sourceKey: 'user_id' // Use Users.user_id (Auth0 string) instead of Users.id (UUID)
+// Phase 87.1 (BINT-02, D-01): re-keyed onto the internal UUID surrogate Users.id via
+// the user_uuid FK column. The join now uses the DEFAULT source/target key (Users.id),
+// so no sourceKey/targetKey override is needed. ON DELETE CASCADE removes a deleted
+// user's group memberships.
+User.belongsToMany(Group, {
+  through: UserGroup,
+  foreignKey: 'user_uuid' // UUID FK column in UserGroup that references Users.id
 });
-Group.belongsToMany(User, { 
-  through: UserGroup, 
+Group.belongsToMany(User, {
+  through: UserGroup,
   foreignKey: 'group_id', // Column in UserGroup that references Group
-  otherKey: 'user_id', // Column in UserGroup that references User
-  targetKey: 'user_id' // Use Users.user_id (Auth0 string) instead of Users.id (UUID)
+  otherKey: 'user_uuid' // UUID FK column in UserGroup that references Users.id
 });
 
 
 // UserGroup → User (direct association for worker include queries)
-UserGroup.belongsTo(User, { foreignKey: 'user_id', targetKey: 'user_id' });
-User.hasMany(UserGroup, { foreignKey: 'user_id', sourceKey: 'user_id' });
+UserGroup.belongsTo(User, { foreignKey: 'user_uuid', onDelete: 'CASCADE' });
+User.hasMany(UserGroup, { foreignKey: 'user_uuid', onDelete: 'CASCADE' });
 
 // Groups ↔ Events (One-to-Many)
 Group.hasMany(Event, { foreignKey: 'group_id' });
@@ -162,32 +162,38 @@ User.hasMany(SingleUseToken, { foreignKey: 'user_id', sourceKey: 'user_id' });
 SingleUseToken.belongsTo(User, { foreignKey: 'user_id', targetKey: 'user_id' });
 
 // Friendships (Social Graph)
-// Note: Uses sourceKey/targetKey because requester_id/addressee_id are STRING (Auth0 ID), not UUID
-User.hasMany(Friendship, { as: 'SentFriendRequests', foreignKey: 'requester_id', sourceKey: 'user_id' });
-User.hasMany(Friendship, { as: 'ReceivedFriendRequests', foreignKey: 'addressee_id', sourceKey: 'user_id' });
-Friendship.belongsTo(User, { as: 'Requester', foreignKey: 'requester_id', targetKey: 'user_id' });
-Friendship.belongsTo(User, { as: 'Addressee', foreignKey: 'addressee_id', targetKey: 'user_id' });
+// Phase 87.1 (BINT-02, D-05): re-keyed onto Users.id via requester_uuid/addressee_uuid,
+// each a protective FK ON DELETE CASCADE (deleting either endpoint removes the pair row).
+// Default source/target key (Users.id) — no override needed.
+User.hasMany(Friendship, { as: 'SentFriendRequests', foreignKey: 'requester_uuid', onDelete: 'CASCADE' });
+User.hasMany(Friendship, { as: 'ReceivedFriendRequests', foreignKey: 'addressee_uuid', onDelete: 'CASCADE' });
+Friendship.belongsTo(User, { as: 'Requester', foreignKey: 'requester_uuid', onDelete: 'CASCADE' });
+Friendship.belongsTo(User, { as: 'Addressee', foreignKey: 'addressee_uuid', onDelete: 'CASCADE' });
 
 // Group Invites
 Group.hasMany(GroupInvite, { foreignKey: 'group_id' });
 GroupInvite.belongsTo(Group, { foreignKey: 'group_id' });
-// Note: Uses sourceKey/targetKey because invited_by is STRING (Auth0 ID), not UUID
-User.hasMany(GroupInvite, { as: 'SentInvites', foreignKey: 'invited_by', sourceKey: 'user_id' });
-GroupInvite.belongsTo(User, { as: 'Inviter', foreignKey: 'invited_by', targetKey: 'user_id' });
+// Phase 87.1 (BINT-02, D-04): re-keyed onto Users.id via invited_by_uuid, a NULLABLE
+// protective FK ON DELETE SET NULL — a pending invite outlives its inviter's account.
+// Default target key (Users.id) — no override needed.
+User.hasMany(GroupInvite, { as: 'SentInvites', foreignKey: 'invited_by_uuid', onDelete: 'SET NULL' });
+GroupInvite.belongsTo(User, { as: 'Inviter', foreignKey: 'invited_by_uuid', onDelete: 'SET NULL' });
 
 // Event RSVPs (yes/no/maybe responses)
 Event.hasMany(EventRsvp, { foreignKey: 'event_id' });
 EventRsvp.belongsTo(Event, { foreignKey: 'event_id' });
-// Note: Uses sourceKey/targetKey because user_id is STRING (Auth0 ID), not UUID
-User.hasMany(EventRsvp, { foreignKey: 'user_id', sourceKey: 'user_id' });
-EventRsvp.belongsTo(User, { foreignKey: 'user_id', targetKey: 'user_id' });
+// Phase 87.1 (BINT-02, D-02): re-keyed onto Users.id via user_uuid, protective FK
+// ON DELETE CASCADE. Default source/target key (Users.id) — no override needed.
+User.hasMany(EventRsvp, { foreignKey: 'user_uuid', onDelete: 'CASCADE' });
+EventRsvp.belongsTo(User, { foreignKey: 'user_uuid', onDelete: 'CASCADE' });
 
 // Event Brings (games users commit to bring)
 Event.hasMany(EventBring, { foreignKey: 'event_id' });
 EventBring.belongsTo(Event, { foreignKey: 'event_id' });
-// Note: Uses sourceKey/targetKey because user_id is STRING (Auth0 ID), not UUID
-User.hasMany(EventBring, { foreignKey: 'user_id', sourceKey: 'user_id' });
-EventBring.belongsTo(User, { foreignKey: 'user_id', targetKey: 'user_id' });
+// Phase 87.1 (BINT-02, D-02): re-keyed onto Users.id via user_uuid, protective FK
+// ON DELETE CASCADE. Default source/target key (Users.id) — no override needed.
+User.hasMany(EventBring, { foreignKey: 'user_uuid', onDelete: 'CASCADE' });
+EventBring.belongsTo(User, { foreignKey: 'user_uuid', onDelete: 'CASCADE' });
 Game.hasMany(EventBring, { foreignKey: 'game_id' });
 EventBring.belongsTo(Game, { foreignKey: 'game_id' });
 
@@ -200,16 +206,18 @@ EventBallotOption.belongsTo(Game, { foreignKey: 'game_id' });
 // Event Ballot Votes (per-user approval votes on ballot options)
 EventBallotOption.hasMany(EventBallotVote, { foreignKey: 'option_id' });
 EventBallotVote.belongsTo(EventBallotOption, { foreignKey: 'option_id' });
-// Note: Uses sourceKey/targetKey because user_id is STRING (Auth0 ID), not UUID
-User.hasMany(EventBallotVote, { foreignKey: 'user_id', sourceKey: 'user_id' });
-EventBallotVote.belongsTo(User, { foreignKey: 'user_id', targetKey: 'user_id' });
+// Phase 87.1 (BINT-02, D-02): re-keyed onto Users.id via user_uuid, protective FK
+// ON DELETE CASCADE. Default source/target key (Users.id) — no override needed.
+User.hasMany(EventBallotVote, { foreignKey: 'user_uuid', onDelete: 'CASCADE' });
+EventBallotVote.belongsTo(User, { foreignKey: 'user_uuid', onDelete: 'CASCADE' });
 
 // Sent Notifications (outbound SMS log for inbound reply resolution)
 Event.hasMany(SentNotification, { foreignKey: 'event_id' });
 SentNotification.belongsTo(Event, { foreignKey: 'event_id' });
-// Note: Uses sourceKey/targetKey because user_id is STRING (Auth0 ID), not UUID
-User.hasMany(SentNotification, { foreignKey: 'user_id', sourceKey: 'user_id' });
-SentNotification.belongsTo(User, { foreignKey: 'user_id', targetKey: 'user_id' });
+// Phase 87.1 (BINT-02, D-03): re-keyed onto Users.id via user_uuid, protective FK
+// ON DELETE CASCADE. Default source/target key (Users.id) — no override needed.
+User.hasMany(SentNotification, { foreignKey: 'user_uuid', onDelete: 'CASCADE' });
+SentNotification.belongsTo(User, { foreignKey: 'user_uuid', onDelete: 'CASCADE' });
 
 
 module.exports = {
