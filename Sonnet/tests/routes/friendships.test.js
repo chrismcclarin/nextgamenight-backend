@@ -1,35 +1,43 @@
 // tests/routes/friendships.test.js
 // Phase 87 / BINT-01 (T-87-07): friend-request idempotency under a concurrent
 // duplicate.
+// Phase 87.1 / BINT-02 (D-11/D-12, Plan 87.1-05): friendship authz cutover onto
+// the Users.id UUID keyspace (requester_uuid/addressee_uuid) + the D-10/D-12
+// wire shim that keeps requester_id/addressee_id serialized as Auth0 strings.
 //
-// NEW file (Wave-0 gap). CRITICAL test-fidelity caveat (RESEARCH Pitfall 2):
-// the Friendship unique constraint is a FUNCTIONAL `LEAST/GREATEST` index
-// defined ONLY in a migration — it is absent from the model, so
-// sequelize.sync() does NOT build it. A real-DB race therefore CANNOT throw a
-// UniqueConstraintError on the sync-built test DB. This suite must instead MOCK
-// `Friendship.create` to throw a UniqueConstraintError once, driving the
-// route's absorb branch directly. (The RSVP race is real-DB — EventRsvp's
-// unique index IS in its model. See rsvp.test.js.)
+// CRITICAL test-fidelity caveat (RESEARCH Pitfall 2): the Friendship unique
+// constraint is a FUNCTIONAL `LEAST/GREATEST` index defined ONLY in a migration
+// — it is absent from the model, so sequelize.sync() does NOT build it. A real-DB
+// race therefore CANNOT throw a UniqueConstraintError on the sync-built test DB.
+// This suite MOCKS Friendship.create to throw once, driving the absorb branch.
+//
+// SANDBOX NOTE (confirmed Plans 01-04): the local test Postgres is UNREACHABLE,
+// so this suite is deliberately mock-based (jest.spyOn on model methods + injected
+// req.user) — no real rows, no DB connection. The authoritative gate is BE PR CI
+// Postgres. The mocks let us assert the UUID-keyed authz + the Auth0-string wire
+// contract without a live DB.
 //
 // Behaviors covered:
-//   1. happy path: no existing friendship -> create -> 201 with the row.
-//   2. idempotency: a concurrent duplicate wins the race -> Friendship.create
-//      throws UniqueConstraintError -> the route absorbs it, re-finds the
-//      winning row, and returns the SAME (byte-identical) 201 success shape the
-//      happy path returns — NOT a 500. Exactly one row is reported.
-//
-// The route mounts behind verifyAuth0Token in server.js; here we inject req.user
-// ahead of the router (mirrors invites.test.js). Friendship model methods are
-// spied so no real rows are needed (and the migration-only index is irrelevant).
+//   1. request happy path -> 201, Auth0-string wire, no *_uuid leak.
+//   2. request idempotency: concurrent duplicate -> 201 (not 500), one row.
+//   3. accept: real addressee CAN accept (200); a non-addressee CANNOT (403).
+//   4. decline: real addressee CAN decline (200); a non-addressee CANNOT (403).
+//   5. delete: requester/addressee CAN unfriend (200); an outsider CANNOT (403).
+//   6. declined-re-request DIRECTIONALITY SWAP: A req B, B declines, B re-requests
+//      A -> the UUID direction swaps; only A can now accept, B cannot self-accept.
+//   7. GET wire shape: requester_id/addressee_id are the Auth0 subs, not UUIDs;
+//      friend-derive returns the correct counterpart.
+//   8. GET directional: a pending request surfaces in BOTH the received (addressee)
+//      and sent (requester) lists, Auth0 strings on the wire in both.
 
 require('dotenv').config({ path: '.env.test' });
 process.env.NODE_ENV = 'test';
 
 const request = require('supertest');
 const express = require('express');
-const { UniqueConstraintError } = require('sequelize');
+const { Op, UniqueConstraintError } = require('sequelize');
 const friendshipsRoutes = require('../../routes/friendships');
-const { Friendship } = require('../../models');
+const { Friendship, User } = require('../../models');
 
 // Harness: inject a verified req.user before the router (mirrors the real
 // verifyAuth0Token middleware server.js mounts).
@@ -42,26 +50,75 @@ app.use((req, _res, next) => {
 });
 app.use('/api/friendships', friendshipsRoutes);
 
+// --- Identity fixtures: Auth0 string <-> Users.id UUID surrogate ---
 const REQUESTER = 'auth0|friend-requester';
 const ADDRESSEE = 'auth0|friend-addressee';
+const OUTSIDER = 'auth0|friend-outsider';
+const REQUESTER_UUID = '11111111-1111-1111-1111-111111111111';
+const ADDRESSEE_UUID = '22222222-2222-2222-2222-222222222222';
+const OUTSIDER_UUID = '33333333-3333-3333-3333-333333333333';
 
-describe('POST /friendships/request — idempotency (BINT-01 / T-87-07)', () => {
+const USERS = {
+  [REQUESTER]: { id: REQUESTER_UUID, user_id: REQUESTER, username: 'requester' },
+  [ADDRESSEE]: { id: ADDRESSEE_UUID, user_id: ADDRESSEE, username: 'addressee' },
+  [OUTSIDER]: { id: OUTSIDER_UUID, user_id: OUTSIDER, username: 'outsider' },
+};
+
+// Stub User.findOne to resolve Auth0 string -> Users row (the once-per-handler
+// resolution every re-keyed gate now performs).
+function stubUsers() {
+  jest.spyOn(User, 'findOne').mockImplementation(async ({ where }) => USERS[where.user_id] || null);
+}
+
+// A fake Friendship instance with a spyable update()/destroy(). Carries BOTH
+// keyspaces + the Requester/Addressee includes so we can assert the shim strips
+// the *_uuid columns and emits the Auth0 strings.
+function fakeFriendship(overrides = {}) {
+  const f = {
+    id: 'friendship-1',
+    requester_id: REQUESTER,
+    requester_uuid: REQUESTER_UUID,
+    addressee_id: ADDRESSEE,
+    addressee_uuid: ADDRESSEE_UUID,
+    status: 'pending',
+    Requester: { id: REQUESTER_UUID, user_id: REQUESTER, username: 'requester' },
+    Addressee: { id: ADDRESSEE_UUID, user_id: ADDRESSEE, username: 'addressee' },
+    ...overrides,
+  };
+  f.update = jest.fn(async (patch) => { Object.assign(f, patch); return f; });
+  f.destroy = jest.fn(async () => {});
+  return f;
+}
+
+// Assert a wire body honors the D-10/D-12 contract: Auth0-string id fields, no
+// surrogate UUID leak.
+function expectAuth0Wire(body, { requester, addressee }) {
+  expect(body.requester_id).toBe(requester);
+  expect(body.addressee_id).toBe(addressee);
+  expect(body).not.toHaveProperty('requester_uuid');
+  expect(body).not.toHaveProperty('addressee_uuid');
+}
+
+afterEach(() => {
+  jest.restoreAllMocks();
+  currentActor = null;
+});
+
+describe('POST /friendships/request — idempotency (BINT-01 / T-87-07) + D-12 wire', () => {
   beforeEach(() => {
     currentActor = REQUESTER;
+    stubUsers();
   });
 
-  afterEach(() => {
-    jest.restoreAllMocks();
-  });
-
-  it('happy path: no existing friendship -> creates a pending request (201)', async () => {
+  it('happy path: no existing friendship -> creates a pending request (201) with Auth0-string wire', async () => {
     const created = {
       id: 'friendship-1',
       requester_id: REQUESTER,
+      requester_uuid: REQUESTER_UUID,
       addressee_id: ADDRESSEE,
+      addressee_uuid: ADDRESSEE_UUID,
       status: 'pending',
     };
-    // No existing friendship in either direction.
     jest.spyOn(Friendship, 'findOne').mockResolvedValue(null);
     const createSpy = jest.spyOn(Friendship, 'create').mockResolvedValue(created);
 
@@ -70,29 +127,24 @@ describe('POST /friendships/request — idempotency (BINT-01 / T-87-07)', () => 
       .send({ addressee_user_id: ADDRESSEE });
 
     expect(res.status).toBe(201);
-    expect(res.body).toMatchObject(created);
+    expect(res.body).toMatchObject({ id: 'friendship-1', status: 'pending' });
+    // D-12: Auth0 strings on the wire, no *_uuid leak.
+    expectAuth0Wire(res.body, { requester: REQUESTER, addressee: ADDRESSEE });
+    // Create keyed the UUID columns (dual-writing the Auth0 strings).
     expect(createSpy).toHaveBeenCalledTimes(1);
+    expect(createSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ requester_uuid: REQUESTER_UUID, addressee_uuid: ADDRESSEE_UUID })
+    );
   });
 
-  it('absorbs a concurrent duplicate: UniqueConstraintError -> 201 success (no 500), exactly one row', async () => {
-    // The winning concurrent request created this row between our pre-check and
-    // our create. The absorb path must re-find it and return it verbatim.
-    const winner = {
-      id: 'friendship-winner',
-      requester_id: REQUESTER,
-      addressee_id: ADDRESSEE,
-      status: 'pending',
-    };
+  it('absorbs a concurrent duplicate: UniqueConstraintError -> 201 success (no 500), exactly one row, Auth0-string wire', async () => {
+    const winner = fakeFriendship({ id: 'friendship-winner' });
 
-    // Pre-check (:150) sees nothing -> route takes the create branch. The absorb
-    // re-find (post-violation) returns the winning row.
     const findOneSpy = jest
       .spyOn(Friendship, 'findOne')
       .mockResolvedValueOnce(null) // existence pre-check
-      .mockResolvedValueOnce(winner); // absorb re-find
+      .mockResolvedValueOnce(winner); // absorb re-find (with includes)
 
-    // The functional LEAST/GREATEST unique index (migration-only) rejects the
-    // duplicate — simulated here since sync() does not build it.
     const createSpy = jest
       .spyOn(Friendship, 'create')
       .mockRejectedValueOnce(new UniqueConstraintError({}));
@@ -101,15 +153,260 @@ describe('POST /friendships/request — idempotency (BINT-01 / T-87-07)', () => 
       .post('/api/friendships/request')
       .send({ addressee_user_id: ADDRESSEE });
 
-    // Degrades to success, NOT a 500.
     expect(res.status).not.toBe(500);
     expect(res.status).toBe(201);
-    // Byte-identical response shape: the same serialized Friendship row the
-    // happy path returns (adversarial-review acceptance criterion).
-    expect(res.body).toMatchObject(winner);
+    expect(res.body).toMatchObject({ id: 'friendship-winner', status: 'pending' });
+    expectAuth0Wire(res.body, { requester: REQUESTER, addressee: ADDRESSEE });
 
-    // Exactly one create was attempted; the loser re-found the single winner.
     expect(createSpy).toHaveBeenCalledTimes(1);
     expect(findOneSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('404s when the addressee has no local Users row (Rule 2 guard)', async () => {
+    jest.spyOn(Friendship, 'findOne').mockResolvedValue(null);
+    const createSpy = jest.spyOn(Friendship, 'create');
+
+    const res = await request(app)
+      .post('/api/friendships/request')
+      .send({ addressee_user_id: 'auth0|ghost-user' });
+
+    expect(res.status).toBe(404);
+    expect(createSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /friendships/:id/accept — ownership gate on UUID (D-11)', () => {
+  beforeEach(stubUsers);
+
+  it('the REAL addressee CAN accept (200) and gets an Auth0-string wire', async () => {
+    currentActor = ADDRESSEE;
+    const friendship = fakeFriendship();
+    jest.spyOn(Friendship, 'findByPk').mockResolvedValue(friendship);
+
+    const res = await request(app).post('/api/friendships/friendship-1/accept');
+
+    expect(res.status).toBe(200);
+    expect(friendship.update).toHaveBeenCalledWith({ status: 'accepted' });
+    expect(res.body.status).toBe('accepted');
+    expectAuth0Wire(res.body, { requester: REQUESTER, addressee: ADDRESSEE });
+  });
+
+  it('a NON-addressee (the requester) CANNOT accept -> 403, no status change', async () => {
+    currentActor = REQUESTER; // requester is not the addressee
+    const friendship = fakeFriendship();
+    jest.spyOn(Friendship, 'findByPk').mockResolvedValue(friendship);
+
+    const res = await request(app).post('/api/friendships/friendship-1/accept');
+
+    expect(res.status).toBe(403);
+    expect(friendship.update).not.toHaveBeenCalled();
+  });
+
+  it('an unrelated outsider CANNOT accept -> 403', async () => {
+    currentActor = OUTSIDER;
+    const friendship = fakeFriendship();
+    jest.spyOn(Friendship, 'findByPk').mockResolvedValue(friendship);
+
+    const res = await request(app).post('/api/friendships/friendship-1/accept');
+
+    expect(res.status).toBe(403);
+    expect(friendship.update).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /friendships/:id/decline — ownership gate on UUID (D-11)', () => {
+  beforeEach(stubUsers);
+
+  it('the REAL addressee CAN decline (200), Auth0-string wire', async () => {
+    currentActor = ADDRESSEE;
+    const friendship = fakeFriendship();
+    jest.spyOn(Friendship, 'findByPk').mockResolvedValue(friendship);
+
+    const res = await request(app).post('/api/friendships/friendship-1/decline');
+
+    expect(res.status).toBe(200);
+    expect(friendship.update).toHaveBeenCalledWith({ status: 'declined' });
+    expectAuth0Wire(res.body, { requester: REQUESTER, addressee: ADDRESSEE });
+  });
+
+  it('a NON-addressee CANNOT decline -> 403', async () => {
+    currentActor = REQUESTER;
+    const friendship = fakeFriendship();
+    jest.spyOn(Friendship, 'findByPk').mockResolvedValue(friendship);
+
+    const res = await request(app).post('/api/friendships/friendship-1/decline');
+
+    expect(res.status).toBe(403);
+    expect(friendship.update).not.toHaveBeenCalled();
+  });
+});
+
+describe('DELETE /friendships/:id — unfriend gate on UUID (D-11)', () => {
+  beforeEach(stubUsers);
+
+  it('the requester CAN unfriend (200)', async () => {
+    currentActor = REQUESTER;
+    const friendship = fakeFriendship({ status: 'accepted' });
+    jest.spyOn(Friendship, 'findOne').mockResolvedValue(friendship);
+
+    const res = await request(app).delete('/api/friendships/friendship-1');
+
+    expect(res.status).toBe(200);
+    expect(friendship.destroy).toHaveBeenCalled();
+  });
+
+  it('the addressee CAN unfriend (200)', async () => {
+    currentActor = ADDRESSEE;
+    const friendship = fakeFriendship({ status: 'accepted' });
+    jest.spyOn(Friendship, 'findOne').mockResolvedValue(friendship);
+
+    const res = await request(app).delete('/api/friendships/friendship-1');
+
+    expect(res.status).toBe(200);
+    expect(friendship.destroy).toHaveBeenCalled();
+  });
+
+  it('an outsider CANNOT unfriend -> 403, no destroy', async () => {
+    currentActor = OUTSIDER;
+    const friendship = fakeFriendship({ status: 'accepted' });
+    jest.spyOn(Friendship, 'findOne').mockResolvedValue(friendship);
+
+    const res = await request(app).delete('/api/friendships/friendship-1');
+
+    expect(res.status).toBe(403);
+    expect(friendship.destroy).not.toHaveBeenCalled();
+  });
+});
+
+describe('Declined-re-request DIRECTIONALITY SWAP (MED/LOW adopt-all, mandated)', () => {
+  beforeEach(stubUsers);
+
+  it('A req B, B declines, B re-requests A -> UUID direction swaps; only A can accept, B cannot self-accept', async () => {
+    // Original row: A(=REQUESTER) -> B(=ADDRESSEE), now declined.
+    const declinedRow = fakeFriendship({ status: 'declined' });
+    jest.spyOn(Friendship, 'findOne').mockResolvedValue(declinedRow);
+
+    // B re-requests A: caller = B (ADDRESSEE), target = A (REQUESTER).
+    currentActor = ADDRESSEE;
+    const reReq = await request(app)
+      .post('/api/friendships/request')
+      .send({ addressee_user_id: REQUESTER });
+
+    expect(reReq.status).toBe(200);
+    // The existing row's UUID direction SWAPPED to B->A, dual-writing the strings.
+    expect(declinedRow.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        requester_uuid: ADDRESSEE_UUID, // B is now the requester
+        addressee_uuid: REQUESTER_UUID, // A is now the addressee
+        requester_id: ADDRESSEE, // dual-write old string
+        addressee_id: REQUESTER, // dual-write old string
+        status: 'pending',
+      })
+    );
+    // Wire stays Auth0 strings (re-request direction), no *_uuid leak.
+    expectAuth0Wire(reReq.body, { requester: ADDRESSEE, addressee: REQUESTER });
+
+    // Behavioral proof of the swap: the row is now B(requester)->A(addressee).
+    const swapped = fakeFriendship({
+      requester_id: ADDRESSEE,
+      requester_uuid: ADDRESSEE_UUID,
+      addressee_id: REQUESTER,
+      addressee_uuid: REQUESTER_UUID,
+      status: 'pending',
+      Requester: USERS[ADDRESSEE],
+      Addressee: USERS[REQUESTER],
+    });
+    jest.spyOn(Friendship, 'findByPk').mockResolvedValue(swapped);
+
+    // A (the new addressee) CAN accept.
+    currentActor = REQUESTER;
+    const aAccepts = await request(app).post('/api/friendships/friendship-1/accept');
+    expect(aAccepts.status).toBe(200);
+    expect(swapped.update).toHaveBeenCalledWith({ status: 'accepted' });
+
+    // B (the re-requester, now the requester) CANNOT self-accept.
+    swapped.status = 'pending';
+    swapped.update.mockClear();
+    currentActor = ADDRESSEE;
+    const bAccepts = await request(app).post('/api/friendships/friendship-1/accept');
+    expect(bAccepts.status).toBe(403);
+    expect(swapped.update).not.toHaveBeenCalled();
+  });
+});
+
+describe('GET /friendships — D-12 wire shim + UUID where-branches', () => {
+  beforeEach(stubUsers);
+
+  it('accepted branch: emits Auth0-string requester_id/addressee_id (the sub, not a UUID) and derives the counterpart friend', async () => {
+    currentActor = REQUESTER;
+    const row = fakeFriendship({ status: 'accepted' });
+    const findAllSpy = jest.spyOn(Friendship, 'findAll').mockResolvedValue([row]);
+
+    const res = await request(app).get('/api/friendships');
+
+    expect(res.status).toBe(200);
+    const [f] = res.body;
+    // Auth0 subs on the wire, never the UUID.
+    expect(f.requester_id).toBe(REQUESTER);
+    expect(f.requester_id).not.toBe(REQUESTER_UUID);
+    expect(f.addressee_id).toBe(ADDRESSEE);
+    expect(f).not.toHaveProperty('requester_uuid');
+    expect(f).not.toHaveProperty('addressee_uuid');
+    // friend-derive: caller is the requester -> friend is the Addressee.
+    expect(f.friend.user_id).toBe(ADDRESSEE);
+    // accepted where-branch (Op.or) keyed the UUID columns, not the Auth0 strings.
+    const whereArg = findAllSpy.mock.calls[0][0].where;
+    expect(whereArg[Op.or][0].requester_uuid).toBe(REQUESTER_UUID);
+    expect(whereArg[Op.or][1].addressee_uuid).toBe(REQUESTER_UUID);
+    expect(whereArg[Op.or][0].requester_id).toBeUndefined();
+  });
+
+  it('a pending request surfaces in BOTH received (addressee) and sent (requester) lists, Auth0 strings in both (mandated directional test)', async () => {
+    const pending = fakeFriendship({ status: 'pending' });
+
+    // received: the ADDRESSEE views incoming pending requests.
+    currentActor = ADDRESSEE;
+    const findAllReceived = jest.spyOn(Friendship, 'findAll').mockResolvedValue([pending]);
+    const received = await request(app).get('/api/friendships?status=pending&direction=received');
+    expect(received.status).toBe(200);
+    expectAuth0Wire(received.body[0], { requester: REQUESTER, addressee: ADDRESSEE });
+    // received branch keys addressee_uuid = caller.id.
+    expect(findAllReceived.mock.calls[0][0].where.addressee_uuid).toBe(ADDRESSEE_UUID);
+    jest.restoreAllMocks();
+    stubUsers();
+
+    // sent: the REQUESTER views their outgoing pending requests.
+    currentActor = REQUESTER;
+    const findAllSent = jest.spyOn(Friendship, 'findAll').mockResolvedValue([pending]);
+    const sent = await request(app).get('/api/friendships?status=pending&direction=sent');
+    expect(sent.status).toBe(200);
+    expectAuth0Wire(sent.body[0], { requester: REQUESTER, addressee: ADDRESSEE });
+    // sent branch keys requester_uuid = caller.id.
+    expect(findAllSent.mock.calls[0][0].where.requester_uuid).toBe(REQUESTER_UUID);
+  });
+
+  it('default (non-accepted, no direction) branch also keys the UUID columns and strips *_uuid', async () => {
+    currentActor = REQUESTER;
+    const row = fakeFriendship({ status: 'blocked' });
+    const findAllSpy = jest.spyOn(Friendship, 'findAll').mockResolvedValue([row]);
+
+    const res = await request(app).get('/api/friendships?status=blocked');
+
+    expect(res.status).toBe(200);
+    expectAuth0Wire(res.body[0], { requester: REQUESTER, addressee: ADDRESSEE });
+    const whereArg = findAllSpy.mock.calls[0][0].where;
+    expect(whereArg[Op.or][0].requester_uuid).toBe(REQUESTER_UUID);
+    expect(whereArg[Op.or][1].addressee_uuid).toBe(REQUESTER_UUID);
+  });
+
+  it('a caller with no Users row gets an empty list (fail-safe)', async () => {
+    currentActor = 'auth0|ghost';
+    const findAllSpy = jest.spyOn(Friendship, 'findAll');
+
+    const res = await request(app).get('/api/friendships');
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual([]);
+    expect(findAllSpy).not.toHaveBeenCalled();
   });
 });
