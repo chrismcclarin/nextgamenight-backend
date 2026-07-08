@@ -20,7 +20,21 @@ const GroupInvite = sequelize.define('GroupInvite', {
   invited_by: {
     type: DataTypes.STRING,
     allowNull: false,
-    // Auth0 user_id of the inviter
+    // Auth0 user_id of the inviter.
+    // Retained through the UUID re-key (D-07 rollback net); removed from the model
+    // in Plan 09, dropped from the DB in the D-08 follow-up PR.
+  },
+  invited_by_uuid: {
+    // Phase 87.1 (BINT-02, D-04): NULLABLE protective FK to the Users UUID PK,
+    // ON DELETE SET NULL — a pending invite outlives its inviter's account. Ships in
+    // BOTH this model (sync() builds the FK on the CI/test DB) AND migration
+    // 20260703000003 (prod via migrate:apply). SET NULL precedent: models/index.js:126
+    // (created_by_user_id). Stays nullable permanently (no Plan 09 tightening — SET NULL
+    // requires nullability).
+    type: DataTypes.UUID,
+    allowNull: true,
+    references: { model: 'Users', key: 'id' },
+    onDelete: 'SET NULL',
   },
   token: {
     type: DataTypes.STRING,
