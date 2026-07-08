@@ -259,9 +259,11 @@ router.get('/user/:user_id', requireParamMatchesToken('user_id'), async (req, re
       return res.status(404).json({ error: 'User not found' });
     }
     
-    // Get all groups the user belongs to
+    // Get all groups the user belongs to. Phase 87.1 (BINT-02, deferred from
+    // Plan 06): the subject user (URL param) is resolved above, so key the
+    // re-keyed UserGroup on user_uuid (Users.id), not the legacy Auth0 string.
     const userGroups = await UserGroup.findAll({
-      where: { user_id: user.user_id, status: 'active' }, // Use user.user_id (Auth0 string) not user.id (UUID)
+      where: { user_uuid: user.id, status: 'active' },
       attributes: ['group_id']
     });
 

@@ -138,8 +138,13 @@ describe('User Routes', () => {
         name: 'Test Group'
       });
 
+      // Phase 87.1 (BINT-02): DUAL-WRITE both keyspaces. The User<->Group
+      // belongsToMany association was flipped to join on user_uuid (Plan 03), so
+      // a seed that only writes the legacy Auth0-string user_id column would make
+      // the Groups include resolve to nothing and this assertion silently break.
       await UserGroup.create({
-        user_id: testUser.user_id, // Auth0 STRING id (sourceKey), NOT the UUID testUser.id
+        user_id: testUser.user_id, // Auth0 STRING (old keyspace)
+        user_uuid: testUser.id, // Users.id UUID (new keyspace — the join key)
         group_id: testGroup.id
       });
 

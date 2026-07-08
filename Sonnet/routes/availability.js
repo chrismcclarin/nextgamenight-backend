@@ -279,16 +279,22 @@ router.get('/group/:group_id/overlaps',
       }
 
       // Verify user is a member of the group
-      const { Group, UserGroup } = require('../models');
+      const { Group, UserGroup, User } = require('../models');
       let userGroup;
       try {
-        userGroup = await UserGroup.findOne({
+        // Phase 87.1 (BINT-02): UserGroup is re-keyed onto the user_uuid UUID FK.
+        // Resolve the authenticated caller's Users.id first, then gate on
+        // user_uuid — keying the legacy Auth0-string user_id column is an
+        // undefined-SILENT read once Plan 09 drops it. Fail-closed (userGroup
+        // stays null -> 403) if the caller has no Users row.
+        const caller = await User.findOne({ where: { user_id: userId }, attributes: ['id'] });
+        userGroup = caller ? await UserGroup.findOne({
           where: {
             group_id: req.params.group_id,
-            user_id: userId,
+            user_uuid: caller.id,
             status: 'active',
           },
-        });
+        }) : null;
       } catch (dbError) {
         console.error('Database error checking group membership:', dbError);
         return sendSafeError(res, 500, dbError, 'Error checking group membership');
@@ -362,16 +368,22 @@ router.get('/group/:group_id/heatmap',
       }
 
       // Verify user is a member of the group
-      const { Group, UserGroup } = require('../models');
+      const { Group, UserGroup, User } = require('../models');
       let userGroup;
       try {
-        userGroup = await UserGroup.findOne({
+        // Phase 87.1 (BINT-02): UserGroup is re-keyed onto the user_uuid UUID FK.
+        // Resolve the authenticated caller's Users.id first, then gate on
+        // user_uuid — keying the legacy Auth0-string user_id column is an
+        // undefined-SILENT read once Plan 09 drops it. Fail-closed (userGroup
+        // stays null -> 403) if the caller has no Users row.
+        const caller = await User.findOne({ where: { user_id: userId }, attributes: ['id'] });
+        userGroup = caller ? await UserGroup.findOne({
           where: {
             group_id: req.params.group_id,
-            user_id: userId,
+            user_uuid: caller.id,
             status: 'active',
           },
-        });
+        }) : null;
       } catch (dbError) {
         console.error('Database error checking group membership:', dbError);
         return sendSafeError(res, 500, dbError, 'Error checking group membership');

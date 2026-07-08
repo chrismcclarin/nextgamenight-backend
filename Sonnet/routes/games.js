@@ -71,9 +71,12 @@ router.get('/search-all', async (req, res) => {
       try {
         const user = await User.findOne({ where: { user_id } });
         if (user) {
-          // Get all active group_ids for the user
+          // Get all active group_ids for the user. Phase 87.1 (BINT-02): the
+          // subject user was resolved from the ?user_id query-param above (this
+          // is a PUBLIC route — no req.user), so key UserGroup on the re-keyed
+          // user_uuid (Users.id) rather than the legacy Auth0-string column.
           const userGroups = await UserGroup.findAll({
-            where: { user_id: user.user_id, status: 'active' },
+            where: { user_uuid: user.id, status: 'active' },
             attributes: ['group_id']
           });
           const groupIds = userGroups.map(ug => ug.group_id);
