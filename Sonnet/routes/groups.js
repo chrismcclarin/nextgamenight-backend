@@ -625,13 +625,39 @@ router.post('/join-by-token', async (req, res) => {
     // row FIRST. A QR deep-link can be a brand-new user's very first API call, so
     // auto-provision (mirrors the GET /user/:user_id auto-create) to preserve that
     // flow rather than 404 a legitimate first-time joiner.
-    const joinerEmail = req.user.email || `${userId.replace(/[|:]/g, '-')}@auth0.local`;
+    //
+    // Only persist the token's email if Auth0 has VERIFIED it. An unverified email in
+    // the token can be attacker-controlled — persisting it on a first-time row could
+    // claim another person's address or trip the Users.email UNIQUE constraint. When
+    // unverified, provision with a synthetic, collision-resistant fallback derived from
+    // the (sanitized) Auth0 sub.
+    const syntheticEmail = `${userId.replace(/[|:]/g, '-')}@auth0.local`;
+    const joinerEmail = req.user.email_verified === true && req.user.email
+      ? req.user.email
+      : syntheticEmail;
     const joinerName = req.user.name || req.user.nickname || req.user.given_name
       || req.user.email?.split('@')[0] || 'User';
-    const [user] = await User.findOrCreate({
-      where: { user_id: userId },
-      defaults: { user_id: userId, email: joinerEmail, username: joinerName },
-    });
+
+    let user;
+    try {
+      [user] = await User.findOrCreate({
+        where: { user_id: userId },
+        defaults: { user_id: userId, email: joinerEmail, username: joinerName },
+      });
+    } catch (error) {
+      // Email UNIQUE collision on a first-time create (the verified token email is
+      // already owned by another Users row). Retry with the synthetic fallback so a
+      // legitimate first-time joiner still provisions instead of hitting a raw 500 —
+      // mirrors the events.js auto-create fallback pattern.
+      if (error.name === 'SequelizeUniqueConstraintError') {
+        [user] = await User.findOrCreate({
+          where: { user_id: userId },
+          defaults: { user_id: userId, email: syntheticEmail, username: joinerName },
+        });
+      } else {
+        throw error;
+      }
+    }
 
     // Check for existing UserGroup
     const existingMembership = await UserGroup.findOne({

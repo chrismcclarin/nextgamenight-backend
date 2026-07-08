@@ -252,4 +252,56 @@ describe('Group Routes', () => {
       expect(entry.id).toMatch(UUID_V4);
     });
   });
+
+  // F2 (#1 + #5): join-by-token auto-provision must not trust an unverified token
+  // email and must not 500 on an email UNIQUE collision.
+  describe('POST /api/groups/join-by-token — auto-provision hardening (F2)', () => {
+    // Local app that injects the FULL req.user (makeApp only forwards user_id+email;
+    // these tests need email_verified too).
+    function makeTokenApp(actor) {
+      const app = express();
+      app.use(express.json());
+      app.use((req, _res, next) => { req.user = actor; next(); });
+      app.use('/api/groups', groupRoutes);
+      return app;
+    }
+
+    it('retries with the synthetic fallback when a VERIFIED token email collides with an existing user', async () => {
+      // An existing user already owns this email (Users.email is UNIQUE, notNull).
+      await makeUser({ user_id: 'auth0|f2-victim', username: 'f2victim', email: 'taken-f2@example.com' });
+      const grp = await Group.create({
+        group_id: `f2-collide-${Date.now()}`, name: 'F2 Collide',
+        invite_token: `tok-f2-collide-${Date.now()}`,
+      });
+
+      const newSub = 'auth0|f2-new-joiner';
+      const res = await request(makeTokenApp({ user_id: newSub, email: 'taken-f2@example.com', email_verified: true }))
+        .post('/api/groups/join-by-token')
+        .send({ token: grp.invite_token })
+        .expect(200);
+      expect(res.body.success).toBe(true);
+
+      // The first-time joiner provisioned with the SYNTHETIC fallback (sub sanitized),
+      // NOT the colliding verified email — and no raw 500 escaped.
+      const created = await User.scope('withContactInfo').findOne({ where: { user_id: newSub } });
+      expect(created).not.toBeNull();
+      expect(created.email).toBe('auth0-f2-new-joiner@auth0.local');
+      expect(await UserGroup.count({ where: { user_uuid: created.id, group_id: grp.id } })).toBe(1);
+    });
+
+    it('does NOT persist an UNVERIFIED token email — provisions with the synthetic fallback', async () => {
+      const grp = await Group.create({
+        group_id: `f2-unver-${Date.now()}`, name: 'F2 Unverified',
+        invite_token: `tok-f2-unver-${Date.now()}`,
+      });
+      const newSub = 'auth0|f2-unverified-joiner';
+      await request(makeTokenApp({ user_id: newSub, email: 'unverified-f2@example.com', email_verified: false }))
+        .post('/api/groups/join-by-token')
+        .send({ token: grp.invite_token })
+        .expect(200);
+
+      const created = await User.scope('withContactInfo').findOne({ where: { user_id: newSub } });
+      expect(created.email).toBe('auth0-f2-unverified-joiner@auth0.local');
+    });
+  });
 });
