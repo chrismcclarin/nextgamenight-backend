@@ -241,3 +241,75 @@ jobs:
       - name: Integration ring (real-Redis queues)
         working-directory: Sonnet
         run: npm run test:integration
+
+  # ---- migrate-cli-replay (Phase 87.1 review, F8 / HIGH-2 opt-3) --------------
+  # ADDITIVE job (does not alter `quality` or `test`). It exercises the REAL
+  # sequelize-cli migration path for the 7 UUID re-key migrations (20260703000001..07),
+  # which backend CI otherwise NEVER runs (see the "NO migrate step (A5)" note in the
+  # `test` job — the schema is sync()-built, not migrated). Because of the known local
+  # cli-migrations gap (URL-only CLI config + a full-chain replay that collides on
+  # already-built tables), Railway pre-deploy would otherwise be the FIRST-EVER real
+  # sequelize-cli run of these migrations. This job moves that first run into CI:
+  #   1. provision a TRUE pre-migration schema (sync from models, then per re-keyed
+  #      table drop *_uuid + re-add the legacy Auth0-string column(s), and seed
+  #      SequelizeMeta with every migration EXCEPT the 7 new ones);
+  #   2. run `npx sequelize-cli db:migrate` — the real CLI config + SequelizeMeta path;
+  #   3. verify all 7 re-key files are now recorded in SequelizeMeta.
+  migrate-cli-replay:
+    name: migrate-cli-replay
+    needs: quality # gate behind the fast grep gate (like `test`); independent of `test`
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: boardgame_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      # The provision script (models) prefers DATABASE_URL; the sequelize-cli config
+      # (config/sequelize-cli.config.js) is URL-only and reads the same DATABASE_URL —
+      # so both hit the SAME throwaway service DB (closes the known URL-only CLI gap).
+      DB_HOST: localhost
+      DB_PORT: 5432
+      DB_USER: postgres
+      DB_PASSWORD: password
+      DB_NAME: boardgame_db
+      DATABASE_URL: postgres://postgres:password@localhost:5432/boardgame_db
+      MAGIC_TOKEN_SECRET: ci-throwaway-magic-token-secret-1f2e3d4c5b6a
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: Sonnet/package-lock.json
+
+      - name: Install dependencies
+        working-directory: Sonnet
+        run: npm ci
+
+      - name: Provision TRUE pre-migration schema (F8)
+        working-directory: Sonnet
+        run: node scripts/ci/provision-premigration-schema.js provision
+
+      - name: Run the real sequelize-cli migration path (npx sequelize-cli db:migrate)
+        working-directory: Sonnet
+        run: npx sequelize-cli db:migrate
+
+      - name: Verify all 7 re-key migrations booked in SequelizeMeta (F8)
+        working-directory: Sonnet
+        run: node scripts/ci/provision-premigration-schema.js verify
