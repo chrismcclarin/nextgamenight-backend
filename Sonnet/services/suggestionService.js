@@ -25,7 +25,13 @@ async function getSuggestions({ groupId, eventId, playerCount, maxPlayTime, minW
     // ------------------------------------------------------------------
     // a) Determine player count source
     // ------------------------------------------------------------------
-    let rsvpUserAuth0Ids = null; // Auth0 string IDs of RSVP'd users
+    // Phase 87.1 (BINT-02, T-87.1-16): EventRsvp and UserGroup are re-keyed onto
+    // the user_uuid UUID FK (Users.id). We read user_uuid DIRECTLY here — the old
+    // user_id string columns still hold Auth0 strings (or nothing for new rows),
+    // so keeping the old reads + Auth0->UUID mapping would empty every suggestion
+    // once the string columns are dropped. UserGame.user_id is already a Users.id
+    // UUID, so these UUIDs feed straight into its where-clause.
+    let rsvpUserUuids = null; // Users.id UUIDs of RSVP'd users
 
     if (eventId) {
       // Get RSVP'd users for this event (yes + maybe)
@@ -34,14 +40,14 @@ async function getSuggestions({ groupId, eventId, playerCount, maxPlayTime, minW
           event_id: eventId,
           status: { [Op.in]: ['yes', 'maybe'] },
         },
-        attributes: ['user_id'],
+        attributes: ['user_uuid'],
       });
 
       if (rsvps.length === 0) {
         return { suggestions: [], playerCount: 0 };
       }
 
-      rsvpUserAuth0Ids = rsvps.map(r => r.user_id); // Auth0 string IDs
+      rsvpUserUuids = rsvps.map(r => r.user_uuid); // Users.id UUIDs
       effectivePlayerCount = rsvps.length;
     }
 
@@ -52,11 +58,11 @@ async function getSuggestions({ groupId, eventId, playerCount, maxPlayTime, minW
     // ------------------------------------------------------------------
     // b) Determine whose collections to search
     // ------------------------------------------------------------------
-    let auth0Ids;
+    let userUuids;
 
-    if (rsvpUserAuth0Ids) {
-      // Event-scoped: use RSVP'd users
-      auth0Ids = rsvpUserAuth0Ids;
+    if (rsvpUserUuids) {
+      // Event-scoped: use RSVP'd users (already Users.id UUIDs)
+      userUuids = rsvpUserUuids;
     } else {
       // Group-scoped: all active group members
       const members = await UserGroup.findAll({
@@ -64,30 +70,31 @@ async function getSuggestions({ groupId, eventId, playerCount, maxPlayTime, minW
           group_id: groupId,
           status: 'active',
         },
-        attributes: ['user_id'], // Auth0 string IDs
+        attributes: ['user_uuid'], // Users.id UUIDs
       });
-      auth0Ids = members.map(m => m.user_id);
+      userUuids = members.map(m => m.user_uuid);
     }
 
-    if (auth0Ids.length === 0) {
+    // Drop any null user_uuid (rows not yet dual-written) so a null never
+    // poisons the UserGame.user_id where-clause.
+    userUuids = userUuids.filter(Boolean);
+
+    if (userUuids.length === 0) {
       return { suggestions: [], playerCount: effectivePlayerCount };
     }
 
-    // Map Auth0 string IDs -> User.id UUIDs (UserGame.user_id is a UUID)
+    // Resolve owner usernames by Users.id (uuidToUsername owner-display-name
+    // behavior preserved). Missing rows fall through to the 'Unknown' default
+    // in the owner-collection step below.
     const users = await User.findAll({
-      where: { user_id: { [Op.in]: auth0Ids } },
-      attributes: ['id', 'user_id', 'username'],
+      where: { id: { [Op.in]: userUuids } },
+      attributes: ['id', 'username'],
     });
 
-    const userUuids = users.map(u => u.id);
     // Build a lookup: UUID -> username
     const uuidToUsername = {};
     for (const u of users) {
       uuidToUsername[u.id] = u.username;
-    }
-
-    if (userUuids.length === 0) {
-      return { suggestions: [], playerCount: effectivePlayerCount };
     }
 
     // ------------------------------------------------------------------
