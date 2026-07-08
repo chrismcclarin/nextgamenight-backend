@@ -38,7 +38,9 @@ router.get('/event/:event_id', verifyAuth0Token, async (req, res) => {
     // (Auth0 sub) and strip the raw user_uuid so it never leaks on the wire.
     const shaped = brings.map((b) => {
       const json = b.toJSON();
-      json.user_id = json.User?.user_id ?? json.user_id;
+      // No `?? json.user_id` fallback — Plan 09 DROPPED the string column, so it is
+      // always undefined and would only mask a missing User include (loud if absent).
+      json.user_id = json.User?.user_id;
       delete json.user_uuid;
       return json;
     });

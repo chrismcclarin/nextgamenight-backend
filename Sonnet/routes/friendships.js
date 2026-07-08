@@ -35,10 +35,14 @@ const USER_INCLUDES = [
 // ============================================
 function toFriendshipWire(friendship, { requesterAuth0, addresseeAuth0 } = {}) {
   const plain = friendship.toJSON ? friendship.toJSON() : { ...friendship };
+  // No `?? plain.requester_id` / `?? plain.addressee_id` fallback — Plan 09 DROPPED
+  // those string columns from the model, so they are always undefined here and would
+  // only mask a missing Requester/Addressee include. If an include is absent the shim
+  // correctly emits undefined (loud) rather than a silently-wrong value.
   const reqAuth0 =
-    requesterAuth0 ?? (plain.Requester && plain.Requester.user_id) ?? plain.requester_id;
+    requesterAuth0 ?? (plain.Requester && plain.Requester.user_id);
   const addrAuth0 =
-    addresseeAuth0 ?? (plain.Addressee && plain.Addressee.user_id) ?? plain.addressee_id;
+    addresseeAuth0 ?? (plain.Addressee && plain.Addressee.user_id);
   plain.requester_id = reqAuth0;
   plain.addressee_id = addrAuth0;
   delete plain.requester_uuid;

@@ -470,7 +470,9 @@ router.post('/', verifyAuth0Token, validateRsvpCreate, async (req, res) => {
     // D-12 wire shim: serialize user_id as the Auth0 sub (from the included User)
     // and strip the raw user_uuid so it never leaks on the wire.
     const shaped = result.toJSON();
-    shaped.user_id = shaped.User?.user_id ?? userId;
+    // No `?? userId` fallback — the User include above is always present, and the
+    // dropped string column would only mask a missing include (loud if absent).
+    shaped.user_id = shaped.User?.user_id;
     delete shaped.user_uuid;
 
     return res.status(isCreate ? 201 : 200).json(shaped);
@@ -519,7 +521,9 @@ router.get('/event/:event_id', verifyAuth0Token, async (req, res) => {
     // (Auth0 sub) and strip the raw user_uuid so it never leaks on the wire.
     const shapedRsvps = rsvps.map((r) => {
       const json = r.toJSON();
-      json.user_id = json.User?.user_id ?? json.user_id;
+      // No `?? json.user_id` fallback — Plan 09 DROPPED the string column, so it is
+      // always undefined and would only mask a missing User include (loud if absent).
+      json.user_id = json.User?.user_id;
       delete json.user_uuid;
       return json;
     });
