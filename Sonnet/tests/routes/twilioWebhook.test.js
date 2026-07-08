@@ -130,10 +130,13 @@ describe('Twilio Inbound SMS Webhook', () => {
     expect(mockEventRsvpCreate).toHaveBeenCalledWith(
       expect.objectContaining({
         event_id: 'event-uuid-1',
-        user_id: 'auth0|test-user-123',
-        user_uuid: 'user-uuid-123', // Phase 87.1: create payload carries user_uuid = user.id
+        user_uuid: 'user-uuid-123', // Phase 87.1 (Plan 09): create payload keyed on user_uuid = user.id
         status: 'yes',
       })
+    );
+    // Plan 09: the old Auth0-string user_id column was removed — it must NOT be written.
+    expect(mockEventRsvpCreate).not.toHaveBeenCalledWith(
+      expect.objectContaining({ user_id: expect.anything() })
     );
   });
 

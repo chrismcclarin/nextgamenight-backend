@@ -464,7 +464,8 @@ router.post('/:eventId/vote', validateBallotVote, async (req, res) => {
     }
 
     // Toggle vote: if exists, delete; if not, create. Phase 87.1 (D-11): key on
-    // user_uuid; dual-write the old Auth0 user_id on create until Plan 09.
+    // user_uuid (Users.id) — the old Auth0-string user_id column was removed from
+    // the model in Plan 09.
     const existingVote = await EventBallotVote.findOne({
       where: { option_id, user_uuid: caller.id },
     });
@@ -478,7 +479,7 @@ router.post('/:eventId/vote', validateBallotVote, async (req, res) => {
     // race. A concurrent duplicate double-click already created the row → the
     // vote is idempotently "on"; return success instead of 500.
     try {
-      await EventBallotVote.create({ option_id, user_id: userId, user_uuid: caller.id });
+      await EventBallotVote.create({ option_id, user_uuid: caller.id });
     } catch (voteErr) {
       if (voteErr instanceof UniqueConstraintError) {
         return res.json({ voted: true });

@@ -109,9 +109,10 @@ router.put('/event/:event_id/my-brings', verifyAuth0Token, async (req, res) => {
     }
 
     // Transaction: clear existing + bulk create new. Phase 87.1 (D-11): key the
-    // destroy, the create dual-write, AND the transactional re-fetch READ on
-    // user_uuid — an Auth0-keyed re-fetch would return an empty body post-cutover
-    // (the just-written UUID-keyed rows match nothing on the Auth0 keyspace).
+    // destroy, the create, AND the transactional re-fetch READ on user_uuid — an
+    // Auth0-keyed re-fetch would return an empty body post-cutover (the UUID-keyed
+    // rows match nothing on the Auth0 keyspace). The old Auth0-string user_id column
+    // was removed from the model in Plan 09.
     const result = await sequelize.transaction(async (t) => {
       await EventBring.destroy({
         where: { event_id, user_uuid: caller.id },
@@ -120,7 +121,6 @@ router.put('/event/:event_id/my-brings', verifyAuth0Token, async (req, res) => {
 
       const records = game_ids.map(game_id => ({
         event_id,
-        user_id: userId, // dual-write old Auth0 column until Plan 09
         user_uuid: caller.id,
         game_id,
       }));

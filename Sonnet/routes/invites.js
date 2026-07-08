@@ -41,15 +41,14 @@ async function acceptInviteTransactional(invite, user) {
 
     // Write 2: create-or-find the membership row (transaction: t MANDATORY)
     // D-11 (Phase 87.1, BINT-02): UserGroup is keyed on the Users.id UUID surrogate
-    // (user_uuid). Look up / create by user_uuid; the defaults DUAL-WRITE both the old
-    // Auth0-string user_id and the new user_uuid until Plan 09 drops the old column.
+    // (user_uuid). Plan 09 cutover: the old Auth0-string user_id column was removed
+    // from the model.
     const [userGroup, created] = await UserGroup.findOrCreate({
       where: {
         user_uuid: user.id,
         group_id: invite.group_id,
       },
       defaults: {
-        user_id: user.user_id,
         user_uuid: user.id,
         group_id: invite.group_id,
         role: 'member',
@@ -314,14 +313,14 @@ router.post(
       // D-04 (Phase 87.1, BINT-02): invited_by_uuid is NULLABLE; the caller passed
       // isOwnerOrAdmin above (which fails closed on a missing Users row) so callerRow
       // is normally present, but fall back to null defensively rather than emit a raw
-      // 500. The old Auth0-string invited_by is DUAL-WRITTEN until Plan 09.
+      // 500. Plan 09 cutover: the old Auth0-string invited_by column was removed from
+      // the model — the invite is keyed solely on invited_by_uuid.
       const callerRow = await User.findOne({ where: { user_id: userId } });
 
       // Create GroupInvite row
       const invite = await GroupInvite.create({
         group_id,
         invited_email: normalizedEmail,
-        invited_by: userId,
         invited_by_uuid: callerRow ? callerRow.id : null,
         token,
         status: 'pending',
@@ -335,7 +334,6 @@ router.post(
             group_id,
           },
           defaults: {
-            user_id: existingUser.user_id,
             user_uuid: existingUser.id,
             group_id,
             role: 'member',

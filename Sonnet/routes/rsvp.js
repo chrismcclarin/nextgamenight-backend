@@ -43,7 +43,8 @@ async function maybeDispatchGcalCleanup({ eventId, authUserId, oldStatus, newSta
   if (newStatus !== 'no' || oldStatus === 'no') return;
   try {
     // Translate Auth0 string user_id -> User.id (UUID) for EventParticipation lookup.
-    // EventRsvp.user_id is the Auth0 sub; EventParticipation.user_id is the User UUID.
+    // Phase 87.1 (Plan 09): EventRsvp is now keyed on user_uuid (Users.id); the old
+    // Auth0-string user_id column was removed. EventParticipation.user_id is the User UUID.
     const user = await User.findOne({
       where: { user_id: authUserId },
       attributes: ['id'],
@@ -298,8 +299,8 @@ router.get('/respond', async (req, res) => {
     }
 
     // Upsert RSVP: find existing or create. Phase 87.1 (BINT-02, D-11): key on
-    // user_uuid (resolved above); dual-write the old Auth0-string user_id until
-    // Plan 09 removes it (transition write contract).
+    // user_uuid (resolved above) — the old Auth0-string user_id column was removed
+    // from the model in Plan 09.
     const existing = await EventRsvp.findOne({
       where: { event_id: eventId, user_uuid: magicLinkUser.id },
     });
@@ -312,7 +313,6 @@ router.get('/respond', async (req, res) => {
     } else {
       await EventRsvp.create({
         event_id: eventId,
-        user_id: userId,
         user_uuid: magicLinkUser.id,
         status,
       });
@@ -419,7 +419,6 @@ router.post('/', verifyAuth0Token, validateRsvpCreate, async (req, res) => {
       try {
         rsvp = await EventRsvp.create({
           event_id,
-          user_id: userId,
           user_uuid: caller.id,
           status,
           note: note || null,

@@ -221,11 +221,12 @@ async function seedDatabase() {
     ];
 
     for (const { user, group, role } of userGroups) {
-      // UserGroup.user_id holds the Auth0 string id (Users.user_id), NOT the
-      // UUID primary key — on a fresh sync()'d schema the association FK
-      // rejects user.id outright.
+      // Phase 87.1 (BINT-02, Plan 09 cutover): UserGroup is now keyed on user_uuid
+      // (= Users.id UUID); the old Auth0-string user_id column was removed from the
+      // model. The FE e2e CI job sync()-builds its DB from these models (no migrations),
+      // so this MUST key user_uuid or the seed crashes on a nonexistent column.
       await UserGroup.findOrCreate({
-        where: { user_id: user.user_id, group_id: group.id },
+        where: { user_uuid: user.id, group_id: group.id },
         defaults: { role }
       });
     }

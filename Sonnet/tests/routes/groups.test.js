@@ -114,10 +114,11 @@ describe('Group Routes', () => {
       expect(response.body.name).toBe('New Test Group');
       expect(response.body).toHaveProperty('group_id');
 
-      // Verify the creator was added to the group as owner (Auth0 string user_id)
+      // Verify the creator was added to the group as owner (keyed on user_uuid =
+      // Users.id UUID; the old Auth0-string user_id column was removed in Plan 09).
       const userGroup = await UserGroup.findOne({
         where: {
-          user_id: testUser1.user_id,
+          user_uuid: testUser1.id,
           group_id: response.body.id
         }
       });
@@ -151,10 +152,11 @@ describe('Group Routes', () => {
 
       expect(response.body.message).toBe('User added to group successfully');
 
-      // Verify the added user (Auth0 string user_id)
+      // Verify the added user (keyed on user_uuid = Users.id UUID; the old
+      // Auth0-string user_id column was removed in Plan 09).
       const userGroup = await UserGroup.findOne({
         where: {
-          user_id: testUser2.user_id,
+          user_uuid: testUser2.id,
           group_id: testGroup.id
         }
       });

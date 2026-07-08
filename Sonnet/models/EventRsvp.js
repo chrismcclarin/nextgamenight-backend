@@ -17,23 +17,16 @@ const EventRsvp = sequelize.define('EventRsvp', {
     },
     onDelete: 'CASCADE',
   },
-  user_id: {
-    type: DataTypes.STRING,
-    allowNull: false,
-    // Auth0 string ID (e.g., "google-oauth2|107459289778553956693")
-    // Retained through the UUID re-key (D-07 rollback net). Removed from the model
-    // in Plan 09, dropped from the DB in the D-08 follow-up PR.
-  },
   user_uuid: {
     // Phase 87.1 (BINT-02, D-02): protective FK to the Users UUID PK, ON DELETE CASCADE.
     // Ships in BOTH this model (sync() builds the FK on the CI/test DB) AND migration
-    // 20260703000004 (prod via migrate:apply). allowNull is deliberately `true` during
-    // waves 1-4 — nothing writes user_uuid until Plan 03's factory dual-write + the route
-    // cutovers, and the test DB force-syncs from this model, so a NOT NULL column here would
-    // break every row-creating test. Prod NOT NULL is enforced by the migration's SET NOT NULL;
-    // Plan 09 tightens this to allowNull: false once all writers are cut over.
+    // 20260703000004 (prod via migrate:apply). Plan 09 cutover: the old Auth0-string
+    // `user_id` column has been removed from this model (D-08 static drop-safety proof;
+    // the physical DB column is retained as the D-07 rollback net and dropped in the
+    // D-08 follow-up PR). allowNull is now `false` — all writers key user_uuid, so the
+    // sync()-built test DB enforces NOT NULL to match the prod migration's SET NOT NULL.
     type: DataTypes.UUID,
-    allowNull: true,
+    allowNull: false,
     references: { model: 'Users', key: 'id' },
     onDelete: 'CASCADE',
   },
@@ -55,13 +48,6 @@ const EventRsvp = sequelize.define('EventRsvp', {
   indexes: [
     {
       fields: ['event_id'],
-    },
-    {
-      fields: ['user_id'],
-    },
-    {
-      fields: ['event_id', 'user_id'],
-      unique: true,
     },
     {
       // Phase 87.1 (T-87.1-01): one RSVP per user per event on the UUID key.

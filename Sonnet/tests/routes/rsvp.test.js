@@ -78,13 +78,17 @@ describe('RSVP single-use magic links (D-04 / BSEC-03)', () => {
   let testGroup;
   let testGame;
   let futureEvent;
+  // Phase 87.1 (Plan 09): EventRsvp is keyed on user_uuid (Users.id); capture the
+  // seeded user's UUID so the assertions can query it (the old user_id column is gone).
+  let rsvpUserUuid;
 
   // NOTE: schema is built once by tests/globalSetup.js; the global beforeEach in
   // tests/setup.js TRUNCATEs every table before each test. The FK parents
   // (User/Group/Game) MUST be re-seeded in beforeEach ABOVE the Event create, or
   // the per-test wipe leaves futureEvent's FK targets missing from test 2 onward.
   beforeEach(async () => {
-    await User.create({ user_id: USER_ID, username: 'RSVP Tester', email: 'rsvp@test.com' });
+    const rsvpUser = await User.create({ user_id: USER_ID, username: 'RSVP Tester', email: 'rsvp@test.com' });
+    rsvpUserUuid = rsvpUser.id;
     testGroup = await Group.create({ name: 'RSVP Group', group_id: 'rsvp-test-group-001' });
     testGame = await Game.create({ name: 'Test Game' });
 
@@ -105,7 +109,7 @@ describe('RSVP single-use magic links (D-04 / BSEC-03)', () => {
     expect(res.body.success).toBe(true);
     expect(res.body.status).toBe('yes');
 
-    const rsvp = await EventRsvp.findOne({ where: { event_id: futureEvent.id, user_id: USER_ID } });
+    const rsvp = await EventRsvp.findOne({ where: { event_id: futureEvent.id, user_uuid: rsvpUserUuid } });
     expect(rsvp).not.toBeNull();
     expect(rsvp.status).toBe('yes');
 
@@ -121,14 +125,14 @@ describe('RSVP single-use magic links (D-04 / BSEC-03)', () => {
     expect(first.status).toBe(200);
 
     // Capture state after first use.
-    const afterFirst = await EventRsvp.findOne({ where: { event_id: futureEvent.id, user_id: USER_ID } });
+    const afterFirst = await EventRsvp.findOne({ where: { event_id: futureEvent.id, user_uuid: rsvpUserUuid } });
     const beforeReplay = { status: afterFirst.status, updatedAt: afterFirst.updatedAt };
 
     const replay = await respond(token, futureEvent.id, USER_ID, 'yes');
     expect(replay.status).toBe(403);
 
     // RSVP state MUST be unchanged (consume gates before the upsert).
-    const afterReplay = await EventRsvp.findOne({ where: { event_id: futureEvent.id, user_id: USER_ID } });
+    const afterReplay = await EventRsvp.findOne({ where: { event_id: futureEvent.id, user_uuid: rsvpUserUuid } });
     expect(afterReplay.status).toBe(beforeReplay.status);
     expect(afterReplay.updatedAt.getTime()).toBe(beforeReplay.updatedAt.getTime());
   });
@@ -145,7 +149,7 @@ describe('RSVP single-use magic links (D-04 / BSEC-03)', () => {
     expect(maybeRes.status).toBe(403);
 
     // RSVP stays 'yes' — the sibling never mutated state.
-    const rsvp = await EventRsvp.findOne({ where: { event_id: futureEvent.id, user_id: USER_ID } });
+    const rsvp = await EventRsvp.findOne({ where: { event_id: futureEvent.id, user_uuid: rsvpUserUuid } });
     expect(rsvp.status).toBe('yes');
   });
 
@@ -162,7 +166,7 @@ describe('RSVP single-use magic links (D-04 / BSEC-03)', () => {
     const res = await respond(token, futureEvent.id, USER_ID, 'yes');
     expect(res.status).toBe(403);
 
-    const rsvp = await EventRsvp.findOne({ where: { event_id: futureEvent.id, user_id: USER_ID } });
+    const rsvp = await EventRsvp.findOne({ where: { event_id: futureEvent.id, user_uuid: rsvpUserUuid } });
     expect(rsvp).toBeNull();
   });
 
@@ -209,7 +213,7 @@ describe('RSVP single-use magic links (D-04 / BSEC-03)', () => {
     expect(res.body.error).toBe('expired_link');
 
     // No RSVP state was mutated.
-    const rsvp = await EventRsvp.findOne({ where: { event_id: futureEvent.id, user_id: USER_ID } });
+    const rsvp = await EventRsvp.findOne({ where: { event_id: futureEvent.id, user_uuid: rsvpUserUuid } });
     expect(rsvp).toBeNull();
   });
 });
@@ -219,7 +223,7 @@ describe('RSVP single-use magic links (D-04 / BSEC-03)', () => {
 //
 // Two concurrent first-RSVPs for the same (event_id, user_id) both take the
 // create branch (their findOne pre-checks each miss the not-yet-committed row).
-// EventRsvp's (event_id, user_id) unique index IS declared in the model, so it
+// EventRsvp's (event_id, user_uuid) unique index IS declared in the model, so it
 // builds on the sync DB and arbitrates the race: one INSERT wins (201), the
 // other raises a UniqueConstraintError that the route absorbs -> re-find +
 // update (200). Neither returns a 500, and exactly one row survives.
@@ -235,10 +239,12 @@ describe('RSVP concurrent first-write idempotency (BINT-01 / T-87-06)', () => {
   let raceGroup;
   let raceGame;
   let raceEvent;
+  let raceUserUuid;
 
   beforeEach(async () => {
     currentActor = RACE_USER;
     const raceUser = await User.create({ user_id: RACE_USER, username: 'RSVP Racer', email: 'race@test.com' });
+    raceUserUuid = raceUser.id;
     raceGroup = await Group.create({ name: 'RSVP Race Group', group_id: 'rsvp-race-group-001' });
     raceGame = await Game.create({ name: 'Race Game' });
     raceEvent = await Event.create({
@@ -248,10 +254,9 @@ describe('RSVP concurrent first-write idempotency (BINT-01 / T-87-06)', () => {
       status: 'scheduled',
     });
     // Active membership so canReadEventScopedSurface (real, unmocked) authorizes.
-    // Phase 87.1: getUserRoleInGroup (Plan 04) queries UserGroup by user_uuid, so
-    // the seed MUST dual-write user_uuid or the surface gate 403s the POST.
+    // Phase 87.1: getUserRoleInGroup (Plan 04) queries UserGroup by user_uuid; the
+    // old Auth0-string user_id column was removed from the model in Plan 09.
     await UserGroup.create({
-      user_id: RACE_USER,
       user_uuid: raceUser.id,
       group_id: raceGroup.id,
       role: 'member',
@@ -289,7 +294,7 @@ describe('RSVP concurrent first-write idempotency (BINT-01 / T-87-06)', () => {
     // The unique index guaranteed exactly one persisted row (findAll is NOT
     // spied, so this is a true DB count).
     const rows = await EventRsvp.findAll({
-      where: { event_id: raceEvent.id, user_id: RACE_USER },
+      where: { event_id: raceEvent.id, user_uuid: raceUserUuid },
     });
     expect(rows).toHaveLength(1);
     expect(rows[0].status).toBe('yes');

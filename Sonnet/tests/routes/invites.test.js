@@ -54,7 +54,6 @@ describe('POST /invites/send — friend_user_id path (83.2 INVITE-01)', () => {
     });
 
     await UserGroup.create({
-      user_id: owner.user_id,
       user_uuid: owner.id, // D-11 dual-write (Plan 87.1-05): isOwnerOrAdmin keys user_uuid
       group_id: group.id,
       role: 'owner',
@@ -67,9 +66,7 @@ describe('POST /invites/send — friend_user_id path (83.2 INVITE-01)', () => {
   it('(a) invite-by-friend_user_id succeeds, creates a pending invite, and returns NO email', async () => {
     // Accepted friendship (owner is requester).
     await Friendship.create({
-      requester_id: owner.user_id,
       requester_uuid: owner.id, // D-11 dual-write (Plan 87.1-05)
-      addressee_id: friend.user_id,
       addressee_uuid: friend.id, // D-11 dual-write (Plan 87.1-05)
       status: 'accepted',
     });
@@ -95,17 +92,14 @@ describe('POST /invites/send — friend_user_id path (83.2 INVITE-01)', () => {
     expect(invite).not.toBeNull();
     expect(invite.invited_email.toLowerCase()).toBe(friend.email.toLowerCase());
 
-    // D-04 (Phase 87.1): the send-create records the caller's Users.id UUID in
-    // invited_by_uuid (dual-written alongside the old Auth0-string invited_by).
+    // D-04 (Phase 87.1, Plan 09): the send-create records the caller's Users.id UUID
+    // in invited_by_uuid (the old Auth0-string invited_by column was removed).
     expect(invite.invited_by_uuid).toBe(owner.id);
-    expect(invite.invited_by).toBe(owner.user_id);
   });
 
   it('(a2) accepted friendship works when the FRIEND is the requester (bidirectional)', async () => {
     await Friendship.create({
-      requester_id: friend.user_id,
       requester_uuid: friend.id, // D-11 dual-write (Plan 87.1-05)
-      addressee_id: owner.user_id,
       addressee_uuid: owner.id, // D-11 dual-write (Plan 87.1-05)
       status: 'accepted',
     });
@@ -132,9 +126,7 @@ describe('POST /invites/send — friend_user_id path (83.2 INVITE-01)', () => {
 
   it('(b2) a PENDING (not accepted) friendship is NOT enough → 403', async () => {
     await Friendship.create({
-      requester_id: owner.user_id,
       requester_uuid: owner.id, // D-11 dual-write (Plan 87.1-05)
-      addressee_id: friend.user_id,
       addressee_uuid: friend.id, // D-11 dual-write (Plan 87.1-05)
       status: 'pending',
     });
@@ -179,9 +171,7 @@ describe('POST /invites/send — friend_user_id path (83.2 INVITE-01)', () => {
       email: 'invite-outsider@example.com',
     });
     await Friendship.create({
-      requester_id: outsider.user_id,
       requester_uuid: outsider.id, // D-11 dual-write (Plan 87.1-05)
-      addressee_id: friend.user_id,
       addressee_uuid: friend.id, // D-11 dual-write (Plan 87.1-05)
       status: 'accepted',
     });
@@ -201,14 +191,11 @@ describe('POST /invites/send — friend_user_id path (83.2 INVITE-01)', () => {
 
   it('(f) friend already an active member → 409 (friend path reuses the member guard, IN-03)', async () => {
     await Friendship.create({
-      requester_id: owner.user_id,
       requester_uuid: owner.id, // D-11 dual-write (Plan 87.1-05)
-      addressee_id: friend.user_id,
       addressee_uuid: friend.id, // D-11 dual-write (Plan 87.1-05)
       status: 'accepted',
     });
     await UserGroup.create({
-      user_id: friend.user_id,
       user_uuid: friend.id, // D-11 dual-write (Plan 87.1-05)
       group_id: group.id,
       role: 'member',
@@ -225,16 +212,14 @@ describe('POST /invites/send — friend_user_id path (83.2 INVITE-01)', () => {
 
   it('(g) friend already has a pending invite → 409 (friend path reuses the pending guard, IN-03)', async () => {
     await Friendship.create({
-      requester_id: owner.user_id,
       requester_uuid: owner.id, // D-11 dual-write (Plan 87.1-05)
-      addressee_id: friend.user_id,
       addressee_uuid: friend.id, // D-11 dual-write (Plan 87.1-05)
       status: 'accepted',
     });
     await GroupInvite.create({
       group_id: group.id,
       invited_email: friend.email.toLowerCase(),
-      invited_by: owner.user_id,
+      invited_by_uuid: owner.id,
       token: 'pre-existing-pending-token',
       status: 'pending',
     });
@@ -299,7 +284,6 @@ describe('POST /invites/send — participant_user_id path (83.3 SEAM-01)', () =>
     });
 
     await UserGroup.create({
-      user_id: owner.user_id,
       user_uuid: owner.id, // D-11 dual-write (Plan 87.1-05): isOwnerOrAdmin keys user_uuid
       group_id: group.id,
       role: 'owner',
@@ -344,7 +328,7 @@ describe('POST /invites/send — participant_user_id path (83.3 SEAM-01)', () =>
     // The success path must also create the guest's UserGroup row as 'invited'
     // (the core mutation — keyed on the Auth0 string user_id).
     const ug = await UserGroup.findOne({
-      where: { user_id: guest.user_id, group_id: group.id },
+      where: { user_uuid: guest.id, group_id: group.id },
     });
     expect(ug).not.toBeNull();
     expect(ug.status).toBe('invited');
@@ -402,8 +386,7 @@ describe('POST /invites/send — participant_user_id path (83.3 SEAM-01)', () =>
       email: 'seam01-member@example.com',
     });
     await UserGroup.create({
-      user_id: randomMember.user_id,
-      user_uuid: randomMember.id, // D-11 dual-write (Plan 87.1-05)
+      user_uuid: randomMember.id, // Plan 09: keyed on user_uuid (old user_id column removed)
       group_id: group.id,
       role: 'member',
       status: 'active',
@@ -420,7 +403,7 @@ describe('POST /invites/send — participant_user_id path (83.3 SEAM-01)', () =>
     await GroupInvite.create({
       group_id: group.id,
       invited_email: guest.email.toLowerCase(),
-      invited_by: owner.user_id,
+      invited_by_uuid: owner.id,
       token: 'seam01-existing-token',
       status: 'pending',
     });
@@ -442,7 +425,6 @@ describe('POST /invites/send — participant_user_id path (83.3 SEAM-01)', () =>
 
   it('(g) participant already an active member → 409 (reuses the member guard)', async () => {
     await UserGroup.create({
-      user_id: guest.user_id,
       user_uuid: guest.id, // D-11 dual-write (Plan 87.1-05)
       group_id: group.id,
       role: 'member',
@@ -503,7 +485,7 @@ describe('POST invite-accept — atomicity rollback on BOTH paths (87-02 BINT-01
   let invite;
 
   beforeEach(async () => {
-    // invited_by carries a FK to Users.user_id — seed a real inviter row.
+    // invited_by_uuid carries a FK to Users.id — seed a real inviter row.
     inviter = await User.create({
       user_id: 'auth0|bint01-inviter',
       username: 'bint01-inviter',
@@ -524,7 +506,7 @@ describe('POST invite-accept — atomicity rollback on BOTH paths (87-02 BINT-01
     invite = await GroupInvite.create({
       group_id: group.id,
       invited_email: invitee.email.toLowerCase(),
-      invited_by: inviter.user_id,
+      invited_by_uuid: inviter.id,
       token: 'bint01-accept-token',
       status: 'pending',
     });
@@ -553,7 +535,7 @@ describe('POST invite-accept — atomicity rollback on BOTH paths (87-02 BINT-01
 
     // And no active UserGroup membership was created for (user, group).
     const activeMembership = await UserGroup.findOne({
-      where: { user_id: invitee.user_id, group_id: group.id, status: 'active' },
+      where: { user_uuid: invitee.id, group_id: group.id, status: 'active' },
     });
     expect(activeMembership).toBeNull();
   });
@@ -572,7 +554,7 @@ describe('POST invite-accept — atomicity rollback on BOTH paths (87-02 BINT-01
     expect(reloaded.status).toBe('pending');
 
     const activeMembership = await UserGroup.findOne({
-      where: { user_id: invitee.user_id, group_id: group.id, status: 'active' },
+      where: { user_uuid: invitee.id, group_id: group.id, status: 'active' },
     });
     expect(activeMembership).toBeNull();
   });
@@ -613,7 +595,6 @@ describe('GET /invites/pending — invited_by_name via the Inviter association (
     await GroupInvite.create({
       group_id: group.id,
       invited_email: invitee.email.toLowerCase(),
-      invited_by: inviter.user_id,
       invited_by_uuid: inviter.id,
       token: 'd12-pending-token',
       status: 'pending',

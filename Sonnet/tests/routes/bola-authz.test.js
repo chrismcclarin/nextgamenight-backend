@@ -56,10 +56,10 @@ describe('BOLA cross-actor 403 regression (Plan 83-05)', () => {
     group = await Group.create({ group_id: `bola-group-${ts}`, name: 'BOLA Group' });
     game = await Game.create({ name: `BOLA Game ${ts}`, is_custom: true });
     // owner is an active member; attacker is NOT. Phase 87.1 D-11: the role gates
-    // now resolve the caller to Users.id and query UserGroup.user_uuid, so DUAL-WRITE
-    // user_uuid (owner.id) alongside the Auth0-string user_id or the member/owner
-    // positive branches would wrongly 403.
-    await UserGroup.create({ user_id: owner.user_id, user_uuid: owner.id, group_id: group.id, role: 'owner', status: 'active' });
+    // resolve the caller to Users.id and query UserGroup.user_uuid, so the membership
+    // is seeded UUID-only on user_uuid (owner.id) — the old Auth0-string user_id column
+    // was removed from the model in Plan 09.
+    await UserGroup.create({ user_uuid: owner.id, group_id: group.id, role: 'owner', status: 'active' });
   });
 
   // ---- Test 1: gameReviews DELETE — cross-actor spoof → 403 (BE-100) ----------
@@ -156,7 +156,7 @@ describe('BOLA cross-actor 403 regression (Plan 83-05)', () => {
         .post(`/api/groups/${group.id}/users`)
         .send({ user_id: target.user_id });
       expect(res.status).toBe(403);
-      const membership = await UserGroup.findOne({ where: { user_id: target.user_id, group_id: group.id } });
+      const membership = await UserGroup.findOne({ where: { user_uuid: target.id, group_id: group.id } });
       expect(membership).toBeNull();
     });
 
@@ -169,7 +169,7 @@ describe('BOLA cross-actor 403 regression (Plan 83-05)', () => {
         .post(`/api/groups/${group.id}/users`)
         .send({ user_id: target.user_id });
       expect(res.status).toBe(200);
-      const membership = await UserGroup.findOne({ where: { user_id: target.user_id, group_id: group.id } });
+      const membership = await UserGroup.findOne({ where: { user_uuid: target.id, group_id: group.id } });
       expect(membership).not.toBeNull();
       expect(membership.role).toBe('member');
     });

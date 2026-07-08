@@ -66,14 +66,18 @@ async function main() {
     return;
   }
 
-  // 2. Build (event_id -> Set<user_id>) of voters per event so we can batch-load
+  // Phase 87.1 (BINT-02, Plan 09 cutover): EventBallotVote / EventRsvp are keyed on the
+  // Users.id UUID (user_uuid); the old Auth0-string user_id columns were removed from the
+  // models. This audit joins votes -> RSVPs -> users all on the UUID keyspace.
+
+  // 2. Build (event_id -> Set<user_uuid>) of voters per event so we can batch-load
   //    the relevant EventRsvp rows in one query per event (cheaper than per-vote).
-  const eventToVoters = new Map(); // event_id -> Set of voter user_ids
+  const eventToVoters = new Map(); // event_id -> Set of voter user_uuids
   for (const vote of allVotes) {
     const eventId = vote.EventBallotOption?.event_id;
     if (!eventId) continue; // orphaned vote (option deleted) — skip
     if (!eventToVoters.has(eventId)) eventToVoters.set(eventId, new Set());
-    eventToVoters.get(eventId).add(vote.user_id);
+    eventToVoters.get(eventId).add(vote.user_uuid);
   }
 
   // 3. Load events (for start_date + rsvp_deadline + game_id resolution) in one query
@@ -87,35 +91,35 @@ async function main() {
   const eventById = new Map(events.map((e) => [e.id, e]));
 
   // 4. Load EventRsvps for every (event, voter) pair in one query per event.
-  //    Build map: rsvpKey = `${event_id}|${user_id}` -> { status, exists }
+  //    Build map: rsvpKey = `${event_id}|${user_uuid}` -> { status, exists }
   const rsvpMap = new Map();
   for (const [eventId, voterSet] of eventToVoters.entries()) {
     const rsvps = await EventRsvp.findAll({
-      where: { event_id: eventId, user_id: Array.from(voterSet) },
-      attributes: ['event_id', 'user_id', 'status'],
+      where: { event_id: eventId, user_uuid: Array.from(voterSet) },
+      attributes: ['event_id', 'user_uuid', 'status'],
     });
     for (const r of rsvps) {
-      rsvpMap.set(`${r.event_id}|${r.user_id}`, r.status);
+      rsvpMap.set(`${r.event_id}|${r.user_uuid}`, r.status);
     }
   }
 
-  // 5. Resolve usernames/emails for bypass voters in one User query
-  const bypassUserIds = new Set();
+  // 5. Resolve usernames/emails for bypass voters in one User query (keyed on Users.id UUID)
+  const bypassUserUuids = new Set();
   for (const vote of allVotes) {
     const eventId = vote.EventBallotOption?.event_id;
     if (!eventId) continue;
-    const status = rsvpMap.get(`${eventId}|${vote.user_id}`);
+    const status = rsvpMap.get(`${eventId}|${vote.user_uuid}`);
     if (!status || !['yes', 'maybe'].includes(status)) {
-      bypassUserIds.add(vote.user_id);
+      bypassUserUuids.add(vote.user_uuid);
     }
   }
-  const bypassUsers = bypassUserIds.size === 0
+  const bypassUsers = bypassUserUuids.size === 0
     ? []
     : await User.findAll({
-        where: { user_id: Array.from(bypassUserIds) },
-        attributes: ['user_id', 'username', 'email'],
+        where: { id: Array.from(bypassUserUuids) },
+        attributes: ['id', 'user_id', 'username', 'email'],
       });
-  const userById = new Map(bypassUsers.map((u) => [u.user_id, u]));
+  const userById = new Map(bypassUsers.map((u) => [u.id, u]));
 
   // 6. Walk votes, classify, group by ballot/event, compute winners
   const perEvent = new Map(); // event_id -> { allVotesByOption, bypassVotesByOption, bypassVoters }
@@ -123,7 +127,7 @@ async function main() {
     const opt = vote.EventBallotOption;
     if (!opt || !opt.event_id) continue;
     const eventId = opt.event_id;
-    const status = rsvpMap.get(`${eventId}|${vote.user_id}`);
+    const status = rsvpMap.get(`${eventId}|${vote.user_uuid}`);
     const isBypass = !status || !['yes', 'maybe'].includes(status);
 
     if (!perEvent.has(eventId)) {
@@ -145,9 +149,10 @@ async function main() {
         opt.id,
         (bucket.bypassVotesByOption.get(opt.id) || 0) + 1
       );
-      const u = userById.get(vote.user_id);
+      const u = userById.get(vote.user_uuid);
       bucket.bypassVoters.push({
-        user_id: vote.user_id,
+        user_uuid: vote.user_uuid,
+        user_id: u?.user_id || null, // Auth0 sub (for human-readable cross-reference)
         username: u?.username || null,
         email: u?.email || null,
         rsvp_status_or_null: status || null,

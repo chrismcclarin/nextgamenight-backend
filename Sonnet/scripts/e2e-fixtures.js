@@ -103,9 +103,13 @@ async function main() {
     where: { group_id: 'e2e-invite-group' },
     defaults: { group_id: 'e2e-invite-group', name: 'E2E Invite Group' },
   });
+  // Phase 87.1 (BINT-02, Plan 09 cutover): UserGroup/Friendship are keyed on the
+  // Users.id UUID (*_uuid columns); the old Auth0-string columns were removed from the
+  // models. This script runs against the FE e2e CI DB, which is sync()-built from the
+  // models (no migrations), so it MUST key the UUID columns via the User rows it holds.
   await UserGroup.findOrCreate({
-    where: { user_id: alice.user_id, group_id: inviteGroup.id },
-    defaults: { user_id: alice.user_id, group_id: inviteGroup.id, role: 'owner', status: 'active' },
+    where: { user_uuid: alice.id, group_id: inviteGroup.id },
+    defaults: { user_uuid: alice.id, group_id: inviteGroup.id, role: 'owner', status: 'active' },
   });
 
   // Pick a seeded friend (Bob) who is NOT a member of the invite group.
@@ -120,11 +124,11 @@ async function main() {
   }
   // Accepted, bidirectional friendship Alice <-> Bob.
   await Friendship.findOrCreate({
-    where: { requester_id: alice.user_id, addressee_id: friend.user_id },
-    defaults: { requester_id: alice.user_id, addressee_id: friend.user_id, status: 'accepted' },
+    where: { requester_uuid: alice.id, addressee_uuid: friend.id },
+    defaults: { requester_uuid: alice.id, addressee_uuid: friend.id, status: 'accepted' },
   });
   // Make sure Bob is NOT in the invite group (so the friend checkbox stays enabled).
-  await UserGroup.destroy({ where: { user_id: friend.user_id, group_id: inviteGroup.id } });
+  await UserGroup.destroy({ where: { user_uuid: friend.id, group_id: inviteGroup.id } });
 
   console.log(`E2E_FIXTURES_JSON=${JSON.stringify({
     group_id: group.id,

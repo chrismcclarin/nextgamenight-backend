@@ -99,8 +99,8 @@ describe('Leave-event cascade (Phase 71.1-02)', () => {
 
     // Phase 87.1: getUserRoleInGroup (Plan 04) queries UserGroup by user_uuid, so
     // owner-initiated authz needs the membership seeds to dual-write user_uuid.
-    await UserGroup.create({ user_id: owner.user_id, user_uuid: ownerRow.id, group_id: group.id, status: 'active', role: 'owner' });
-    await UserGroup.create({ user_id: bystander.user_id, user_uuid: bystanderRow.id, group_id: group.id, status: 'active', role: 'member' });
+    await UserGroup.create({ user_uuid: ownerRow.id, group_id: group.id, status: 'active', role: 'owner' });
+    await UserGroup.create({ user_uuid: bystanderRow.id, group_id: group.id, status: 'active', role: 'member' });
     // leaver is intentionally NOT a group member — game-only participant flow.
 
     event = await Event.create({
@@ -115,18 +115,18 @@ describe('Leave-event cascade (Phase 71.1-02)', () => {
     // the cascade destroys key user_uuid, so dual-write it (= User.id) alongside
     // the old Auth0-string user_id.
     await EventParticipation.create({ event_id: event.id, user_id: leaverRow.id, is_guest: true });
-    await EventRsvp.create({ event_id: event.id, user_id: leaver.user_id, user_uuid: leaverRow.id, status: 'yes' });
-    await EventBring.create({ event_id: event.id, user_id: leaver.user_id, user_uuid: leaverRow.id, game_id: game.id });
+    await EventRsvp.create({ event_id: event.id, user_uuid: leaverRow.id, status: 'yes' });
+    await EventBring.create({ event_id: event.id, user_uuid: leaverRow.id, game_id: game.id });
     ballotOption = await EventBallotOption.create({
       event_id: event.id, game_id: game.id, game_name: game.name, display_order: 0,
     });
-    await EventBallotVote.create({ option_id: ballotOption.id, user_id: leaver.user_id, user_uuid: leaverRow.id });
+    await EventBallotVote.create({ option_id: ballotOption.id, user_uuid: leaverRow.id });
 
     // Seed bystander rows on the same event — must NOT be touched.
     await EventParticipation.create({ event_id: event.id, user_id: bystanderRow.id });
-    await EventRsvp.create({ event_id: event.id, user_id: bystander.user_id, user_uuid: bystanderRow.id, status: 'yes' });
-    await EventBring.create({ event_id: event.id, user_id: bystander.user_id, user_uuid: bystanderRow.id, game_id: game.id });
-    await EventBallotVote.create({ option_id: ballotOption.id, user_id: bystander.user_id, user_uuid: bystanderRow.id });
+    await EventRsvp.create({ event_id: event.id, user_uuid: bystanderRow.id, status: 'yes' });
+    await EventBring.create({ event_id: event.id, user_uuid: bystanderRow.id, game_id: game.id });
+    await EventBallotVote.create({ option_id: ballotOption.id, user_uuid: bystanderRow.id });
   });
 
   it('cascades the leaving user’s RSVP / EventBring / EventBallotVote rows on the event (self-leave)', async () => {
@@ -138,10 +138,10 @@ describe('Leave-event cascade (Phase 71.1-02)', () => {
     expect(res.body).toEqual(expect.objectContaining({ success: true }));
 
     expect(await EventParticipation.count({ where: { event_id: event.id, user_id: leaverRow.id } })).toBe(0);
-    expect(await EventRsvp.count({ where: { event_id: event.id, user_id: leaver.user_id } })).toBe(0);
-    expect(await EventBring.count({ where: { event_id: event.id, user_id: leaver.user_id } })).toBe(0);
+    expect(await EventRsvp.count({ where: { event_id: event.id, user_uuid: leaverRow.id } })).toBe(0);
+    expect(await EventBring.count({ where: { event_id: event.id, user_uuid: leaverRow.id } })).toBe(0);
     expect(
-      await EventBallotVote.count({ where: { option_id: ballotOption.id, user_id: leaver.user_id } })
+      await EventBallotVote.count({ where: { option_id: ballotOption.id, user_uuid: leaverRow.id } })
     ).toBe(0);
   });
 
@@ -169,10 +169,10 @@ describe('Leave-event cascade (Phase 71.1-02)', () => {
       .expect(200);
 
     expect(await EventParticipation.count({ where: { event_id: event.id, user_id: bystanderRow.id } })).toBe(1);
-    expect(await EventRsvp.count({ where: { event_id: event.id, user_id: bystander.user_id } })).toBe(1);
-    expect(await EventBring.count({ where: { event_id: event.id, user_id: bystander.user_id } })).toBe(1);
+    expect(await EventRsvp.count({ where: { event_id: event.id, user_uuid: bystanderRow.id } })).toBe(1);
+    expect(await EventBring.count({ where: { event_id: event.id, user_uuid: bystanderRow.id } })).toBe(1);
     expect(
-      await EventBallotVote.count({ where: { option_id: ballotOption.id, user_id: bystander.user_id } })
+      await EventBallotVote.count({ where: { option_id: ballotOption.id, user_uuid: bystanderRow.id } })
     ).toBe(1);
   });
 
@@ -204,18 +204,18 @@ describe('Leave-event cascade (Phase 71.1-02)', () => {
     // Leaver's participation gone (destroy-then-recreate left them out)
     expect(await EventParticipation.count({ where: { event_id: event.id, user_id: leaverRow.id } })).toBe(0);
     // Cascade fired for diff-removed leaver: RSVP/brings/votes also gone
-    expect(await EventRsvp.count({ where: { event_id: event.id, user_id: leaver.user_id } })).toBe(0);
-    expect(await EventBring.count({ where: { event_id: event.id, user_id: leaver.user_id } })).toBe(0);
+    expect(await EventRsvp.count({ where: { event_id: event.id, user_uuid: leaverRow.id } })).toBe(0);
+    expect(await EventBring.count({ where: { event_id: event.id, user_uuid: leaverRow.id } })).toBe(0);
     expect(
-      await EventBallotVote.count({ where: { option_id: ballotOption.id, user_id: leaver.user_id } })
+      await EventBallotVote.count({ where: { option_id: ballotOption.id, user_uuid: leaverRow.id } })
     ).toBe(0);
 
     // Bystander preserved across all tables (kept in the new participants array)
     expect(await EventParticipation.count({ where: { event_id: event.id, user_id: bystanderRow.id } })).toBe(1);
-    expect(await EventRsvp.count({ where: { event_id: event.id, user_id: bystander.user_id } })).toBe(1);
-    expect(await EventBring.count({ where: { event_id: event.id, user_id: bystander.user_id } })).toBe(1);
+    expect(await EventRsvp.count({ where: { event_id: event.id, user_uuid: bystanderRow.id } })).toBe(1);
+    expect(await EventBring.count({ where: { event_id: event.id, user_uuid: bystanderRow.id } })).toBe(1);
     expect(
-      await EventBallotVote.count({ where: { option_id: ballotOption.id, user_id: bystander.user_id } })
+      await EventBallotVote.count({ where: { option_id: ballotOption.id, user_uuid: bystanderRow.id } })
     ).toBe(1);
 
     // Audit log written for the diff-removed leaver (EVT-08 contract parity)
@@ -236,10 +236,10 @@ describe('Leave-event cascade (Phase 71.1-02)', () => {
     expect(res.status).toBe(200);
 
     expect(await EventParticipation.count({ where: { event_id: event.id, user_id: leaverRow.id } })).toBe(0);
-    expect(await EventRsvp.count({ where: { event_id: event.id, user_id: leaver.user_id } })).toBe(0);
-    expect(await EventBring.count({ where: { event_id: event.id, user_id: leaver.user_id } })).toBe(0);
+    expect(await EventRsvp.count({ where: { event_id: event.id, user_uuid: leaverRow.id } })).toBe(0);
+    expect(await EventBring.count({ where: { event_id: event.id, user_uuid: leaverRow.id } })).toBe(0);
     expect(
-      await EventBallotVote.count({ where: { option_id: ballotOption.id, user_id: leaver.user_id } })
+      await EventBallotVote.count({ where: { option_id: ballotOption.id, user_uuid: leaverRow.id } })
     ).toBe(0);
 
     // Bystander untouched

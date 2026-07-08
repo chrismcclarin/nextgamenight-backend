@@ -292,8 +292,9 @@ describe('Phase 87 ballot integrity (DB-backed)', () => {
   // ---- (b) VOTE IDEMPOTENCY ----
   it('absorbs a concurrent duplicate vote: no 500 and exactly one vote row', async () => {
     const [option] = await seedOptions(2, creator);
-    // Phase 87.1: the cast-vote RSVP-eligibility gate keys user_uuid — dual-write it.
-    await EventRsvp.create({ event_id: event.id, user_id: creator.user_id, user_uuid: creator.id, status: 'yes' });
+    // Phase 87.1 (Plan 09): the cast-vote RSVP-eligibility gate keys user_uuid
+    // (Users.id) — the old Auth0-string user_id column was removed from the model.
+    await EventRsvp.create({ event_id: event.id, user_uuid: creator.id, status: 'yes' });
 
     // Force the toggle-off lookup to see NO existing vote for BOTH concurrent
     // requests, so both take the create branch — the real concurrent-duplicate
@@ -313,7 +314,7 @@ describe('Phase 87 ballot integrity (DB-backed)', () => {
     expect(r2.body).toEqual({ voted: true });
 
     const votes = await EventBallotVote.findAll({
-      where: { option_id: option.id, user_id: creator.user_id },
+      where: { option_id: option.id, user_uuid: creator.id },
     });
     expect(votes).toHaveLength(1);
   });
@@ -365,7 +366,7 @@ describe('Phase 87 ballot integrity (DB-backed)', () => {
     // Remove the creator's membership — historical created_by must NOT grant
     // replace/wipe rights once they leave the group (EoP fix).
     await sequelize.models.UserGroup.destroy({
-      where: { user_id: creator.user_id, group_id: group.id },
+      where: { user_uuid: creator.id, group_id: group.id },
     });
 
     const res = await request(makeApp(creator))

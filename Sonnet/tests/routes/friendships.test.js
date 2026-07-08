@@ -293,15 +293,18 @@ describe('Declined-re-request DIRECTIONALITY SWAP (MED/LOW adopt-all, mandated)'
       .send({ addressee_user_id: REQUESTER });
 
     expect(reReq.status).toBe(200);
-    // The existing row's UUID direction SWAPPED to B->A, dual-writing the strings.
+    // The existing row's UUID direction SWAPPED to B->A. Phase 87.1 (Plan 09): the
+    // old Auth0-string requester_id/addressee_id columns were removed from the model,
+    // so the update writes ONLY the UUID endpoints + status.
     expect(declinedRow.update).toHaveBeenCalledWith(
       expect.objectContaining({
         requester_uuid: ADDRESSEE_UUID, // B is now the requester
         addressee_uuid: REQUESTER_UUID, // A is now the addressee
-        requester_id: ADDRESSEE, // dual-write old string
-        addressee_id: REQUESTER, // dual-write old string
         status: 'pending',
       })
+    );
+    expect(declinedRow.update).not.toHaveBeenCalledWith(
+      expect.objectContaining({ requester_id: expect.anything() })
     );
     // Wire stays Auth0 strings (re-request direction), no *_uuid leak.
     expectAuth0Wire(reReq.body, { requester: ADDRESSEE, addressee: REQUESTER });

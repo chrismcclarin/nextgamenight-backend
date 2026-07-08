@@ -229,11 +229,10 @@ router.post('/', validateGroupCreate, async (req, res) => {
       group_id: `group_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
     });
     
-    // Creator is set as 'owner'. DUAL-WRITE during the Phase 87.1 cutover:
-    // user_id (Auth0 string, still NOT NULL until Plan 09) AND user_uuid (Users.id FK).
+    // Creator is set as 'owner'. Phase 87.1 (Plan 09 cutover): keyed on user_uuid
+    // (Users.id FK) — the old Auth0-string user_id column was removed from the model.
     await UserGroup.create({
-      user_id: user.user_id, // Auth0 STRING (old keyspace, retained until Plan 09)
-      user_uuid: user.id, // Users.id UUID (new keyspace)
+      user_uuid: user.id, // Users.id UUID (the join key)
       group_id: group.id,
       role: 'owner'
     });
@@ -412,15 +411,15 @@ router.post('/:group_id/users', async (req, res) => {
       return res.status(404).json({ error: 'User or Group not found' });
     }
 
-    // D-11: key on user_uuid (Users.id). DUAL-WRITE defaults during cutover.
+    // D-11: key on user_uuid (Users.id). Phase 87.1 (Plan 09 cutover): the old
+    // Auth0-string user_id column was removed from the model.
     await UserGroup.findOrCreate({
       where: {
         user_uuid: user.id,
         group_id: group.id
       },
       defaults: {
-        user_id: user.user_id, // Auth0 STRING (old keyspace, retained until Plan 09)
-        user_uuid: user.id, // Users.id UUID (new keyspace)
+        user_uuid: user.id, // Users.id UUID (the join key)
         group_id: group.id,
         role: 'member'
       }
@@ -656,10 +655,10 @@ router.post('/join-by-token', async (req, res) => {
     }
 
     // Create new membership -- CRITICAL: role is 'member' NOT 'pending' (QR invites bypass pending)
-    // DUAL-WRITE during cutover: user_id (Auth0 string) AND user_uuid (Users.id).
+    // Phase 87.1 (Plan 09 cutover): keyed on user_uuid — the old Auth0-string user_id
+    // column was removed from the model.
     await UserGroup.create({
-      user_id: userId, // Auth0 STRING (old keyspace, retained until Plan 09)
-      user_uuid: user.id, // Users.id UUID (new keyspace)
+      user_uuid: user.id, // Users.id UUID (the join key)
       group_id: group.id,
       role: 'member',
       status: 'active',

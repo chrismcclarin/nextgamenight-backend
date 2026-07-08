@@ -327,10 +327,10 @@ describe('notificationService', () => {
       createSpy.mockRestore();
     });
 
-    it('logs the SentNotification row on the Users.id UUID (user_uuid), dual-writing the Auth0 string', async () => {
+    it('logs the SentNotification row on the Users.id UUID (user_uuid)', async () => {
       const user = {
         id: 'user-uuid-abc', // Users.id UUID → user_uuid
-        user_id: 'auth0|sms-user', // Auth0 string → user_id (dual-write)
+        user_id: 'auth0|sms-user', // Auth0 sub (still on the User object; NOT written to SentNotification)
         email_notifications_enabled: false,
         sms_enabled: true,
         phone: '+14155559999',
@@ -348,10 +348,13 @@ describe('notificationService', () => {
       expect(createSpy).toHaveBeenCalledWith(
         expect.objectContaining({
           user_uuid: 'user-uuid-abc',
-          user_id: 'auth0|sms-user',
           event_id: 'event-uuid-1',
           channel: 'sms',
         })
+      );
+      // Plan 09: the old Auth0-string user_id column was removed from SentNotification.
+      expect(createSpy).not.toHaveBeenCalledWith(
+        expect.objectContaining({ user_id: expect.anything() })
       );
     });
   });

@@ -222,13 +222,11 @@ router.post(
             // The re-requester (the caller) becomes the new requester, so this
             // swaps requester_uuid/addressee_uuid to the caller→target direction
             // (guaranteeing only the new addressee can accept — not the
-            // re-requester). DUAL-WRITE the old Auth0-string columns alongside,
-            // kept in sync until Plan 09 removes them.
+            // re-requester). Plan 09 cutover: the old Auth0-string requester_id /
+            // addressee_id columns were removed from the model.
             await existing.update({
               requester_uuid: caller.id,
               addressee_uuid: addresseeUser.id,
-              requester_id: userId, // Auth0 STRING (old keyspace, retained until Plan 09)
-              addressee_id: addressee_user_id, // Auth0 STRING (old keyspace)
               status: 'pending',
             });
             // D-12 shim: emit Auth0 strings, strip the *_uuid columns.
@@ -252,12 +250,11 @@ router.post(
       // success shape the happy path returns, so a double-submit degrades to
       // success (exactly one row) instead of a 500. Canonical keying unchanged.
       try {
-        // DUAL-WRITE: old Auth0-string columns + new Users.id UUID columns.
+        // Phase 87.1 (Plan 09 cutover): keyed on the Users.id UUID endpoints — the old
+        // Auth0-string requester_id / addressee_id columns were removed from the model.
         const friendship = await Friendship.create({
-          requester_id: userId, // Auth0 STRING (old keyspace, retained until Plan 09)
-          requester_uuid: caller.id, // Users.id UUID (new keyspace)
-          addressee_id: addressee_user_id, // Auth0 STRING (old keyspace)
-          addressee_uuid: addresseeUser.id, // Users.id UUID (new keyspace)
+          requester_uuid: caller.id, // Users.id UUID (requester endpoint)
+          addressee_uuid: addresseeUser.id, // Users.id UUID (addressee endpoint)
           status: 'pending',
         });
 
