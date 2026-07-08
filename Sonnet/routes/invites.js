@@ -184,15 +184,26 @@ router.post(
         // 1) Gate on an ACCEPTED friendship between the requester and the
         //    target (bidirectional). This prevents using the endpoint as an
         //    email/membership oracle for arbitrary user_ids.
-        const friendship = await Friendship.findOne({
-          where: {
-            status: 'accepted',
-            [Op.or]: [
-              { requester_id: userId, addressee_id: friend_user_id },
-              { requester_id: friend_user_id, addressee_id: userId },
-            ],
-          },
-        });
+        //
+        // D-11 (Phase 87.1, BINT-02): Friendship is keyed on the Users.id UUID
+        // surrogate (requester_uuid/addressee_uuid). Resolve BOTH the caller and
+        // the friend-target Auth0 strings to Users.id before the gate — a UUID
+        // column compared against an Auth0 string is always-false, which would
+        // silently 403 every legitimate friend-invite. A missing Users row on
+        // either side fails closed (treated as "no friendship").
+        const callerUser = await User.findOne({ where: { user_id: userId } });
+        const friendUserRow = await User.findOne({ where: { user_id: friend_user_id } });
+        const friendship = callerUser && friendUserRow
+          ? await Friendship.findOne({
+            where: {
+              status: 'accepted',
+              [Op.or]: [
+                { requester_uuid: callerUser.id, addressee_uuid: friendUserRow.id },
+                { requester_uuid: friendUserRow.id, addressee_uuid: callerUser.id },
+              ],
+            },
+          })
+          : null;
 
         if (!friendship) {
           return res

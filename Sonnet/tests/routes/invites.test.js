@@ -55,6 +55,7 @@ describe('POST /invites/send — friend_user_id path (83.2 INVITE-01)', () => {
 
     await UserGroup.create({
       user_id: owner.user_id,
+      user_uuid: owner.id, // D-11 dual-write (Plan 87.1-05): isOwnerOrAdmin keys user_uuid
       group_id: group.id,
       role: 'owner',
       status: 'active',
@@ -67,7 +68,9 @@ describe('POST /invites/send — friend_user_id path (83.2 INVITE-01)', () => {
     // Accepted friendship (owner is requester).
     await Friendship.create({
       requester_id: owner.user_id,
+      requester_uuid: owner.id, // D-11 dual-write (Plan 87.1-05)
       addressee_id: friend.user_id,
+      addressee_uuid: friend.id, // D-11 dual-write (Plan 87.1-05)
       status: 'accepted',
     });
 
@@ -96,7 +99,9 @@ describe('POST /invites/send — friend_user_id path (83.2 INVITE-01)', () => {
   it('(a2) accepted friendship works when the FRIEND is the requester (bidirectional)', async () => {
     await Friendship.create({
       requester_id: friend.user_id,
+      requester_uuid: friend.id, // D-11 dual-write (Plan 87.1-05)
       addressee_id: owner.user_id,
+      addressee_uuid: owner.id, // D-11 dual-write (Plan 87.1-05)
       status: 'accepted',
     });
 
@@ -123,7 +128,9 @@ describe('POST /invites/send — friend_user_id path (83.2 INVITE-01)', () => {
   it('(b2) a PENDING (not accepted) friendship is NOT enough → 403', async () => {
     await Friendship.create({
       requester_id: owner.user_id,
+      requester_uuid: owner.id, // D-11 dual-write (Plan 87.1-05)
       addressee_id: friend.user_id,
+      addressee_uuid: friend.id, // D-11 dual-write (Plan 87.1-05)
       status: 'pending',
     });
 
@@ -168,7 +175,9 @@ describe('POST /invites/send — friend_user_id path (83.2 INVITE-01)', () => {
     });
     await Friendship.create({
       requester_id: outsider.user_id,
+      requester_uuid: outsider.id, // D-11 dual-write (Plan 87.1-05)
       addressee_id: friend.user_id,
+      addressee_uuid: friend.id, // D-11 dual-write (Plan 87.1-05)
       status: 'accepted',
     });
     currentActor = outsider.user_id;
@@ -188,11 +197,14 @@ describe('POST /invites/send — friend_user_id path (83.2 INVITE-01)', () => {
   it('(f) friend already an active member → 409 (friend path reuses the member guard, IN-03)', async () => {
     await Friendship.create({
       requester_id: owner.user_id,
+      requester_uuid: owner.id, // D-11 dual-write (Plan 87.1-05)
       addressee_id: friend.user_id,
+      addressee_uuid: friend.id, // D-11 dual-write (Plan 87.1-05)
       status: 'accepted',
     });
     await UserGroup.create({
       user_id: friend.user_id,
+      user_uuid: friend.id, // D-11 dual-write (Plan 87.1-05)
       group_id: group.id,
       role: 'member',
       status: 'active',
@@ -209,7 +221,9 @@ describe('POST /invites/send — friend_user_id path (83.2 INVITE-01)', () => {
   it('(g) friend already has a pending invite → 409 (friend path reuses the pending guard, IN-03)', async () => {
     await Friendship.create({
       requester_id: owner.user_id,
+      requester_uuid: owner.id, // D-11 dual-write (Plan 87.1-05)
       addressee_id: friend.user_id,
+      addressee_uuid: friend.id, // D-11 dual-write (Plan 87.1-05)
       status: 'accepted',
     });
     await GroupInvite.create({
@@ -281,6 +295,7 @@ describe('POST /invites/send — participant_user_id path (83.3 SEAM-01)', () =>
 
     await UserGroup.create({
       user_id: owner.user_id,
+      user_uuid: owner.id, // D-11 dual-write (Plan 87.1-05): isOwnerOrAdmin keys user_uuid
       group_id: group.id,
       role: 'owner',
       status: 'active',
@@ -383,6 +398,7 @@ describe('POST /invites/send — participant_user_id path (83.3 SEAM-01)', () =>
     });
     await UserGroup.create({
       user_id: randomMember.user_id,
+      user_uuid: randomMember.id, // D-11 dual-write (Plan 87.1-05)
       group_id: group.id,
       role: 'member',
       status: 'active',
@@ -422,6 +438,7 @@ describe('POST /invites/send — participant_user_id path (83.3 SEAM-01)', () =>
   it('(g) participant already an active member → 409 (reuses the member guard)', async () => {
     await UserGroup.create({
       user_id: guest.user_id,
+      user_uuid: guest.id, // D-11 dual-write (Plan 87.1-05)
       group_id: group.id,
       role: 'member',
       status: 'active',
