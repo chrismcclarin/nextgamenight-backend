@@ -11,11 +11,19 @@ const SentNotification = sequelize.define('SentNotification', {
     defaultValue: DataTypes.UUIDV4,
     primaryKey: true,
   },
-  user_id: {
-    type: DataTypes.STRING,
+  user_uuid: {
+    // Phase 87.1 (BINT-02, D-03, PII cleanup): protective FK to the Users UUID PK,
+    // ON DELETE CASCADE — a deleted user's SMS notification trail is purged with them.
+    // Ships in BOTH this model (sync() builds the FK on the CI/test DB) AND migration
+    // 20260703000007 (prod via migrate:apply). Plan 09 cutover: the old Auth0-string
+    // `user_id` column has been removed from this model (D-08 static drop-safety proof;
+    // the physical DB column is retained as the D-07 rollback net and dropped in the
+    // D-08 follow-up PR). allowNull is now `false` — all writers key user_uuid, so the
+    // sync()-built test DB enforces NOT NULL to match the prod migration's SET NOT NULL.
+    type: DataTypes.UUID,
     allowNull: false,
-    // Auth0 string ID (e.g., "google-oauth2|107459289778553956693")
-    // NOT UUID -- matches EventRsvp, UserGroup, MagicToken pattern
+    references: { model: 'Users', key: 'id' },
+    onDelete: 'CASCADE',
   },
   event_id: {
     type: DataTypes.UUID,
@@ -59,8 +67,9 @@ const SentNotification = sequelize.define('SentNotification', {
       fields: ['phone', 'sent_at'],
     },
     {
-      // Audit: which notifications were sent for a user+event combo
-      fields: ['user_id', 'event_id'],
+      // Phase 87.1: audit lookup on the UUID key. NON-unique — this table has no
+      // one-per-user constraint (simplest table); a user may be notified repeatedly.
+      fields: ['user_uuid', 'event_id'],
     },
     {
       // CASCADE cleanup performance

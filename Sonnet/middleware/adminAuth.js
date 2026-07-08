@@ -6,6 +6,13 @@ const { Op } = require('sequelize');
 /**
  * Require the authenticated user to be an owner or admin of at least one active group.
  * Must be placed AFTER verifyAuth0Token in the middleware chain (needs req.user.user_id).
+ *
+ * D-11 (Phase 87.1, BINT-02) — A3: this middleware was an ADDITIONAL direct-query
+ * D-11 site (it bypasses getUserRoleInGroup). UserGroup is now keyed on `user_uuid`
+ * (Users.id), so the caller's Auth0 id is resolved to the Users row ONCE before the
+ * membership query; comparing user_uuid against an Auth0 string is always-false and
+ * would silently 403 every legitimate group admin. Fail-closed (403) when no Users
+ * row exists. requirePlatformAdmin below is DELIBERATELY left unchanged.
  */
 const requireGroupAdmin = async (req, res, next) => {
   try {
@@ -15,9 +22,14 @@ const requireGroupAdmin = async (req, res, next) => {
       return res.status(403).json({ error: 'Admin access required' });
     }
 
+    const user = await User.findOne({ where: { user_id: userId } });
+    if (!user) {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+
     const membership = await UserGroup.findOne({
       where: {
-        user_id: userId,
+        user_uuid: user.id,
         role: { [Op.in]: ['owner', 'admin'] },
         status: 'active'
       }

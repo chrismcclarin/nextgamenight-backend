@@ -120,22 +120,27 @@ router.get('/:group_id/prompt-settings', async (req, res) => {
       }
     }
 
-    // Get group members for recipient selection
+    // Get group members for recipient selection.
+    // A1 / T-87.1-13 (Phase 87.1): the FE MemberSelector stores members[].user_id
+    // back into selected_member_ids, which the invitation fanout filters on the
+    // Auth0-string keyspace. So members[].user_id MUST be the Auth0 sub. Reading
+    // ug.user_id off the UserGroup instance is an undefined-SILENT read once Plan 09
+    // strips the column — the FE would fall back to member.id (the User UUID),
+    // re-poisoning selected_member_ids with UUIDs and silently defeating the fanout.
+    // Fetch user_id on the User include and serialize the Auth0 sub from there.
     const groupMembers = await UserGroup.findAll({
       where: { group_id, status: 'active' },
       include: [{
         model: User,
-        // BSEC-01 (D-03): email removed — username is allowNull:false so the
-        // email display-name fallback was dead; drop it to user_id instead.
-        attributes: ['id', 'username'],
+        attributes: ['id', 'user_id', 'username'],
       }],
     });
 
     const members = groupMembers.map(ug => ({
       id: ug.User?.id,
-      user_id: ug.user_id,
+      user_id: ug.User?.user_id,
       username: ug.User?.username,
-      display_name: ug.User?.username || ug.user_id,
+      display_name: ug.User?.username || ug.User?.user_id,
     }));
 
     res.json({

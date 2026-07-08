@@ -43,7 +43,8 @@ async function maybeDispatchGcalCleanup({ eventId, authUserId, oldStatus, newSta
   if (newStatus !== 'no' || oldStatus === 'no') return;
   try {
     // Translate Auth0 string user_id -> User.id (UUID) for EventParticipation lookup.
-    // EventRsvp.user_id is the Auth0 sub; EventParticipation.user_id is the User UUID.
+    // Phase 87.1 (Plan 09): EventRsvp is now keyed on user_uuid (Users.id); the old
+    // Auth0-string user_id column was removed. EventParticipation.user_id is the User UUID.
     const user = await User.findOne({
       where: { user_id: authUserId },
       attributes: ['id'],
@@ -212,6 +213,25 @@ router.get('/respond', async (req, res) => {
       return res.status(403).json({ error: 'Invalid or expired link' });
     }
 
+    // Phase 87.1 (BINT-02, D-11): resolve the magic-link Auth0 sub to a Users row
+    // BEFORE consuming the single-use token. EventRsvp is keyed on user_uuid
+    // post-cutover, so we need the Users.id. Resolving FIRST means a sub with no
+    // Users row fails-closed WITHOUT burning the token — the link must not be
+    // consumed by a failed resolve (it stays consumable once the account exists).
+    // Fail-closed with a 403, never a 500. The message is DISTINCT from the
+    // expired/replayed-link envelope: a missing account is an honestly different
+    // condition (the link is valid, the account just doesn't exist yet).
+    const magicLinkUser = await User.findOne({
+      where: { user_id: userId },
+      attributes: ['id'],
+    });
+    if (!magicLinkUser) {
+      return res.status(403).json({
+        error: 'account_not_found',
+        message: 'We could not find your account — sign in and open the event to RSVP.',
+      });
+    }
+
     // D-04 / BSEC-03: single-use gate. ATOMICALLY consume the matching active
     // SingleUseToken row (the row nonce IS this HMAC token). This MUST happen
     // AFTER the HMAC check but BEFORE any EventRsvp write, so a replayed/expired/
@@ -280,9 +300,11 @@ router.get('/respond', async (req, res) => {
       });
     }
 
-    // Upsert RSVP: find existing or create
+    // Upsert RSVP: find existing or create. Phase 87.1 (BINT-02, D-11): key on
+    // user_uuid (resolved above) — the old Auth0-string user_id column was removed
+    // from the model in Plan 09.
     const existing = await EventRsvp.findOne({
-      where: { event_id: eventId, user_id: userId },
+      where: { event_id: eventId, user_uuid: magicLinkUser.id },
     });
     // Phase 75 / GCAL-01: capture old status BEFORE the update so we can
     // detect yes->no transitions (the only case that triggers GCal cleanup).
@@ -293,7 +315,7 @@ router.get('/respond', async (req, res) => {
     } else {
       await EventRsvp.create({
         event_id: eventId,
-        user_id: userId,
+        user_uuid: magicLinkUser.id,
         status,
       });
     }
@@ -361,9 +383,21 @@ router.post('/', verifyAuth0Token, validateRsvpCreate, async (req, res) => {
       return res.status(400).json({ error: 'Cannot RSVP to a cancelled event' });
     }
 
+    // Phase 87.1 (BINT-02, D-11): resolve the verified caller to Users.id ONCE
+    // and key every EventRsvp/EventBring write below on user_uuid. Fail-closed
+    // with the existing participant 403 envelope (never a raw 500) if the caller
+    // has no Users row.
+    const caller = await User.findOne({
+      where: { user_id: userId },
+      attributes: ['id'],
+    });
+    if (!caller) {
+      return res.status(403).json({ error: 'You must be a participant on this event to RSVP' });
+    }
+
     // Upsert: find existing RSVP or create new
     const existing = await EventRsvp.findOne({
-      where: { event_id, user_id: userId },
+      where: { event_id, user_uuid: caller.id },
     });
 
     let rsvp;
@@ -387,7 +421,7 @@ router.post('/', verifyAuth0Token, validateRsvpCreate, async (req, res) => {
       try {
         rsvp = await EventRsvp.create({
           event_id,
-          user_id: userId,
+          user_uuid: caller.id,
           status,
           note: note || null,
         });
@@ -396,7 +430,7 @@ router.post('/', verifyAuth0Token, validateRsvpCreate, async (req, res) => {
         if (createErr instanceof UniqueConstraintError) {
           // Concurrent create won the race — treat as an update, not a create.
           const raceRow = await EventRsvp.findOne({
-            where: { event_id, user_id: userId },
+            where: { event_id, user_uuid: caller.id },
           });
           if (raceRow) {
             await raceRow.update({ status, note: note || null });
@@ -411,9 +445,12 @@ router.post('/', verifyAuth0Token, validateRsvpCreate, async (req, res) => {
       }
     }
 
-    // Hard-delete bring commitments when RSVP changes to 'no' or 'maybe'
+    // Hard-delete bring commitments when RSVP changes to 'no' or 'maybe'.
+    // Phase 87.1 (D-11): key on user_uuid (reuse the resolved caller) — an
+    // Auth0-keyed destroy matches nothing post-cutover, silently leaving stale
+    // 'bringing' entries the FE documents as cleared.
     if (status === 'no' || status === 'maybe') {
-      await EventBring.destroy({ where: { event_id, user_id: userId } });
+      await EventBring.destroy({ where: { event_id, user_uuid: caller.id } });
     }
 
     // Phase 75 / GCAL-01: yes -> no triggers GCal cleanup for this attendee.
@@ -432,7 +469,15 @@ router.post('/', verifyAuth0Token, validateRsvpCreate, async (req, res) => {
       include: [{ model: User, attributes: ['id', 'username', 'user_id'] }],
     });
 
-    return res.status(isCreate ? 201 : 200).json(result);
+    // D-12 wire shim: serialize user_id as the Auth0 sub (from the included User)
+    // and strip the raw user_uuid so it never leaks on the wire.
+    const shaped = result.toJSON();
+    // No `?? userId` fallback — the User include above is always present, and the
+    // dropped string column would only mask a missing include (loud if absent).
+    shaped.user_id = shaped.User?.user_id;
+    delete shaped.user_uuid;
+
+    return res.status(isCreate ? 201 : 200).json(shaped);
   } catch (error) {
     console.error('Error creating/updating RSVP:', error.message);
     return res.status(500).json({ error: error.message });
@@ -474,7 +519,18 @@ router.get('/event/:event_id', verifyAuth0Token, async (req, res) => {
       }
     });
 
-    return res.json({ rsvps, summary });
+    // D-12 wire shim: serialize each row's user_id from the included User.user_id
+    // (Auth0 sub) and strip the raw user_uuid so it never leaks on the wire.
+    const shapedRsvps = rsvps.map((r) => {
+      const json = r.toJSON();
+      // No `?? json.user_id` fallback — Plan 09 DROPPED the string column, so it is
+      // always undefined and would only mask a missing User include (loud if absent).
+      json.user_id = json.User?.user_id;
+      delete json.user_uuid;
+      return json;
+    });
+
+    return res.json({ rsvps: shapedRsvps, summary });
   } catch (error) {
     console.error('Error fetching event RSVPs:', error.message);
     return res.status(500).json({ error: error.message });
@@ -487,13 +543,26 @@ router.get('/user/:user_id', verifyAuth0Token, async (req, res) => {
     const { user_id } = req.params;
     const userId = req.user.user_id;
 
-    // Only allow users to fetch their own RSVPs
+    // Only allow users to fetch their own RSVPs. The param-vs-token equality
+    // check stays on Auth0 strings (unchanged).
     if (userId !== user_id) {
       return res.status(403).json({ error: 'You can only view your own RSVPs' });
     }
 
+    // Phase 87.1 (BINT-02, D-11/D-12): resolve the verified caller to Users.id and
+    // query by user_uuid — post-cutover RSVPs carry only user_uuid, so the old
+    // Auth0-keyed query would silently return only pre-migration rows. Fail-closed:
+    // a caller with no Users row gets an empty list (never a raw 500).
+    const caller = await User.findOne({
+      where: { user_id: userId },
+      attributes: ['id'],
+    });
+    if (!caller) {
+      return res.json([]);
+    }
+
     const rsvps = await EventRsvp.findAll({
-      where: { user_id },
+      where: { user_uuid: caller.id },
       include: [
         {
           model: Event,
@@ -506,7 +575,17 @@ router.get('/user/:user_id', verifyAuth0Token, async (req, res) => {
       order: [[Event, 'start_date', 'DESC']],
     });
 
-    return res.json(rsvps);
+    // D-12 wire shim: this endpoint is self-only (param === token above), so every
+    // returned row belongs to the caller. Serialize user_id as the caller's Auth0
+    // sub (this endpoint has NO User include to source from) and strip user_uuid.
+    const shaped = rsvps.map((r) => {
+      const json = r.toJSON();
+      json.user_id = userId;
+      delete json.user_uuid;
+      return json;
+    });
+
+    return res.json(shaped);
   } catch (error) {
     console.error('Error fetching user RSVPs:', error.message);
     return res.status(500).json({ error: error.message });
@@ -524,8 +603,14 @@ router.delete('/:rsvp_id', verifyAuth0Token, async (req, res) => {
       return res.status(404).json({ error: 'RSVP not found' });
     }
 
-    // Only the RSVP owner can delete it
-    if (rsvp.user_id !== userId) {
+    // Only the RSVP owner can delete it. Phase 87.1 (D-11): resolve the verified
+    // caller to Users.id and compare user_uuid. Fail-closed: a null resolve (no
+    // Users row) is treated as non-owner → 403, never a raw 500.
+    const caller = await User.findOne({
+      where: { user_id: userId },
+      attributes: ['id'],
+    });
+    if (!caller || rsvp.user_uuid !== caller.id) {
       return res.status(403).json({ error: 'You can only remove your own RSVP' });
     }
 
@@ -535,8 +620,9 @@ router.delete('/:rsvp_id', verifyAuth0Token, async (req, res) => {
     const priorStatus = rsvp.status;
     const eventId = rsvp.event_id;
 
-    // Hard-delete bring commitments when RSVP is removed
-    await EventBring.destroy({ where: { event_id: rsvp.event_id, user_id: rsvp.user_id } });
+    // Hard-delete bring commitments when RSVP is removed. Phase 87.1 (D-11):
+    // key on user_uuid (both columns are UUID now).
+    await EventBring.destroy({ where: { event_id: rsvp.event_id, user_uuid: rsvp.user_uuid } });
 
     await rsvp.destroy();
 

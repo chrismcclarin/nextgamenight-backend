@@ -4,12 +4,13 @@
 //   events of the group they leave (or are removed from), while preserving
 //   past/completed event history and other users' rows on the same events.
 //
-// Cascade tables (FK type asymmetry preserved — load-bearing):
-//   - EventParticipation.user_id  = UUID    (User.id)
-//   - EventRsvp.user_id           = STRING  (Auth0 user_id)
-//   - EventBring.user_id          = STRING  (Auth0 user_id)
-//   - EventBallotVote.user_id     = STRING  (Auth0 user_id) — joined to event
-//                                          via EventBallotOption.event_id
+// Cascade tables (Phase 87.1 D-11 — now uniformly UUID-keyed on user_uuid):
+//   - EventParticipation.user_id  = UUID       (User.id)
+//   - EventRsvp.user_uuid         = UUID       (User.id) — was Auth0 STRING
+//   - EventBring.user_uuid        = UUID       (User.id) — was Auth0 STRING
+//   - EventBallotVote.user_uuid   = UUID       (User.id) — was Auth0 STRING;
+//                                          joined to event via EventBallotOption.event_id
+// Seeds dual-write both columns during the cutover; the route cascades by user_uuid.
 //
 // Auth0 middleware is short-circuited by injecting `req.user` ahead of the
 // router (matches the polls.test.js / events.lifecycle.test.js pattern).
@@ -53,6 +54,7 @@ describe('Group leave cascade (Phase 71.1-02)', () => {
 
   let group;
   let game;
+  let ownerRow;
   let leaverRow;
   let bystanderRow;
   let futureEvent;
@@ -85,7 +87,7 @@ describe('Group leave cascade (Phase 71.1-02)', () => {
     await clearAll();
 
     // Create users
-    await User.create(owner);
+    ownerRow = await User.create(owner);
     leaverRow = await User.create(leaver);
     bystanderRow = await User.create(bystander);
 
@@ -97,9 +99,11 @@ describe('Group leave cascade (Phase 71.1-02)', () => {
     });
     game = await Game.create({ name: 'CascadeTestGame', is_custom: true });
 
-    await UserGroup.create({ user_id: owner.user_id, group_id: group.id, status: 'active', role: 'owner' });
-    await UserGroup.create({ user_id: leaver.user_id, group_id: group.id, status: 'active', role: 'member' });
-    await UserGroup.create({ user_id: bystander.user_id, group_id: group.id, status: 'active', role: 'member' });
+    // Phase 87.1 D-11: DUAL-WRITE user_uuid (Users.id) alongside the old Auth0-string
+    // user_id — the group routes now query UserGroup by user_uuid.
+    await UserGroup.create({ user_uuid: ownerRow.id, group_id: group.id, status: 'active', role: 'owner' });
+    await UserGroup.create({ user_uuid: leaverRow.id, group_id: group.id, status: 'active', role: 'member' });
+    await UserGroup.create({ user_uuid: bystanderRow.id, group_id: group.id, status: 'active', role: 'member' });
 
     // Future event (cascade target) — start_date > NOW() AND status='scheduled'
     futureEvent = await Event.create({
@@ -120,25 +124,27 @@ describe('Group leave cascade (Phase 71.1-02)', () => {
     });
 
     // Seed cascade rows on the FUTURE event for the leaver across all four tables.
-    // (User_id type asymmetry intentional: EventParticipation = UUID, others = Auth0 STRING.)
+    // Phase 87.1 D-11: EventRsvp/EventBring/EventBallotVote now cascade by user_uuid,
+    // so dual-write it alongside the Auth0-string user_id. EventParticipation was
+    // always UUID-keyed (user_id: leaverRow.id).
     await EventParticipation.create({ event_id: futureEvent.id, user_id: leaverRow.id, score: null });
-    await EventRsvp.create({ event_id: futureEvent.id, user_id: leaver.user_id, status: 'yes' });
-    await EventBring.create({ event_id: futureEvent.id, user_id: leaver.user_id, game_id: game.id });
+    await EventRsvp.create({ event_id: futureEvent.id, user_uuid: leaverRow.id, status: 'yes' });
+    await EventBring.create({ event_id: futureEvent.id, user_uuid: leaverRow.id, game_id: game.id });
     const futureOption = await EventBallotOption.create({ event_id: futureEvent.id, game_id: game.id, game_name: game.name, display_order: 0 });
-    await EventBallotVote.create({ option_id: futureOption.id, user_id: leaver.user_id });
+    await EventBallotVote.create({ option_id: futureOption.id, user_uuid: leaverRow.id });
 
     // Seed identical rows on the PAST event for the leaver — these MUST be preserved.
     await EventParticipation.create({ event_id: pastEvent.id, user_id: leaverRow.id, score: 5 });
-    await EventRsvp.create({ event_id: pastEvent.id, user_id: leaver.user_id, status: 'yes' });
-    await EventBring.create({ event_id: pastEvent.id, user_id: leaver.user_id, game_id: game.id });
+    await EventRsvp.create({ event_id: pastEvent.id, user_uuid: leaverRow.id, status: 'yes' });
+    await EventBring.create({ event_id: pastEvent.id, user_uuid: leaverRow.id, game_id: game.id });
     const pastOption = await EventBallotOption.create({ event_id: pastEvent.id, game_id: game.id, game_name: game.name, display_order: 0 });
-    await EventBallotVote.create({ option_id: pastOption.id, user_id: leaver.user_id });
+    await EventBallotVote.create({ option_id: pastOption.id, user_uuid: leaverRow.id });
 
     // Seed bystander rows on the FUTURE event — these MUST NOT be touched.
     await EventParticipation.create({ event_id: futureEvent.id, user_id: bystanderRow.id, score: null });
-    await EventRsvp.create({ event_id: futureEvent.id, user_id: bystander.user_id, status: 'yes' });
-    await EventBring.create({ event_id: futureEvent.id, user_id: bystander.user_id, game_id: game.id });
-    await EventBallotVote.create({ option_id: futureOption.id, user_id: bystander.user_id });
+    await EventRsvp.create({ event_id: futureEvent.id, user_uuid: bystanderRow.id, status: 'yes' });
+    await EventBring.create({ event_id: futureEvent.id, user_uuid: bystanderRow.id, game_id: game.id });
+    await EventBallotVote.create({ option_id: futureOption.id, user_uuid: bystanderRow.id });
   });
 
   describe('POST /api/groups/:group_id/leave (self-leave)', () => {
@@ -150,7 +156,7 @@ describe('Group leave cascade (Phase 71.1-02)', () => {
 
       // Membership row gone
       const remainingMembership = await UserGroup.findOne({
-        where: { user_id: leaver.user_id, group_id: group.id },
+        where: { user_uuid: leaverRow.id, group_id: group.id },
       });
       expect(remainingMembership).toBeNull();
 
@@ -159,17 +165,17 @@ describe('Group leave cascade (Phase 71.1-02)', () => {
         await EventParticipation.count({ where: { event_id: futureEvent.id, user_id: leaverRow.id } })
       ).toBe(0);
       expect(
-        await EventRsvp.count({ where: { event_id: futureEvent.id, user_id: leaver.user_id } })
+        await EventRsvp.count({ where: { event_id: futureEvent.id, user_uuid: leaverRow.id } })
       ).toBe(0);
       expect(
-        await EventBring.count({ where: { event_id: futureEvent.id, user_id: leaver.user_id } })
+        await EventBring.count({ where: { event_id: futureEvent.id, user_uuid: leaverRow.id } })
       ).toBe(0);
       const futureOptions = await EventBallotOption.findAll({
         where: { event_id: futureEvent.id }, attributes: ['id'],
       });
       expect(
         await EventBallotVote.count({
-          where: { option_id: futureOptions.map(o => o.id), user_id: leaver.user_id },
+          where: { option_id: futureOptions.map(o => o.id), user_uuid: leaverRow.id },
         })
       ).toBe(0);
     });
@@ -182,17 +188,17 @@ describe('Group leave cascade (Phase 71.1-02)', () => {
         await EventParticipation.count({ where: { event_id: pastEvent.id, user_id: leaverRow.id } })
       ).toBe(1);
       expect(
-        await EventRsvp.count({ where: { event_id: pastEvent.id, user_id: leaver.user_id } })
+        await EventRsvp.count({ where: { event_id: pastEvent.id, user_uuid: leaverRow.id } })
       ).toBe(1);
       expect(
-        await EventBring.count({ where: { event_id: pastEvent.id, user_id: leaver.user_id } })
+        await EventBring.count({ where: { event_id: pastEvent.id, user_uuid: leaverRow.id } })
       ).toBe(1);
       const pastOptions = await EventBallotOption.findAll({
         where: { event_id: pastEvent.id }, attributes: ['id'],
       });
       expect(
         await EventBallotVote.count({
-          where: { option_id: pastOptions.map(o => o.id), user_id: leaver.user_id },
+          where: { option_id: pastOptions.map(o => o.id), user_uuid: leaverRow.id },
         })
       ).toBeGreaterThanOrEqual(1);
     });
@@ -210,8 +216,8 @@ describe('Group leave cascade (Phase 71.1-02)', () => {
         status: 'completed', // ← the corruption: future event marked completed
       });
       await EventParticipation.create({ event_id: corruptedFutureEvent.id, user_id: leaverRow.id, score: null });
-      await EventRsvp.create({ event_id: corruptedFutureEvent.id, user_id: leaver.user_id, status: 'yes' });
-      await EventBring.create({ event_id: corruptedFutureEvent.id, user_id: leaver.user_id, game_id: game.id });
+      await EventRsvp.create({ event_id: corruptedFutureEvent.id, user_uuid: leaverRow.id, status: 'yes' });
+      await EventBring.create({ event_id: corruptedFutureEvent.id, user_uuid: leaverRow.id, game_id: game.id });
 
       const app = makeApp(leaver.user_id);
       await request(app).post(`/api/groups/${group.id}/leave`).send().expect(200);
@@ -220,10 +226,10 @@ describe('Group leave cascade (Phase 71.1-02)', () => {
         await EventParticipation.count({ where: { event_id: corruptedFutureEvent.id, user_id: leaverRow.id } })
       ).toBe(0);
       expect(
-        await EventRsvp.count({ where: { event_id: corruptedFutureEvent.id, user_id: leaver.user_id } })
+        await EventRsvp.count({ where: { event_id: corruptedFutureEvent.id, user_uuid: leaverRow.id } })
       ).toBe(0);
       expect(
-        await EventBring.count({ where: { event_id: corruptedFutureEvent.id, user_id: leaver.user_id } })
+        await EventBring.count({ where: { event_id: corruptedFutureEvent.id, user_uuid: leaverRow.id } })
       ).toBe(0);
     });
 
@@ -235,17 +241,17 @@ describe('Group leave cascade (Phase 71.1-02)', () => {
         await EventParticipation.count({ where: { event_id: futureEvent.id, user_id: bystanderRow.id } })
       ).toBe(1);
       expect(
-        await EventRsvp.count({ where: { event_id: futureEvent.id, user_id: bystander.user_id } })
+        await EventRsvp.count({ where: { event_id: futureEvent.id, user_uuid: bystanderRow.id } })
       ).toBe(1);
       expect(
-        await EventBring.count({ where: { event_id: futureEvent.id, user_id: bystander.user_id } })
+        await EventBring.count({ where: { event_id: futureEvent.id, user_uuid: bystanderRow.id } })
       ).toBe(1);
       const futureOptions = await EventBallotOption.findAll({
         where: { event_id: futureEvent.id }, attributes: ['id'],
       });
       expect(
         await EventBallotVote.count({
-          where: { option_id: futureOptions.map(o => o.id), user_id: bystander.user_id },
+          where: { option_id: futureOptions.map(o => o.id), user_uuid: bystanderRow.id },
         })
       ).toBe(1);
     });
@@ -261,7 +267,7 @@ describe('Group leave cascade (Phase 71.1-02)', () => {
 
       // Membership row gone
       const remainingMembership = await UserGroup.findOne({
-        where: { user_id: leaver.user_id, group_id: group.id },
+        where: { user_uuid: leaverRow.id, group_id: group.id },
       });
       expect(remainingMembership).toBeNull();
 
@@ -270,17 +276,17 @@ describe('Group leave cascade (Phase 71.1-02)', () => {
         await EventParticipation.count({ where: { event_id: futureEvent.id, user_id: leaverRow.id } })
       ).toBe(0);
       expect(
-        await EventRsvp.count({ where: { event_id: futureEvent.id, user_id: leaver.user_id } })
+        await EventRsvp.count({ where: { event_id: futureEvent.id, user_uuid: leaverRow.id } })
       ).toBe(0);
       expect(
-        await EventBring.count({ where: { event_id: futureEvent.id, user_id: leaver.user_id } })
+        await EventBring.count({ where: { event_id: futureEvent.id, user_uuid: leaverRow.id } })
       ).toBe(0);
       const futureOptions = await EventBallotOption.findAll({
         where: { event_id: futureEvent.id }, attributes: ['id'],
       });
       expect(
         await EventBallotVote.count({
-          where: { option_id: futureOptions.map(o => o.id), user_id: leaver.user_id },
+          where: { option_id: futureOptions.map(o => o.id), user_uuid: leaverRow.id },
         })
       ).toBe(0);
 

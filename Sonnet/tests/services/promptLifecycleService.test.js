@@ -233,7 +233,14 @@ describe('promptLifecycleService.handlePromptClosed — recipient resolution', (
     expect(emailService.send.mock.calls[0][0].to).toBe('admin-a@test.com');
   });
 
-  it('Test 5b: auto prompt with NULL settings.created_by_user_id falls back to group owner via UserGroup', async () => {
+  it('Test 5b: auto prompt with NULL settings.created_by_user_id falls back to group owner via UserGroup (D-11: user_uuid → findByPk)', async () => {
+    // T-87.1-13 (corrected): the owner-fallback used to read ownerUg.user_id (an
+    // Auth0-string instance property). After Plan 09 strips user_id from the
+    // UserGroup model that read is undefined-SILENT → the branch is skipped → the
+    // owner never gets the close email. This test EXERCISES the branch on the
+    // re-keyed column (ownerUg.user_uuid, resolved via findByPk) so the fix is
+    // proven live, not dead — a defined-value assertion is the only backstop for a
+    // silent instance-property read.
     const prompt = makePromptMock({
       status: 'closed',
       created_by_user_id: null,
@@ -245,13 +252,13 @@ describe('promptLifecycleService.handlePromptClosed — recipient resolution', (
       created_by_user_id: null, // legacy row — fallback path
     });
     UserGroup.findOne.mockResolvedValue({
-      user_id: 'auth0|owner-sub',
+      user_uuid: 'user-uuid-owner', // re-keyed surrogate (Users.id)
       role: 'owner',
       status: 'active',
       group_id: 'group-uuid-1',
     });
-    User.findOne.mockImplementation(async ({ where }) => {
-      if (where && where.user_id === 'auth0|owner-sub') {
+    User.findByPk.mockImplementation(async (id) => {
+      if (id === 'user-uuid-owner') {
         return {
           id: 'user-uuid-owner',
           user_id: 'auth0|owner-sub',
@@ -273,16 +280,16 @@ describe('promptLifecycleService.handlePromptClosed — recipient resolution', (
     // Settings was consulted.
     expect(GroupPromptSettings.findByPk).toHaveBeenCalledWith('settings-uuid-1');
     // Group owner lookup is the documented two-step path — UserGroup by role,
-    // then User by Auth0 sub (NOT a single User.findByPk).
+    // then the owner resolved by the re-keyed user_uuid via findByPk (NOT the old
+    // Auth0-string User.findOne).
     expect(UserGroup.findOne).toHaveBeenCalledWith(expect.objectContaining({
       where: expect.objectContaining({
         group_id: 'group-uuid-1',
         role: 'owner',
       }),
     }));
-    expect(User.findOne).toHaveBeenCalledWith(expect.objectContaining({
-      where: expect.objectContaining({ user_id: 'auth0|owner-sub' }),
-    }));
+    expect(User.findByPk).toHaveBeenCalledWith('user-uuid-owner');
+    // The owner ACTUALLY resolved (branch is live, not dead) → email dispatched.
     expect(emailService.send).toHaveBeenCalledTimes(1);
     expect(emailService.send.mock.calls[0][0].to).toBe('owner@test.com');
   });

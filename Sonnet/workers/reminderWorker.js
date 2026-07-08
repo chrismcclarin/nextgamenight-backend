@@ -152,7 +152,14 @@ async function processReminderJob(job) {
 
   for (const membership of eligibleMemberships) {
     const user = membership.User;
-    const userId = membership.user_id;
+    // Pitfall 4 (keyspace bridge): AvailabilityResponse is NOT re-keyed — its
+    // user_id column still holds Auth0 STRINGS. UserGroup is now re-keyed onto
+    // user_uuid, so `membership.user_id` (the legacy string column) is an
+    // undefined-SILENT read once Plan 09 drops it. Pull the Auth0 id from the
+    // included User row instead (the join resolves on user_uuid, required:true
+    // guarantees membership.User exists) — this is the value that keys every
+    // AvailabilityResponse read/claim/create below.
+    const userId = membership.User.user_id;
 
     // Skip if already responded
     if (respondedUserIds.has(userId)) {

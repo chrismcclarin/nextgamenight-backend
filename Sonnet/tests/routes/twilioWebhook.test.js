@@ -71,6 +71,7 @@ const futureDate = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days fro
 const pastDate = new Date(Date.now() - 24 * 60 * 60 * 1000); // 1 day ago
 
 const mockUser = {
+  id: 'user-uuid-123', // Users.id (UUID) — EventRsvp is keyed on user_uuid (Phase 87.1)
   user_id: 'auth0|test-user-123',
   phone: '+15551234567',
   sms_enabled: true,
@@ -129,9 +130,13 @@ describe('Twilio Inbound SMS Webhook', () => {
     expect(mockEventRsvpCreate).toHaveBeenCalledWith(
       expect.objectContaining({
         event_id: 'event-uuid-1',
-        user_id: 'auth0|test-user-123',
+        user_uuid: 'user-uuid-123', // Phase 87.1 (Plan 09): create payload keyed on user_uuid = user.id
         status: 'yes',
       })
+    );
+    // Plan 09: the old Auth0-string user_id column was removed — it must NOT be written.
+    expect(mockEventRsvpCreate).not.toHaveBeenCalledWith(
+      expect.objectContaining({ user_id: expect.anything() })
     );
   });
 

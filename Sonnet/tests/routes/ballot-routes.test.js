@@ -292,7 +292,9 @@ describe('Phase 87 ballot integrity (DB-backed)', () => {
   // ---- (b) VOTE IDEMPOTENCY ----
   it('absorbs a concurrent duplicate vote: no 500 and exactly one vote row', async () => {
     const [option] = await seedOptions(2, creator);
-    await EventRsvp.create({ event_id: event.id, user_id: creator.user_id, status: 'yes' });
+    // Phase 87.1 (Plan 09): the cast-vote RSVP-eligibility gate keys user_uuid
+    // (Users.id) — the old Auth0-string user_id column was removed from the model.
+    await EventRsvp.create({ event_id: event.id, user_uuid: creator.id, status: 'yes' });
 
     // Force the toggle-off lookup to see NO existing vote for BOTH concurrent
     // requests, so both take the create branch — the real concurrent-duplicate
@@ -312,7 +314,7 @@ describe('Phase 87 ballot integrity (DB-backed)', () => {
     expect(r2.body).toEqual({ voted: true });
 
     const votes = await EventBallotVote.findAll({
-      where: { option_id: option.id, user_id: creator.user_id },
+      where: { option_id: option.id, user_uuid: creator.id },
     });
     expect(votes).toHaveLength(1);
   });
@@ -364,7 +366,7 @@ describe('Phase 87 ballot integrity (DB-backed)', () => {
     // Remove the creator's membership — historical created_by must NOT grant
     // replace/wipe rights once they leave the group (EoP fix).
     await sequelize.models.UserGroup.destroy({
-      where: { user_id: creator.user_id, group_id: group.id },
+      where: { user_uuid: creator.id, group_id: group.id },
     });
 
     const res = await request(makeApp(creator))
@@ -413,5 +415,51 @@ describe('Phase 87 ballot integrity (DB-backed)', () => {
     // Every option row is born with a NON-NULL creator = the event creator, so
     // the "creator can replace/wipe" branch is live against the real FE path.
     expect(rows.every(o => o.created_by === owner.user_id)).toBe(true);
+  });
+
+  // ---- (e) Phase 87.1: cast-vote RSVP-eligibility gate + user_voted on the UUID keyspace ----
+  it('casts a vote when the RSVP is UUID-keyed ONLY, and user_voted reflects it behaviorally (D-11)', async () => {
+    const [optA, optB] = await seedOptions(2, creator);
+    // UUID-only RSVP: user_uuid is correct, user_id is a NON-matching sentinel so
+    // an Auth0-keyed gate would 403 — only a user_uuid-keyed gate can match. This
+    // survives Plan 09's UUID-only factory flip (a dual-write seed would mask an
+    // Auth0-keyed gate until then).
+    await EventRsvp.create({
+      event_id: event.id,
+      user_id: `auth0|uuid-only-sentinel-${Date.now()}`,
+      user_uuid: creator.id,
+      status: 'yes',
+    });
+
+    const app = makeApp(creator);
+    const voteRes = await request(app)
+      .post(`/api/ballot/${event.id}/vote`)
+      .send({ option_id: optA.id });
+    expect(voteRes.status).toBe(200);
+    expect(voteRes.body).toEqual({ voted: true });
+
+    // The vote row is keyed on user_uuid.
+    const voteRow = await EventBallotVote.findOne({
+      where: { option_id: optA.id, user_uuid: creator.id },
+    });
+    expect(voteRow).not.toBeNull();
+
+    // user_voted behavioral (not source-regex): GET the ballot as the voter.
+    const getRes = await request(app).get(`/api/ballot/${event.id}`);
+    expect(getRes.status).toBe(200);
+    const votedOpt = getRes.body.options.find(o => o.id === optA.id);
+    const notVotedOpt = getRes.body.options.find(o => o.id === optB.id);
+    expect(votedOpt.user_voted).toBe(true);   // voted option → true on the UUID keyspace
+    expect(notVotedOpt.user_voted).toBe(false); // non-voted option → false
+  });
+
+  it('fails a vote closed (not 500) when the caller cannot be resolved to a participant', async () => {
+    const [optA] = await seedOptions(2, creator);
+    const ghost = { user_id: 'auth0|ballot-ghost-no-users-row', email: 'ghost@example.com' };
+    const res = await request(makeApp(ghost))
+      .post(`/api/ballot/${event.id}/vote`)
+      .send({ option_id: optA.id });
+    expect(res.status).toBe(403);
+    expect(res.status).not.toBe(500);
   });
 });

@@ -48,8 +48,11 @@ describe('BSEC-01 Group invite_token defaultScope + stability', () => {
       name: 'Invite Test Group',
     });
 
+    // Phase 87.1 seed cutover: DUAL-WRITE user_uuid (Users.id) alongside the old
+    // Auth0-string user_id so the re-keyed UserGroup gates resolve post-Plan-09.
     await UserGroup.create({
-      user_id: owner.user_id, // Auth0 string — UserGroup.user_id is the Auth0 sub
+      user_id: owner.user_id, // Auth0 string (old keyspace)
+      user_uuid: owner.id,    // Users.id UUID (new keyspace)
       group_id: group.id,     // UUID — references Group.id
       role: 'owner',
       status: 'active',

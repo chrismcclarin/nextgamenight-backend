@@ -36,15 +36,15 @@ describe('Ballot Models', () => {
       expect(EventBallotVote).toBeDefined();
     });
 
-    it('should have required fields: id, option_id, user_id (STRING)', () => {
+    it('should have required fields: id, option_id, user_uuid (UUID)', () => {
       const EventBallotVote = require('../../models/EventBallotVote');
       const attrs = EventBallotVote.rawAttributes;
       expect(attrs.id).toBeDefined();
       expect(attrs.id.primaryKey).toBe(true);
       expect(attrs.option_id).toBeDefined();
       expect(attrs.option_id.allowNull).toBe(false);
-      expect(attrs.user_id).toBeDefined();
-      expect(attrs.user_id.allowNull).toBe(false);
+      expect(attrs.user_uuid).toBeDefined();
+      expect(attrs.user_uuid.allowNull).toBe(false);
     });
 
     it('should have ON DELETE CASCADE on option_id', () => {
@@ -53,11 +53,12 @@ describe('Ballot Models', () => {
       expect(attrs.option_id.onDelete).toBe('CASCADE');
     });
 
-    it('should use STRING type for user_id (Auth0 ID, not UUID)', () => {
+    it('should use UUID type for user_uuid (Users.id FK; Auth0-string user_id removed in phase 87.1)', () => {
       const EventBallotVote = require('../../models/EventBallotVote');
       const attrs = EventBallotVote.rawAttributes;
-      // Sequelize STRING type has key 'STRING'
-      expect(attrs.user_id.type.key).toBe('STRING');
+      // Phase 87.1 (BINT-02 Part B): votes are keyed by the internal UUID surrogate key.
+      expect(attrs.user_uuid.type.key).toBe('UUID');
+      expect(attrs.user_id).toBeUndefined();
     });
   });
 

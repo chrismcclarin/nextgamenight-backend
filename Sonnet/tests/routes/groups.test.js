@@ -114,10 +114,11 @@ describe('Group Routes', () => {
       expect(response.body.name).toBe('New Test Group');
       expect(response.body).toHaveProperty('group_id');
 
-      // Verify the creator was added to the group as owner (Auth0 string user_id)
+      // Verify the creator was added to the group as owner (keyed on user_uuid =
+      // Users.id UUID; the old Auth0-string user_id column was removed in Plan 09).
       const userGroup = await UserGroup.findOne({
         where: {
-          user_id: testUser1.user_id,
+          user_uuid: testUser1.id,
           group_id: response.body.id
         }
       });
@@ -151,10 +152,11 @@ describe('Group Routes', () => {
 
       expect(response.body.message).toBe('User added to group successfully');
 
-      // Verify the added user (Auth0 string user_id)
+      // Verify the added user (keyed on user_uuid = Users.id UUID; the old
+      // Auth0-string user_id column was removed in Plan 09).
       const userGroup = await UserGroup.findOne({
         where: {
-          user_id: testUser2.user_id,
+          user_uuid: testUser2.id,
           group_id: testGroup.id
         }
       });
@@ -218,6 +220,88 @@ describe('Group Routes', () => {
         .expect(403);
 
       expect(response.body.error).toContain('owners and admins');
+    });
+  });
+
+  // D-12 WIRE REGRESSION (W1, Phase 87.1): GET /:group_id/users (routes/groups.js:301)
+  // needs NO code change, but RESEARCH called for the shim to be pinned by a test.
+  // The group cutover (Task 2) moved every UserGroup gate onto user_uuid; this proves
+  // the roster wire contract — user_id serialized as the Auth0 sub STRING (the FE keys
+  // off it), NOT the internal Users.id UUID — survives that cutover unchanged.
+  describe('GET /api/groups/:group_id/users (D-12 roster wire shape)', () => {
+    const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+    it('serializes roster user_id as the Auth0 sub string, NOT a v4 UUID', async () => {
+      const authSub = 'google-oauth2|108246800000000000001';
+      const member = await makeUser({ user_id: authSub, username: 'd12rosteruser' });
+      const grp = await Group.create({ group_id: `d12-roster-${Date.now()}`, name: 'D12 Roster Group' });
+      // Active member → the member-caller branch returns the full group.Users roster.
+      await addToGroup(member, grp, 'owner');
+
+      const res = await request(makeApp(member))
+        .get(`/api/groups/${grp.id}/users`)
+        .expect(200);
+
+      expect(Array.isArray(res.body)).toBe(true);
+      const entry = res.body.find(u => u.username === 'd12rosteruser');
+      expect(entry).toBeDefined();
+      // D-12: the roster wire contract is the Auth0 STRING sub.
+      expect(entry.user_id).toBe(authSub);
+      expect(entry.user_id).not.toMatch(UUID_V4);
+      // The internal UUID PK is a SEPARATE field and IS a v4 UUID.
+      expect(entry.id).toMatch(UUID_V4);
+    });
+  });
+
+  // F2 (#1 + #5): join-by-token auto-provision must not trust an unverified token
+  // email and must not 500 on an email UNIQUE collision.
+  describe('POST /api/groups/join-by-token — auto-provision hardening (F2)', () => {
+    // Local app that injects the FULL req.user (makeApp only forwards user_id+email;
+    // these tests need email_verified too).
+    function makeTokenApp(actor) {
+      const app = express();
+      app.use(express.json());
+      app.use((req, _res, next) => { req.user = actor; next(); });
+      app.use('/api/groups', groupRoutes);
+      return app;
+    }
+
+    it('retries with the synthetic fallback when a VERIFIED token email collides with an existing user', async () => {
+      // An existing user already owns this email (Users.email is UNIQUE, notNull).
+      await makeUser({ user_id: 'auth0|f2-victim', username: 'f2victim', email: 'taken-f2@example.com' });
+      const grp = await Group.create({
+        group_id: `f2-collide-${Date.now()}`, name: 'F2 Collide',
+        invite_token: `tok-f2-collide-${Date.now()}`,
+      });
+
+      const newSub = 'auth0|f2-new-joiner';
+      const res = await request(makeTokenApp({ user_id: newSub, email: 'taken-f2@example.com', email_verified: true }))
+        .post('/api/groups/join-by-token')
+        .send({ token: grp.invite_token })
+        .expect(200);
+      expect(res.body.success).toBe(true);
+
+      // The first-time joiner provisioned with the SYNTHETIC fallback (sub sanitized),
+      // NOT the colliding verified email — and no raw 500 escaped.
+      const created = await User.scope('withContactInfo').findOne({ where: { user_id: newSub } });
+      expect(created).not.toBeNull();
+      expect(created.email).toBe('auth0-f2-new-joiner@auth0.local');
+      expect(await UserGroup.count({ where: { user_uuid: created.id, group_id: grp.id } })).toBe(1);
+    });
+
+    it('does NOT persist an UNVERIFIED token email — provisions with the synthetic fallback', async () => {
+      const grp = await Group.create({
+        group_id: `f2-unver-${Date.now()}`, name: 'F2 Unverified',
+        invite_token: `tok-f2-unver-${Date.now()}`,
+      });
+      const newSub = 'auth0|f2-unverified-joiner';
+      await request(makeTokenApp({ user_id: newSub, email: 'unverified-f2@example.com', email_verified: false }))
+        .post('/api/groups/join-by-token')
+        .send({ token: grp.invite_token })
+        .expect(200);
+
+      const created = await User.scope('withContactInfo').findOne({ where: { user_id: newSub } });
+      expect(created.email).toBe('auth0-f2-unverified-joiner@auth0.local');
     });
   });
 });

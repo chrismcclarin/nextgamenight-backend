@@ -62,8 +62,11 @@ async function seedActivePromptAndMember() {
     email_notifications_enabled: true,
   });
   const group = await Group.create({ name: 'Reminder Idem Group', group_id: 'reminder-idem-group-001' });
+  // Phase 87.1 seed cutover: DUAL-WRITE user_uuid (Users.id) alongside the old
+  // Auth0-string user_id so the re-keyed UserGroup queries resolve post-Plan-09.
   await UserGroup.create({
     user_id: USER_SUB,
+    user_uuid: user.id,
     group_id: group.id,
     role: 'member',
     status: 'active',

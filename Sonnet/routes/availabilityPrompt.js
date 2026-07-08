@@ -44,10 +44,17 @@ router.get('/prompts/:promptId/respondents', verifyAuth0Token, async (req, res) 
       return res.status(404).json({ error: 'Prompt not found' });
     }
 
-    // 2. Verify requester is a member of the group
-    const requesterGroup = await UserGroup.findOne({
-      where: { group_id: prompt.group_id, user_id: userId, status: 'active' }
-    });
+    // 2. Verify requester is a member of the group.
+    // D-11 (Phase 87.1, BINT-02): this direct UserGroup gate bypasses the central
+    // authorizationService, so it's cut over here. Resolve the caller's Auth0 sub
+    // to Users.id ONCE, then key the membership on user_uuid. A missing Users row
+    // fails closed (403) — never a raw 500 from an undefined where-value.
+    const requester = await User.findOne({ where: { user_id: userId } });
+    const requesterGroup = requester
+      ? await UserGroup.findOne({
+        where: { group_id: prompt.group_id, user_uuid: requester.id, status: 'active' }
+      })
+      : null;
 
     if (!requesterGroup) {
       return res.status(403).json({ error: 'You must be a member of this group' });
@@ -82,9 +89,16 @@ router.get('/prompts/:promptId/respondents', verifyAuth0Token, async (req, res) 
     const pollClosed = prompt.status === 'closed' || prompt.status === 'converted' ||
                        new Date(prompt.deadline) < new Date();
 
-    // 6. Build respondent list with visibility rules
+    // 6. Build respondent list with visibility rules.
+    // D-11 / T-87.1-13 (corrected): `member` is a UserGroup instance whose OLD
+    // user_id column is stripped in Plan 09 — reading `member.user_id` would then
+    // be undefined-SILENT (every respondent shows has_responded=false; FE self-row
+    // + remind buttons break). The AvailabilityResponse map stays Auth0-keyed, so
+    // read the member's Auth0 sub from the User include (member.User.user_id) for
+    // the response-map bridge, the visibility compare, AND the serialized wire field.
     const respondents = groupMembers.map(member => {
-      const response = responseMap.get(member.user_id);
+      const memberAuthSub = member.User?.user_id;
+      const response = responseMap.get(memberAuthSub);
       const hasResponded = !!response && response.submitted_at !== null;
 
       // Calculate slot count
@@ -101,10 +115,10 @@ router.get('/prompts/:promptId/respondents', verifyAuth0Token, async (req, res) 
                             pollClosed ||
                             userHasResponded ||
                             isAdmin ||
-                            member.user_id === userId;
+                            memberAuthSub === userId;
 
       return {
-        user_id: member.user_id,
+        user_id: memberAuthSub,
         username: member.User?.username || 'Unknown',
         has_responded: hasResponded,
         slot_count: showSlotCount ? slotCount : null,
@@ -154,10 +168,15 @@ router.post('/prompts/:promptId/remind/:userId', verifyAuth0Token, async (req, r
       return res.status(404).json({ error: 'Prompt not found' });
     }
 
-    // 2. Verify requester is admin/owner of the group
-    const userGroup = await UserGroup.findOne({
-      where: { group_id: prompt.group_id, user_id: userId, status: 'active' }
-    });
+    // 2. Verify requester is admin/owner of the group.
+    // D-11 (Phase 87.1): resolve the CALLER's Users.id once and key user_uuid.
+    // Fails closed (403) on a missing Users row.
+    const caller = await User.findOne({ where: { user_id: userId } });
+    const userGroup = caller
+      ? await UserGroup.findOne({
+        where: { group_id: prompt.group_id, user_uuid: caller.id, status: 'active' }
+      })
+      : null;
 
     if (!userGroup || !['owner', 'admin'].includes(userGroup.role)) {
       return res.status(403).json({ error: 'Only admins can send reminders' });
@@ -203,9 +222,16 @@ router.post('/prompts/:promptId/remind/:userId', verifyAuth0Token, async (req, r
       return res.status(404).json({ error: 'User not found' });
     }
 
-    // 7. Verify target user is in the group
+    // 7. Verify the TARGET user is in the group.
+    // T-87.1-19 (Phase 87.1): this checks the TARGET's membership (from
+    // req.params), NOT the caller's — the caller's admin gate is step 2 above.
+    // Keying this on the caller would tautologize the check (the caller already
+    // passed step 2), letting an admin remind ANY user platform-wide and create
+    // placeholder AvailabilityResponse rows for non-members. Key user_uuid on the
+    // TARGET's Users.id, reusing the targetUser fetched at step 6 (which already
+    // precedes and guards this check).
     const targetUserGroup = await UserGroup.findOne({
-      where: { group_id: prompt.group_id, user_id: targetUserId, status: 'active' }
+      where: { group_id: prompt.group_id, user_uuid: targetUser.id, status: 'active' }
     });
     if (!targetUserGroup) {
       return res.status(400).json({ error: 'User is not a member of this group' });
@@ -335,23 +361,25 @@ router.post('/prompts', verifyAuth0Token, async (req, res) => {
       return res.status(404).json({ error: 'Group not found' });
     }
 
+    // Phase 71.2 / D-SCHEMA-04: stamp the creator on manual polls. The frontend
+    // body cannot supply this field — it's derived server-side from the verified
+    // Auth0 sub via the User table (see threat T-71.2-05 in plan threat model).
+    // D-11 (Phase 87.1): resolve the caller ONCE up front — Users.id is reused for
+    // BOTH the membership gate (user_uuid) and created_by_user_id below.
+    const dbUser = await User.findOne({ where: { user_id: userId } });
+    if (!dbUser) {
+      return res.status(404).json({ error: 'User record not found' });
+    }
+
     // Phase 71.2 / D-CLOSE-06: any active group member can fire an availability
     // prompt — admin gate replaced with active-member gate. Pending and removed
-    // members still receive 403.
+    // members still receive 403. Keyed on the caller's user_uuid (D-11).
     const userGroup = await UserGroup.findOne({
-      where: { group_id, user_id: userId, status: 'active' }
+      where: { group_id, user_uuid: dbUser.id, status: 'active' }
     });
 
     if (!userGroup || userGroup.status !== 'active') {
       return res.status(403).json({ error: 'You must be an active group member to create a poll' });
-    }
-
-    // Phase 71.2 / D-SCHEMA-04: stamp the creator on manual polls. The frontend
-    // body cannot supply this field — it's derived server-side from the verified
-    // Auth0 sub via the User table (see threat T-71.2-05 in plan threat model).
-    const dbUser = await User.findOne({ where: { user_id: userId } });
-    if (!dbUser) {
-      return res.status(404).json({ error: 'User record not found' });
     }
 
     // Create the prompt. Wrap in try/catch on UniqueConstraintError so the
@@ -450,10 +478,15 @@ router.get('/groups/:groupId/prompts/active', verifyAuth0Token, async (req, res)
     const { groupId } = req.params;
     const userId = req.user.user_id; // auth0.js sets req.user.user_id = decoded.sub
 
-    // Verify requester is a member of the group
-    const userGroup = await UserGroup.findOne({
-      where: { group_id: groupId, user_id: userId, status: 'active' }
-    });
+    // Verify requester is a member of the group.
+    // D-11 (Phase 87.1): resolve the caller's Users.id once and key user_uuid;
+    // a missing Users row fails closed (403).
+    const caller = await User.findOne({ where: { user_id: userId } });
+    const userGroup = caller
+      ? await UserGroup.findOne({
+        where: { group_id: groupId, user_uuid: caller.id, status: 'active' }
+      })
+      : null;
     if (!userGroup) {
       return res.status(403).json({ error: 'You must be a member of this group' });
     }
@@ -522,8 +555,9 @@ router.patch('/availability-prompts/:id/close', verifyAuth0Token, async (req, re
     const dbUser = await User.findOne({ where: { user_id: userId } });
     if (!dbUser) return res.status(404).json({ error: 'User record not found' });
 
+    // D-11 (Phase 87.1): key the membership on the caller's user_uuid (Users.id).
     const userGroup = await UserGroup.findOne({
-      where: { user_id: userId, group_id: prompt.group_id, status: 'active' }
+      where: { user_uuid: dbUser.id, group_id: prompt.group_id, status: 'active' }
     });
 
     const isAdmin = !!userGroup && ['owner', 'admin'].includes(userGroup.role);
@@ -596,13 +630,18 @@ router.get('/groups/:groupId/prompts/open', verifyAuth0Token, async (req, res) =
     const { groupId } = req.params;
     const userId = req.user.user_id;
 
-    const userGroup = await UserGroup.findOne({
-      where: { group_id: groupId, user_id: userId, status: 'active' }
-    });
-    if (!userGroup) return res.status(403).json({ error: 'You must be a member of this group' });
-
+    // D-11 (Phase 87.1): this GET /prompts/open member gate was previously an
+    // UNADDRESSED direct UserGroup site (the first pass enumerated only 8 and
+    // missed it) — members would 403 from viewing open prompts once the column is
+    // re-keyed. Resolve the caller once (Users.id is reused for the can_close
+    // creator compare) and key the membership on user_uuid; fail closed (403).
     const dbUser = await User.findOne({ where: { user_id: userId } });
     if (!dbUser) return res.status(404).json({ error: 'User record not found' });
+
+    const userGroup = await UserGroup.findOne({
+      where: { group_id: groupId, user_uuid: dbUser.id, status: 'active' }
+    });
+    if (!userGroup) return res.status(403).json({ error: 'You must be a member of this group' });
     const isAdmin = ['owner', 'admin'].includes(userGroup.role);
 
     const prompts = await AvailabilityPrompt.findAll({
@@ -667,12 +706,16 @@ router.get('/prompts/:promptId/heatmap', verifyAuth0Token, async (req, res) => {
 
     // Authz — active group member is fine; the poll creator gets through even
     // if their UserGroup lapsed (consistent with the close-notification email
-    // recipient resolution).
-    const userGroup = await UserGroup.findOne({
-      where: { group_id: prompt.group_id, user_id: userId, status: 'active' }
-    });
+    // recipient resolution). D-11 (Phase 87.1): resolve the caller once and key
+    // the membership on user_uuid; the resolved dbUser is reused for the creator
+    // fallback. A missing Users row fails closed (403).
+    const dbUser = await User.findOne({ where: { user_id: userId } });
+    const userGroup = dbUser
+      ? await UserGroup.findOne({
+        where: { group_id: prompt.group_id, user_uuid: dbUser.id, status: 'active' }
+      })
+      : null;
     if (!userGroup) {
-      const dbUser = await User.findOne({ where: { user_id: userId } });
       if (!dbUser || dbUser.id !== prompt.created_by_user_id) {
         return res.status(403).json({ error: 'You must be a member of this group' });
       }

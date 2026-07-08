@@ -36,14 +36,13 @@ const {
 //
 // Scope: events where `start_date > NOW()` AND status IN ('scheduled', 'in_progress').
 //
-// FK type asymmetry (load-bearing — do NOT normalize):
-//   - EventParticipation.user_id  = UUID    (User.id)
-//   - EventRsvp.user_id           = STRING  (Auth0 user_id)
-//   - EventBring.user_id          = STRING  (Auth0 user_id)
-//   - EventBallotVote.user_id     = STRING  (Auth0 user_id) — joined to event
-//                                          via EventBallotOption.event_id
-// The asymmetry is required by email-link RSVP /respond, eventBrings my-brings
-// gates, and the game-only-participant flow (Phase 71.1). See
+// UNIFORM UUID KEYING (Phase 87.1, BINT-02 / D-01 / D-11): all four cascade
+// tables are now keyed on the Users.id UUID surrogate (`*.user_uuid`), resolved
+// ONCE from the leaving user's Users row before the cascade runs. The former FK
+// type asymmetry (EventParticipation on UUID; EventRsvp/EventBring/EventBallotVote
+// on the Auth0 STRING) is gone — every destroy below targets `user_uuid`, so a
+// single resolved UUID drives the whole cascade. EventBallotVote is still joined
+// to the event via EventBallotOption.event_id (option-keyed table). See
 // `.planning/phases/71.1-game-only-participant-read-access/71.1-01-SUMMARY.md`.
 //
 // Audit log: this helper deliberately does NOT write EventAuditLog
@@ -53,7 +52,6 @@ const {
 // welcome-back if the user later QR-rejoins a specific event — they left the
 // group, not any individual event explicitly.
 async function cascadeDeleteFutureEventDataOnLeaveGroup({
-  authUserId,
   userUuid,
   group_id,
   transaction,
@@ -79,16 +77,17 @@ async function cascadeDeleteFutureEventDataOnLeaveGroup({
   if (futureEvents.length === 0) return;
   const futureEventIds = futureEvents.map(e => e.id);
 
+  // D-11 uniform UUID keying: all four tables key on user_uuid (Users.id).
   await EventParticipation.destroy({
     where: { event_id: { [Op.in]: futureEventIds }, user_id: userUuid },
     transaction,
   });
   await EventRsvp.destroy({
-    where: { event_id: { [Op.in]: futureEventIds }, user_id: authUserId },
+    where: { event_id: { [Op.in]: futureEventIds }, user_uuid: userUuid },
     transaction,
   });
   await EventBring.destroy({
-    where: { event_id: { [Op.in]: futureEventIds }, user_id: authUserId },
+    where: { event_id: { [Op.in]: futureEventIds }, user_uuid: userUuid },
     transaction,
   });
 
@@ -103,7 +102,7 @@ async function cascadeDeleteFutureEventDataOnLeaveGroup({
     await EventBallotVote.destroy({
       where: {
         option_id: { [Op.in]: futureBallotOptions.map(o => o.id) },
-        user_id: authUserId,
+        user_uuid: userUuid,
       },
       transaction,
     });
@@ -172,8 +171,9 @@ router.get('/user/:user_id', async (req, res) => {
     }
     
     // Get all groups for this user using UserGroup join
+    // D-11: UserGroup is keyed on user_uuid (Users.id UUID), not the Auth0 string.
     const userGroups = await UserGroup.findAll({
-      where: { user_id: user.user_id, status: 'active' }, // Use user.user_id (Auth0 string) not user.id (UUID)
+      where: { user_uuid: user.id, status: 'active' },
       attributes: ['group_id']
     });
     
@@ -229,9 +229,10 @@ router.post('/', validateGroupCreate, async (req, res) => {
       group_id: `group_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
     });
     
-    // Creator is set as 'owner'
+    // Creator is set as 'owner'. Phase 87.1 (Plan 09 cutover): keyed on user_uuid
+    // (Users.id FK) — the old Auth0-string user_id column was removed from the model.
     await UserGroup.create({
-      user_id: user.user_id, // Use user.user_id (Auth0 string) not user.id (UUID)
+      user_uuid: user.id, // Users.id UUID (the join key)
       group_id: group.id,
       role: 'owner'
     });
@@ -401,20 +402,24 @@ router.post('/:group_id/users', async (req, res) => {
       return res.status(403).json({ error: 'Only owners and admins can add members to a group' });
     }
 
+    // V5: the client-supplied `user_id` (Auth0 string) is resolved to a Users row
+    // server-side here — never trusted directly as the UserGroup FK.
     const user = await User.findOne({ where: { user_id } });
     const group = await Group.findByPk(req.params.group_id);
 
     if (!user || !group) {
       return res.status(404).json({ error: 'User or Group not found' });
     }
-    
+
+    // D-11: key on user_uuid (Users.id). Phase 87.1 (Plan 09 cutover): the old
+    // Auth0-string user_id column was removed from the model.
     await UserGroup.findOrCreate({
       where: {
-        user_id: user.user_id, // Use user.user_id (Auth0 string) not user.id (UUID)
+        user_uuid: user.id,
         group_id: group.id
       },
       defaults: {
-        user_id: user.user_id, // Use user.user_id (Auth0 string) not user.id (UUID)
+        user_uuid: user.id, // Users.id UUID (the join key)
         group_id: group.id,
         role: 'member'
       }
@@ -460,9 +465,10 @@ router.put('/:group_id/users/:target_user_id/role', async (req, res) => {
       return res.status(404).json({ error: 'Target user not found' });
     }
     
+    // D-11: targetUser (resolved above from the Auth0-string param) keyed by user_uuid.
     const targetUserGroup = await UserGroup.findOne({
       where: {
-        user_id: targetUser.user_id, // Use targetUser.user_id (Auth0 string) not targetUser.id (UUID)
+        user_uuid: targetUser.id,
         group_id: group_id,
         status: 'active'
       }
@@ -615,9 +621,47 @@ router.post('/join-by-token', async (req, res) => {
       return res.status(404).json({ error: 'Invalid invite link' });
     }
 
+    // D-11: UserGroup is keyed on user_uuid (Users.id). Resolve the caller's Users
+    // row FIRST. A QR deep-link can be a brand-new user's very first API call, so
+    // auto-provision (mirrors the GET /user/:user_id auto-create) to preserve that
+    // flow rather than 404 a legitimate first-time joiner.
+    //
+    // Only persist the token's email if Auth0 has VERIFIED it. An unverified email in
+    // the token can be attacker-controlled — persisting it on a first-time row could
+    // claim another person's address or trip the Users.email UNIQUE constraint. When
+    // unverified, provision with a synthetic, collision-resistant fallback derived from
+    // the (sanitized) Auth0 sub.
+    const syntheticEmail = `${userId.replace(/[|:]/g, '-')}@auth0.local`;
+    const joinerEmail = req.user.email_verified === true && req.user.email
+      ? req.user.email
+      : syntheticEmail;
+    const joinerName = req.user.name || req.user.nickname || req.user.given_name
+      || req.user.email?.split('@')[0] || 'User';
+
+    let user;
+    try {
+      [user] = await User.findOrCreate({
+        where: { user_id: userId },
+        defaults: { user_id: userId, email: joinerEmail, username: joinerName },
+      });
+    } catch (error) {
+      // Email UNIQUE collision on a first-time create (the verified token email is
+      // already owned by another Users row). Retry with the synthetic fallback so a
+      // legitimate first-time joiner still provisions instead of hitting a raw 500 —
+      // mirrors the events.js auto-create fallback pattern.
+      if (error.name === 'SequelizeUniqueConstraintError') {
+        [user] = await User.findOrCreate({
+          where: { user_id: userId },
+          defaults: { user_id: userId, email: syntheticEmail, username: joinerName },
+        });
+      } else {
+        throw error;
+      }
+    }
+
     // Check for existing UserGroup
     const existingMembership = await UserGroup.findOne({
-      where: { user_id: userId, group_id: group.id },
+      where: { user_uuid: user.id, group_id: group.id },
     });
 
     if (existingMembership) {
@@ -637,8 +681,10 @@ router.post('/join-by-token', async (req, res) => {
     }
 
     // Create new membership -- CRITICAL: role is 'member' NOT 'pending' (QR invites bypass pending)
+    // Phase 87.1 (Plan 09 cutover): keyed on user_uuid — the old Auth0-string user_id
+    // column was removed from the model.
     await UserGroup.create({
-      user_id: userId,
+      user_uuid: user.id, // Users.id UUID (the join key)
       group_id: group.id,
       role: 'member',
       status: 'active',
@@ -711,10 +757,16 @@ router.post('/:group_id/users/:target_user_id/approve', async (req, res) => {
       return res.status(403).json({ error: 'Only owners and admins can approve members' });
     }
 
+    // V5 / D-11: resolve the client-supplied Auth0-string target to a Users row,
+    // then key UserGroup on user_uuid (never trust the raw param as the FK).
     const decodedTargetId = decodeURIComponent(target_user_id);
+    const targetUser = await User.findOne({ where: { user_id: decodedTargetId } });
+    if (!targetUser) {
+      return res.status(404).json({ error: 'Pending member not found' });
+    }
     const targetUserGroup = await UserGroup.findOne({
       where: {
-        user_id: decodedTargetId,
+        user_uuid: targetUser.id,
         group_id: group_id,
         status: 'active',
         role: 'pending',
@@ -745,10 +797,16 @@ router.post('/:group_id/users/:target_user_id/reject', async (req, res) => {
       return res.status(403).json({ error: 'Only owners and admins can reject members' });
     }
 
+    // V5 / D-11: resolve the client-supplied Auth0-string target to a Users row,
+    // then key UserGroup on user_uuid (never trust the raw param as the FK).
     const decodedTargetId = decodeURIComponent(target_user_id);
+    const targetUser = await User.findOne({ where: { user_id: decodedTargetId } });
+    if (!targetUser) {
+      return res.status(404).json({ error: 'Pending member not found' });
+    }
     const targetUserGroup = await UserGroup.findOne({
       where: {
-        user_id: decodedTargetId,
+        user_uuid: targetUser.id,
         group_id: group_id,
         status: 'active',
         role: 'pending',
@@ -774,9 +832,15 @@ router.post('/:group_id/leave', async (req, res) => {
     const userId = req.user.user_id;
     const { group_id } = req.params;
 
+    // D-11: resolve the caller's Users row ONCE; UserGroup is keyed on user_uuid.
+    const user = await User.findOne({ where: { user_id: userId } });
+    if (!user) {
+      return res.status(404).json({ error: 'You are not a member of this group' });
+    }
+
     const userGroup = await UserGroup.findOne({
       where: {
-        user_id: userId,
+        user_uuid: user.id,
         group_id: group_id,
         status: 'active',
       },
@@ -791,22 +855,14 @@ router.post('/:group_id/leave', async (req, res) => {
     }
 
     // Phase 71.1-02: atomic membership removal + future-event cascade.
-    // Resolve caller's User.id UUID inside the transaction so the cascade
-    // helper can target EventParticipation rows (UUID-keyed) correctly.
+    // The caller's Users.id UUID (resolved above) drives the now-uniform
+    // UUID-keyed cascade.
     await sequelize.transaction(async (t) => {
-      const callerRow = await User.findOne({
-        where: { user_id: userId },
-        attributes: ['id'],
+      await cascadeDeleteFutureEventDataOnLeaveGroup({
+        userUuid: user.id,
+        group_id,
         transaction: t,
       });
-      if (callerRow) {
-        await cascadeDeleteFutureEventDataOnLeaveGroup({
-          authUserId: userId,
-          userUuid: callerRow.id,
-          group_id,
-          transaction: t,
-        });
-      }
       await userGroup.destroy({ transaction: t });
     });
 
@@ -835,17 +891,27 @@ router.post('/:group_id/transfer-ownership', async (req, res) => {
       return res.status(400).json({ error: 'Cannot transfer ownership to yourself' });
     }
 
+    // D-11: resolve both parties' Users rows; UserGroup is keyed on user_uuid.
     // 3. Requester must be the current active owner
+    const requesterUser = await User.findOne({ where: { user_id: userId } });
+    if (!requesterUser) {
+      return res.status(403).json({ error: 'Only the group owner can transfer ownership' });
+    }
     const requesterUg = await UserGroup.findOne({
-      where: { user_id: userId, group_id, status: 'active' },
+      where: { user_uuid: requesterUser.id, group_id, status: 'active' },
     });
     if (!requesterUg || requesterUg.role !== 'owner') {
       return res.status(403).json({ error: 'Only the group owner can transfer ownership' });
     }
 
-    // 4. Target must be an active member (pending members are filtered out by status: 'active')
+    // 4. Target must be an active member (pending members are filtered out by status: 'active').
+    // V5: new_owner_user_id is a client-supplied Auth0 string — resolved server-side here.
+    const newOwnerUser = await User.findOne({ where: { user_id: new_owner_user_id } });
+    if (!newOwnerUser) {
+      return res.status(404).json({ error: 'Target user is not an active member of this group' });
+    }
     const targetUg = await UserGroup.findOne({
-      where: { user_id: new_owner_user_id, group_id, status: 'active' },
+      where: { user_uuid: newOwnerUser.id, group_id, status: 'active' },
     });
     if (!targetUg) {
       return res.status(404).json({ error: 'Target user is not an active member of this group' });
@@ -901,9 +967,10 @@ router.delete('/:group_id/users/:target_user_id', async (req, res) => {
       }
     }
     
+    // D-11: targetUser (resolved above from the Auth0-string param) keyed by user_uuid.
     const targetUserGroup = await UserGroup.findOne({
       where: {
-        user_id: targetUser.user_id, // Use targetUser.user_id (Auth0 string) not targetUser.id (UUID)
+        user_uuid: targetUser.id,
         group_id: group_id,
         status: 'active'
       }
@@ -914,11 +981,9 @@ router.delete('/:group_id/users/:target_user_id', async (req, res) => {
     }
 
     // Phase 71.1-02: atomic membership removal + future-event cascade.
-    // targetUser has both user_id (Auth0 string) and id (UUID) already loaded
-    // at line ~727, so no extra lookup is needed here.
+    // targetUser.id (Users.id UUID) drives the now-uniform UUID-keyed cascade.
     await sequelize.transaction(async (t) => {
       await cascadeDeleteFutureEventDataOnLeaveGroup({
-        authUserId: targetUser.user_id,
         userUuid: targetUser.id,
         group_id,
         transaction: t,
@@ -987,24 +1052,27 @@ router.get('/:group_id/library', async (req, res) => {
     }
 
     // 3. Get confirmed group members (exclude pending)
+    // D-11: UserGroup is keyed on user_uuid — select it directly (these ARE the
+    // Users.id UUIDs), so no Auth0-string bridge is needed and this survives the
+    // Plan 09 removal of the UserGroup.user_id column.
     const memberRecords = await UserGroup.findAll({
       where: {
         group_id,
         status: 'active',
         role: { [Op.in]: ['member', 'admin', 'owner'] },
       },
-      attributes: ['user_id'],
+      attributes: ['user_uuid'],
     });
 
-    const auth0Ids = memberRecords.map(m => m.user_id);
+    const memberUuids = memberRecords.map(m => m.user_uuid).filter(Boolean);
 
-    if (auth0Ids.length === 0) {
+    if (memberUuids.length === 0) {
       return res.json({ games: [], members: [] });
     }
 
-    // 4. Bridge Auth0 string IDs -> User UUIDs
+    // 4. Load the member Users directly by UUID.
     const users = await User.findAll({
-      where: { user_id: { [Op.in]: auth0Ids } },
+      where: { id: { [Op.in]: memberUuids } },
       attributes: ['id', 'user_id', 'username'],
     });
 

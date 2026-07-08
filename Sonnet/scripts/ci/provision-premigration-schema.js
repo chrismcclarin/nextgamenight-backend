@@ -1,0 +1,149 @@
+#!/usr/bin/env node
+'use strict';
+//
+// scripts/ci/provision-premigration-schema.js
+//
+// F8 (Phase 87.1 review, HIGH-2 option 3): provision a TRUE pre-migration schema so CI can
+// exercise the REAL sequelize-cli path (`npx sequelize-cli db:migrate`) for the 7 UUID
+// re-key migrations (20260703000001..07). The known local cli-migrations gap
+// (URL-only CLI config + a full-chain replay that collides on already-built tables) means
+// Railway pre-deploy would otherwise be the FIRST-EVER real CLI run of these migrations —
+// this script + the migrate-cli-replay CI job move that first real run into CI.
+//
+// It reuses the same pre-migration-shape technique as tests/migrations/rekey.test.js:
+//   run each migration's own down() (drops the *_uuid column + its FK + uuid indexes;
+//   Postgres auto-drops the sync-built dependent index/constraint objects), then re-add
+//   the legacy Auth0-string column(s) via raw SQL — because Plan 09 removed them from the
+//   models, sync() no longer builds them, so without this the migrations' backfill UPDATE
+//   / DROP-NOT-NULL steps (which reference the old column) would throw "column does not
+//   exist".
+//
+// MODES
+//   provision (default):
+//     1. sync-build the schema from the MODELS (POST-migration shape: *_uuid present,
+//        legacy string columns absent);
+//     2. transform the 7 re-keyed tables to TRUE pre-migration shape (down() + re-add
+//        legacy columns);
+//     3. seed SequelizeMeta with EVERY migration filename EXCEPT the 7 new 20260703* ones,
+//        so `db:migrate` runs ONLY those 7 (the ~53 older migrations assume an empty DB
+//        and are already satisfied by the sync-built schema — marking them applied skips
+//        them, avoiding the A5 "earliest migration assumes Users exists" collision).
+//   verify:
+//     assert SequelizeMeta now records all 7 of the 20260703* filenames (run AFTER
+//     `npx sequelize-cli db:migrate`).
+//
+// LOCAL PROOF (against the sandbox test DB):
+//   DATABASE_URL=postgres://... node scripts/ci/provision-premigration-schema.js provision
+//   DATABASE_URL=postgres://... npx sequelize-cli db:migrate
+//   DATABASE_URL=postgres://... node scripts/ci/provision-premigration-schema.js verify
+//
+// The CLI config (config/sequelize-cli.config.js) resolves DATABASE_URL via the same
+// precedence chain as the runtime, so all three commands hit the same DB.
+
+const fs = require('fs');
+const path = require('path');
+const { QueryTypes } = require('sequelize');
+const { sequelize } = require('../../models');
+
+const MIGRATIONS_DIR = path.resolve(__dirname, '..', '..', 'migrations');
+
+// The 7 UUID re-key migrations + the legacy Auth0-string column(s) each one replaced.
+// (Matches the rekey.test.js provisioning map; 000003/GroupInvite re-keys invited_by.)
+const REKEY = [
+  { file: '20260703000001-rekey-usergroup-user-uuid.js', table: 'UserGroups', legacy: ['user_id'] },
+  { file: '20260703000002-rekey-friendship-uuid.js', table: 'Friendships', legacy: ['requester_id', 'addressee_id'] },
+  { file: '20260703000003-rekey-groupinvite-invited-by-uuid.js', table: 'GroupInvites', legacy: ['invited_by'] },
+  { file: '20260703000004-rekey-eventrsvp-user-uuid.js', table: 'EventRsvps', legacy: ['user_id'] },
+  { file: '20260703000005-rekey-eventbring-user-uuid.js', table: 'EventBrings', legacy: ['user_id'] },
+  { file: '20260703000006-rekey-eventballotvote-user-uuid.js', table: 'EventBallotVotes', legacy: ['user_id'] },
+  { file: '20260703000007-rekey-sentnotification-user-uuid.js', table: 'SentNotifications', legacy: ['user_id'] },
+];
+const REKEY_FILES = new Set(REKEY.map((r) => r.file));
+
+async function provision() {
+  // Safety: sync({force:true}) DROPS every table. This script is CI/local-only and
+  // must NEVER touch a production DB. Refuse under NODE_ENV=production (mirrors the
+  // tests/globalSetup.js first guard); CI leaves NODE_ENV unset, local proof sets test.
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('refusing to provision: NODE_ENV=production (sync({force:true}) would drop every table)');
+  }
+
+  const qi = sequelize.getQueryInterface();
+
+  // (1) Build the current (POST-migration) schema from the models.
+  console.log('[premigration] sync({force:true}) — build POST-migration schema from models');
+  await sequelize.sync({ force: true });
+
+  // (2) Transform the 7 re-keyed tables to TRUE pre-migration shape.
+  for (const { file, table, legacy } of REKEY) {
+    const migration = require(path.join(MIGRATIONS_DIR, file));
+    await migration.down(qi); // drops *_uuid + FK + uuid indexes (Postgres auto-drops dependents)
+    for (const col of legacy) {
+      await sequelize.query(`ALTER TABLE "${table}" ADD COLUMN IF NOT EXISTS "${col}" VARCHAR`);
+    }
+    console.log(`[premigration] ${table}: down() + re-added legacy column(s) ${legacy.join(', ')}`);
+  }
+
+  // (3) Seed SequelizeMeta with every migration EXCEPT the 7 new ones.
+  await sequelize.query(
+    `CREATE TABLE IF NOT EXISTS "SequelizeMeta" (
+       "name" VARCHAR(255) NOT NULL,
+       CONSTRAINT "SequelizeMeta_pkey" PRIMARY KEY ("name")
+     )`
+  );
+  const allFiles = fs
+    .readdirSync(MIGRATIONS_DIR)
+    .filter((f) => f.endsWith('.js'))
+    .sort();
+  const toSeed = allFiles.filter((f) => !REKEY_FILES.has(f));
+  for (const name of toSeed) {
+    await sequelize.query(
+      `INSERT INTO "SequelizeMeta" ("name") VALUES (:name) ON CONFLICT ("name") DO NOTHING`,
+      { replacements: { name } }
+    );
+  }
+  console.log(
+    `[premigration] SequelizeMeta seeded with ${toSeed.length} pre-existing migration(s); ` +
+      `${REKEY_FILES.size} re-key migrations left UNAPPLIED for the CLI to run.`
+  );
+}
+
+async function verify() {
+  const rows = await sequelize.query(
+    `SELECT name FROM "SequelizeMeta" WHERE name IN (:names)`,
+    { replacements: { names: [...REKEY_FILES] }, type: QueryTypes.SELECT }
+  );
+  const found = new Set(rows.map((r) => r.name));
+  const missing = [...REKEY_FILES].filter((f) => !found.has(f));
+  if (missing.length) {
+    console.error(
+      `[premigration:verify] FAIL — ${missing.length} re-key migration(s) NOT recorded in ` +
+        `SequelizeMeta after db:migrate:\n  ${missing.join('\n  ')}`
+    );
+    process.exitCode = 1;
+    return;
+  }
+  console.log(
+    `[premigration:verify] OK — all ${REKEY_FILES.size} re-key migrations recorded in SequelizeMeta ` +
+      `(the sequelize-cli path applied and booked them).`
+  );
+}
+
+(async () => {
+  const mode = process.argv[2] || 'provision';
+  try {
+    if (mode === 'provision') {
+      await provision();
+    } else if (mode === 'verify') {
+      await verify();
+    } else {
+      console.error(`Unknown mode "${mode}" — use "provision" or "verify".`);
+      process.exitCode = 1;
+    }
+  } catch (err) {
+    console.error(`[premigration] ${mode} threw:`, err && err.message ? err.message : err);
+    process.exitCode = 1;
+  } finally {
+    await sequelize.close();
+  }
+})();

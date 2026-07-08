@@ -69,7 +69,10 @@ async function main() {
     }
     console.log(`[2] User ${authUserId}  →  User.id (UUID) = ${user.id}\n`);
 
-    const ug = await UserGroup.findOne({ where: { user_id: authUserId, group_id: groupId } });
+    // Phase 87.1 (BINT-02, Plan 09 cutover): UserGroup / EventRsvp / EventBring /
+    // EventBallotVote are keyed on the Users.id UUID (*_uuid columns); the old
+    // Auth0-string columns were removed from the models. Query by user.id (UUID).
+    const ug = await UserGroup.findOne({ where: { user_uuid: user.id, group_id: groupId } });
     console.log(`[3] UserGroup row for this user in this group:`);
     console.log(`    ${ug ? `EXISTS  status=${ug.status}  role=${ug.role}` : 'absent (user has left or was never a member)'}\n`);
 
@@ -86,20 +89,20 @@ async function main() {
     }
 
     const rsvp = await EventRsvp.findAll({
-      where: { event_id: { [Op.in]: allEventIds }, user_id: authUserId },
-      attributes: ['id', 'event_id', 'response'],
+      where: { event_id: { [Op.in]: allEventIds }, user_uuid: user.id },
+      attributes: ['id', 'event_id', 'status'],
     });
-    console.log(`\n[5] EventRsvp rows (Auth0-string-keyed, in this group):  ${rsvp.length}`);
+    console.log(`\n[5] EventRsvp rows (UUID-keyed, in this group):  ${rsvp.length}`);
     for (const r of rsvp) {
       const inFuture = futureEventIds.includes(r.event_id);
-      console.log(`    ${inFuture ? 'FUTURE' : 'past  '}  event=${r.event_id}  response=${r.response}`);
+      console.log(`    ${inFuture ? 'FUTURE' : 'past  '}  event=${r.event_id}  status=${r.status}`);
     }
 
     const brings = await EventBring.findAll({
-      where: { event_id: { [Op.in]: allEventIds }, user_id: authUserId },
+      where: { event_id: { [Op.in]: allEventIds }, user_uuid: user.id },
       attributes: ['id', 'event_id', 'game_id'],
     });
-    console.log(`\n[6] EventBring rows (Auth0-string-keyed, in this group):  ${brings.length}`);
+    console.log(`\n[6] EventBring rows (UUID-keyed, in this group):  ${brings.length}`);
     for (const r of brings) {
       const inFuture = futureEventIds.includes(r.event_id);
       console.log(`    ${inFuture ? 'FUTURE' : 'past  '}  event=${r.event_id}  game=${r.game_id}`);
@@ -111,10 +114,10 @@ async function main() {
     });
     const ballotOptionIds = ballotOptions.map((o) => o.id);
     const votes = ballotOptionIds.length === 0 ? [] : await EventBallotVote.findAll({
-      where: { option_id: { [Op.in]: ballotOptionIds }, user_id: authUserId },
+      where: { option_id: { [Op.in]: ballotOptionIds }, user_uuid: user.id },
       attributes: ['id', 'option_id'],
     });
-    console.log(`\n[7] EventBallotVote rows (Auth0-string-keyed, in this group):  ${votes.length}`);
+    console.log(`\n[7] EventBallotVote rows (UUID-keyed, in this group):  ${votes.length}`);
     for (const v of votes) {
       console.log(`    option=${v.option_id}`);
     }

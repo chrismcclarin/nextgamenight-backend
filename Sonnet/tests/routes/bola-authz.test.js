@@ -22,6 +22,7 @@ const { optionalAuth } = require('../../middleware/auth0');
 const {
   GameReview, User, Group, Game, UserGroup, Event, EventParticipation, Feedback, sequelize,
 } = require('../../models');
+const { makeUser, makeGroup, addToGroup } = require('../factories');
 
 // Build an app with a fixed stubbed actor mounted before the router under test.
 const appWith = (actor, mountPath, routes, { optional = false } = {}) => {
@@ -54,8 +55,11 @@ describe('BOLA cross-actor 403 regression (Plan 83-05)', () => {
     });
     group = await Group.create({ group_id: `bola-group-${ts}`, name: 'BOLA Group' });
     game = await Game.create({ name: `BOLA Game ${ts}`, is_custom: true });
-    // owner is an active member; attacker is NOT (Auth0-string user_id — matches isActiveMember).
-    await UserGroup.create({ user_id: owner.user_id, group_id: group.id, role: 'owner', status: 'active' });
+    // owner is an active member; attacker is NOT. Phase 87.1 D-11: the role gates
+    // resolve the caller to Users.id and query UserGroup.user_uuid, so the membership
+    // is seeded UUID-only on user_uuid (owner.id) — the old Auth0-string user_id column
+    // was removed from the model in Plan 09.
+    await UserGroup.create({ user_uuid: owner.id, group_id: group.id, role: 'owner', status: 'active' });
   });
 
   // ---- Test 1: gameReviews DELETE — cross-actor spoof → 403 (BE-100) ----------
@@ -152,7 +156,7 @@ describe('BOLA cross-actor 403 regression (Plan 83-05)', () => {
         .post(`/api/groups/${group.id}/users`)
         .send({ user_id: target.user_id });
       expect(res.status).toBe(403);
-      const membership = await UserGroup.findOne({ where: { user_id: target.user_id, group_id: group.id } });
+      const membership = await UserGroup.findOne({ where: { user_uuid: target.id, group_id: group.id } });
       expect(membership).toBeNull();
     });
 
@@ -165,9 +169,92 @@ describe('BOLA cross-actor 403 regression (Plan 83-05)', () => {
         .post(`/api/groups/${group.id}/users`)
         .send({ user_id: target.user_id });
       expect(res.status).toBe(200);
-      const membership = await UserGroup.findOne({ where: { user_id: target.user_id, group_id: group.id } });
+      const membership = await UserGroup.findOne({ where: { user_uuid: target.id, group_id: group.id } });
       expect(membership).not.toBeNull();
       expect(membership.role).toBe('member');
+    });
+  });
+});
+
+// Phase 87.1 (BINT-02, D-11): POSITIVE-and-negative gate regression for the group
+// role path after the UUID keyspace cutover. A negative-only suite would PASS even
+// if every legitimate owner/admin were wrongly 403'd (Pitfall 1) — so each gate has
+// a load-bearing POSITIVE assertion (the authorized actor SUCCEEDS) paired with a
+// NEGATIVE one (the unauthorized actor is denied). Seeds via the Plan 03 dual-write
+// factories so UserGroup.user_uuid is populated and the resolved-UUID gate can pass.
+describe('Group role-gate BOLA positive+negative (Phase 87.1 D-11)', () => {
+  let ownerU, memberU, outsiderU, grp;
+
+  // Global beforeEach TRUNCATEs all tables, so seed fresh per-test.
+  beforeEach(async () => {
+    ownerU = await makeUser();
+    memberU = await makeUser();
+    outsiderU = await makeUser(); // no UserGroup row — the unauthorized actor
+    grp = await makeGroup();
+    await addToGroup(ownerU, grp, 'owner');
+    await addToGroup(memberU, grp, 'member');
+  });
+
+  describe('PUT /:group_id/users/:target_user_id/role (owner-only)', () => {
+    it('POSITIVE: owner promotes a member → 200 and the role is updated', async () => {
+      const app = appWith({ user_id: ownerU.user_id }, '/api/groups', groupRoutes);
+      const res = await request(app)
+        .put(`/api/groups/${grp.id}/users/${memberU.user_id}/role`)
+        .send({ role: 'admin' });
+      expect(res.status).toBe(200);
+      const ug = await UserGroup.findOne({ where: { user_uuid: memberU.id, group_id: grp.id } });
+      expect(ug.role).toBe('admin');
+    });
+
+    it('NEGATIVE: a non-member cannot change roles → 403', async () => {
+      const app = appWith({ user_id: outsiderU.user_id }, '/api/groups', groupRoutes);
+      const res = await request(app)
+        .put(`/api/groups/${grp.id}/users/${memberU.user_id}/role`)
+        .send({ role: 'admin' });
+      expect(res.status).toBe(403);
+    });
+  });
+
+  describe('DELETE /:group_id/users/:target_user_id (owner/admin-only)', () => {
+    it('POSITIVE: owner removes a member → 200 and the membership is gone', async () => {
+      const app = appWith({ user_id: ownerU.user_id }, '/api/groups', groupRoutes);
+      const res = await request(app)
+        .delete(`/api/groups/${grp.id}/users/${memberU.user_id}`)
+        .send();
+      expect(res.status).toBe(200);
+      const ug = await UserGroup.findOne({ where: { user_uuid: memberU.id, group_id: grp.id } });
+      expect(ug).toBeNull();
+    });
+
+    it('NEGATIVE: a non-member cannot remove members → 403', async () => {
+      const app = appWith({ user_id: outsiderU.user_id }, '/api/groups', groupRoutes);
+      const res = await request(app)
+        .delete(`/api/groups/${grp.id}/users/${memberU.user_id}`)
+        .send();
+      expect(res.status).toBe(403);
+      // membership untouched
+      const ug = await UserGroup.findOne({ where: { user_uuid: memberU.id, group_id: grp.id } });
+      expect(ug).not.toBeNull();
+    });
+  });
+
+  describe('POST /:group_id/transfer-ownership (owner-only)', () => {
+    it('POSITIVE: owner transfers to a member → 200 and the member becomes owner', async () => {
+      const app = appWith({ user_id: ownerU.user_id }, '/api/groups', groupRoutes);
+      const res = await request(app)
+        .post(`/api/groups/${grp.id}/transfer-ownership`)
+        .send({ new_owner_user_id: memberU.user_id });
+      expect(res.status).toBe(200);
+      const newOwnerUg = await UserGroup.findOne({ where: { user_uuid: memberU.id, group_id: grp.id } });
+      expect(newOwnerUg.role).toBe('owner');
+    });
+
+    it('NEGATIVE: a non-owner member cannot transfer ownership → 403', async () => {
+      const app = appWith({ user_id: memberU.user_id }, '/api/groups', groupRoutes);
+      const res = await request(app)
+        .post(`/api/groups/${grp.id}/transfer-ownership`)
+        .send({ new_owner_user_id: ownerU.user_id });
+      expect(res.status).toBe(403);
     });
   });
 });

@@ -8,6 +8,7 @@ const {
   EventBallotVote,
   EventRsvp,
   Game,
+  User,
   sequelize,
 } = require('../models');
 const { validateBallotOptions, validateBallotVote } = require('../middleware/validators');
@@ -65,6 +66,16 @@ router.get('/:eventId', async (req, res) => {
   try {
     const { eventId } = req.params;
     const userId = req.user.user_id;
+
+    // Phase 87.1 (BINT-02, D-11): resolve the caller to Users.id once for the
+    // user_voted compute below (votes are keyed on user_uuid post-cutover). A
+    // null resolve leaves caller undefined → user_voted is false everywhere
+    // (fail-closed; canReadEventScopedSurface already gates access).
+    const caller = await User.findOne({
+      where: { user_id: userId },
+      attributes: ['id'],
+    });
+    const callerUuid = caller ? caller.id : null;
 
     // Find event with ballot options and votes
     const event = await Event.findByPk(eventId, {
@@ -166,7 +177,7 @@ router.get('/:eventId', async (req, res) => {
             game_name: opt.game_name,
             display_order: opt.display_order,
             vote_count: (opt.EventBallotVotes || []).length,
-            user_voted: (opt.EventBallotVotes || []).some(v => v.user_id === userId),
+            user_voted: (opt.EventBallotVotes || []).some(v => v.user_uuid === callerUuid),
           })),
         winner,
         needs_tie_break: needsTieBreak || (persistedNeedsTieBreak && !persistedNeedsFallbackPick),
@@ -186,7 +197,7 @@ router.get('/:eventId', async (req, res) => {
           game_id: opt.game_id,
           game_name: opt.game_name,
           display_order: opt.display_order,
-          user_voted: (opt.EventBallotVotes || []).some(v => v.user_id === userId),
+          user_voted: (opt.EventBallotVotes || []).some(v => v.user_uuid === callerUuid),
         })),
       winner,
     });
@@ -418,8 +429,24 @@ router.post('/:eventId/vote', validateBallotVote, async (req, res) => {
       });
     }
 
+    // Phase 87.1 (BINT-02, D-11): resolve the verified caller to Users.id ONCE and
+    // reuse it for the RSVP-eligibility gate AND the vote find/create below. Fail-
+    // closed with the existing participant 403 envelope (never a raw 500) if the
+    // caller has no Users row.
+    const caller = await User.findOne({
+      where: { user_id: userId },
+      attributes: ['id'],
+    });
+    if (!caller) {
+      return res.status(403).json({
+        error: 'Only event participants can vote on the ballot',
+      });
+    }
+
+    // Yes/Maybe RSVP-eligibility gate. Key on user_uuid — post-cutover EventRsvp
+    // rows carry only user_uuid, so an Auth0-keyed gate would 403 EVERY vote.
     const rsvp = await EventRsvp.findOne({
-      where: { event_id: eventId, user_id: userId },
+      where: { event_id: eventId, user_uuid: caller.id },
     });
     if (!rsvp || !['yes', 'maybe'].includes(rsvp.status)) {
       const currentStatus = rsvp?.status || 'not set';
@@ -436,9 +463,11 @@ router.post('/:eventId/vote', validateBallotVote, async (req, res) => {
       return res.status(404).json({ error: 'Ballot option not found for this event' });
     }
 
-    // Toggle vote: if exists, delete; if not, create
+    // Toggle vote: if exists, delete; if not, create. Phase 87.1 (D-11): key on
+    // user_uuid (Users.id) — the old Auth0-string user_id column was removed from
+    // the model in Plan 09.
     const existingVote = await EventBallotVote.findOne({
-      where: { option_id, user_id: userId },
+      where: { option_id, user_uuid: caller.id },
     });
 
     if (existingVote) {
@@ -446,11 +475,11 @@ router.post('/:eventId/vote', validateBallotVote, async (req, res) => {
       return res.json({ voted: false });
     }
 
-    // Phase 87 (T-87-03): absorb the (option_id, user_id) unique-constraint
+    // Phase 87 (T-87-03): absorb the (option_id, user_uuid) unique-constraint
     // race. A concurrent duplicate double-click already created the row → the
     // vote is idempotently "on"; return success instead of 500.
     try {
-      await EventBallotVote.create({ option_id, user_id: userId });
+      await EventBallotVote.create({ option_id, user_uuid: caller.id });
     } catch (voteErr) {
       if (voteErr instanceof UniqueConstraintError) {
         return res.json({ voted: true });

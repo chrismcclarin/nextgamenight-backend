@@ -17,11 +17,18 @@ const EventBring = sequelize.define('EventBring', {
     },
     onDelete: 'CASCADE',
   },
-  user_id: {
-    type: DataTypes.STRING,
+  user_uuid: {
+    // Phase 87.1 (BINT-02, D-02): protective FK to the Users UUID PK, ON DELETE CASCADE.
+    // Ships in BOTH this model (sync() builds the FK on the CI/test DB) AND migration
+    // 20260703000005 (prod via migrate:apply). Plan 09 cutover: the old Auth0-string
+    // `user_id` column has been removed from this model (D-08 static drop-safety proof;
+    // the physical DB column is retained as the D-07 rollback net and dropped in the
+    // D-08 follow-up PR). allowNull is now `false` — all writers key user_uuid, so the
+    // sync()-built test DB enforces NOT NULL to match the prod migration's SET NOT NULL.
+    type: DataTypes.UUID,
     allowNull: false,
-    // Auth0 string ID (e.g., "google-oauth2|107459289778553956693")
-    // NOT UUID -- matches EventRsvp, UserGroup pattern
+    references: { model: 'Users', key: 'id' },
+    onDelete: 'CASCADE',
   },
   game_id: {
     type: DataTypes.UUID,
@@ -39,10 +46,8 @@ const EventBring = sequelize.define('EventBring', {
       fields: ['event_id'],
     },
     {
-      fields: ['user_id'],
-    },
-    {
-      fields: ['event_id', 'user_id', 'game_id'],
+      // Phase 87.1 (T-87.1-01): one bring per user per game per event on the UUID key.
+      fields: ['event_id', 'user_uuid', 'game_id'],
       unique: true,
     },
   ],

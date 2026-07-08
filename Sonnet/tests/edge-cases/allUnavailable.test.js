@@ -55,19 +55,24 @@ describe('All-unavailable deadline processing', () => {
       })
     ]);
 
-    // Create UserGroup memberships
+    // Create UserGroup memberships.
+    // Phase 87.1 seed cutover: DUAL-WRITE user_uuid (Users.id) alongside the old
+    // Auth0-string user_id so the re-keyed UserGroup queries resolve post-Plan-09.
     await UserGroup.create({
       user_id: testUsers[0].user_id,
+      user_uuid: testUsers[0].id,
       group_id: testGroup.id,
       role: 'member'
     });
     await UserGroup.create({
       user_id: testUsers[1].user_id,
+      user_uuid: testUsers[1].id,
       group_id: testGroup.id,
       role: 'member'
     });
     await UserGroup.create({
       user_id: testUsers[2].user_id,
+      user_uuid: testUsers[2].id,
       group_id: testGroup.id,
       role: 'admin'
     });

@@ -34,7 +34,18 @@ router.get('/event/:event_id', verifyAuth0Token, async (req, res) => {
       ],
     });
 
-    return res.json(brings);
+    // D-12 wire shim: serialize each row's user_id from the included User.user_id
+    // (Auth0 sub) and strip the raw user_uuid so it never leaks on the wire.
+    const shaped = brings.map((b) => {
+      const json = b.toJSON();
+      // No `?? json.user_id` fallback — Plan 09 DROPPED the string column, so it is
+      // always undefined and would only mask a missing User include (loud if absent).
+      json.user_id = json.User?.user_id;
+      delete json.user_uuid;
+      return json;
+    });
+
+    return res.json(shaped);
   } catch (error) {
     console.error('Error fetching event brings:', error.message);
     return res.status(500).json({ error: error.message });
@@ -59,9 +70,19 @@ router.put('/event/:event_id/my-brings', verifyAuth0Token, async (req, res) => {
       return res.status(404).json({ error: 'Event not found' });
     }
 
-    // Verify user has RSVP 'yes' for this event
+    // Phase 87.1 (BINT-02, D-11): resolve the verified caller to Users.id ONCE and
+    // reuse it for every gate/write below (RSVP-yes gate, bring destroy/create, the
+    // transactional re-fetch). Fail-closed with the existing 404 envelope (never a
+    // raw 500) if the caller has no Users row.
+    const caller = await User.findOne({ where: { user_id: userId } });
+    if (!caller) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Verify user has RSVP 'yes' for this event. Key on user_uuid — post-cutover
+    // EventRsvp rows carry only user_uuid, so an Auth0-keyed gate would 403 EVERY PUT.
     const rsvp = await EventRsvp.findOne({
-      where: { event_id, user_id: userId, status: 'yes' },
+      where: { event_id, user_uuid: caller.id, status: 'yes' },
     });
     if (!rsvp) {
       return res.status(403).json({ error: 'Must RSVP yes to mark games to bring' });
@@ -69,19 +90,14 @@ router.put('/event/:event_id/my-brings', verifyAuth0Token, async (req, res) => {
 
     // If empty array, just clear all brings
     if (game_ids.length === 0) {
-      await EventBring.destroy({ where: { event_id, user_id: userId } });
+      await EventBring.destroy({ where: { event_id, user_uuid: caller.id } });
       return res.json([]);
     }
 
-    // Auth0->UUID bridge: find User record to get UUID for UserGame lookup
-    const user = await User.findOne({ where: { user_id: userId } });
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-
     // Verify ownership: UserGame.user_id is UUID (User.id), NOT Auth0 string
+    // (NON-SITE — already UUID-keyed, left unchanged).
     const ownedGames = await UserGame.findAll({
-      where: { user_id: user.id, game_id: game_ids },
+      where: { user_id: caller.id, game_id: game_ids },
       attributes: ['game_id'],
     });
     const ownedGameIds = ownedGames.map(ug => ug.game_id);
@@ -94,16 +110,20 @@ router.put('/event/:event_id/my-brings', verifyAuth0Token, async (req, res) => {
       });
     }
 
-    // Transaction: clear existing + bulk create new
+    // Transaction: clear existing + bulk create new. Phase 87.1 (D-11): key the
+    // destroy, the create, AND the transactional re-fetch READ on user_uuid — an
+    // Auth0-keyed re-fetch would return an empty body post-cutover (the UUID-keyed
+    // rows match nothing on the Auth0 keyspace). The old Auth0-string user_id column
+    // was removed from the model in Plan 09.
     const result = await sequelize.transaction(async (t) => {
       await EventBring.destroy({
-        where: { event_id, user_id: userId },
+        where: { event_id, user_uuid: caller.id },
         transaction: t,
       });
 
       const records = game_ids.map(game_id => ({
         event_id,
-        user_id: userId,
+        user_uuid: caller.id,
         game_id,
       }));
 
@@ -111,7 +131,7 @@ router.put('/event/:event_id/my-brings', verifyAuth0Token, async (req, res) => {
 
       // Re-fetch with includes
       return EventBring.findAll({
-        where: { event_id, user_id: userId },
+        where: { event_id, user_uuid: caller.id },
         include: [
           { model: Game, attributes: ['id', 'name', 'thumbnail_url'] },
         ],
@@ -120,7 +140,17 @@ router.put('/event/:event_id/my-brings', verifyAuth0Token, async (req, res) => {
       });
     });
 
-    return res.json(result);
+    // D-12 wire shim (write-path response): this endpoint is self-only, so every
+    // returned row belongs to the caller. Serialize user_id as the caller's Auth0
+    // sub and strip user_uuid so the raw UUID never leaks on the wire.
+    const shaped = result.map((r) => {
+      const json = r.toJSON();
+      json.user_id = userId;
+      delete json.user_uuid;
+      return json;
+    });
+
+    return res.json(shaped);
   } catch (error) {
     console.error('Error updating brings:', error.message);
     return res.status(500).json({ error: error.message });
@@ -138,8 +168,14 @@ router.delete('/:bring_id', verifyAuth0Token, async (req, res) => {
       return res.status(404).json({ error: 'Bring record not found' });
     }
 
-    // Only the owner can remove their own bring
-    if (bring.user_id !== userId) {
+    // Only the owner can remove their own bring. Phase 87.1 (D-11): resolve the
+    // verified caller to Users.id and compare user_uuid. Fail-closed: a null
+    // resolve (no Users row) is treated as non-owner → 403, never a raw 500.
+    const caller = await User.findOne({
+      where: { user_id: userId },
+      attributes: ['id'],
+    });
+    if (!caller || bring.user_uuid !== caller.id) {
       return res.status(403).json({ error: 'You can only remove your own brings' });
     }
 

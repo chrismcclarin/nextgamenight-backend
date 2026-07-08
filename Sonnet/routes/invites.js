@@ -40,13 +40,16 @@ async function acceptInviteTransactional(invite, user) {
     );
 
     // Write 2: create-or-find the membership row (transaction: t MANDATORY)
+    // D-11 (Phase 87.1, BINT-02): UserGroup is keyed on the Users.id UUID surrogate
+    // (user_uuid). Plan 09 cutover: the old Auth0-string user_id column was removed
+    // from the model.
     const [userGroup, created] = await UserGroup.findOrCreate({
       where: {
-        user_id: user.user_id,
+        user_uuid: user.id,
         group_id: invite.group_id,
       },
       defaults: {
-        user_id: user.user_id,
+        user_uuid: user.id,
         group_id: invite.group_id,
         role: 'member',
         status: 'active',
@@ -184,15 +187,26 @@ router.post(
         // 1) Gate on an ACCEPTED friendship between the requester and the
         //    target (bidirectional). This prevents using the endpoint as an
         //    email/membership oracle for arbitrary user_ids.
-        const friendship = await Friendship.findOne({
-          where: {
-            status: 'accepted',
-            [Op.or]: [
-              { requester_id: userId, addressee_id: friend_user_id },
-              { requester_id: friend_user_id, addressee_id: userId },
-            ],
-          },
-        });
+        //
+        // D-11 (Phase 87.1, BINT-02): Friendship is keyed on the Users.id UUID
+        // surrogate (requester_uuid/addressee_uuid). Resolve BOTH the caller and
+        // the friend-target Auth0 strings to Users.id before the gate — a UUID
+        // column compared against an Auth0 string is always-false, which would
+        // silently 403 every legitimate friend-invite. A missing Users row on
+        // either side fails closed (treated as "no friendship").
+        const callerUser = await User.findOne({ where: { user_id: userId } });
+        const friendUserRow = await User.findOne({ where: { user_id: friend_user_id } });
+        const friendship = callerUser && friendUserRow
+          ? await Friendship.findOne({
+            where: {
+              status: 'accepted',
+              [Op.or]: [
+                { requester_uuid: callerUser.id, addressee_uuid: friendUserRow.id },
+                { requester_uuid: friendUserRow.id, addressee_uuid: callerUser.id },
+              ],
+            },
+          })
+          : null;
 
         if (!friendship) {
           return res
@@ -268,7 +282,7 @@ router.post(
       if (existingUser) {
         const activeUserGroup = await UserGroup.findOne({
           where: {
-            user_id: existingUser.user_id,
+            user_uuid: existingUser.id,
             group_id,
             status: 'active',
           },
@@ -295,11 +309,19 @@ router.post(
       // Generate secure token
       const token = crypto.randomBytes(32).toString('hex');
 
+      // Resolve the caller's Users.id once for the invited_by_uuid surrogate.
+      // D-04 (Phase 87.1, BINT-02): invited_by_uuid is NULLABLE; the caller passed
+      // isOwnerOrAdmin above (which fails closed on a missing Users row) so callerRow
+      // is normally present, but fall back to null defensively rather than emit a raw
+      // 500. Plan 09 cutover: the old Auth0-string invited_by column was removed from
+      // the model — the invite is keyed solely on invited_by_uuid.
+      const callerRow = await User.findOne({ where: { user_id: userId } });
+
       // Create GroupInvite row
       const invite = await GroupInvite.create({
         group_id,
         invited_email: normalizedEmail,
-        invited_by: userId,
+        invited_by_uuid: callerRow ? callerRow.id : null,
         token,
         status: 'pending',
       });
@@ -308,11 +330,11 @@ router.post(
       if (existingUser) {
         const [userGroup, created] = await UserGroup.findOrCreate({
           where: {
-            user_id: existingUser.user_id,
+            user_uuid: existingUser.id,
             group_id,
           },
           defaults: {
-            user_id: existingUser.user_id,
+            user_uuid: existingUser.id,
             group_id,
             role: 'member',
             status: 'invited',
@@ -330,9 +352,8 @@ router.post(
       let emailSent = false;
       if (emailService.isConfigured()) {
         try {
-          // Get inviter info for the email
-          const inviter = await User.findOne({ where: { user_id: userId } });
-          const inviterName = inviter ? inviter.username : 'Someone';
+          // Get inviter info for the email (reuse the caller row resolved above)
+          const inviterName = callerRow ? callerRow.username : 'Someone';
 
           // Count active group members
           const memberCount = await UserGroup.count({
@@ -500,10 +521,11 @@ router.post('/:invite_id/decline', async (req, res) => {
     // Update invite status
     await invite.update({ status: 'declined' });
 
-    // If a UserGroup row exists with status 'invited', destroy it
+    // If a UserGroup row exists with status 'invited', destroy it (keyed on the
+    // Users.id UUID surrogate — D-11).
     await UserGroup.destroy({
       where: {
-        user_id: user.user_id,
+        user_uuid: user.id,
         group_id: invite.group_id,
         status: 'invited',
       },

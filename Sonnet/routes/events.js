@@ -104,11 +104,11 @@ const {
 // from an event (called from DELETE /:event_id/participations/:user_id and
 // from PUT /:id Edit Event for each diff'd-removed participant).
 //
-// :userUuid is the User.id UUID (matches EventParticipation.user_id). The
-// RSVP / EventBring / EventBallotVote tables are Auth0-string-keyed, so we
-// resolve the target's Auth0 string user_id via User.findByPk first. The
-// user_id type asymmetry is load-bearing — see services/authorizationService.js
-// and the Phase 71.1-01 SUMMARY.
+// :userUuid is the User.id UUID (matches EventParticipation.user_id). Phase 87.1
+// (BINT-02, D-11): the RSVP / EventBring / EventBallotVote tables are now keyed on
+// user_uuid (= User.id), so we destroy directly by userUuid — no Auth0-string
+// resolution needed. The existence guard is kept so a stale/deleted target is a
+// clean no-op.
 //
 // Caller is responsible for destroying the EventParticipation row itself and
 // for opening the surrounding transaction. This helper does NOT write the
@@ -117,18 +117,17 @@ const {
 // the EVT-08 silent-welcome-back contract from Phase 65-01.
 const cascadeRemoveUserFromEvent = async ({ event_id, userUuid, transaction }) => {
   const targetUser = await User.findByPk(userUuid, {
-    attributes: ['user_id'],
+    attributes: ['id'],
     transaction,
   });
   if (!targetUser) return;
-  const targetAuth0Id = targetUser.user_id;
 
   await EventRsvp.destroy({
-    where: { event_id, user_id: targetAuth0Id },
+    where: { event_id, user_uuid: userUuid },
     transaction,
   });
   await EventBring.destroy({
-    where: { event_id, user_id: targetAuth0Id },
+    where: { event_id, user_uuid: userUuid },
     transaction,
   });
   const ballotOptions = await EventBallotOption.findAll({
@@ -140,7 +139,7 @@ const cascadeRemoveUserFromEvent = async ({ event_id, userUuid, transaction }) =
     await EventBallotVote.destroy({
       where: {
         option_id: { [Op.in]: ballotOptions.map(o => o.id) },
-        user_id: targetAuth0Id,
+        user_uuid: userUuid,
       },
       transaction,
     });
@@ -260,9 +259,11 @@ router.get('/user/:user_id', requireParamMatchesToken('user_id'), async (req, re
       return res.status(404).json({ error: 'User not found' });
     }
     
-    // Get all groups the user belongs to
+    // Get all groups the user belongs to. Phase 87.1 (BINT-02, deferred from
+    // Plan 06): the subject user (URL param) is resolved above, so key the
+    // re-keyed UserGroup on user_uuid (Users.id), not the legacy Auth0 string.
     const userGroups = await UserGroup.findAll({
-      where: { user_id: user.user_id, status: 'active' }, // Use user.user_id (Auth0 string) not user.id (UUID)
+      where: { user_uuid: user.id, status: 'active' },
       attributes: ['group_id']
     });
 

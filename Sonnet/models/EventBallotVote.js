@@ -18,11 +18,18 @@ const EventBallotVote = sequelize.define('EventBallotVote', {
     },
     onDelete: 'CASCADE',
   },
-  user_id: {
-    type: DataTypes.STRING,
+  user_uuid: {
+    // Phase 87.1 (BINT-02, D-02): protective FK to the Users UUID PK, ON DELETE CASCADE.
+    // Ships in BOTH this model (sync() builds the FK on the CI/test DB) AND migration
+    // 20260703000006 (prod via migrate:apply). Plan 09 cutover: the old Auth0-string
+    // `user_id` column has been removed from this model (D-08 static drop-safety proof;
+    // the physical DB column is retained as the D-07 rollback net and dropped in the
+    // D-08 follow-up PR). allowNull is now `false` — all writers key user_uuid, so the
+    // sync()-built test DB enforces NOT NULL to match the prod migration's SET NOT NULL.
+    type: DataTypes.UUID,
     allowNull: false,
-    // Auth0 string ID (e.g., "google-oauth2|107459289778553956693")
-    // NOT UUID -- matches EventRsvp, UserGroup, MagicToken pattern
+    references: { model: 'Users', key: 'id' },
+    onDelete: 'CASCADE',
   },
 }, {
   timestamps: true,
@@ -31,11 +38,9 @@ const EventBallotVote = sequelize.define('EventBallotVote', {
       fields: ['option_id'],
     },
     {
-      fields: ['user_id'],
-    },
-    {
-      fields: ['option_id', 'user_id'],
-      unique: true, // one vote per option per user
+      // Phase 87.1 (T-87.1-01): one vote per option per user on the UUID key.
+      fields: ['option_id', 'user_uuid'],
+      unique: true,
     },
   ],
 });

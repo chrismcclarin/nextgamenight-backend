@@ -9,6 +9,7 @@
 // Works for both auto-prompts and manual polls. Errors per-recipient are
 // logged but do not stop the fanout.
 
+const { Op } = require('sequelize');
 const { UserGroup, User, Group, Game } = require('../models');
 const magicTokenService = require('./magicTokenService');
 const emailService = require('./emailService');
@@ -94,15 +95,24 @@ async function notifyMembersOfPrompt(prompt, { selectedMemberIds, tokenExpiryHou
     if (game) gameName = game.name;
   }
 
-  const membershipWhere = { group_id: prompt.group_id, status: 'active' };
+  // A1 (Phase 87.1, BINT-02): schedule.selected_member_ids stores Auth0 user_id
+  // STRINGS. Once Plan 09 re-keys UserGroup onto user_uuid, keying UserGroup.user_id
+  // with those strings silently matches NOBODY (the column is gone). Instead, keep
+  // UserGroup itself keyed on the group and scope the selected subset through the
+  // User include's user_id (still the Auth0 string) — so the filter stays on the
+  // keyspace the schedule actually stores.
+  const userInclude = {
+    model: User.scope('withContactInfo'),
+    required: true,
+  };
   if (Array.isArray(selectedMemberIds) && selectedMemberIds.length > 0) {
-    membershipWhere.user_id = selectedMemberIds;
+    userInclude.where = { user_id: { [Op.in]: selectedMemberIds } };
   }
   const memberships = await UserGroup.findAll({
-    where: membershipWhere,
+    where: { group_id: prompt.group_id, status: 'active' },
     // BSEC-01 (D-03): include the contact-info scope so user.email is present
     // for the invitation send loop; defaultScope would strip it (Pitfall 4).
-    include: [{ model: User.scope('withContactInfo'), required: true }],
+    include: [userInclude],
   });
 
   const weekDescription = prompt.week_identifier || 'this week';

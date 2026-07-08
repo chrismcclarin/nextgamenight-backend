@@ -524,3 +524,59 @@ describe('EventParticipation.user_id → Users.id FK (Phase 87 BINT-02)', () => 
     }
   });
 });
+
+// Phase 87.1 (BINT-02, Part B) — EventParticipation UUID consistency assertion.
+// EventParticipation was already re-keyed onto Users.id (UUID) with its protective
+// FK in Phase 87 Part A (migration 20260701000002). Plan 87.1-02's discretion
+// conclusion is that it needs NOTHING beyond a guarding assertion here — this suite
+// makes that conclusion executable so a future regression (a revert to the Auth0
+// string key, or a dropped FK) fails CI. NO change to models/EventParticipation.js
+// or routes/events.js accompanies this test.
+describe('EventParticipation UUID consistency (Phase 87.1 BINT-02, Part B — assertion only)', () => {
+  it('EventParticipations retains a user FK to Users.id (case-agnostic pg_constraint discovery)', async () => {
+    // Case-agnostic: the sync()-built CI DB names the FK "EventParticipations_user_id_fkey"
+    // (Sequelize preserves table case) while prod's migration uses the lowercase
+    // "eventparticipations_user_id_fkey". ILIKE + regclass + contype matches both — do NOT
+    // assert an exact conname.
+    const fks = await sequelize.query(
+      `SELECT conname FROM pg_constraint
+        WHERE conrelid = '"EventParticipations"'::regclass
+          AND contype = 'f'
+          AND conname ILIKE '%user_id%'`,
+      { type: QueryTypes.SELECT }
+    );
+    expect(fks.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('the events roster serializes participant user_id as a UUID (Users.id), not an Auth0 string', async () => {
+    const owner = await makeUser({ user_id: 'auth0|ep-consistency-owner', username: 'ep-consistency-owner' });
+    const group = await makeGroup({ group_id: 'group-ep-consistency', name: 'EP Consistency Group' });
+    await addToGroup(owner, group, 'owner');
+    const game = await Game.create({ name: 'EP Consistency Game', is_custom: true });
+    const event = await Event.create({
+      group_id: group.id,
+      game_id: game.id,
+      start_date: new Date(),
+      status: 'completed',
+    });
+    // EventParticipation.user_id is the UUID Users.id (Phase 87 Part A re-key).
+    await EventParticipation.create({
+      event_id: event.id,
+      user_id: owner.id,
+      score: 7,
+    });
+
+    const app = makeApp(owner);
+    const res = await request(app).get(`/api/events/${event.id}`);
+    expect(res.status).toBe(200);
+
+    // formatEventWithCustomParticipants returns the roster under EventParticipations
+    // with `user_id: ep.User?.id` (events.js:26) — i.e. the UUID PK, not the Auth0 string.
+    const roster = res.body.EventParticipations || [];
+    const mine = roster.find((p) => p.username === 'ep-consistency-owner');
+    expect(mine).toBeTruthy();
+    const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    expect(mine.user_id).toMatch(UUID_V4);
+    expect(mine.user_id).not.toMatch(/^(google-oauth2|auth0)\|/);
+  });
+});
