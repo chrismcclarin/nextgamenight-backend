@@ -2,6 +2,7 @@
 // Processes scheduled prompt sending jobs
 const { Worker } = require('bullmq');
 const Redis = require('ioredis');
+const { Op } = require('sequelize');
 const { AvailabilityPrompt, Group, GroupPromptSettings, UserGroup, User, Game } = require('../models');
 const magicTokenService = require('../services/magicTokenService');
 const emailService = require('../services/emailService');
@@ -65,7 +66,16 @@ function calculateDeadline(deadlineHours) {
   return new Date(Date.now() + deadlineHours * 60 * 60 * 1000);
 }
 
-const promptWorker = new Worker('prompts', async (job) => {
+/**
+ * Prompt job handler — extracted from the inline anonymous Worker callback so it
+ * is directly unit-testable against the real test DB (invokable without a live
+ * BullMQ/Redis runtime). Exported as `module.exports.processPromptJob`. This is
+ * the load-bearing surface for the A1 selected-member-subset proof (Pitfall 4):
+ * a mock could not catch a silent zero-match on the UserGroup→User join.
+ *
+ * @param {import('bullmq').Job} job
+ */
+async function processPromptJob(job) {
   const { groupId, settingsId, scheduleId, timezone, deadlineMinutes } = job.data;
   console.log(`[PromptWorker] Processing job for group ${groupId} schedule ${scheduleId || '(legacy)'}`);
 
@@ -157,18 +167,26 @@ const promptWorker = new Worker('prompts', async (job) => {
 
   // Get active group members. If the schedule targets a specific subset of
   // members (selected_member_ids), filter to those — otherwise email everyone.
-  const membershipWhere = { group_id: groupId, status: 'active' };
+  //
+  // A1 (Pitfall 4): selected_member_ids stores Auth0 user_id STRINGS (verified).
+  // UserGroup is now re-keyed onto the user_uuid UUID FK (Plan 03), so keying
+  // `UserGroup.user_id = selectedMemberIds` would silently match NOBODY once the
+  // old string column is dropped — selected-subset schedules would target zero
+  // members with no loud error. Scope the subset through the User include's
+  // Auth0-string `user_id` instead; the UserGroup→User join itself resolves on
+  // user_uuid (the flipped association), so the keyspaces never cross.
+  const userInclude = {
+    // BSEC-01 (D-03): withContactInfo — user.email is read in the prompt
+    // send loop; defaultScope would strip it and silently skip everyone.
+    model: User.scope('withContactInfo'),
+    required: true
+  };
   if (selectedMemberIds.length > 0) {
-    membershipWhere.user_id = selectedMemberIds;
+    userInclude.where = { user_id: { [Op.in]: selectedMemberIds } };
   }
   const memberships = await UserGroup.findAll({
-    where: membershipWhere,
-    include: [{
-      // BSEC-01 (D-03): withContactInfo — user.email is read in the prompt
-      // send loop; defaultScope would strip it and silently skip everyone.
-      model: User.scope('withContactInfo'),
-      required: true
-    }]
+    where: { group_id: groupId, status: 'active' },
+    include: [userInclude]
   });
 
   const group = await Group.findByPk(groupId);
@@ -237,7 +255,9 @@ const promptWorker = new Worker('prompts', async (job) => {
 
   console.log(`[PromptWorker] Created prompt ${prompt.id}, sent ${emailsSent} emails`);
   return { promptId: prompt.id, recipientCount: emailsSent };
-}, {
+}
+
+const promptWorker = new Worker('prompts', processPromptJob, {
   connection,
   concurrency: 3 // Process up to 3 prompt jobs simultaneously
 });
@@ -268,3 +288,7 @@ promptWorker.on('completed', (job, result) => {
 
 module.exports = promptWorker;
 module.exports.handleJobFailed = handleJobFailed;
+// Exported for unit tests: the extracted handler is double-invokable without a
+// live BullMQ/Redis runtime so the A1 selected-member-subset bridge (Pitfall 4)
+// can be proven against the real test DB.
+module.exports.processPromptJob = processPromptJob;
