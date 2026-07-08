@@ -43,6 +43,7 @@ const rsvpRoutes = require('../../routes/rsvp');
 const { generateRsvpToken, mintRsvpBatch } = require('../../routes/rsvp');
 const {
   EventRsvp,
+  EventBring,
   Event,
   User,
   Group,
@@ -51,6 +52,7 @@ const {
   SingleUseToken,
   sequelize,
 } = require('../../models');
+const { makeUser, makeGroup, addToGroup, makeEventRsvp, makeEventBring } = require('../factories');
 
 // Shared actor ref: injected as req.user ahead of the router (mirrors the real
 // verifyAuth0Token middleware server.js mounts). Only the authenticated routes
@@ -236,7 +238,7 @@ describe('RSVP concurrent first-write idempotency (BINT-01 / T-87-06)', () => {
 
   beforeEach(async () => {
     currentActor = RACE_USER;
-    await User.create({ user_id: RACE_USER, username: 'RSVP Racer', email: 'race@test.com' });
+    const raceUser = await User.create({ user_id: RACE_USER, username: 'RSVP Racer', email: 'race@test.com' });
     raceGroup = await Group.create({ name: 'RSVP Race Group', group_id: 'rsvp-race-group-001' });
     raceGame = await Game.create({ name: 'Race Game' });
     raceEvent = await Event.create({
@@ -246,8 +248,11 @@ describe('RSVP concurrent first-write idempotency (BINT-01 / T-87-06)', () => {
       status: 'scheduled',
     });
     // Active membership so canReadEventScopedSurface (real, unmocked) authorizes.
+    // Phase 87.1: getUserRoleInGroup (Plan 04) queries UserGroup by user_uuid, so
+    // the seed MUST dual-write user_uuid or the surface gate 403s the POST.
     await UserGroup.create({
       user_id: RACE_USER,
+      user_uuid: raceUser.id,
       group_id: raceGroup.id,
       role: 'member',
       status: 'active',
@@ -288,5 +293,160 @@ describe('RSVP concurrent first-write idempotency (BINT-01 / T-87-06)', () => {
     });
     expect(rows).toHaveLength(1);
     expect(rows[0].status).toBe('yes');
+  });
+});
+
+// ============================================================================
+// Phase 87.1 (BINT-02, D-11/D-12): RSVP ownership gates + wire shims on the
+// UUID keyspace. Owners CAN act, non-owners CANNOT; responses serialize the
+// Auth0 sub (never a raw user_uuid); null caller / magic-link resolves fail
+// closed with the existing 403/404 envelope (never a raw 500); GET /respond
+// resolves the user BEFORE burning the single-use token.
+//
+// Run ALONE per the never-green-locally caveat:
+//   npm test -- tests/routes/rsvp.test.js
+// ============================================================================
+describe('RSVP UUID keyspace authz + wire (Phase 87.1)', () => {
+  let owner;
+  let other;
+  let group;
+  let game;
+  let event;
+
+  beforeEach(async () => {
+    owner = await makeUser({ username: 'rsvp-uuid-owner' });
+    other = await makeUser({ username: 'rsvp-uuid-other' });
+    group = await makeGroup({ name: 'RSVP UUID Group' });
+    game = await Game.create({ name: 'RSVP UUID Game', is_custom: true });
+    await addToGroup(owner, group, 'member');
+    await addToGroup(other, group, 'member');
+    event = await Event.create({
+      group_id: group.id,
+      game_id: game.id,
+      start_date: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+      status: 'scheduled',
+    });
+  });
+
+  afterEach(() => {
+    currentActor = null;
+    jest.restoreAllMocks();
+  });
+
+  it('DELETE: the RSVP owner can remove their own RSVP (UUID gate positive)', async () => {
+    const rsvp = await makeEventRsvp(event, owner, { status: 'yes' });
+    currentActor = owner.user_id;
+    const res = await request(app).delete(`/api/rsvp/${rsvp.id}`);
+    expect(res.status).toBe(200);
+    expect(await EventRsvp.findByPk(rsvp.id)).toBeNull();
+  });
+
+  it("DELETE: a non-owner cannot remove someone else's RSVP (UUID gate negative)", async () => {
+    const rsvp = await makeEventRsvp(event, owner, { status: 'yes' });
+    currentActor = other.user_id;
+    const res = await request(app).delete(`/api/rsvp/${rsvp.id}`);
+    expect(res.status).toBe(403);
+    expect(await EventRsvp.findByPk(rsvp.id)).not.toBeNull();
+  });
+
+  it('DELETE: an unresolvable caller fails closed with 403, not a 500', async () => {
+    const rsvp = await makeEventRsvp(event, owner, { status: 'yes' });
+    currentActor = 'auth0|ghost-no-users-row';
+    const res = await request(app).delete(`/api/rsvp/${rsvp.id}`);
+    expect(res.status).toBe(403);
+    expect(await EventRsvp.findByPk(rsvp.id)).not.toBeNull();
+  });
+
+  it('POST downgrade to no destroys the caller bring on the UUID keyspace (D-11)', async () => {
+    await makeEventRsvp(event, owner, { status: 'yes' });
+    const bring = await makeEventBring(event, owner, game);
+    currentActor = owner.user_id;
+    const res = await request(app)
+      .post('/api/rsvp')
+      .send({ event_id: event.id, status: 'no' });
+    expect([200, 201]).toContain(res.status);
+    // The bring commitment must be gone (Auth0-keyed destroy would leave it).
+    expect(await EventBring.findByPk(bring.id)).toBeNull();
+  });
+
+  it('POST response serializes user_id as the Auth0 sub, not a UUID (D-12)', async () => {
+    currentActor = owner.user_id;
+    const res = await request(app)
+      .post('/api/rsvp')
+      .send({ event_id: event.id, status: 'yes' });
+    expect([200, 201]).toContain(res.status);
+    expect(res.body.user_id).toBe(owner.user_id);
+    expect(res.body.user_uuid).toBeUndefined();
+  });
+
+  it('GET /event/:id list serializes each rsvp user_id as the Auth0 sub (D-12)', async () => {
+    await makeEventRsvp(event, owner, { status: 'yes' });
+    currentActor = owner.user_id;
+    const res = await request(app).get(`/api/rsvp/event/${event.id}`);
+    expect(res.status).toBe(200);
+    const row = res.body.rsvps.find((r) => r.id);
+    expect(row).toBeDefined();
+    expect(row.user_id).toBe(owner.user_id);
+    expect(row.user_uuid).toBeUndefined();
+  });
+
+  it('GET /user/:id returns a freshly UUID-keyed RSVP and serializes user_id as the Auth0 sub (D-12)', async () => {
+    // Seed UUID-keyed only: user_id is a non-matching sentinel so a query keyed
+    // on the Auth0 param would MISS — only a user_uuid-keyed query finds it.
+    const rsvp = await EventRsvp.create({
+      event_id: event.id,
+      user_id: `auth0|uuid-only-sentinel-${Date.now()}`,
+      user_uuid: owner.id,
+      status: 'yes',
+    });
+    currentActor = owner.user_id;
+    const res = await request(app).get(`/api/rsvp/user/${owner.user_id}`);
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body)).toBe(true);
+    const row = res.body.find((r) => r.id === rsvp.id);
+    expect(row).toBeDefined(); // proves the query keyed user_uuid, not the Auth0 param
+    expect(row.user_id).toBe(owner.user_id); // D-12: Auth0 sub, defined, not a UUID
+    expect(row.user_uuid).toBeUndefined();
+  });
+
+  it('GET /user/:id with an unresolvable caller returns an empty list (fail-closed, no 500)', async () => {
+    const ghost = 'auth0|ghost-no-users-row';
+    currentActor = ghost;
+    const res = await request(app).get(`/api/rsvp/user/${encodeURIComponent(ghost)}`);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual([]);
+  });
+
+  it('GET /respond writes an EventRsvp keyed by user_uuid for a seeded user', async () => {
+    await mintRsvpBatch(event.id, owner.user_id);
+    const token = generateRsvpToken(event.id, owner.user_id, 'yes');
+    const res = await request(app)
+      .get('/api/rsvp/respond')
+      .query({ token, e: event.id, u: owner.user_id, s: 'yes' });
+    expect(res.status).toBe(200);
+    const rsvp = await EventRsvp.findOne({
+      where: { event_id: event.id, user_uuid: owner.id },
+    });
+    expect(rsvp).not.toBeNull(); // proves the create wrote user_uuid
+    expect(rsvp.user_uuid).toBe(owner.id);
+  });
+
+  it('GET /respond resolves the user BEFORE consuming the token: a null resolve returns 403 and does NOT burn the token', async () => {
+    // Mint for a REAL user (SingleUseToken.user_id has a DB FK to Users.user_id,
+    // so a token cannot exist for a nonexistent sub). Then simulate the sub
+    // resolving to no Users row (e.g. account deleted mid-flight) by mocking the
+    // resolve — this asserts the ordering guarantee: resolve happens BEFORE the
+    // atomic consume, so a failed resolve never burns the single-use token.
+    await mintRsvpBatch(event.id, owner.user_id);
+    const token = generateRsvpToken(event.id, owner.user_id, 'yes');
+    jest.spyOn(User, 'findOne').mockResolvedValue(null);
+    const res = await request(app)
+      .get('/api/rsvp/respond')
+      .query({ token, e: event.id, u: owner.user_id, s: 'yes' });
+    expect(res.status).toBe(403);
+    expect(res.body.error).toBe('expired_link');
+    // The single-use token MUST survive the failed resolve (still active).
+    const row = await SingleUseToken.findOne({ where: { nonce: token } });
+    expect(row.status).toBe('active');
   });
 });
