@@ -60,6 +60,7 @@ describe('Leave-event cascade (Phase 71.1-02)', () => {
 
   let group;
   let game;
+  let ownerRow;
   let leaverRow;
   let bystanderRow;
   let event;
@@ -86,7 +87,7 @@ describe('Leave-event cascade (Phase 71.1-02)', () => {
   beforeEach(async () => {
     await clearAll();
 
-    await User.create(owner);
+    ownerRow = await User.create(owner);
     leaverRow = await User.create(leaver);
     bystanderRow = await User.create(bystander);
 
@@ -96,8 +97,10 @@ describe('Leave-event cascade (Phase 71.1-02)', () => {
     });
     game = await Game.create({ name: 'LeaveEvtCascadeGame', is_custom: true });
 
-    await UserGroup.create({ user_id: owner.user_id, group_id: group.id, status: 'active', role: 'owner' });
-    await UserGroup.create({ user_id: bystander.user_id, group_id: group.id, status: 'active', role: 'member' });
+    // Phase 87.1: getUserRoleInGroup (Plan 04) queries UserGroup by user_uuid, so
+    // owner-initiated authz needs the membership seeds to dual-write user_uuid.
+    await UserGroup.create({ user_id: owner.user_id, user_uuid: ownerRow.id, group_id: group.id, status: 'active', role: 'owner' });
+    await UserGroup.create({ user_id: bystander.user_id, user_uuid: bystanderRow.id, group_id: group.id, status: 'active', role: 'member' });
     // leaver is intentionally NOT a group member — game-only participant flow.
 
     event = await Event.create({
@@ -108,20 +111,22 @@ describe('Leave-event cascade (Phase 71.1-02)', () => {
       status: 'scheduled',
     });
 
-    // Seed leaver's per-event rows across all four cascade tables.
+    // Seed leaver's per-event rows across all four cascade tables. Phase 87.1:
+    // the cascade destroys key user_uuid, so dual-write it (= User.id) alongside
+    // the old Auth0-string user_id.
     await EventParticipation.create({ event_id: event.id, user_id: leaverRow.id, is_guest: true });
-    await EventRsvp.create({ event_id: event.id, user_id: leaver.user_id, status: 'yes' });
-    await EventBring.create({ event_id: event.id, user_id: leaver.user_id, game_id: game.id });
+    await EventRsvp.create({ event_id: event.id, user_id: leaver.user_id, user_uuid: leaverRow.id, status: 'yes' });
+    await EventBring.create({ event_id: event.id, user_id: leaver.user_id, user_uuid: leaverRow.id, game_id: game.id });
     ballotOption = await EventBallotOption.create({
       event_id: event.id, game_id: game.id, game_name: game.name, display_order: 0,
     });
-    await EventBallotVote.create({ option_id: ballotOption.id, user_id: leaver.user_id });
+    await EventBallotVote.create({ option_id: ballotOption.id, user_id: leaver.user_id, user_uuid: leaverRow.id });
 
     // Seed bystander rows on the same event — must NOT be touched.
     await EventParticipation.create({ event_id: event.id, user_id: bystanderRow.id });
-    await EventRsvp.create({ event_id: event.id, user_id: bystander.user_id, status: 'yes' });
-    await EventBring.create({ event_id: event.id, user_id: bystander.user_id, game_id: game.id });
-    await EventBallotVote.create({ option_id: ballotOption.id, user_id: bystander.user_id });
+    await EventRsvp.create({ event_id: event.id, user_id: bystander.user_id, user_uuid: bystanderRow.id, status: 'yes' });
+    await EventBring.create({ event_id: event.id, user_id: bystander.user_id, user_uuid: bystanderRow.id, game_id: game.id });
+    await EventBallotVote.create({ option_id: ballotOption.id, user_id: bystander.user_id, user_uuid: bystanderRow.id });
   });
 
   it('cascades the leaving user’s RSVP / EventBring / EventBallotVote rows on the event (self-leave)', async () => {

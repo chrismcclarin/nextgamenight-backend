@@ -285,9 +285,11 @@ router.post('/twilio/sms', smsInboundLimiter, twilioWebhookValidation, async (re
       return res.type('text/xml').send(twiml.toString());
     }
 
-    // 4. RSVP upsert (matching existing pattern from routes/rsvp.js)
+    // 4. RSVP upsert (matching existing pattern from routes/rsvp.js).
+    // Phase 87.1 (BINT-02, D-11): the user is already resolved (via phone) above,
+    // so key EventRsvp on user_uuid; dual-write the old Auth0 user_id until Plan 09.
     const existing = await EventRsvp.findOne({
-      where: { event_id: notification.Event.id, user_id: user.user_id },
+      where: { event_id: notification.Event.id, user_uuid: user.id },
     });
 
     if (existing) {
@@ -296,6 +298,7 @@ router.post('/twilio/sms', smsInboundLimiter, twilioWebhookValidation, async (re
       await EventRsvp.create({
         event_id: notification.Event.id,
         user_id: user.user_id,
+        user_uuid: user.id,
         status: parsed.status,
       });
     }
