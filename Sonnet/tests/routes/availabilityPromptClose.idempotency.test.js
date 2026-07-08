@@ -69,8 +69,11 @@ async function seedClosablePrompt() {
     email_notifications_enabled: true,
   });
   const group = await Group.create({ name: 'PATCH Close Group', group_id: 'patch-close-group-001' });
+  // Phase 87.1 seed cutover: DUAL-WRITE user_uuid (Users.id) so the re-keyed PATCH
+  // close admin gate (user_uuid) resolves — not just the isCreator fallback.
   await UserGroup.create({
     user_id: ACTOR,
+    user_uuid: owner.id,
     group_id: group.id,
     role: 'owner',
     status: 'active',

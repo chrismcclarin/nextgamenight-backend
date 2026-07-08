@@ -166,3 +166,120 @@ describe('POST /api/prompts/:promptId/remind/:userId — concurrent-duplicate ab
     expect(raceRow.update.mock.calls[0][0]).toHaveProperty('last_reminded_at');
   });
 });
+
+// Phase 87.1 / Plan 07 (D-11, T-87.1-13 corrected): the respondents endpoint reads
+// the member's Auth0 sub from the User include (member.User.user_id) for the
+// serialized wire field AND the AvailabilityResponse-map bridge — NOT off the
+// UserGroup instance, whose user_id column Plan 09 strips (an undefined-SILENT read
+// that would make every respondent show has_responded=false and break FE self-row /
+// remind buttons). This real-DB test pins the seam BEFORE Plan 09 lands.
+describe('GET /api/prompts/:promptId/respondents — Auth0-sub wire field + response bridge (87.1 D-11)', () => {
+  let owner;
+  let responder;
+  let nonResponder;
+  let group;
+  let prompt;
+
+  beforeEach(async () => {
+    owner = await makeUser({ username: 'respondents-owner' });
+    responder = await makeUser({ username: 'respondents-responder' });
+    nonResponder = await makeUser({ username: 'respondents-nonresponder' });
+    group = await makeGroup({ name: 'Respondents Wire Group' });
+    await addToGroup(owner, group, 'owner');
+    await addToGroup(responder, group, 'member');
+    await addToGroup(nonResponder, group, 'member');
+
+    prompt = await AvailabilityPrompt.create({
+      group_id: group.id,
+      prompt_date: new Date(),
+      deadline: new Date(Date.now() + 72 * 60 * 60 * 1000),
+      status: 'active',
+      week_identifier: '2026-W28',
+    });
+
+    // Only `responder` submits — AvailabilityResponse stays Auth0-keyed.
+    await AvailabilityResponse.create({
+      prompt_id: prompt.id,
+      user_id: responder.user_id,
+      user_timezone: 'UTC',
+      time_slots: [{ start: '2026-07-10T18:00:00Z', end: '2026-07-10T21:00:00Z', preference: 'preferred' }],
+      submitted_at: new Date(),
+    });
+  });
+
+  it('serializes each respondent with the Auth0-sub user_id and bridges has_responded correctly', async () => {
+    const res = await request(makeApp(owner))
+      .get(`/api/prompts/${prompt.id}/respondents`)
+      .send();
+
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body)).toBe(true);
+
+    const responderEntry = res.body.find((r) => r.user_id === responder.user_id);
+    const nonResponderEntry = res.body.find((r) => r.user_id === nonResponder.user_id);
+
+    // Wire field carries the Auth0 sub (NOT the Users.id UUID, NOT undefined).
+    expect(responderEntry).toBeDefined();
+    expect(responderEntry.user_id).toBe(responder.user_id);
+    // Bridge into the Auth0-keyed AvailabilityResponse map resolved correctly.
+    expect(responderEntry.has_responded).toBe(true);
+
+    // The non-responder bridges to has_responded=false (would ALSO be false if the
+    // bridge regressed to an undefined UserGroup instance read — so the responder
+    // assertion above is the load-bearing one).
+    expect(nonResponderEntry).toBeDefined();
+    expect(nonResponderEntry.user_id).toBe(nonResponder.user_id);
+    expect(nonResponderEntry.has_responded).toBe(false);
+  });
+});
+
+// Phase 87.1 / Plan 07 (T-87.1-19): the remind target-membership check (step 7)
+// must gate on the TARGET's membership, not the caller's. Keyed on the caller it
+// would fail GREEN (the caller already passed the step-2 admin gate), letting an
+// admin remind ANY user platform-wide and seed placeholder AvailabilityResponse
+// rows for non-members. This negative test proves the boundary is live: an admin
+// reminding a NON-member target gets 400, no email, no placeholder row.
+describe('POST /api/prompts/:promptId/remind/:userId — non-member target rejected (87.1 T-87.1-19)', () => {
+  let owner;
+  let outsider;
+  let group;
+  let prompt;
+
+  beforeEach(async () => {
+    owner = await makeUser({ username: 'remind-authz-owner' });
+    // `outsider` is a real User but is NOT added to the group.
+    outsider = await makeUser({ username: 'remind-authz-outsider' });
+    group = await makeGroup({ name: 'Remind Authz Group' });
+    await addToGroup(owner, group, 'owner');
+
+    prompt = await AvailabilityPrompt.create({
+      group_id: group.id,
+      prompt_date: new Date(),
+      deadline: new Date(Date.now() + 72 * 60 * 60 * 1000),
+      status: 'active',
+      week_identifier: '2026-W29',
+    });
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  it('an admin reminding a non-member target → 400, no reminder email, no AvailabilityResponse row', async () => {
+    const sendSpy = jest.spyOn(emailService, 'send').mockResolvedValue({ success: true });
+
+    const res = await request(makeApp(owner))
+      .post(`/api/prompts/${prompt.id}/remind/${encodeURIComponent(outsider.user_id)}`)
+      .send({});
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/not a member of this group/i);
+
+    // The check sits BEFORE the email + placeholder-create steps.
+    expect(sendSpy).not.toHaveBeenCalled();
+    const rowCount = await AvailabilityResponse.count({
+      where: { prompt_id: prompt.id, user_id: outsider.user_id },
+    });
+    expect(rowCount).toBe(0);
+  });
+});
