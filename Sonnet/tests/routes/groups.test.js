@@ -220,4 +220,34 @@ describe('Group Routes', () => {
       expect(response.body.error).toContain('owners and admins');
     });
   });
+
+  // D-12 WIRE REGRESSION (W1, Phase 87.1): GET /:group_id/users (routes/groups.js:301)
+  // needs NO code change, but RESEARCH called for the shim to be pinned by a test.
+  // The group cutover (Task 2) moved every UserGroup gate onto user_uuid; this proves
+  // the roster wire contract — user_id serialized as the Auth0 sub STRING (the FE keys
+  // off it), NOT the internal Users.id UUID — survives that cutover unchanged.
+  describe('GET /api/groups/:group_id/users (D-12 roster wire shape)', () => {
+    const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+    it('serializes roster user_id as the Auth0 sub string, NOT a v4 UUID', async () => {
+      const authSub = 'google-oauth2|108246800000000000001';
+      const member = await makeUser({ user_id: authSub, username: 'd12rosteruser' });
+      const grp = await Group.create({ group_id: `d12-roster-${Date.now()}`, name: 'D12 Roster Group' });
+      // Active member → the member-caller branch returns the full group.Users roster.
+      await addToGroup(member, grp, 'owner');
+
+      const res = await request(makeApp(member))
+        .get(`/api/groups/${grp.id}/users`)
+        .expect(200);
+
+      expect(Array.isArray(res.body)).toBe(true);
+      const entry = res.body.find(u => u.username === 'd12rosteruser');
+      expect(entry).toBeDefined();
+      // D-12: the roster wire contract is the Auth0 STRING sub.
+      expect(entry.user_id).toBe(authSub);
+      expect(entry.user_id).not.toMatch(UUID_V4);
+      // The internal UUID PK is a SEPARATE field and IS a v4 UUID.
+      expect(entry.id).toMatch(UUID_V4);
+    });
+  });
 });
