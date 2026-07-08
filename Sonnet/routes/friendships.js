@@ -271,10 +271,13 @@ router.post(
         );
       } catch (createErr) {
         if (createErr instanceof UniqueConstraintError) {
-          // Concurrent duplicate won the race — re-find and return the winner
-          // with a byte-identical response shape (a serialized Friendship row).
-          // The winner may be in EITHER direction, so serialize its Auth0
-          // strings from the included Requester/Addressee rows (D-12).
+          // Concurrent duplicate won the race — re-find and return the winner with a
+          // shape BYTE-IDENTICAL to the happy path (F5). The happy path serializes a
+          // create() row with NO includes, so re-find WITHOUT USER_INCLUDES (nested
+          // Requester/Addressee objects would otherwise leak on ONLY this path). Both
+          // Auth0 strings are already known (caller.user_id === userId,
+          // addresseeUser.user_id === addressee_user_id); the winner may be in EITHER
+          // direction, so map requester/addressee by which uuid landed in requester_uuid.
           const raceRow = await Friendship.findOne({
             where: {
               [Op.or]: [
@@ -282,10 +285,15 @@ router.post(
                 { requester_uuid: addresseeUser.id, addressee_uuid: caller.id },
               ],
             },
-            include: USER_INCLUDES,
           });
           if (raceRow) {
-            return res.status(201).json(toFriendshipWire(raceRow));
+            const callerIsRequester = raceRow.requester_uuid === caller.id;
+            return res.status(201).json(
+              toFriendshipWire(raceRow, {
+                requesterAuth0: callerIsRequester ? userId : addressee_user_id,
+                addresseeAuth0: callerIsRequester ? addressee_user_id : userId,
+              })
+            );
           }
           throw createErr; // Unexpected state — re-throw
         }
