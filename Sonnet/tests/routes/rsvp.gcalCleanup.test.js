@@ -148,11 +148,23 @@ beforeEach(() => {
   mockEventFindByPk.mockResolvedValue(buildFutureEvent());
   mockEventBringDestroy.mockResolvedValue(0);
   mockEventRsvpCreate.mockResolvedValue({ id: 'rsvp-uuid-new' });
+  // Phase 87.1: the POST re-fetch is a Sequelize instance (has toJSON) and the
+  // route serializes via the D-12 wire shim. Mirror that here.
   mockEventRsvpFindByPk.mockResolvedValue({
     id: 'rsvp-uuid-existing',
     event_id: TEST_EVENT_ID,
     user_id: TEST_USER_ID_AUTH0,
+    user_uuid: TEST_USER_ID_UUID,
     status: 'no',
+    toJSON() {
+      return {
+        id: this.id,
+        event_id: this.event_id,
+        user_id: this.user_id,
+        user_uuid: this.user_uuid,
+        status: this.status,
+      };
+    },
   });
   mockUserFindOne.mockResolvedValue({ id: TEST_USER_ID_UUID });
   mockEventParticipationFindOne.mockResolvedValue({
@@ -444,11 +456,15 @@ describe('DELETE /api/rsvp/:rsvp_id — Phase 75 / Plan 04 GCal cleanup dispatch
   // Helper: build a "loaded" RSVP row that the route will mutate.
   // Captures destroy() vs the helper invocation so Test 21 can prove timing.
   function buildLoadedRsvp(status, opts = {}) {
-    const { ownerAuth0Id = TEST_USER_ID_AUTH0 } = opts;
+    // Phase 87.1: the DELETE ownership gate compares rsvp.user_uuid vs the caller's
+    // resolved Users.id (mockUserFindOne → TEST_USER_ID_UUID). Owner rows carry that
+    // uuid; a non-owner row carries a different one.
+    const { ownerAuth0Id = TEST_USER_ID_AUTH0, ownerUuid = TEST_USER_ID_UUID } = opts;
     return {
       id: RSVP_ID,
       event_id: TEST_EVENT_ID,
       user_id: ownerAuth0Id,
+      user_uuid: ownerUuid,
       status,
       destroy: jest.fn(async function () {
         callOrder.push('rsvp.destroy');
@@ -551,9 +567,13 @@ describe('DELETE /api/rsvp/:rsvp_id — Phase 75 / Plan 04 GCal cleanup dispatch
   });
 
   test('Test 19: DELETE 403 (non-owner) → returns 403 and does NOT call helper', async () => {
-    // RSVP is owned by a different Auth0 user than the request actor.
+    // RSVP is owned by a different user than the request actor (different
+    // user_uuid → the UUID ownership gate 403s).
     mockEventRsvpFindByPk.mockResolvedValueOnce(
-      buildLoadedRsvp('yes', { ownerAuth0Id: 'auth0|some-other-user' })
+      buildLoadedRsvp('yes', {
+        ownerAuth0Id: 'auth0|some-other-user',
+        ownerUuid: 'ffffffff-ffff-ffff-ffff-ffffffffffff',
+      })
     );
 
     const res = await request(app).delete(`/api/rsvp/${RSVP_ID}`);
