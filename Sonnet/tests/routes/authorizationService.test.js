@@ -19,6 +19,7 @@ jest.mock('../../models', () => ({
 
 const { UserGroup, EventParticipation, Event, User } = require('../../models');
 const {
+  getUserRoleInGroup,
   isEventParticipant,
   canReadEventScopedSurface,
   stripMemberPII,
@@ -29,6 +30,43 @@ beforeEach(() => {
   EventParticipation.findOne.mockReset();
   Event.findByPk.mockReset();
   User.findOne.mockReset();
+});
+
+describe('getUserRoleInGroup (D-11 central funnel)', () => {
+  it('POSITIVE: resolves a seeded owner to role "owner" (funnel is not always-null)', async () => {
+    // Regression guard for the always-false UUID-vs-Auth0-string compare: with
+    // the fix, an owner's Auth0 id resolves to a Users row, then UserGroup keyed
+    // on user_uuid returns the owner membership.
+    User.findOne.mockResolvedValue({ id: 'owner-uuid', user_id: 'auth0|owner' });
+    UserGroup.findOne.mockResolvedValue({ role: 'owner', user_uuid: 'owner-uuid', group_id: 'group-1' });
+
+    const role = await getUserRoleInGroup('auth0|owner', 'group-1');
+    expect(role).toBe('owner');
+
+    // Resolves the Users row by Auth0 string FIRST...
+    expect(User.findOne).toHaveBeenCalledWith({ where: { user_id: 'auth0|owner' } });
+    // ...then queries UserGroup by the resolved user_uuid — NEVER the Auth0 string.
+    expect(UserGroup.findOne).toHaveBeenCalledWith({
+      where: { user_uuid: 'owner-uuid', group_id: 'group-1', status: 'active' },
+    });
+  });
+
+  it('fail-closed: returns null when the caller has no Users row', async () => {
+    User.findOne.mockResolvedValue(null);
+
+    const role = await getUserRoleInGroup('auth0|ghost', 'group-1');
+    expect(role).toBeNull();
+    // Must NOT fall through to a UserGroup query with an unresolved caller.
+    expect(UserGroup.findOne).not.toHaveBeenCalled();
+  });
+
+  it('returns null when the caller has a Users row but no active membership', async () => {
+    User.findOne.mockResolvedValue({ id: 'user-uuid', user_id: 'auth0|abc' });
+    UserGroup.findOne.mockResolvedValue(null);
+
+    const role = await getUserRoleInGroup('auth0|abc', 'group-1');
+    expect(role).toBeNull();
+  });
 });
 
 describe('isEventParticipant', () => {
@@ -117,13 +155,19 @@ describe('canReadEventScopedSurface', () => {
   it('returns allowed=true scope=group-member when caller is active group member', async () => {
     const event = { id: 'event-1', group_id: 'group-1' };
     Event.findByPk.mockResolvedValue(event);
+    // D-11: getUserRoleInGroup now resolves the caller's Users row FIRST, then
+    // queries UserGroup by user_uuid. Mock both hops.
+    User.findOne.mockResolvedValue({ id: 'user-uuid-1', user_id: 'auth0|abc' });
     // isActiveMember resolves to true (UserGroup row exists with status=active)
-    UserGroup.findOne.mockResolvedValue({ role: 'member', user_id: 'auth0|abc', group_id: 'group-1' });
+    UserGroup.findOne.mockResolvedValue({ role: 'member', user_uuid: 'user-uuid-1', group_id: 'group-1' });
 
     const result = await canReadEventScopedSurface('auth0|abc', 'event-1');
     expect(result).toEqual({ allowed: true, scope: 'group-member', event });
+    // getUserRoleInGroup keys UserGroup on the resolved user_uuid, never the Auth0 string.
+    expect(UserGroup.findOne).toHaveBeenCalledWith({
+      where: { user_uuid: 'user-uuid-1', group_id: 'group-1', status: 'active' },
+    });
     // Should not have fallen through to the event-participant check.
-    expect(User.findOne).not.toHaveBeenCalled();
     expect(EventParticipation.findOne).not.toHaveBeenCalled();
   });
 

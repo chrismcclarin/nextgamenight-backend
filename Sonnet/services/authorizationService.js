@@ -17,17 +17,27 @@ const ROLE_HIERARCHY = {
 
 /**
  * Get a user's role in a group.
- * Uses the "direct" pattern: queries UserGroup directly with the Auth0 user_id string.
- * No User table lookup is needed because UserGroup.user_id IS the Auth0 string.
+ *
+ * D-11 (Phase 87.1, BINT-02): UserGroup is now keyed on `user_uuid` (the Users.id
+ * UUID surrogate), NOT the Auth0 string. The caller's Auth0 id MUST be resolved to
+ * the Users row ONCE before querying — comparing a UUID column against an Auth0
+ * string is always-false, which would silently 403 every legitimate owner/admin/
+ * member. This is the CENTRAL funnel behind isOwner/isActiveMember/
+ * isMemberOrHigher/isOwnerOrAdmin, so this single resolution covers all of them.
+ *
+ * Fail-closed: returns null when the caller has no Users row (same defensive
+ * pattern as isEventParticipant below).
  *
  * @param {string} auth0UserId - Auth0 user ID string (e.g. "google-oauth2|123")
  * @param {string} groupId - Group UUID
  * @returns {Promise<string|null>} Role string ('owner', 'admin', 'member') or null
  */
 const getUserRoleInGroup = async (auth0UserId, groupId) => {
+  const user = await User.findOne({ where: { user_id: auth0UserId } });
+  if (!user) return null; // fail-closed: no Users row → no role
   const userGroup = await UserGroup.findOne({
     where: {
-      user_id: auth0UserId,
+      user_uuid: user.id,
       group_id: groupId,
       status: 'active',
     },
