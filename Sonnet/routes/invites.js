@@ -40,13 +40,17 @@ async function acceptInviteTransactional(invite, user) {
     );
 
     // Write 2: create-or-find the membership row (transaction: t MANDATORY)
+    // D-11 (Phase 87.1, BINT-02): UserGroup is keyed on the Users.id UUID surrogate
+    // (user_uuid). Look up / create by user_uuid; the defaults DUAL-WRITE both the old
+    // Auth0-string user_id and the new user_uuid until Plan 09 drops the old column.
     const [userGroup, created] = await UserGroup.findOrCreate({
       where: {
-        user_id: user.user_id,
+        user_uuid: user.id,
         group_id: invite.group_id,
       },
       defaults: {
         user_id: user.user_id,
+        user_uuid: user.id,
         group_id: invite.group_id,
         role: 'member',
         status: 'active',
@@ -279,7 +283,7 @@ router.post(
       if (existingUser) {
         const activeUserGroup = await UserGroup.findOne({
           where: {
-            user_id: existingUser.user_id,
+            user_uuid: existingUser.id,
             group_id,
             status: 'active',
           },
@@ -306,11 +310,19 @@ router.post(
       // Generate secure token
       const token = crypto.randomBytes(32).toString('hex');
 
+      // Resolve the caller's Users.id once for the invited_by_uuid surrogate.
+      // D-04 (Phase 87.1, BINT-02): invited_by_uuid is NULLABLE; the caller passed
+      // isOwnerOrAdmin above (which fails closed on a missing Users row) so callerRow
+      // is normally present, but fall back to null defensively rather than emit a raw
+      // 500. The old Auth0-string invited_by is DUAL-WRITTEN until Plan 09.
+      const callerRow = await User.findOne({ where: { user_id: userId } });
+
       // Create GroupInvite row
       const invite = await GroupInvite.create({
         group_id,
         invited_email: normalizedEmail,
         invited_by: userId,
+        invited_by_uuid: callerRow ? callerRow.id : null,
         token,
         status: 'pending',
       });
@@ -319,11 +331,12 @@ router.post(
       if (existingUser) {
         const [userGroup, created] = await UserGroup.findOrCreate({
           where: {
-            user_id: existingUser.user_id,
+            user_uuid: existingUser.id,
             group_id,
           },
           defaults: {
             user_id: existingUser.user_id,
+            user_uuid: existingUser.id,
             group_id,
             role: 'member',
             status: 'invited',
@@ -341,9 +354,8 @@ router.post(
       let emailSent = false;
       if (emailService.isConfigured()) {
         try {
-          // Get inviter info for the email
-          const inviter = await User.findOne({ where: { user_id: userId } });
-          const inviterName = inviter ? inviter.username : 'Someone';
+          // Get inviter info for the email (reuse the caller row resolved above)
+          const inviterName = callerRow ? callerRow.username : 'Someone';
 
           // Count active group members
           const memberCount = await UserGroup.count({
@@ -511,10 +523,11 @@ router.post('/:invite_id/decline', async (req, res) => {
     // Update invite status
     await invite.update({ status: 'declined' });
 
-    // If a UserGroup row exists with status 'invited', destroy it
+    // If a UserGroup row exists with status 'invited', destroy it (keyed on the
+    // Users.id UUID surrogate — D-11).
     await UserGroup.destroy({
       where: {
-        user_id: user.user_id,
+        user_uuid: user.id,
         group_id: invite.group_id,
         status: 'invited',
       },

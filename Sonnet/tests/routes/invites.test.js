@@ -94,6 +94,11 @@ describe('POST /invites/send — friend_user_id path (83.2 INVITE-01)', () => {
     });
     expect(invite).not.toBeNull();
     expect(invite.invited_email.toLowerCase()).toBe(friend.email.toLowerCase());
+
+    // D-04 (Phase 87.1): the send-create records the caller's Users.id UUID in
+    // invited_by_uuid (dual-written alongside the old Auth0-string invited_by).
+    expect(invite.invited_by_uuid).toBe(owner.id);
+    expect(invite.invited_by).toBe(owner.user_id);
   });
 
   it('(a2) accepted friendship works when the FRIEND is the requester (bidirectional)', async () => {
@@ -570,5 +575,63 @@ describe('POST invite-accept — atomicity rollback on BOTH paths (87-02 BINT-01
       where: { user_id: invitee.user_id, group_id: group.id, status: 'active' },
     });
     expect(activeMembership).toBeNull();
+  });
+});
+
+// D-12 (Phase 87.1, BINT-02): GroupInvite carries NO raw invited_by wire shim —
+// only invited_by_name is serialized, resolved via the Inviter association which
+// Plan 03 re-keyed to invited_by_uuid (NOT invited_by → Users.user_id). This test
+// pins that the inviter name still resolves post-flip: the seeded invite carries
+// invited_by_uuid so the association join finds the inviter, and GET /pending
+// emits invited_by_name = the inviter's username.
+describe('GET /invites/pending — invited_by_name via the Inviter association (87.1 D-12)', () => {
+  let inviter;
+  let invitee;
+  let group;
+
+  beforeEach(async () => {
+    inviter = await User.create({
+      user_id: 'auth0|d12-inviter',
+      username: 'd12-inviter',
+      email: 'd12-inviter@example.com',
+    });
+
+    invitee = await User.create({
+      user_id: 'auth0|d12-invitee',
+      username: 'd12-invitee',
+      email: 'd12-invitee@example.com',
+    });
+
+    group = await Group.create({
+      group_id: 'd12-test-group',
+      name: 'D12 Test Group',
+    });
+
+    // Seed the invite with BOTH columns so the assertion stays valid before AND
+    // after the Plan 03 factory flip — the Inviter association is keyed on
+    // invited_by_uuid, so without it invited_by_name would degrade to 'Someone'.
+    await GroupInvite.create({
+      group_id: group.id,
+      invited_email: invitee.email.toLowerCase(),
+      invited_by: inviter.user_id,
+      invited_by_uuid: inviter.id,
+      token: 'd12-pending-token',
+      status: 'pending',
+    });
+
+    currentActor = invitee.user_id;
+  });
+
+  it('resolves invited_by_name from the Inviter association (invited_by_uuid → Users)', async () => {
+    const res = await request(app)
+      .get('/api/invites/pending')
+      .expect(200);
+
+    expect(Array.isArray(res.body)).toBe(true);
+    expect(res.body).toHaveLength(1);
+    expect(res.body[0].invited_by_name).toBe(inviter.username);
+    // D-12: no raw invited_by id leaks onto the wire.
+    expect(res.body[0]).not.toHaveProperty('invited_by');
+    expect(res.body[0]).not.toHaveProperty('invited_by_uuid');
   });
 });
