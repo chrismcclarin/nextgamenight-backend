@@ -449,7 +449,9 @@ describe('RSVP UUID keyspace authz + wire (Phase 87.1)', () => {
       .get('/api/rsvp/respond')
       .query({ token, e: event.id, u: owner.user_id, s: 'yes' });
     expect(res.status).toBe(403);
-    expect(res.body.error).toBe('expired_link');
+    // F4: the no-Users-row branch returns a DISTINCT, honest error code (the link is
+    // valid; the account just doesn't exist) — not the expired/replayed-link envelope.
+    expect(res.body.error).toBe('account_not_found');
     // The single-use token MUST survive the failed resolve (still active).
     const row = await SingleUseToken.findOne({ where: { nonce: token } });
     expect(row.status).toBe('active');

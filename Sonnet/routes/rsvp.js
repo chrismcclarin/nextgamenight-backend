@@ -216,17 +216,19 @@ router.get('/respond', async (req, res) => {
     // Phase 87.1 (BINT-02, D-11): resolve the magic-link Auth0 sub to a Users row
     // BEFORE consuming the single-use token. EventRsvp is keyed on user_uuid
     // post-cutover, so we need the Users.id. Resolving FIRST means a sub with no
-    // Users row returns the friendly expired_link 403 WITHOUT burning the token —
-    // the link must not be consumed by a failed resolve (it stays consumable once
-    // the account exists). Fail-closed with the existing 403 envelope, never a 500.
+    // Users row fails-closed WITHOUT burning the token — the link must not be
+    // consumed by a failed resolve (it stays consumable once the account exists).
+    // Fail-closed with a 403, never a 500. The message is DISTINCT from the
+    // expired/replayed-link envelope: a missing account is an honestly different
+    // condition (the link is valid, the account just doesn't exist yet).
     const magicLinkUser = await User.findOne({
       where: { user_id: userId },
       attributes: ['id'],
     });
     if (!magicLinkUser) {
       return res.status(403).json({
-        error: 'expired_link',
-        message: 'This RSVP link has expired or was already used. Open the event to RSVP.',
+        error: 'account_not_found',
+        message: 'We could not find your account — sign in and open the event to RSVP.',
       });
     }
 
