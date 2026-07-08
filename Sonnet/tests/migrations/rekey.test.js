@@ -108,6 +108,20 @@ async function rowCount(table, id) {
   return r.n;
 }
 
+/**
+ * Read a column's nullability from information_schema. Used to PROVE the expand
+ * migrations leave the new *_uuid columns NULLABLE post-up() — the DB-level
+ * SET NOT NULL is deliberately deferred to the D-08 follow-up migration (F1).
+ */
+async function columnIsNullable(table, col) {
+  const r = await selectOne(
+    `SELECT is_nullable FROM information_schema.columns
+      WHERE table_name = :table AND column_name = :col`,
+    { table, col }
+  );
+  return r ? r.is_nullable === 'YES' : null;
+}
+
 /** Capture console.log emitted while `fn` runs so we can assert on the migration's counts. */
 async function withLogCapture(fn) {
   const lines = [];
@@ -160,6 +174,8 @@ async function runCascadeScenario({ migration, table, uuidCol, matchedUser, seed
   // (a) backfill
   const m = await selectOne(`SELECT "${uuidCol}" AS v FROM "${table}" WHERE id = :id`, { id: matchedId });
   expect(m.v).toBe(matchedUser.id);
+  // (a2) *_uuid stays NULLABLE post-up() — DB-level SET NOT NULL ships in D-08 (F1).
+  expect(await columnIsNullable(table, uuidCol)).toBe(true);
   // (b) orphan DELETEd + logged count matches
   expect(await rowCount(table, orphanId)).toBe(0);
   expect(deletedCount(logs)).toBe(1);
@@ -355,6 +371,9 @@ describe('Phase 87.1 UUID re-key migrations — backfill / orphan / idempotency'
       );
       expect(m.req).toBe(requester.id);
       expect(m.addr).toBe(addressee.id);
+      // both *_uuid columns stay NULLABLE post-up() — DB-level SET NOT NULL ships in D-08 (F1).
+      expect(await columnIsNullable('Friendships', 'requester_uuid')).toBe(true);
+      expect(await columnIsNullable('Friendships', 'addressee_uuid')).toBe(true);
       // orphan-either: deleted, logged count matches
       expect(await rowCount('Friendships', orphanId)).toBe(0);
       expect(deletedCount(logs)).toBe(1);

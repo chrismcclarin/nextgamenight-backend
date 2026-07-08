@@ -18,7 +18,9 @@
 // PROD source (migrate:apply / SequelizeMeta); models/SentNotification.js is the
 // sync()-built test-DB source. Both carry the FK. The model column is
 // `allowNull: true` through waves 1-4 (nothing writes it until Plan 03's factory
-// dual-write + route cutovers); prod NOT NULL is enforced HERE via SET NOT NULL.
+// dual-write + route cutovers); Plan 09 tightens the model to allowNull: false
+// (app-level enforcement). The DB-level SET NOT NULL is DEFERRED to the D-08
+// follow-up migration (NOT enforced here) — see the step-(3) note below.
 //
 // This is the SIMPLEST table: it has NO unique constraint on the user column.
 //   The recreated index is a plain NON-unique (user_uuid, event_id) — audit lookup
@@ -72,11 +74,13 @@ module.exports = {
       const deleted = Array.isArray(orphans) ? orphans.length : 0;
       console.log(`[SENTNOTIF-UUID] orphaned rows deleted: ${deleted}`);
 
-      // (3) ENFORCE NOT NULL (prod authoritative constraint).
-      await sequelize.query(
-        `ALTER TABLE "SentNotifications" ALTER COLUMN user_uuid SET NOT NULL`,
-        { transaction: t }
-      );
+      // (3) DB-level SET NOT NULL on user_uuid is DELIBERATELY DEFERRED to the D-08
+      //     follow-up migration (see .planning/todos). Running it here (pre-deploy,
+      //     while old code that does NOT write user_uuid still serves traffic) would
+      //     500 every SentNotifications INSERT during the deploy window, and it breaks
+      //     the D-07 app-rollback net for writes. App-level NOT NULL is enforced by the
+      //     model's allowNull:false since Plan 09; the DB constraint ships in D-08
+      //     only after the cutover deploy is verified live.
 
       // (4) GUARDED FK ADD — idempotent via pg_constraint existence check.
       const existing = await sequelize.query(
