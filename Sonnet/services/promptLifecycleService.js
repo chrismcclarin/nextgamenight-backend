@@ -159,11 +159,13 @@ async function handlePromptClosed(prompt) {
         const ownerUg = await UserGroup.findOne({
           where: { group_id: prompt.group_id, role: 'owner', status: 'active' },
         });
-        if (ownerUg && ownerUg.user_id) {
-          // UserGroup.user_id is an Auth0 sub STRING, not a User.id UUID —
-          // look up by user_id, NOT findByPk.
+        if (ownerUg && ownerUg.user_uuid) {
+          // D-11 (Phase 87.1, BINT-02): UserGroup is re-keyed onto the Users.id UUID
+          // surrogate (user_uuid). Reading the OLD user_id here would be undefined
+          // after Plan 09 strips the column — a SILENT failure that skips the owner's
+          // close email. user_uuid IS Users.id, so resolve the owner via findByPk.
           // BSEC-01 (D-03): withContactInfo — recipient.email read below.
-          recipient = await User.scope('withContactInfo').findOne({ where: { user_id: ownerUg.user_id } });
+          recipient = await User.scope('withContactInfo').findByPk(ownerUg.user_uuid);
         }
       }
     }

@@ -110,8 +110,12 @@ class NotificationService {
     // Logging failure is non-fatal -- the notification was already sent.
     if (results.sms && results.sms.success && payload.eventId) {
       try {
+        // D-03 (Phase 87.1, BINT-02): SentNotification is re-keyed onto the Users.id
+        // UUID surrogate (user_uuid). DUAL-WRITE both the new user_uuid and the old
+        // Auth0-string user_id until Plan 09 drops the old column.
         await SentNotification.create({
           user_id: user.user_id,
+          user_uuid: user.id,
           event_id: payload.eventId,
           phone: user.phone,
           channel: 'sms',

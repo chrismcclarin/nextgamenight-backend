@@ -310,6 +310,53 @@ describe('notificationService', () => {
   });
 
   // =============================================
+  // SMS SentNotification logging — D-03 user_uuid (Phase 87.1)
+  // =============================================
+  describe('SMS SentNotification logging keys user_uuid (87.1 D-03)', () => {
+    // The outbound-SMS log row is re-keyed onto the Users.id UUID surrogate
+    // (user_uuid). Spy on the real model so we assert the write shape without a DB.
+    const { SentNotification } = require('../../models');
+    let createSpy;
+
+    beforeEach(() => {
+      jest.clearAllMocks();
+      createSpy = jest.spyOn(SentNotification, 'create').mockResolvedValue({ id: 'sent-1' });
+    });
+
+    afterEach(() => {
+      createSpy.mockRestore();
+    });
+
+    it('logs the SentNotification row on the Users.id UUID (user_uuid), dual-writing the Auth0 string', async () => {
+      const user = {
+        id: 'user-uuid-abc', // Users.id UUID → user_uuid
+        user_id: 'auth0|sms-user', // Auth0 string → user_id (dual-write)
+        email_notifications_enabled: false,
+        sms_enabled: true,
+        phone: '+14155559999',
+        phone_verified: true,
+        notification_preferences: { event_created: { sms: true } },
+      };
+      smsService.send.mockResolvedValue({ success: true, sid: 'SM_abc' });
+
+      await notificationService.send(user, 'event_created', {
+        data: { gameName: 'Catan' },
+        eventId: 'event-uuid-1',
+      });
+
+      expect(createSpy).toHaveBeenCalledTimes(1);
+      expect(createSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          user_uuid: 'user-uuid-abc',
+          user_id: 'auth0|sms-user',
+          event_id: 'event-uuid-1',
+          channel: 'sms',
+        })
+      );
+    });
+  });
+
+  // =============================================
   // sendToMany tests (Phase 50)
   // =============================================
   describe('sendToMany', () => {
