@@ -29,6 +29,9 @@ const EXPECTED_STATUS = {
   prompt_closed: 400,
   reminder_cooldown: 429,
   internal: 500,
+  // Phase 87.2 (account deletion): owner gate + tombstone codes.
+  owner_of_active_groups: 409,
+  account_deleted: 410,
 };
 
 describe('utils/errors — exports', () => {
