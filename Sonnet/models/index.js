@@ -29,6 +29,9 @@ const EventBallotVote = require('./EventBallotVote');
 const SentNotification = require('./SentNotification');
 const SchedulerRun = require('./SchedulerRun');
 const EventAuditLog = require('./EventAuditLog');
+// Phase 87.2 (REQ-6, D-08): durable Auth0-deletion marker. No associations — it
+// must outlive the deleted Users row, so it carries no FK to Users.
+const PendingAuth0Deletion = require('./PendingAuth0Deletion');
 const sequelize = require('../config/database');
 
 
@@ -248,5 +251,6 @@ module.exports = {
   SentNotification,
   SchedulerRun,
   EventAuditLog,
+  PendingAuth0Deletion,
   sequelize,
 };
