@@ -46,7 +46,6 @@ const {
   SingleUseToken,
   Feedback,
   EventBallotOption,
-  AvailabilitySuggestion,
   PendingAuth0Deletion,
   sequelize,
 } = require('../models');
