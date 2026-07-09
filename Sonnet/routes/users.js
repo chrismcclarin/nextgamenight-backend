@@ -1,12 +1,14 @@
 // routes/users.js
 const express = require('express');
-const { User, Group, UserGroup, sequelize } = require('../models');
+const { User, Group, UserGroup, PendingAuth0Deletion, sequelize } = require('../models');
 const router = express.Router();
 const { validateUserSearch } = require('../middleware/validators');
 const { writeOperationLimiter } = require('../middleware/rateLimiter');
 const { requireParamMatchesToken } = require('../middleware/objectAuth');
 const auth0Service = require('../services/auth0Service');
 const smsService = require('../services/smsService');
+const accountDeletionService = require('../services/accountDeletionService');
+const { sendError } = require('../utils/errors');
 
 // Sentry SDK is initialized in server.js when SENTRY_DSN is set. Use a defensive
 // require so dev / test envs without the DSN don't blow up — addBreadcrumb /
@@ -45,7 +47,15 @@ router.get('/search/email/:email', validateUserSearch, async (req, res) => {
           // Found in Auth0, safe to create user in our database
           const auth0User = auth0Users[0]; // Use first match
           const userDetails = auth0Service.extractUserDetails(auth0User);
-          
+
+          // SPEC Req 6 (tombstone guard): this is a THIRD-PARTY-triggered create keyed on
+          // the SEARCHED user's sub. If that sub was deleted (tombstone present, pending or
+          // completed, within the ~24h token-TTL retention window), a still-valid deletion
+          // must not let a third party re-materialize the deleted user's PII. Skip creation
+          // entirely and fall through to the normal DB-miss 404 below — leaking nothing.
+          if (await PendingAuth0Deletion.isTombstoned(userDetails.user_id)) {
+            // user stays null → returns the ordinary "User not found" 404.
+          } else {
           // Create user in our database (they exist in Auth0, so this is safe)
           const [newUser, created] = await User.findOrCreate({
             where: { user_id: userDetails.user_id },
@@ -65,6 +75,7 @@ router.get('/search/email/:email', validateUserSearch, async (req, res) => {
           }
           
           user = newUser;
+          } // end tombstone-guard else
         }
         // If not found in Auth0, user doesn't exist - return 404 (don't create from thin air)
       } catch (auth0Error) {
@@ -94,6 +105,81 @@ router.get('/search/email/:email', validateUserSearch, async (req, res) => {
     res.json(payload);
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Phase 87.2 (D-01) — self-serve account deletion HTTP surface.
+//
+// These two routes MUST be registered ABOVE the `/:user_id` param routes below
+// (Pitfall 7 defensive ordering): a bare `GET /:user_id` would otherwise swallow
+// a `/me` segment. Both handlers are THIN (D-01) — they resolve the caller from
+// req.user.user_id ONLY (never a param/body/query) and delegate to
+// accountDeletionService. No request shape can target another user (SPEC Req 1).
+// ---------------------------------------------------------------------------
+
+// Pre-flight: which owned groups (if any) block this caller's deletion?
+// Returns a raw 200 { groups: [{ id, name, memberCount }] } — success bodies are
+// plain JSON. The Phase 85 envelope is reserved for the DELETE error responses.
+router.get('/me/deletion-blockers', async (req, res) => {
+  try {
+    const sub = req.user && req.user.user_id;
+    if (!sub) {
+      return sendError(res, 'unauthorized');
+    }
+    // Resolve the caller's Users.id (UUID) — getDeletionBlockers keys on the UUID
+    // surrogate PK, not the Auth0 sub. A stale session whose row is already gone
+    // (still inside the token-TTL window) must return the 410 account_deleted
+    // envelope, NEVER a 500 from feeding a null row into getDeletionBlockers.
+    const user = await User.findOne({ where: { user_id: sub } });
+    if (!user) {
+      return sendError(res, 'account_deleted');
+    }
+    const groups = await accountDeletionService.getDeletionBlockers(user.id);
+    return res.json({ groups });
+  } catch (error) {
+    console.error('[users] deletion-blockers pre-flight failed:', error.message);
+    return sendError(res, 'internal');
+  }
+});
+
+// Authoritative self-delete. Behind writeOperationLimiter (per-route, matching the
+// PATCH /:user_id/timezone idiom) — the most destructive endpoint must not ship
+// unthrottled since every attempt drives shared Auth0 Management + Google quota.
+router.delete('/me', writeOperationLimiter, async (req, res) => {
+  try {
+    const sub = req.user && req.user.user_id;
+    if (!sub) {
+      return sendError(res, 'unauthorized');
+    }
+    // Delegate — the service resolves the caller from the sub ONLY. No param/body
+    // target is read here or there (SPEC Req 1 — cross-user delete is structurally
+    // impossible).
+    const result = await accountDeletionService.deleteAccount({ userId: sub });
+    if (result.status === 'blocked') {
+      // Owner gate rides the Phase 85 envelope @409 with details.groups (D-11) —
+      // NOT the legacy raw-403 groups.js shape. When the block fired at the
+      // IN-TXN re-check (after Google cleanup already ran), the service adds
+      // google_access_revoked: true — a pinned FE contract key — so the user can
+      // be told to reconnect Google Calendar. Absent on the pre-flight block.
+      const details = { groups: result.groups };
+      if (result.google_access_revoked) {
+        details.google_access_revoked = true;
+      }
+      return sendError(res, 'owner_of_active_groups', details);
+    }
+    if (result.status === 'not_found') {
+      // Repeat DELETE inside the retention window → HTTP 410 with code
+      // account_deleted on the envelope. Never a bare 401 (a still-valid token must
+      // not be bounced by a generic auth guard) and never a raw non-envelope 410
+      // (the FE maps a raw 410 to 'unknown' and default-retries it).
+      return sendError(res, 'account_deleted');
+    }
+    // status === 'deleted'
+    return res.json({ message: 'Your account and associated data have been deleted.' });
+  } catch (error) {
+    console.error('[users] account deletion failed:', error.message);
+    return sendError(res, 'internal');
   }
 });
 
@@ -148,15 +234,30 @@ router.get('/:user_id', requireParamMatchesToken('user_id'), async (req, res) =>
     // A valid Auth0 token can ONLY be issued by Auth0, which means the user MUST exist in Auth0
     // Therefore, we can safely create them in our database
     if (!user && req.user && req.user.user_id === req.params.user_id) {
+      // SPEC Req 6 (tombstone guard): a still-valid access token whose Auth0 identity
+      // was deleted must NOT JIT re-create the Users row (Auth0 deletion does not revoke
+      // issued tokens for up to ~24h). Refuse with the pinned 410 account_deleted envelope
+      // — the SAME shape as repeat DELETE — and create nothing.
+      if (await PendingAuth0Deletion.isTombstoned(req.params.user_id)) {
+        return sendError(res, 'account_deleted');
+      }
+
       // Start with username from token (for email/password users, this is what they entered during signup)
       let userName = req.user.username || req.user.name || req.user.nickname || req.user.given_name || req.user.email?.split('@')[0] || 'User';
       let userEmail = req.user.email;
-      
+
       // ALWAYS try to fetch from Auth0 Management API if we have credentials
       // This ensures we get the username they entered during signup (for email/password users)
       // Even if email is in token, username might not be, so we need Management API
       try {
         const auth0User = await auth0Service.getUserById(req.params.user_id);
+        if (auth0User === null) {
+          // SPEC Req 6: getUserById returns null ONLY on a 404 — the Auth0 identity is
+          // GONE (deleted). Refuse to re-provision from token claims; a deleted identity
+          // must never re-materialize email/username as a fresh Users row. (Management-API
+          // *errors* throw and are handled by the catch below as the optional-lookup path.)
+          return sendError(res, 'account_deleted');
+        }
         if (auth0User) {
           // User exists in Auth0 (verified), safe to use their details
           const userDetails = auth0Service.extractUserDetails(auth0User);
@@ -399,6 +500,13 @@ router.post('/', async (req, res) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
+    // SPEC Req 6 (tombstone guard, self-keyed): a still-valid token surviving the
+    // Auth0 deletion must not re-create the Users row from token claims. Pinned
+    // refusal shape: 410 account_deleted on the Phase 85 envelope.
+    if (await PendingAuth0Deletion.isTombstoned(user_id)) {
+      return sendError(res, 'account_deleted');
+    }
+
     const [user, created] = await User.findOrCreate({
       where: { user_id },
       defaults: { username, email, user_id }
@@ -463,6 +571,14 @@ router.post('/:user_id/refresh', async (req, res) => {
     // Verify that the requested user_id matches the authenticated user
     if (req.params.user_id !== userId) {
       return res.status(403).json({ error: 'Forbidden: Cannot refresh other users\' info' });
+    }
+
+    // SPEC Req 6 (tombstone guard, self-keyed): during the pending window the Auth0
+    // identity may not be deleted yet, so the Auth0-404 check below is not enough —
+    // this route's User.create could re-materialize the deleted row. Pinned refusal
+    // shape: 410 account_deleted envelope.
+    if (await PendingAuth0Deletion.isTombstoned(userId)) {
+      return sendError(res, 'account_deleted');
     }
 
     // BSEC-01 (D-03): withContactInfo — self-gated refresh that returns the

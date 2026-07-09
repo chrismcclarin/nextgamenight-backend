@@ -751,6 +751,43 @@ class GoogleCalendarService {
 
     return result;
   }
+
+  /**
+   * Revoke a user's Google OAuth grant (D-04 gap — no revoke helper existed before).
+   * Prefers the refresh token because revoking it kills the ENTIRE grant (access +
+   * refresh); the access token alone only revokes that one short-lived token.
+   *
+   * Tokens flow as arguments only (D-02) — never read from Redis, never logged.
+   * Best-effort in the deletion pipeline: the caller (accountDeletionService) time-boxes
+   * and never blocks on it (D-03). Contract:
+   *   - no token          -> { revoked: false, skipped: true, reason: 'no_token' } (no call)
+   *   - success           -> { revoked: true }
+   *   - 400 invalid/expired-> { revoked: true, alreadyRevoked: true } (already gone = success)
+   *   - any other error   -> throws (caller logs, never blocks)
+   */
+  async revokeGoogleAccess(accessToken, refreshToken = null) {
+    const token = refreshToken || accessToken; // refresh token kills the whole grant
+    if (!token) {
+      return { revoked: false, skipped: true, reason: 'no_token' };
+    }
+    try {
+      const oauth2Client = new google.auth.OAuth2(
+        process.env.GOOGLE_CLIENT_ID,
+        process.env.GOOGLE_CLIENT_SECRET,
+        getGoogleRedirectUri()
+      );
+      await oauth2Client.revokeToken(token); // POST https://oauth2.googleapis.com/revoke
+      return { revoked: true };
+    } catch (error) {
+      // Coerce before comparing — GaxiosError.code is frequently the STRING '400', so a
+      // strict === against the number would silently rethrow an already-revoked token.
+      const status = Number(error.code ?? error.response?.status ?? error.status);
+      if (status === 400) {
+        return { revoked: true, alreadyRevoked: true }; // invalid/expired = already gone
+      }
+      throw error; // caller logs + never blocks per D-03
+    }
+  }
 }
 
 module.exports = new GoogleCalendarService();

@@ -544,6 +544,36 @@ const startServer = async () => {
         }
       }
 
+      // PendingAuth0Deletion reconciliation sweep (Phase 87.2 / REQ-6, D-08 backstop;
+      // every 30 min, production + ENABLE_SCHEDULER only, UTC). Three passes — see
+      // services/pendingAuth0DeletionSweep.js:
+      //   1. Stale pending markers (completed_at NULL, >5 min): fetch the queue job by
+      //      its deterministic id (auth0-cleanup-<sub>) and gate on its STATE — an
+      //      exhausted 'failed' job is re-fired, never treated as live; a missing job
+      //      is re-enqueued. Emails on pending rows past the ~17h exhaustion horizon
+      //      are nulled (PII hygiene).
+      //   2. Ghost-row destroy: any Users row matching a tombstoned sub is erased
+      //      (plus sub-keyed MagicToken/SingleUseToken remnants).
+      //   3. Retention purge: tombstones with completed_at older than 24h (>= max
+      //      access-token TTL) are destroyed; pending rows are never purged.
+      // The queue is lazy-required inside the sweep (never at module top).
+      if (process.env.NODE_ENV === 'production' || process.env.ENABLE_SCHEDULER === 'true') {
+        try {
+          const cron = require('node-cron');
+          const { runPendingAuth0DeletionSweep } = require('./services/pendingAuth0DeletionSweep');
+          cron.schedule('*/30 * * * *', async () => {
+            try {
+              await runPendingAuth0DeletionSweep();
+            } catch (err) {
+              console.error('PendingAuth0Deletion sweep error:', err.message);
+            }
+          }, { timezone: 'UTC' });
+          console.log('PendingAuth0Deletion reconciliation sweep started (every 30 min)');
+        } catch (err) {
+          console.error('PendingAuth0Deletion sweep failed to start:', err.message);
+        }
+      }
+
       // Mount Bull Board dashboard (only if workers are enabled)
       if (process.env.NODE_ENV === 'production' || process.env.ENABLE_WORKERS === 'true') {
         try {

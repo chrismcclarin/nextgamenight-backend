@@ -9,8 +9,13 @@
 // CI provides a redis:7 service + REDIS_URL; locally it targets redis://localhost:6379.
 module.exports = {
   testEnvironment: 'node',
-  // Target ONLY the integration ring — nothing from the default unit/DB suite.
-  testMatch: ['<rootDir>/tests/integration/**/*.test.js'],
+  // Target ONLY the real-Redis integration ring — nothing from the default unit/DB
+  // suite. Phase 87.2 Plan 06 added tests/integration/accountDeletion.integrity.test.js,
+  // which is a REAL-POSTGRES (no Redis) test that needs the default config's globalSetup
+  // schema build + per-test TRUNCATE — it runs under `npm test`, NOT here. So this
+  // config matches ONLY the Redis-ring file, not the whole tests/integration/ tree
+  // (a directory-wide match would run the DB test here with no Postgres provisioning).
+  testMatch: ['<rootDir>/tests/integration/queues.integration.test.js'],
   // No globalSetup/globalTeardown (those provision Postgres for the unit suite) and
   // no setupFilesAfterEnv tests/setup.js (its per-test TRUNCATE needs the DB).
   verbose: true,

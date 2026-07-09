@@ -14,8 +14,11 @@ const {
   EventBallotVote,
   GameReview,
   UserGame,
+  GroupInvite,
+  PendingAuth0Deletion,
   sequelize,
 } = require('../models');
+const { sendError } = require('../utils/errors');
 const { Op } = require('sequelize');
 const router = express.Router();
 const { validateGroupCreate, validateGroupUpdate, validateUUID } = require('../middleware/validators');
@@ -130,6 +133,12 @@ router.get('/user/:user_id', async (req, res) => {
 
     // If user doesn't exist, auto-create using Auth0 token info
     if (!user) {
+      // SPEC Req 6 (Phase 87.2 tombstone guard, self-keyed): a still-valid token
+      // surviving account deletion must not JIT re-create the Users row. Pinned
+      // refusal shape: 410 account_deleted on the Phase 85 envelope.
+      if (await PendingAuth0Deletion.isTombstoned(userId)) {
+        return sendError(res, 'account_deleted');
+      }
       // For Google sign-in, email should be available in the token
       const userEmail = req.user.email;
       if (!userEmail) {
@@ -638,6 +647,14 @@ router.post('/join-by-token', async (req, res) => {
     const joinerName = req.user.name || req.user.nickname || req.user.given_name
       || req.user.email?.split('@')[0] || 'User';
 
+    // SPEC Req 6 (Phase 87.2 tombstone guard, self-keyed): covers BOTH findOrCreate
+    // calls below (primary + unique-collision retry — same sub). A still-valid token
+    // surviving account deletion must not re-provision the Users row by joining a
+    // group. Pinned refusal shape: 410 account_deleted on the Phase 85 envelope.
+    if (await PendingAuth0Deletion.isTombstoned(userId)) {
+      return sendError(res, 'account_deleted');
+    }
+
     let user;
     try {
       [user] = await User.findOrCreate({
@@ -732,7 +749,11 @@ router.delete('/:group_id', async (req, res) => {
     
     // Delete all game reviews for this group
     await GameReview.destroy({ where: { group_id } });
-    
+
+    // Delete all pending invites for this group — GroupInvite.group_id has NO FK,
+    // so skipping this orphans rows carrying invitee email PII.
+    await GroupInvite.destroy({ where: { group_id } });
+
     // Delete all user-group associations
     await UserGroup.destroy({ where: { group_id } });
     

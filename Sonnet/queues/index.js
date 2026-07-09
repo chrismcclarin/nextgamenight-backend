@@ -25,7 +25,8 @@ const queueExports = [
   ['reminderQueue', './reminderQueue'],
   ['promptQueue', './promptQueue'],
   ['deadlineQueue', './deadlineQueue'],
-  ['gcalSyncQueue', './gcalSyncQueue']
+  ['gcalSyncQueue', './gcalSyncQueue'],
+  ['auth0CleanupQueue', './auth0CleanupQueue']
 ];
 
 for (const [name, mod] of queueExports) {

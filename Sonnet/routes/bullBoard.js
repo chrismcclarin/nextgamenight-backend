@@ -14,7 +14,7 @@ function mountBullBoard(app) {
   // Lazy require (BTEST-04 / review HIGH-3): destructuring queues fires the
   // queues/index.js getter (which connects Redis). Keep it inside this function
   // so requiring the route module never connects at import.
-  const { promptQueue, deadlineQueue, reminderQueue, gcalSyncQueue } = require('../queues');
+  const { promptQueue, deadlineQueue, reminderQueue, gcalSyncQueue, auth0CleanupQueue } = require('../queues');
 
   // Create server adapter for Express
   const serverAdapter = new ExpressAdapter();
@@ -27,7 +27,9 @@ function mountBullBoard(app) {
       new BullMQAdapter(deadlineQueue),
       new BullMQAdapter(reminderQueue),
       // Phase 75 / GCAL-01: register gcal-sync queue in Bull Board for ops visibility (D-CONTEXT)
-      new BullMQAdapter(gcalSyncQueue)
+      new BullMQAdapter(gcalSyncQueue),
+      // Phase 87.2 / REQ-6: register auth0-cleanup dead-letter lane for ops visibility (D-06/T-87.2-08)
+      new BullMQAdapter(auth0CleanupQueue)
     ],
     serverAdapter,
     options: {

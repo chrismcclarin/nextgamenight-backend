@@ -1,6 +1,19 @@
 // tests/routes/users.test.js
 const request = require('supertest');
 const express = require('express');
+
+// Mock auth0Service — previously this suite hit the REAL Auth0 Management API
+// (getUserById 404'd for fake test subs and the route fell back to token data).
+// Phase 87.2 / REQ-6 changed the contract: a resolved null (Auth0 404) now means
+// "identity deleted" and the JIT branch refuses with the 410 account_deleted
+// envelope. Simulate the not-configured behavior (THROW) so the token-fallback
+// auto-provision path stays exercised — and no real network call fires in tests.
+jest.mock('../../services/auth0Service', () => ({
+  getUserById: jest.fn().mockRejectedValue(new Error('Auth0 Management API credentials not configured')),
+  searchUsersByEmail: jest.fn().mockResolvedValue([]),
+  extractUserDetails: jest.fn(() => ({ email: null, username: null, user_id: null })),
+}));
+
 const userRoutes = require('../../routes/users');
 const { stubAuth } = require('../helpers/authStub');
 const { User, Group, UserGroup, sequelize } = require('../../models');
@@ -138,13 +151,10 @@ describe('User Routes', () => {
         name: 'Test Group'
       });
 
-      // Phase 87.1 (BINT-02): DUAL-WRITE both keyspaces. The User<->Group
-      // belongsToMany association was flipped to join on user_uuid (Plan 03), so
-      // a seed that only writes the legacy Auth0-string user_id column would make
-      // the Groups include resolve to nothing and this assertion silently break.
+      // Phase 87.1 (Plan 09 cutover): UserGroup is keyed on user_uuid ONLY — the
+      // legacy Auth0-string user_id column was removed from the model.
       await UserGroup.create({
-        user_id: testUser.user_id, // Auth0 STRING (old keyspace)
-        user_uuid: testUser.id, // Users.id UUID (new keyspace — the join key)
+        user_uuid: testUser.id, // Users.id UUID (the join key)
         group_id: testGroup.id
       });
 

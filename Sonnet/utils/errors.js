@@ -35,6 +35,12 @@ const ERROR_REGISTRY = Object.freeze({
   prompt_deadline_expired: { httpStatus: 400, message: 'The deadline for this availability prompt has passed.' },
   prompt_closed:           { httpStatus: 400, message: 'This availability prompt is no longer accepting responses.' },
   reminder_cooldown:       { httpStatus: 429, message: 'A reminder was sent too recently. Please wait before retrying.' }, // 429 verified at routes/availabilityPrompt.js:179
+  // Phase 87.2 (account deletion) — append-only per D-11. Cross-repo contract consumed by the FE
+  // in plan 87.2-07 (queryClient NON_RETRYABLE_API_CODES + DangerZone blocked-groups render).
+  // The blocked groups list rides in `details.groups` via formatEnvelope — no envelope-format change.
+  owner_of_active_groups:  { httpStatus: 409, message: 'You still own one or more groups with other members. Transfer ownership or remove members before deleting your account.' },
+  // 410 tombstone/JIT guard: repeat-DELETE and post-deletion re-auth refusals emit this (never a raw 410).
+  account_deleted:         { httpStatus: 410, message: 'This account has been deleted.' },
   internal:                { httpStatus: 500, message: 'An internal error occurred' }, // 500 fallback
 });
 
