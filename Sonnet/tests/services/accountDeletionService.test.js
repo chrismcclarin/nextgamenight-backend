@@ -138,7 +138,7 @@ beforeEach(() => {
   // Transaction: run the callback with a fake `t`, logging start/commit around it.
   mockSequelizeTransaction.mockImplementation(async (cb) => {
     callLog.push('txn:start');
-    const result = await cb({ LOCK: {} });
+    const result = await cb({ LOCK: { UPDATE: 'UPDATE' } });
     callLog.push('txn:commit');
     return result;
   });
@@ -176,6 +176,54 @@ describe('deleteAccount — owner gate (REQ-2)', () => {
     expect(res.groups).toEqual([{ id: 'g1', name: 'Group One', memberCount: 3 }]);
     expect(mockSequelizeTransaction).not.toHaveBeenCalled();
     expect(mockDeleteUser).not.toHaveBeenCalled();
+  });
+});
+
+describe('deleteAccount — blocked-at-recheck Google side-effect surfacing (WR-02)', () => {
+  test('IN-TXN blocked result carries google_access_revoked: true when a Google grant existed', async () => {
+    const user = makeUser({ google_calendar_token: 'at', google_calendar_refresh_token: 'rt' });
+    mockUserFindOne.mockResolvedValue(user);
+    // Step 1 fast-fail gate passes (no owned groups yet)...
+    mockUGFindAll.mockResolvedValueOnce([]);
+    // ...but the IN-TXN re-check finds an owned group (a member joined during
+    // the Google-cleanup window).
+    mockUGFindAll.mockResolvedValueOnce([{ group_id: 'g1' }]);
+    // The in-txn re-check derives counts from the locked (FOR UPDATE) membership
+    // row set: owner + one other member -> blocker, memberCount 2.
+    mockSequelizeQuery.mockImplementation(async (sql) => {
+      if (typeof sql === 'string' && sql.includes('"UserGroups"') && sql.includes('FOR UPDATE')) {
+        return [{ user_uuid: UUID }, { user_uuid: '22222222-2222-2222-2222-222222222222' }];
+      }
+      return [];
+    });
+
+    const res = await deleteAccount({ userId: SUB });
+
+    expect(res.status).toBe('blocked');
+    expect(res.groups).toEqual([{ id: 'g1', name: 'Group One', memberCount: 2 }]);
+    // Pinned FE contract key — Step 2 (Google cleanup + revoke) already ran.
+    expect(res.google_access_revoked).toBe(true);
+    expect(mockRevoke).toHaveBeenCalled();
+    // Nothing was deleted; Auth0 untouched.
+    expect(mockDeleteUser).not.toHaveBeenCalled();
+    expect(mockEmailSend).not.toHaveBeenCalled();
+  });
+
+  test('pre-flight (Step 1) blocked result does NOT carry google_access_revoked', async () => {
+    const user = makeUser({ google_calendar_token: 'at', google_calendar_refresh_token: 'rt' });
+    mockUserFindOne.mockResolvedValue(user);
+    mockUGFindAll.mockResolvedValue([{ group_id: 'g1' }]);
+    mockUGCount.mockResolvedValueOnce(1); // other-count -> blocker
+    mockUGCount.mockResolvedValueOnce(3); // total member count
+
+    const res = await deleteAccount({ userId: SUB });
+
+    expect(res.status).toBe('blocked');
+    expect(res.google_access_revoked).toBeUndefined();
+    expect('google_access_revoked' in res).toBe(false);
+    // Nothing ran: the fast-fail gate fired BEFORE Google cleanup.
+    expect(mockRevoke).not.toHaveBeenCalled();
+    expect(mockSequelizeTransaction).not.toHaveBeenCalled();
   });
 });
 

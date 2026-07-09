@@ -158,8 +158,15 @@ router.delete('/me', writeOperationLimiter, async (req, res) => {
     const result = await accountDeletionService.deleteAccount({ userId: sub });
     if (result.status === 'blocked') {
       // Owner gate rides the Phase 85 envelope @409 with details.groups (D-11) —
-      // NOT the legacy raw-403 groups.js shape.
-      return sendError(res, 'owner_of_active_groups', { groups: result.groups });
+      // NOT the legacy raw-403 groups.js shape. When the block fired at the
+      // IN-TXN re-check (after Google cleanup already ran), the service adds
+      // google_access_revoked: true — a pinned FE contract key — so the user can
+      // be told to reconnect Google Calendar. Absent on the pre-flight block.
+      const details = { groups: result.groups };
+      if (result.google_access_revoked) {
+        details.google_access_revoked = true;
+      }
+      return sendError(res, 'owner_of_active_groups', details);
     }
     if (result.status === 'not_found') {
       // Repeat DELETE inside the retention window → HTTP 410 with code

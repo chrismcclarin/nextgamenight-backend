@@ -76,6 +76,18 @@ const DEFAULT_BUDGETS = { googleMs: 10000, auth0Ms: 5000, emailMs: 5000 };
  * OTHER UserGroup row of ANY status (incl. pending/invited/declined). Sole-member owned
  * groups (zero other rows) are NOT blockers — they are auto-delete targets.
  *
+ * LOCKING (T-87.2-11): when called with a transaction, every read takes row locks that
+ * are held for the REMAINDER of that transaction:
+ *   - the owner's UserGroup rows (FOR UPDATE via Sequelize lock),
+ *   - each owned group's parent Groups row (raw SELECT ... FOR UPDATE) — this is what
+ *     blocks a concurrent join-by-token: its UserGroup INSERT must take FOR KEY SHARE
+ *     on the referenced Groups row for the FK check, which conflicts with our
+ *     FOR UPDATE, so the join waits until the deletion transaction decides,
+ *   - each owned group's membership rows (raw SELECT ... FOR UPDATE), from which both
+ *     counts are derived, so concurrent updates to existing membership rows serialize
+ *     behind this transaction too.
+ * Without a transaction (the pre-flight GET) all reads are plain lock-free SELECTs.
+ *
  * Wire shape: [{ id, name, memberCount }] where memberCount is the TOTAL UserGroup row
  * count for the group (any status, INCLUDING the owner's own row) — the FE renders this
  * as the group's member count. (Returning the other-count here would render every
@@ -92,22 +104,60 @@ async function getDeletionBlockers(userUuid, options = {}) {
     where: { user_uuid: userUuid, role: 'owner' },
     attributes: ['group_id'],
     transaction,
+    // In-txn: hold FOR UPDATE on the owner's own membership rows (see LOCKING above).
+    ...(transaction ? { lock: transaction.LOCK.UPDATE } : {}),
   });
+
+  // In-txn: lock every owned group's parent Groups row FOR UPDATE. A concurrent
+  // join-by-token INSERT needs FOR KEY SHARE on that row for its FK check, which
+  // conflicts with FOR UPDATE — the join blocks until this transaction decides.
+  // If the deletion commits (sole-member group destroyed) the join then fails its
+  // FK check; if it rolls back (blocked) the join proceeds normally.
+  if (transaction && ownedRows.length > 0) {
+    await sequelize.query(
+      'SELECT id FROM "Groups" WHERE id IN (:groupIds) FOR UPDATE',
+      {
+        replacements: { groupIds: ownedRows.map((r) => r.group_id) },
+        type: sequelize.QueryTypes.SELECT,
+        transaction,
+      }
+    );
+  }
 
   const blockers = [];
   for (const row of ownedRows) {
     const groupId = row.group_id;
     // Other-members predicate: ANY UserGroup row (any status) that is not the owner's.
-    const otherCount = await UserGroup.count({
-      where: { group_id: groupId, user_uuid: { [Op.ne]: userUuid } },
-      transaction,
-    });
-    if (otherCount >= 1) {
+    let otherCount;
+    let memberCount = null;
+    if (transaction) {
+      // In-txn: lock the group's ENTIRE membership row set FOR UPDATE and derive
+      // both counts from the one locked read, so the rows the decision was based
+      // on cannot be mutated by another transaction until this one decides.
+      // (FOR UPDATE cannot ride an aggregate, hence rows-then-count.)
+      const memberRows = await sequelize.query(
+        'SELECT user_uuid FROM "UserGroups" WHERE group_id = :groupId FOR UPDATE',
+        {
+          replacements: { groupId },
+          type: sequelize.QueryTypes.SELECT,
+          transaction,
+        }
+      );
+      otherCount = memberRows.filter((m) => m.user_uuid !== userUuid).length;
       // memberCount = TOTAL rows (incl. the owner) — the value the FE displays.
-      const memberCount = await UserGroup.count({
-        where: { group_id: groupId },
-        transaction,
+      memberCount = memberRows.length;
+    } else {
+      otherCount = await UserGroup.count({
+        where: { group_id: groupId, user_uuid: { [Op.ne]: userUuid } },
       });
+    }
+    if (otherCount >= 1) {
+      if (memberCount === null) {
+        // memberCount = TOTAL rows (incl. the owner) — the value the FE displays.
+        memberCount = await UserGroup.count({
+          where: { group_id: groupId },
+        });
+      }
       const group = await Group.findByPk(groupId, {
         attributes: ['id', 'name'],
         transaction,
@@ -419,7 +469,12 @@ async function deleteAccount({ userId }, overrides = {}) {
   // Step 3 — DB transaction (all-or-nothing). Its FIRST statement re-runs the owner gate
   // INSIDE the txn (T-87.2-11): up to ~10s of Google cleanup separates Step 1 from here,
   // and a member joining an owned group in that window would otherwise strand a populated
-  // group with no owner. A non-empty re-check rolls back and deletes nothing.
+  // group with no owner. The re-check takes row locks held for the remainder of the
+  // transaction (owner's UserGroup rows, each owned group's membership rows, and each
+  // owned group's parent Groups row — all FOR UPDATE; see getDeletionBlockers LOCKING).
+  // The Groups-row lock is what serializes a concurrent join-by-token: its INSERT's FK
+  // check (FOR KEY SHARE on the Groups row) conflicts with our FOR UPDATE and blocks
+  // until this transaction decides. A non-empty re-check rolls back and deletes nothing.
   const OWNER_RECHECK_SENTINEL = 'OWNER_GATE_RECHECK_BLOCKED';
   let txnOutcome;
   try {
@@ -435,7 +490,23 @@ async function deleteAccount({ userId }, overrides = {}) {
     });
   } catch (err) {
     if (err && err.message === OWNER_RECHECK_SENTINEL) {
-      return { status: 'blocked', groups: err._blockedGroups };
+      // Blocked at the in-txn re-check: Step 2 already ran, so if the user had a
+      // Google grant their RSVP calendar events were deleted and the OAuth grant
+      // revoked — on an account that now SURVIVES. Surface it (google_access_revoked
+      // is a pinned contract key the FE reads off the 409 envelope) so the user can
+      // be told to reconnect Google Calendar. The pre-flight/Step-1 blocked path
+      // never sets this key (nothing has run there).
+      const googleAccessRevoked = !!(captured.accessToken || captured.refreshToken);
+      if (googleAccessRevoked) {
+        console.warn(
+          `[accountDeletion] Owner-gate re-check blocked deletion for ${captured.sub} AFTER Google cleanup already ran — calendar events deleted and OAuth grant revoked on a surviving account.`
+        );
+      }
+      return {
+        status: 'blocked',
+        groups: err._blockedGroups,
+        ...(googleAccessRevoked ? { google_access_revoked: true } : {}),
+      };
     }
     // Real DB failure: nothing was committed; surface a retryable (500-mappable) error.
     throw err;
