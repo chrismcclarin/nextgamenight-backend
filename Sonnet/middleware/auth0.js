@@ -155,14 +155,14 @@ const verifyAuth0Token = (req, res, next) => {
       // Phase 87.2 tombstone choke (see block comment above). Emits the pinned
       // 410 account_deleted envelope for a tombstoned caller — never 401. Any
       // rejection here is call-site handled (Pitfall 1: no bare callback throw).
-      callerIsTombstoned(decoded.sub)
-        .then((tombstoned) => {
-          if (tombstoned) {
-            return sendError(res, 'account_deleted');
-          }
-          next();
-        })
-        .catch(() => next()); // fail OPEN — per-site guards + sweep are the backstops
+      // Two-argument then (NOT .then().catch()): a trailing .catch would also
+      // re-catch a downstream error thrown back through next()/sendError inside
+      // the fulfillment handler and call next() a SECOND time (double dispatch).
+      // The rejection handler fires ONLY on a callerIsTombstoned rejection.
+      callerIsTombstoned(decoded.sub).then(
+        (tombstoned) => (tombstoned ? sendError(res, 'account_deleted') : next()),
+        () => next() // fail OPEN only on a callerIsTombstoned rejection — per-site guards + sweep are the backstops
+      );
     }
   );
 };
