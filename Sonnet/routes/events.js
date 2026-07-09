@@ -1,7 +1,8 @@
 // routes/events.js
 const express = require('express');
 const crypto = require('crypto');
-const { Event, Game, User, Group, EventParticipation, UserGroup, EventRsvp, EventBring, EventBallotOption, EventBallotVote, EventAuditLog } = require('../models');
+const { Event, Game, User, Group, EventParticipation, UserGroup, EventRsvp, EventBring, EventBallotOption, EventBallotVote, EventAuditLog, PendingAuth0Deletion } = require('../models');
+const { sendError } = require('../utils/errors');
 const { Op } = require('sequelize');
 const sequelize = require('../config/database');
 const router = express.Router();
@@ -185,6 +186,12 @@ router.get('/user/:user_id', requireParamMatchesToken('user_id'), async (req, re
     
     // If user doesn't exist but we have authenticated user info, auto-create
     if (!user && req.user && req.user.user_id === req.params.user_id) {
+      // SPEC Req 6 (Phase 87.2 tombstone guard, self-keyed): a still-valid token
+      // surviving account deletion must not JIT re-create the Users row. Pinned
+      // refusal shape: 410 account_deleted on the Phase 85 envelope.
+      if (await PendingAuth0Deletion.isTombstoned(req.params.user_id)) {
+        return sendError(res, 'account_deleted');
+      }
       let userEmail = req.user.email;
       let userName = req.user.name || req.user.nickname || req.user.given_name || req.user.email?.split('@')[0] || 'User';
       

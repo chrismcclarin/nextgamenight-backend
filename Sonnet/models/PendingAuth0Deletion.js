@@ -48,4 +48,30 @@ const PendingAuth0Deletion = sequelize.define('PendingAuth0Deletion', {
   timestamps: true,
 });
 
+/**
+ * Shared tombstone guard (Phase 87.2 / Plan 05, SPEC Req 6). Returns true when a
+ * PendingAuth0Deletion row exists for the given Auth0 sub — PENDING **or** COMPLETED.
+ *
+ * Auth0 deletion does not revoke already-issued access tokens (up to ~24h TTL), so a
+ * still-valid token — or a THIRD PARTY searching the deleted user's email — could
+ * otherwise re-materialize the user's PII as a fresh Users row. Every Users create /
+ * findOrCreate site keys THIS check on the sub of the row BEING CREATED (not merely the
+ * caller's token sub) and refuses when it returns true. The row persists through the
+ * retention window (Task 2's completed_at + Task 3's purge), so a completed tombstone
+ * still blocks re-provisioning until the retention window closes.
+ *
+ * @param {string} sub - the Auth0 subject of the row about to be created.
+ * @param {{ transaction?: import('sequelize').Transaction }} [options]
+ * @returns {Promise<boolean>}
+ */
+PendingAuth0Deletion.isTombstoned = async function isTombstoned(sub, options = {}) {
+  if (!sub) return false;
+  const row = await PendingAuth0Deletion.findOne({
+    where: { auth0_sub: sub },
+    attributes: ['id'],
+    ...options,
+  });
+  return !!row;
+};
+
 module.exports = PendingAuth0Deletion;

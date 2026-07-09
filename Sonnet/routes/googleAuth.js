@@ -3,7 +3,8 @@
 const express = require('express');
 const crypto = require('crypto');
 const { google } = require('googleapis');
-const { User, SingleUseToken } = require('../models');
+const { User, SingleUseToken, PendingAuth0Deletion } = require('../models');
+const { sendError, AppError } = require('../utils/errors');
 const { resolveAllowedFrontendUrl } = require('../config/allowedOrigins');
 const router = express.Router();
 
@@ -44,6 +45,14 @@ const getOAuth2Client = () => {
 
 // Helper function to generate Google OAuth URL
 const generateGoogleAuthUrl = async (user_id, email = null, username = null, frontendUrl = null) => {
+  // SPEC Req 6 (Phase 87.2 tombstone guard, self-keyed): both callers pass the
+  // verified token sub. A still-valid token surviving account deletion must not
+  // re-provision the Users row via the OAuth-URL mint. Throw the registered
+  // AppError so the routes' catch blocks map it to the pinned 410 envelope.
+  if (await PendingAuth0Deletion.isTombstoned(user_id)) {
+    throw new AppError('account_deleted');
+  }
+
   // Create or find user (auto-create if doesn't exist)
   const [user, created] = await User.findOrCreate({
     where: { user_id },
@@ -122,10 +131,14 @@ router.get('/google/url', async (req, res) => {
                        'http://localhost:3000';
 
     const authUrl = await generateGoogleAuthUrl(userId, email, username, frontendUrl);
-    
+
     // Return URL as JSON
     res.json({ authUrl });
   } catch (error) {
+    if (error instanceof AppError && error.code === 'account_deleted') {
+      // Phase 87.2 tombstone refusal — pinned 410 envelope, never a raw 500.
+      return sendError(res, 'account_deleted');
+    }
     console.error('Error generating Google OAuth URL:', error.message);
     res.status(500).json({ error: error.message });
   }
@@ -147,6 +160,10 @@ router.get('/google', async (req, res) => {
     // Redirect to Google
     res.redirect(authUrl);
   } catch (error) {
+    if (error instanceof AppError && error.code === 'account_deleted') {
+      // Phase 87.2 tombstone refusal — pinned 410 envelope, never a raw 500.
+      return sendError(res, 'account_deleted');
+    }
     console.error('Error initiating Google OAuth:', error.message);
     res.status(500).json({ error: error.message });
   }
@@ -182,6 +199,14 @@ router.get('/google/callback', async (req, res) => {
     const user_id = consumedToken.user_id;
     // frontend_url was allow-listed at mint time; trust the stored value.
     const frontendUrl = consumedToken.frontend_url || process.env.FRONTEND_URL || 'http://localhost:3000';
+
+    // SPEC Req 6 (Phase 87.2 tombstone guard, self-keyed): the sub was resolved from
+    // the nonce minted by the same (now-deleted) user. Refuse before the findOrCreate
+    // below can re-materialize the Users row mid-OAuth-flow. Pinned refusal shape:
+    // 410 account_deleted envelope.
+    if (await PendingAuth0Deletion.isTombstoned(user_id)) {
+      return sendError(res, 'account_deleted');
+    }
 
     // Find or create user (should exist from step 1, but create if needed)
     const [user] = await User.findOrCreate({

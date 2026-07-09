@@ -17,10 +17,14 @@ const { User, Group, UserGroup, sequelize } = require('../../models');
 
 // Mock auth0Service so Auth0 Management API calls don't fire during tests.
 // extractUserDetails / getUserById are called inside the auto-create branch; we
-// return null so the handler falls back to req.user (token) data — the simpler
-// happy path we want to exercise here.
+// THROW (Management API not configured — the real not-configured behavior) so
+// the handler falls back to req.user (token) data — the simpler happy path we
+// want to exercise here. NOTE (Phase 87.2 / REQ-6): a RESOLVED null now means
+// "Auth0 identity deleted (404)" and makes the JIT branch refuse with the 410
+// account_deleted envelope, so mockResolvedValue(null) is no longer a valid
+// stand-in for "unavailable".
 jest.mock('../../services/auth0Service', () => ({
-  getUserById: jest.fn().mockResolvedValue(null),
+  getUserById: jest.fn().mockRejectedValue(new Error('Auth0 Management API credentials not configured')),
   searchUsersByEmail: jest.fn().mockResolvedValue([]),
   extractUserDetails: jest.fn(() => ({ email: null, username: null, user_id: null })),
 }));

@@ -29,6 +29,49 @@ function getKey(header, callback) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Phase 87.2 (SPEC Req 6) — tombstone choke, DEFENSE-IN-DEPTH for SELF-keyed paths.
+//
+// Auth0 deletion does not revoke already-issued access tokens (~24h TTL). The
+// per-create-site guards (routes/users.js / events.js / groups.js / googleAuth.js)
+// are the primary defense; this choke additionally refuses a tombstoned CALLER at
+// the authn layer so no self-keyed path is missed. It cannot substitute for the
+// per-site guards — third-party-keyed creates (search-by-email) create a row for
+// a sub that is not the caller's, which this choke never sees.
+//
+// Steady-state cost discipline: verifyAuth0Token is DB-free today (stateless JWT
+// + cached JWKS); coupling every authenticated request to a Postgres lookup of an
+// almost-always-empty table would also couple auth availability to DB
+// availability. So the per-caller lookup is gated behind a short-TTL in-process
+// any-tombstones count cache: when zero tombstones exist (the overwhelming norm)
+// NO per-request query runs. Any DB error fails OPEN (auth proceeds) — the
+// per-site guards and the reconciliation sweep remain the backstops.
+//
+// Refusal shape is PINNED: the 410 account_deleted envelope — never 401 (a
+// central 401 would make repeat DELETE /users/me bounce inside the retention
+// window) and never a raw 410 (the FE maps a raw 410 to 'unknown' and retries).
+// ---------------------------------------------------------------------------
+const TOMBSTONE_COUNT_CACHE_TTL_MS = 60 * 1000;
+let _tombstoneCountCache = { count: 0, fetchedAt: 0 };
+
+async function callerIsTombstoned(sub) {
+  if (!sub) return false;
+  try {
+    // Lazy require — keeps this middleware import-time DB-free (test suites mock
+    // ../models or never touch it).
+    const { PendingAuth0Deletion } = require('../models');
+    const now = Date.now();
+    if (now - _tombstoneCountCache.fetchedAt > TOMBSTONE_COUNT_CACHE_TTL_MS) {
+      _tombstoneCountCache = { count: await PendingAuth0Deletion.count(), fetchedAt: now };
+    }
+    if (_tombstoneCountCache.count === 0) return false; // steady state: zero per-request DB cost
+    return await PendingAuth0Deletion.isTombstoned(sub);
+  } catch (err) {
+    // Fail OPEN — never couple auth availability to DB availability.
+    return false;
+  }
+}
+
 /**
  * Auth0 JWT verification middleware
  * Verifies the JWT token from Authorization header and extracts user info
@@ -109,7 +152,17 @@ const verifyAuth0Token = (req, res, next) => {
         });
       }
 
-      next();
+      // Phase 87.2 tombstone choke (see block comment above). Emits the pinned
+      // 410 account_deleted envelope for a tombstoned caller — never 401. Any
+      // rejection here is call-site handled (Pitfall 1: no bare callback throw).
+      callerIsTombstoned(decoded.sub)
+        .then((tombstoned) => {
+          if (tombstoned) {
+            return sendError(res, 'account_deleted');
+          }
+          next();
+        })
+        .catch(() => next()); // fail OPEN — per-site guards + sweep are the backstops
     }
   );
 };
