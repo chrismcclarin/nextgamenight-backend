@@ -15,11 +15,14 @@
 // WR-03: mirror the full Queue surface that prod consumers actually call so a suite
 // activating this mock exercises a faithful double, not a divergent one:
 //  - add (enqueue assertions)
+//  - getJob (services/pendingAuth0DeletionSweep.js liveness check — resolves null by
+//    default = "no job exists"; suites override per-test to simulate live/failed jobs)
 //  - getJobCounts (routes/adminMetrics.js)
 //  - upsertJobScheduler / getJobSchedulers / removeJobScheduler (schedulers/promptScheduler.js)
 //  - close (teardown)
 const stubQueue = () => ({
   add: jest.fn().mockResolvedValue({ id: 'mock-job' }),
+  getJob: jest.fn().mockResolvedValue(null),
   getJobCounts: jest.fn().mockResolvedValue({}),
   upsertJobScheduler: jest.fn().mockResolvedValue({}),
   getJobSchedulers: jest.fn().mockResolvedValue([]),
