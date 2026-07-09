@@ -112,6 +112,41 @@ class Auth0Service {
   }
 
   /**
+   * Delete an Auth0 login identity by user_id (sub).
+   * Molded on getUserById: acquire the cached client-credentials Management token,
+   * issue DELETE /api/v2/users/:encodedSub, treat 204 as success and 404 as
+   * already-deleted (idempotent). Any other status throws so the caller's durable
+   * retry lane (accountDeletionService / auth0CleanupWorker) engages — this method
+   * NEVER swallows a 401/403/429/5xx.
+   *
+   * Requires the delete:users scope on the Management client (provisioned as a gated
+   * human dashboard step in plan 87.2-09, not code-provisioned).
+   */
+  async deleteUser(userId) {
+    const token = await this.getManagementToken();
+    try {
+      await axios.delete(`https://${this.domain}/api/v2/users/${encodeURIComponent(userId)}`, {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 10000
+      });
+      return { deleted: true }; // 204 No Content on success
+    } catch (error) {
+      if (error.response?.status === 404) {
+        return { deleted: true, alreadyGone: true }; // idempotent — already deleted
+      }
+      console.error('Error deleting Auth0 user:', error.message);
+      if (error.response) {
+        console.error('Auth0 response:', error.response.data);
+      }
+      // Rethrow (wrapped) so the enqueue/retry path fires on 401/403/429/5xx.
+      throw new Error(`Failed to delete Auth0 user: ${error.message}`);
+    }
+  }
+
+  /**
    * Extract user details from Auth0 user object
    * Handles both Google OAuth and email/password users
    * 
