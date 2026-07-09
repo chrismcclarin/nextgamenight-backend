@@ -450,7 +450,11 @@ async function deleteAccount({ userId }, overrides = {}) {
     await withTimeout(auth0Service.deleteUser(captured.sub), budgets.auth0Ms, 'auth0 delete');
     try {
       const marker = await PendingAuth0Deletion.findOne({ where: { auth0_sub: captured.sub } });
-      if (marker) await marker.update({ completed_at: new Date() });
+      // Null the email at completion — same PII invariant the worker
+      // (workers/auth0CleanupWorker.js) and sweep (pendingAuth0DeletionSweep.js)
+      // honor: a completed tombstone must not retain the deleted user's email
+      // for the ~24h retention window.
+      if (marker) await marker.update({ completed_at: new Date(), email: null });
     } catch (markerErr) {
       // Marker bookkeeping is best-effort; the deletion already committed.
       console.error('[accountDeletion] Failed to mark Auth0 marker completed (non-fatal):', markerErr.message);

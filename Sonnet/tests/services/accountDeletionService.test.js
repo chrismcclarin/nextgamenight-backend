@@ -227,7 +227,7 @@ describe('deleteAccount — Auth0 lane (REQ-5 / REQ-6)', () => {
     expect(res).toEqual({ status: 'deleted' });
     expect(markerUpdate).toHaveBeenCalledTimes(1);
     expect(markerUpdate).toHaveBeenCalledWith(
-      expect.objectContaining({ completed_at: expect.any(Date) })
+      expect.objectContaining({ completed_at: expect.any(Date), email: null })
     );
     expect(marker.destroy).not.toHaveBeenCalled();
     expect(mockQueueAdd).not.toHaveBeenCalled();
