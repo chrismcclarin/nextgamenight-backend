@@ -14,6 +14,7 @@ const {
   EventBallotVote,
   GameReview,
   UserGame,
+  GroupInvite,
   PendingAuth0Deletion,
   sequelize,
 } = require('../models');
@@ -748,7 +749,11 @@ router.delete('/:group_id', async (req, res) => {
     
     // Delete all game reviews for this group
     await GameReview.destroy({ where: { group_id } });
-    
+
+    // Delete all pending invites for this group — GroupInvite.group_id has NO FK,
+    // so skipping this orphans rows carrying invitee email PII.
+    await GroupInvite.destroy({ where: { group_id } });
+
     // Delete all user-group associations
     await UserGroup.destroy({ where: { group_id } });
     

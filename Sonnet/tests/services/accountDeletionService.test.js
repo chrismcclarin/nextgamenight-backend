@@ -60,6 +60,7 @@ jest.mock('../../models', () => ({
     count: (...a) => mockUGCount(...a),
     destroy: jest.fn().mockResolvedValue(0),
   },
+  GroupInvite: { destroy: jest.fn().mockResolvedValue(0) },
   GameReview: { destroy: jest.fn().mockResolvedValue(0) },
   UserGame: { destroy: jest.fn().mockResolvedValue(0) },
   MagicToken: { destroy: jest.fn().mockResolvedValue(0) },

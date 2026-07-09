@@ -40,6 +40,7 @@ const {
   Event,
   EventParticipation,
   UserGroup,
+  GroupInvite,
   GameReview,
   UserGame,
   MagicToken,
@@ -221,6 +222,9 @@ async function applyDispositions(user, t) {
       }
       await Event.destroy({ where: { group_id: groupId }, transaction: t });
       await GameReview.destroy({ where: { group_id: groupId }, transaction: t });
+      // GroupInvite.group_id has NO FK — without this, pending invites for the
+      // auto-deleted group would survive as orphans carrying invitee email PII.
+      await GroupInvite.destroy({ where: { group_id: groupId }, transaction: t });
       await UserGroup.destroy({ where: { group_id: groupId }, transaction: t });
       await Group.destroy({ where: { id: groupId }, transaction: t });
     }
