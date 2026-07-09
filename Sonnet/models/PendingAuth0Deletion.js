@@ -43,6 +43,16 @@ const PendingAuth0Deletion = sequelize.define('PendingAuth0Deletion', {
     allowNull: true,
     // Timestamp of the most recent worker retry; null until first attempt.
   },
+  completed_at: {
+    type: DataTypes.DATE,
+    allowNull: true,
+    // Phase 87.2 / Plan 05 Task 2 (Req 6 tombstone retention): set when the Auth0
+    // identity deletion SUCCEEDS. The row is retained (never destroyed on success)
+    // because it doubles as the tombstone the create-site guards read — it must
+    // outlive the Auth0 deletion by >= the max access-token TTL (~24h). The sweep
+    // (server.js) purges rows whose completed_at is older than the retention
+    // window. NULL = still pending (Auth0 delete not yet confirmed).
+  },
 }, {
   tableName: 'PendingAuth0Deletions',
   timestamps: true,

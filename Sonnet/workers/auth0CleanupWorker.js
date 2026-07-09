@@ -12,9 +12,10 @@
 //   2. auth0Service.deleteUser(sub) — 404-idempotent (plan 87.2-02); throws on
 //      401/403/429/5xx so BullMQ retries per the D-06 profile (attempts:10,
 //      exponential 60s ≈ 17h).
-//   3. On success, clear the PendingAuth0Deletion marker row for that sub.
-//      NOTE: destroy at this wave — plan 87.2-05 Task 2 converts the success path
-//      to mark-completed retention (completed_at set, row retained).
+//   3. On success, mark the PendingAuth0Deletion row COMPLETED (completed_at set,
+//      email nulled, row RETAINED — plan 87.2-05 Task 2). The row is the tombstone
+//      that blocks orphaned-token re-provision for the ~24h token-TTL window; the
+//      reconciliation sweep purges it after the retention window.
 //   4. On failure, re-throw. On attempts-exhausted the failed-event hook pages via
 //      Sentry (T-87.2-08) — removeOnFail:false keeps the dead-letter row visible.
 //
@@ -60,11 +61,23 @@ async function processAuth0CleanupJob(job) {
   //    401/403/429/5xx throw and bubble to BullMQ's retry lane.
   await auth0Service.deleteUser(sub);
 
-  // 2. Clear the durable marker on success. (plan 87.2-05 Task 2 converts this to
-  //    mark-completed retention.)
-  await PendingAuth0Deletion.destroy({ where: { auth0_sub: sub } });
+  // 2. Mark the durable marker COMPLETED on success (plan 87.2-05 Task 2 — this
+  //    supersedes plan 87.2-03's destroy-on-success). The marker doubles as the
+  //    tombstone the Users-create guards read (Req 6): Auth0 deletion does not
+  //    revoke already-issued tokens (~24h TTL), so destroying the row here would
+  //    reopen the JIT re-provision hole the moment this job succeeds. The email
+  //    is nulled in the SAME update — the notice email was already sent
+  //    in-request from the captured value (plan 87.2-04 Step 5); after completion
+  //    the tombstone needs only the sub, and retaining a deleted user's email in
+  //    a GDPR-deletion table past this point would invalidate T-87.2-03's
+  //    short-lived-row acceptance. Purging the row is the sweep's job (server.js)
+  //    once completed_at is older than the 24h retention window.
+  await PendingAuth0Deletion.update(
+    { completed_at: new Date(), email: null },
+    { where: { auth0_sub: sub } }
+  );
 
-  console.log(`[Auth0CleanupWorker] Job ${job.id}: deleted Auth0 identity + cleared marker for ${sub}`);
+  console.log(`[Auth0CleanupWorker] Job ${job.id}: deleted Auth0 identity + marked tombstone completed for ${sub}`);
   return { ok: true, sub };
 }
 

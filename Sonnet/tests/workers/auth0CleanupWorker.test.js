@@ -5,7 +5,9 @@
 // Strategy: the worker file exports the pure handler `processAuth0CleanupJob` and
 // the `handleJobFailed` exhaustion hook so we can invoke them directly with mocked
 // deps — no Redis, no BullMQ runtime, no Auth0 Management API. The tests assert:
-//   - success path: deleteUser(sub) then destroy the PendingAuth0Deletion marker
+//   - success path: deleteUser(sub) then MARK the PendingAuth0Deletion marker
+//     COMPLETED (completed_at set + email nulled, row RETAINED — plan 87.2-05
+//     Task 2 tombstone retention; supersedes the plan-03 destroy-on-success)
 //   - failure path: deleteUser throws -> handler re-throws (BullMQ retries)
 //   - exhausted (attemptsMade >= attempts=10) -> Sentry.captureException with the
 //     exact D-07 tags { worker: 'auth0-cleanup', exhausted: 'true' }
@@ -19,9 +21,13 @@ jest.mock('../../services/auth0Service', () => ({
   deleteUser: (...args) => mockDeleteUser(...args),
 }));
 
+const mockPendingUpdate = jest.fn();
 const mockPendingDestroy = jest.fn();
 jest.mock('../../models', () => ({
-  PendingAuth0Deletion: { destroy: (...args) => mockPendingDestroy(...args) },
+  PendingAuth0Deletion: {
+    update: (...args) => mockPendingUpdate(...args),
+    destroy: (...args) => mockPendingDestroy(...args),
+  },
 }));
 
 // Don't actually boot Redis / BullMQ Worker -- mock the bullmq Worker
@@ -63,38 +69,50 @@ function makeJob(data, opts = { attempts: 10 }, attemptsMade = 1) {
 
 beforeEach(() => {
   jest.clearAllMocks();
+  mockPendingUpdate.mockResolvedValue([1]);
   mockPendingDestroy.mockResolvedValue(1);
 });
 
-describe('auth0CleanupWorker.processAuth0CleanupJob (Phase 87.2 / Plan 03)', () => {
-  test('success path — deletes Auth0 user then destroys the PendingAuth0Deletion marker', async () => {
+describe('auth0CleanupWorker.processAuth0CleanupJob (Phase 87.2 / Plan 03 + Plan 05 Task 2)', () => {
+  test('success path — deletes Auth0 user then MARKS the marker completed (retained, email nulled) — never destroys it', async () => {
     mockDeleteUser.mockResolvedValueOnce({ deleted: true });
 
     const job = makeJob({ sub: 'google-oauth2|123' });
     const result = await processAuth0CleanupJob(job);
 
     expect(mockDeleteUser).toHaveBeenCalledWith('google-oauth2|123');
-    expect(mockPendingDestroy).toHaveBeenCalledWith({ where: { auth0_sub: 'google-oauth2|123' } });
+    // Plan 05 Task 2 (tombstone retention): completed_at set + email nulled in ONE
+    // update; the row is RETAINED as the guard's tombstone — destroy is forbidden.
+    expect(mockPendingUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({ completed_at: expect.any(Date), email: null }),
+      { where: { auth0_sub: 'google-oauth2|123' } }
+    );
+    expect(mockPendingDestroy).not.toHaveBeenCalled();
     expect(result).toMatchObject({ ok: true, sub: 'google-oauth2|123' });
   });
 
-  test('success path — idempotent alreadyGone still clears the marker', async () => {
+  test('success path — idempotent alreadyGone still marks the marker completed', async () => {
     mockDeleteUser.mockResolvedValueOnce({ deleted: true, alreadyGone: true });
 
     const job = makeJob({ sub: 'auth0|abc' });
     const result = await processAuth0CleanupJob(job);
 
-    expect(mockPendingDestroy).toHaveBeenCalledWith({ where: { auth0_sub: 'auth0|abc' } });
+    expect(mockPendingUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({ completed_at: expect.any(Date), email: null }),
+      { where: { auth0_sub: 'auth0|abc' } }
+    );
+    expect(mockPendingDestroy).not.toHaveBeenCalled();
     expect(result).toMatchObject({ ok: true });
   });
 
-  test('failure path — deleteUser throws -> handler re-throws, marker NOT cleared', async () => {
+  test('failure path — deleteUser throws -> handler re-throws, marker NOT touched', async () => {
     const err = Object.assign(new Error('Failed to delete Auth0 user: 429'), { code: 429 });
     mockDeleteUser.mockRejectedValueOnce(err);
 
     const job = makeJob({ sub: 'google-oauth2|123' });
 
     await expect(processAuth0CleanupJob(job)).rejects.toBe(err);
+    expect(mockPendingUpdate).not.toHaveBeenCalled();
     expect(mockPendingDestroy).not.toHaveBeenCalled();
   });
 });
