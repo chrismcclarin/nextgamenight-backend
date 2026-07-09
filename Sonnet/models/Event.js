@@ -28,10 +28,22 @@ const Event = sequelize.define('Event', {
   winner_id: {
     type: DataTypes.UUID,
     allowNull: true, // references User.id
+    // Phase 87.2 (REQ-3/REQ-6, T-87.2-01): protective FK ON DELETE SET NULL so
+    // hard-deleting a member winner nulls the pointer instead of RESTRICT-erroring
+    // or dangling. Dual-write with migration 20260709000001 (sync()-built test/CI
+    // DBs read this; prod reads the migration). winner_name is NOT touched — the
+    // custom-participant display text survives (write paths set winner_id XOR
+    // winner_name). Member-winner display is intentionally lost on SET NULL.
+    references: { model: 'Users', key: 'id' },
+    onDelete: 'SET NULL',
   },
   picked_by_id: {
     type: DataTypes.UUID,
     allowNull: true, // references User.id
+    // Phase 87.2 (REQ-3/REQ-6, T-87.2-01): protective FK ON DELETE SET NULL —
+    // same rationale as winner_id. picked_by_name display text is untouched.
+    references: { model: 'Users', key: 'id' },
+    onDelete: 'SET NULL',
   },
   winner_name: {
     type: DataTypes.STRING,
