@@ -962,7 +962,11 @@ router.post('/:group_id/transfer-ownership', async (req, res) => {
     res.json({
       success: true,
       message: 'Ownership transferred',
-      new_owner_user_id,
+      // 87.3 code-review #7: echo the RESOLVED sub, never the raw client param —
+      // once plan 05 cuts the FE sender to member.id (a UUID), a raw echo would
+      // mix keyspaces in one payload (UUID next to previous_owner's sub). Same
+      // treatment the friendships handlers give their echoed identifiers.
+      new_owner_user_id: newOwnerUser.user_id,
       previous_owner_user_id: userId,
     });
   } catch (error) {
