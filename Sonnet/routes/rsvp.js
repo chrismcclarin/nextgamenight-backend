@@ -475,6 +475,7 @@ router.post('/', verifyAuth0Token, validateRsvpCreate, async (req, res) => {
     // drop (gameDetail joins roster keys to this flat field in lockstep).
     const shaped = result.toJSON();
     shaped.user_id = shaped.User?.id;
+    delete shaped.user_uuid; // one identifier pair on the wire
 
     return res.status(isCreate ? 201 : 200).json(shaped);
   } catch (error) {
@@ -526,6 +527,7 @@ router.get('/event/:event_id', verifyAuth0Token, async (req, res) => {
     const shapedRsvps = rsvps.map((r) => {
       const json = r.toJSON();
       json.user_id = json.User?.id;
+      delete json.user_uuid; // one identifier pair on the wire (value lives in user_id)
       return json;
     });
 
@@ -580,6 +582,7 @@ router.get('/user/:user_id', verifyAuth0Token, async (req, res) => {
     const shaped = rsvps.map((r) => {
       const json = r.toJSON();
       json.user_id = caller.id;
+      delete json.user_uuid; // one identifier pair on the wire
       return json;
     });
 

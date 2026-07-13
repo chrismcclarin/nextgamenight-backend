@@ -42,6 +42,7 @@ router.get('/event/:event_id', verifyAuth0Token, async (req, res) => {
     const shaped = brings.map((b) => {
       const json = b.toJSON();
       json.user_id = json.User?.id;
+      delete json.user_uuid; // one identifier pair on the wire (value lives in user_id)
       return json;
     });
 
@@ -146,6 +147,7 @@ router.put('/event/:event_id/my-brings', verifyAuth0Token, async (req, res) => {
     const shaped = result.map((r) => {
       const json = r.toJSON();
       json.user_id = caller.id;
+      delete json.user_uuid; // one identifier pair on the wire
       return json;
     });
 

@@ -42,6 +42,10 @@ function toFriendshipWire(friendship, { requesterUuid, addresseeUuid } = {}) {
     requesterUuid ?? plain.requester_uuid ?? (plain.Requester && plain.Requester.id);
   plain.addressee_id =
     addresseeUuid ?? plain.addressee_uuid ?? (plain.Addressee && plain.Addressee.id);
+  // Keep the wire to ONE identifier pair (pre-cutover shape had no *_uuid):
+  // the surrogate FK columns duplicate the flat fields' values post-alias.
+  delete plain.requester_uuid;
+  delete plain.addressee_uuid;
   return plain;
 }
 
