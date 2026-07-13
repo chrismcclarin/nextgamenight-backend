@@ -448,6 +448,30 @@ describe('Group admin mutations — dual-key target resolution (87.3 PR-A expand
     expect(ug).toBeNull();
   });
 
+  // 87.3 code-review H2: approve/reject are the only two dual-keyed handlers with
+  // an extra decodeURIComponent before resolveTargetUser, and today's production
+  // FE sends the SUB to exactly these endpoints for the whole expand window — the
+  // sub-shape half of their regression net must exist, mirroring role/remove/transfer.
+  it('approve: still accepts a sub-shaped pending-member target -> 200 (expand-window back-compat)', async () => {
+    const pending = await makeUser({ user_id: 'auth0|dk-pending3', username: 'dk-pending3' });
+    await addToGroup(pending, group, 'pending');
+    await request(makeApp(owner))
+      .post(`/api/groups/${group.id}/users/${encodeURIComponent(pending.user_id)}/approve`) // sub
+      .expect(200);
+    const ug = await UserGroup.findOne({ where: { user_uuid: pending.id, group_id: group.id } });
+    expect(ug.role).toBe('member');
+  });
+
+  it('reject: still accepts a sub-shaped pending-member target -> 200 and removes it (back-compat)', async () => {
+    const pending = await makeUser({ user_id: 'auth0|dk-pending4', username: 'dk-pending4' });
+    await addToGroup(pending, group, 'pending');
+    await request(makeApp(owner))
+      .post(`/api/groups/${group.id}/users/${encodeURIComponent(pending.user_id)}/reject`) // sub
+      .expect(200);
+    const ug = await UserGroup.findOne({ where: { user_uuid: pending.id, group_id: group.id } });
+    expect(ug).toBeNull();
+  });
+
   // ---- POST /:group_id/transfer-ownership ----
   it('transfer-ownership: accepts a UUID-shaped new_owner_user_id -> 200 and swaps roles', async () => {
     const res = await request(makeApp(owner))

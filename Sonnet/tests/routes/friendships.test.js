@@ -269,7 +269,7 @@ describe('POST /friendships/request — dual-key target resolution (87.3 PR-A ex
   it('a UUID-addressed request does not slip past the sub-keyed duplicate check -> 409', async () => {
     // An existing accepted friendship (either direction) must be detected even
     // when the new request addresses the target by UUID.
-    jest.spyOn(Friendship, 'findOne').mockResolvedValue(
+    const findOneSpy = jest.spyOn(Friendship, 'findOne').mockResolvedValue(
       fakeFriendship({ status: 'accepted' })
     );
     const createSpy = jest.spyOn(Friendship, 'create');
@@ -281,6 +281,17 @@ describe('POST /friendships/request — dual-key target resolution (87.3 PR-A ex
     expect(res.status).toBe(409);
     expect(res.body.error).toMatch(/already friends/i);
     expect(createSpy).not.toHaveBeenCalled();
+    // 87.3 code-review #13: findOne is mocked unconditionally, so the 409 alone
+    // proves nothing about HOW the duplicate check was keyed. Pin the where
+    // clause: both Op.or arms must key the RESOLVED UUID pair (caller + resolved
+    // addressee), not the raw param or the Auth0 strings.
+    const dupWhere = findOneSpy.mock.calls[0][0].where;
+    expect(dupWhere[Op.or]).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ requester_uuid: REQUESTER_UUID, addressee_uuid: ADDRESSEE_UUID }),
+        expect.objectContaining({ requester_uuid: ADDRESSEE_UUID, addressee_uuid: REQUESTER_UUID }),
+      ])
+    );
   });
 });
 
@@ -479,6 +490,24 @@ describe('GET /friendships — D-12 wire shim + UUID where-branches', () => {
     expect(whereArg[Op.or][0].requester_uuid).toBe(REQUESTER_UUID);
     expect(whereArg[Op.or][1].addressee_uuid).toBe(REQUESTER_UUID);
     expect(whereArg[Op.or][0].requester_id).toBeUndefined();
+    // 87.3 code-review H1: findAll is MOCKED, so the nested-id assertions above
+    // only exercise the fixture — they would stay green if USER_INCLUDES dropped
+    // 'id'. Make the pin bite on the QUERY: assert the include actually requests
+    // the nested id/user_id the FE cutover (PR-B) and the shim depend on. This is
+    // the half of the regression net PR-C's attribute-list edits can trip.
+    const includeArg = findAllSpy.mock.calls[0][0].include;
+    expect(includeArg).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          as: 'Requester',
+          attributes: expect.arrayContaining(['id', 'user_id']),
+        }),
+        expect.objectContaining({
+          as: 'Addressee',
+          attributes: expect.arrayContaining(['id', 'user_id']),
+        }),
+      ])
+    );
   });
 
   it('a pending request surfaces in BOTH received (addressee) and sent (requester) lists, Auth0 strings in both (mandated directional test)', async () => {
