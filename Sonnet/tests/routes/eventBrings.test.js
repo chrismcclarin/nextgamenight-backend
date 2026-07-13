@@ -42,6 +42,11 @@ const {
   makeEventBring,
 } = require('../factories');
 
+// D-05 include-pin shapes (Phase 87.3 Task 1): the nested User.id the FE cutover
+// (PR-B) compares against is a UUID; the Auth0 sub is provider-prefixed.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const SUB_RE = /^(auth0|google-oauth2|apple)\|/;
+
 // Shared actor ref injected ahead of the router (mirrors verifyAuth0Token).
 let currentActor = null;
 const app = express();
@@ -160,5 +165,12 @@ describe('EventBring UUID keyspace ownership + wire (Phase 87.1)', () => {
     expect(row).toBeDefined();
     expect(row.user_id).toBe(owner.user_id); // Auth0 sub, D-12
     expect(row.user_uuid).toBeUndefined();   // no raw UUID leak
+    // D-05 INCLUDE-PIN (Phase 87.3 Task 1): the nested User.id the FE cutover
+    // (PR-B) will compare against MUST be a UUID, never the Auth0 sub — the
+    // regression net for PR-C's flat-field flip (plan 09).
+    expect(row.User).toBeDefined();
+    expect(row.User.id).toMatch(UUID_RE);
+    expect(row.User.id).not.toMatch(SUB_RE);
+    expect(row.User.id).toBe(owner.id);
   });
 });

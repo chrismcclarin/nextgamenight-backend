@@ -64,10 +64,24 @@ const USERS = {
   [OUTSIDER]: { id: OUTSIDER_UUID, user_id: OUTSIDER, username: 'outsider' },
 };
 
+// D-05 include-pin shapes (Phase 87.3 Task 1): the nested User.id the FE cutover
+// (PR-B) will compare against is a UUID; the Auth0 sub is provider-prefixed.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const SUB_RE = /^(auth0|google-oauth2|apple)\|/;
+
 // Stub User.findOne to resolve Auth0 string -> Users row (the once-per-handler
 // resolution every re-keyed gate now performs).
+//
+// Phase 87.3 (PR-A expand): the target identifier is now dual-keyed via
+// resolveTargetUser — a UUID-shaped param resolves through User.findByPk, a
+// sub-shaped param through User.findOne. Stub BOTH so both identifier shapes
+// resolve to the same fixtures.
+const USERS_BY_UUID = Object.fromEntries(
+  Object.values(USERS).map((u) => [u.id, u])
+);
 function stubUsers() {
   jest.spyOn(User, 'findOne').mockImplementation(async ({ where }) => USERS[where.user_id] || null);
+  jest.spyOn(User, 'findByPk').mockImplementation(async (id) => USERS_BY_UUID[id] || null);
 }
 
 // A fake Friendship instance with a spyable update()/destroy(). Carries BOTH
@@ -171,6 +185,101 @@ describe('POST /friendships/request — idempotency (BINT-01 / T-87-07) + D-12 w
       .send({ addressee_user_id: 'auth0|ghost-user' });
 
     expect(res.status).toBe(404);
+    expect(createSpy).not.toHaveBeenCalled();
+  });
+});
+
+// Phase 87.3 (PR-A expand, Task 3): POST /request resolves its client-supplied
+// addressee_user_id DUAL-KEYED — Users.id UUID first (the post-PR-C shape plan
+// 06 will send), Auth0 sub fallback (today's shape). Both shapes must work for
+// the whole expand window, and the self-request guard must fire on the RESOLVED
+// identity for BOTH shapes (a raw sub-vs-UUID compare would fail-open).
+describe('POST /friendships/request — dual-key target resolution (87.3 PR-A expand)', () => {
+  beforeEach(() => {
+    currentActor = REQUESTER;
+    stubUsers();
+  });
+
+  it('accepts a UUID-shaped addressee_user_id (post-PR-C shape) -> 201, wire still Auth0 subs', async () => {
+    const created = {
+      id: 'friendship-1',
+      requester_uuid: REQUESTER_UUID,
+      addressee_uuid: ADDRESSEE_UUID,
+      status: 'pending',
+    };
+    jest.spyOn(Friendship, 'findOne').mockResolvedValue(null);
+    const createSpy = jest.spyOn(Friendship, 'create').mockResolvedValue(created);
+
+    const res = await request(app)
+      .post('/api/friendships/request')
+      .send({ addressee_user_id: ADDRESSEE_UUID }); // UUID, not the sub
+
+    expect(res.status).toBe(201);
+    // Resolved via User.findByPk (UUID path) to the same addressee row.
+    expect(createSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ requester_uuid: REQUESTER_UUID, addressee_uuid: ADDRESSEE_UUID })
+    );
+    // Response serialization is UNCHANGED — the flat wire fields stay Auth0 subs,
+    // sourced from the resolved row (not the raw UUID param).
+    expectAuth0Wire(res.body, { requester: REQUESTER, addressee: ADDRESSEE });
+  });
+
+  it('still accepts a sub-shaped addressee_user_id (expand-window back-compat) -> 201', async () => {
+    jest.spyOn(Friendship, 'findOne').mockResolvedValue(null);
+    const createSpy = jest.spyOn(Friendship, 'create').mockResolvedValue({
+      id: 'friendship-1',
+      requester_uuid: REQUESTER_UUID,
+      addressee_uuid: ADDRESSEE_UUID,
+      status: 'pending',
+    });
+
+    const res = await request(app)
+      .post('/api/friendships/request')
+      .send({ addressee_user_id: ADDRESSEE }); // Auth0 sub
+
+    expect(res.status).toBe(201);
+    expect(createSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ requester_uuid: REQUESTER_UUID, addressee_uuid: ADDRESSEE_UUID })
+    );
+    expectAuth0Wire(res.body, { requester: REQUESTER, addressee: ADDRESSEE });
+  });
+
+  it('rejects a self-request via the UUID shape -> 400 (guard on resolved identity, no fail-open)', async () => {
+    const createSpy = jest.spyOn(Friendship, 'create');
+    const res = await request(app)
+      .post('/api/friendships/request')
+      .send({ addressee_user_id: REQUESTER_UUID }); // caller's OWN UUID
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/yourself/i);
+    expect(createSpy).not.toHaveBeenCalled();
+  });
+
+  it('rejects a self-request via the sub shape -> 400', async () => {
+    const createSpy = jest.spyOn(Friendship, 'create');
+    const res = await request(app)
+      .post('/api/friendships/request')
+      .send({ addressee_user_id: REQUESTER }); // caller's OWN sub
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/yourself/i);
+    expect(createSpy).not.toHaveBeenCalled();
+  });
+
+  it('a UUID-addressed request does not slip past the sub-keyed duplicate check -> 409', async () => {
+    // An existing accepted friendship (either direction) must be detected even
+    // when the new request addresses the target by UUID.
+    jest.spyOn(Friendship, 'findOne').mockResolvedValue(
+      fakeFriendship({ status: 'accepted' })
+    );
+    const createSpy = jest.spyOn(Friendship, 'create');
+
+    const res = await request(app)
+      .post('/api/friendships/request')
+      .send({ addressee_user_id: ADDRESSEE_UUID });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/already friends/i);
     expect(createSpy).not.toHaveBeenCalled();
   });
 });
@@ -355,6 +464,14 @@ describe('GET /friendships — D-12 wire shim + UUID where-branches', () => {
     expect(f.addressee_id).toBe(ADDRESSEE);
     expect(f).not.toHaveProperty('requester_uuid');
     expect(f).not.toHaveProperty('addressee_uuid');
+    // D-05 INCLUDE-PIN (Phase 87.3 Task 1): the nested Requester.id / Addressee.id
+    // the FE cutover (PR-B) will compare against MUST be the UUID, never the sub.
+    // If a future change (e.g. PR-C's flat-field flip) drops the nested id, this
+    // fails — the regression net PR-C depends on.
+    expect(f.Requester.id).toMatch(UUID_RE);
+    expect(f.Requester.id).not.toMatch(SUB_RE);
+    expect(f.Addressee.id).toMatch(UUID_RE);
+    expect(f.Addressee.id).not.toMatch(SUB_RE);
     // friend-derive: caller is the requester -> friend is the Addressee.
     expect(f.friend.user_id).toBe(ADDRESSEE);
     // accepted where-branch (Op.or) keyed the UUID columns, not the Auth0 strings.

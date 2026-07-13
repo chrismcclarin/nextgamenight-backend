@@ -4,6 +4,7 @@ const express = require('express');
 const { Op, UniqueConstraintError } = require('sequelize');
 const { User, Friendship } = require('../models');
 const { body, validationResult } = require('express-validator');
+const { resolveTargetUser } = require('../utils/resolveTargetUser');
 
 const router = express.Router();
 
@@ -185,22 +186,28 @@ router.post(
       const userId = req.user.user_id;
       const { addressee_user_id } = req.body;
 
-      // Prevent self-friending
-      if (addressee_user_id === userId) {
-        return res.status(400).json({ error: 'Cannot send a friend request to yourself' });
-      }
-
-      // D-11 (Phase 87.1): resolve BOTH the caller and the target Auth0 strings
-      // to Users.id before touching the UUID-keyed Friendship columns. The
-      // target must be a real local user (friend requests originate from
-      // /search, which only returns local Users rows).
+      // D-11 (Phase 87.1): resolve BOTH the caller and the target to Users.id
+      // before touching the UUID-keyed Friendship columns. The target must be a
+      // real local user (friend requests originate from /search, which only
+      // returns local Users rows).
+      //
+      // Phase 87.3 (PR-A expand): the target identifier is now dual-keyed —
+      // resolve by Users.id UUID first (the post-PR-C wire shape the FE cutover
+      // in plan 06 will send), falling back to the Auth0 sub (today's shape).
       const caller = await User.findOne({ where: { user_id: userId } });
       if (!caller) {
         return res.status(403).json({ error: 'Caller not found' });
       }
-      const addresseeUser = await User.findOne({ where: { user_id: addressee_user_id } });
+      const addresseeUser = await resolveTargetUser(addressee_user_id);
       if (!addresseeUser) {
         return res.status(404).json({ error: 'User not found' });
+      }
+
+      // Prevent self-friending — compare canonical (resolved) identity, not the
+      // raw param, so the guard fires whether the client sent a UUID or a sub
+      // (a raw sub-vs-UUID compare would silently stop rejecting self-requests).
+      if (addresseeUser.id === caller.id) {
+        return res.status(400).json({ error: 'Cannot send a friend request to yourself' });
       }
 
       // Check for existing friendship in either direction (UUID keyspace)
@@ -233,11 +240,13 @@ router.post(
               addressee_uuid: addresseeUser.id,
               status: 'pending',
             });
-            // D-12 shim: emit Auth0 strings, strip the *_uuid columns.
+            // D-12 shim: emit Auth0 strings, strip the *_uuid columns. Source
+            // the addressee sub from the RESOLVED row (not the raw param) so the
+            // wire stays the Auth0 sub even when the client sent a UUID (87.3).
             return res.status(200).json(
               toFriendshipWire(existing, {
-                requesterAuth0: userId,
-                addresseeAuth0: addressee_user_id,
+                requesterAuth0: caller.user_id,
+                addresseeAuth0: addresseeUser.user_id,
               })
             );
           default:
@@ -262,11 +271,13 @@ router.post(
           status: 'pending',
         });
 
-        // D-12 shim: emit Auth0 strings, strip the *_uuid columns.
+        // D-12 shim: emit Auth0 strings, strip the *_uuid columns. Source the
+        // subs from the RESOLVED rows so the wire is byte-stable across the 87.3
+        // expand window regardless of which identifier shape the client sent.
         return res.status(201).json(
           toFriendshipWire(friendship, {
-            requesterAuth0: userId,
-            addresseeAuth0: addressee_user_id,
+            requesterAuth0: caller.user_id,
+            addresseeAuth0: addresseeUser.user_id,
           })
         );
       } catch (createErr) {
@@ -288,10 +299,13 @@ router.post(
           });
           if (raceRow) {
             const callerIsRequester = raceRow.requester_uuid === caller.id;
+            // Auth0 subs sourced from the resolved rows (87.3): the winner may be
+            // in EITHER direction, so map requester/addressee by which uuid landed
+            // in requester_uuid — never from the raw (possibly-UUID) param.
             return res.status(201).json(
               toFriendshipWire(raceRow, {
-                requesterAuth0: callerIsRequester ? userId : addressee_user_id,
-                addresseeAuth0: callerIsRequester ? addressee_user_id : userId,
+                requesterAuth0: callerIsRequester ? caller.user_id : addresseeUser.user_id,
+                addresseeAuth0: callerIsRequester ? addresseeUser.user_id : caller.user_id,
               })
             );
           }

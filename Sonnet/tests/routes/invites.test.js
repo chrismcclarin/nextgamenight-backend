@@ -616,3 +616,95 @@ describe('GET /invites/pending — invited_by_name via the Inviter association (
     expect(res.body[0]).not.toHaveProperty('invited_by_uuid');
   });
 });
+
+// ============================================================================
+// Phase 87.3 (PR-A expand, Task 3): POST /send resolves its client-supplied
+// friend_user_id DUAL-KEYED — Users.id UUID first (the post-PR-C shape the
+// FriendInvitePanel sender will pass in plan 06), Auth0 sub fallback (today's
+// shape). Both shapes must pass the accepted-friendship gate, and the WR-02
+// self-invite guard must fire on the RESOLVED identity for BOTH shapes (a raw
+// sub-vs-UUID compare would silently fail-open). The resolved friend email is
+// still resolved server-side (no PII leak) regardless of identifier shape.
+// ============================================================================
+describe('POST /invites/send — friend_user_id dual-key resolution (87.3 PR-A expand)', () => {
+  let owner;
+  let friend;
+  let group;
+
+  beforeEach(async () => {
+    owner = await User.create({
+      user_id: 'auth0|dk-invite-owner',
+      username: 'dk-invite-owner',
+      email: 'dk-invite-owner@example.com',
+    });
+    friend = await User.create({
+      user_id: 'auth0|dk-invite-friend',
+      username: 'dk-invite-friend',
+      email: 'dk-invite-friend@example.com',
+    });
+    group = await Group.create({ group_id: 'dk-invite-group', name: 'DK Invite Group' });
+    await UserGroup.create({
+      user_uuid: owner.id,
+      group_id: group.id,
+      role: 'owner',
+      status: 'active',
+    });
+    await Friendship.create({
+      requester_uuid: owner.id,
+      addressee_uuid: friend.id,
+      status: 'accepted',
+    });
+    currentActor = owner.user_id;
+  });
+
+  it('accepts a UUID-shaped friend_user_id (post-PR-C shape): passes the friendship gate, creates the invite, no PII leak', async () => {
+    const res = await request(app)
+      .post('/api/invites/send')
+      .send({ group_id: group.id, friend_user_id: friend.id }) // UUID, not the sub
+      .expect(201);
+
+    expect(res.body.success).toBe(true);
+    expect(res.body.invite_id).toBeTruthy();
+    // Email resolved server-side — must not appear on the wire.
+    const bodyStr = JSON.stringify(res.body);
+    expect(bodyStr).not.toContain(friend.email);
+
+    const invite = await GroupInvite.findOne({ where: { group_id: group.id, status: 'pending' } });
+    expect(invite).not.toBeNull();
+    expect(invite.invited_email.toLowerCase()).toBe(friend.email.toLowerCase());
+  });
+
+  it('still accepts a sub-shaped friend_user_id (expand-window back-compat) -> 201', async () => {
+    await request(app)
+      .post('/api/invites/send')
+      .send({ group_id: group.id, friend_user_id: friend.user_id }) // Auth0 sub
+      .expect(201);
+    const invite = await GroupInvite.findOne({ where: { group_id: group.id, status: 'pending' } });
+    expect(invite.invited_email.toLowerCase()).toBe(friend.email.toLowerCase());
+  });
+
+  it('rejects a self-invite via the UUID shape -> 400 (guard on resolved identity, no fail-open)', async () => {
+    const res = await request(app)
+      .post('/api/invites/send')
+      .send({ group_id: group.id, friend_user_id: owner.id }) // owner's OWN uuid
+      .expect(400);
+    expect(res.body.error).toMatch(/yourself/i);
+    const count = await GroupInvite.count({ where: { group_id: group.id } });
+    expect(count).toBe(0);
+  });
+
+  it('the friendship gate still denies a UUID-shaped friend_user_id with NO accepted friendship -> 403', async () => {
+    const stranger = await User.create({
+      user_id: 'auth0|dk-invite-stranger',
+      username: 'dk-invite-stranger',
+      email: 'dk-invite-stranger@example.com',
+    });
+    const res = await request(app)
+      .post('/api/invites/send')
+      .send({ group_id: group.id, friend_user_id: stranger.id }) // UUID, not friends
+      .expect(403);
+    expect(res.body.error).toMatch(/only invite your friends/i);
+    const count = await GroupInvite.count({ where: { group_id: group.id } });
+    expect(count).toBe(0);
+  });
+});

@@ -9,6 +9,7 @@ const { body, validationResult } = require('express-validator');
 const emailService = require('../services/emailService');
 
 const { isOwnerOrAdmin } = require('../services/authorizationService');
+const { resolveTargetUser } = require('../utils/resolveTargetUser');
 
 const router = express.Router();
 
@@ -177,12 +178,6 @@ router.post(
       let normalizedEmail;
 
       if (friend_user_id) {
-        // WR-02: you cannot invite yourself via the friend path. There is no
-        // self-friendship row so this is implicitly blocked, but guard explicitly.
-        if (friend_user_id === userId) {
-          return res.status(400).json({ error: "You can't invite yourself" });
-        }
-
         // friend_user_id path takes precedence over email.
         // 1) Gate on an ACCEPTED friendship between the requester and the
         //    target (bidirectional). This prevents using the endpoint as an
@@ -190,12 +185,23 @@ router.post(
         //
         // D-11 (Phase 87.1, BINT-02): Friendship is keyed on the Users.id UUID
         // surrogate (requester_uuid/addressee_uuid). Resolve BOTH the caller and
-        // the friend-target Auth0 strings to Users.id before the gate — a UUID
-        // column compared against an Auth0 string is always-false, which would
-        // silently 403 every legitimate friend-invite. A missing Users row on
+        // the friend-target to Users.id before the gate. A missing Users row on
         // either side fails closed (treated as "no friendship").
+        //
+        // Phase 87.3 (PR-A expand): friend_user_id is dual-keyed — Users.id UUID
+        // first (the post-PR-C shape the FriendInvitePanel sender will pass in
+        // plan 06), falling back to the Auth0 sub (today's shape).
         const callerUser = await User.findOne({ where: { user_id: userId } });
-        const friendUserRow = await User.findOne({ where: { user_id: friend_user_id } });
+        const friendUserRow = await resolveTargetUser(friend_user_id);
+
+        // WR-02: you cannot invite yourself via the friend path. There is no
+        // self-friendship row so the gate below also blocks it, but guard
+        // explicitly on canonical (resolved) identity — not the raw param — so it
+        // fires whether the client sent a UUID or a sub.
+        if (callerUser && friendUserRow && friendUserRow.id === callerUser.id) {
+          return res.status(400).json({ error: "You can't invite yourself" });
+        }
+
         const friendship = callerUser && friendUserRow
           ? await Friendship.findOne({
             where: {
@@ -214,10 +220,10 @@ router.post(
             .json({ error: 'You can only invite your friends this way' });
         }
 
-        // 2) Resolve the friend's email SERVER-SIDE only (never returned to client).
-        const friendUser = await User.scope('withContactInfo').findOne({
-          where: { user_id: friend_user_id },
-        });
+        // 2) Resolve the friend's email SERVER-SIDE only (never returned to
+        //    client). Re-fetch withContactInfo by the RESOLVED primary key so
+        //    the lookup is identifier-shape-independent (87.3).
+        const friendUser = await User.scope('withContactInfo').findByPk(friendUserRow.id);
 
         if (!friendUser || !friendUser.email) {
           return res.status(404).json({ error: 'Friend not found' });

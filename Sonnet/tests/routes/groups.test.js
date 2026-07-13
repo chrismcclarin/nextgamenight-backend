@@ -5,6 +5,11 @@ const groupRoutes = require('../../routes/groups');
 const { Group, User, UserGroup, Event, Game } = require('../../models');
 const { makeUser, addToGroup } = require('../factories');
 
+// D-05 include-pin shapes (Phase 87.3 Task 1): the nested member id the FE
+// cutover (PR-B) compares against is a UUID; the Auth0 sub is provider-prefixed.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const SUB_RE = /^(auth0|google-oauth2|apple)\|/;
+
 // The group routes derive the actor from req.user (BE-044 / BSEC-01 default-deny
 // authz, Phase 83). Build a per-test app that injects req.user ahead of the
 // router (mirrors tests/helpers/authStub.js + the leave-cascade suites). The
@@ -52,6 +57,19 @@ describe('Group Routes', () => {
 
       expect(Array.isArray(response.body)).toBe(true);
       expect(response.body.length).toBeGreaterThan(0);
+
+      // D-05 INCLUDE-PIN (Phase 87.3 Task 1): the nested roster member id the FE
+      // cutover (PR-B) will compare against MUST be a UUID, never the Auth0 sub.
+      // This is the second roster endpoint (the GET /:group_id/users roster is
+      // pinned separately below) — together they form the PR-C regression net.
+      const seededGroup = response.body.find((g) => g.id === testGroup.id);
+      expect(seededGroup).toBeDefined();
+      expect(Array.isArray(seededGroup.Users)).toBe(true);
+      const me = seededGroup.Users.find((u) => u.username === 'testuser1');
+      expect(me).toBeDefined();
+      expect(me.id).toMatch(UUID_RE);
+      expect(me.id).not.toMatch(SUB_RE);
+      expect(me.id).toBe(testUser1.id);
     });
 
     it('should auto-create the user row when it does not exist yet', async () => {
@@ -303,5 +321,170 @@ describe('Group Routes', () => {
       const created = await User.scope('withContactInfo').findOne({ where: { user_id: newSub } });
       expect(created.email).toBe('auth0-f2-unverified-joiner@auth0.local');
     });
+  });
+});
+
+// ============================================================================
+// Phase 87.3 (PR-A expand, Task 3): the five group-admin mutations AND the
+// POST /:group_id/users friend-invite/add-member path resolve their target-user
+// identifier DUAL-KEYED — Users.id UUID first (the post-PR-C roster shape the FE
+// cutover in plan 05 will send), Auth0 sub fallback (today's shape). Both shapes
+// must work for the whole expand window, and the self-removal / self-transfer
+// guards must fire on the RESOLVED identity for BOTH shapes (a raw sub-vs-UUID
+// compare would silently fail-open).
+//
+// Real-DB (factories). Run ALONE per the never-green-locally caveat:
+//   npm test -- tests/routes/groups.test.js
+// ============================================================================
+describe('Group admin mutations — dual-key target resolution (87.3 PR-A expand)', () => {
+  function makeApp(actor) {
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.user = actor ? { user_id: actor.user_id, email: actor.email } : undefined;
+      next();
+    });
+    app.use('/api/groups', groupRoutes);
+    return app;
+  }
+
+  let owner;
+  let member;
+  let group;
+
+  beforeEach(async () => {
+    owner = await makeUser({ user_id: 'auth0|dk-owner', username: 'dk-owner' });
+    member = await makeUser({ user_id: 'auth0|dk-member', username: 'dk-member' });
+    group = await Group.create({ group_id: `dk-group-${Date.now()}`, name: 'Dual-Key Group' });
+    await addToGroup(owner, group, 'owner');
+    await addToGroup(member, group, 'member');
+  });
+
+  // ---- POST /:group_id/users add-member/friend-invite path ----
+  it('add-member: accepts a UUID-shaped target user_id (post-PR-C roster shape) -> 200', async () => {
+    const newcomer = await makeUser({ user_id: 'auth0|dk-newcomer', username: 'dk-newcomer' });
+    const res = await request(makeApp(owner))
+      .post(`/api/groups/${group.id}/users`)
+      .send({ user_id: newcomer.id }) // UUID, not the sub
+      .expect(200);
+    expect(res.body.message).toBe('User added to group successfully');
+    const ug = await UserGroup.findOne({ where: { user_uuid: newcomer.id, group_id: group.id } });
+    expect(ug).not.toBeNull();
+  });
+
+  it('add-member: still accepts a sub-shaped target user_id (expand-window back-compat) -> 200', async () => {
+    const newcomer = await makeUser({ user_id: 'auth0|dk-newcomer2', username: 'dk-newcomer2' });
+    await request(makeApp(owner))
+      .post(`/api/groups/${group.id}/users`)
+      .send({ user_id: newcomer.user_id }) // Auth0 sub
+      .expect(200);
+    const ug = await UserGroup.findOne({ where: { user_uuid: newcomer.id, group_id: group.id } });
+    expect(ug).not.toBeNull();
+  });
+
+  // ---- PUT /:group_id/users/:target_user_id/role ----
+  it('role change: accepts a UUID-shaped target -> 200 and updates the role', async () => {
+    const res = await request(makeApp(owner))
+      .put(`/api/groups/${group.id}/users/${member.id}/role`) // UUID
+      .send({ role: 'admin' })
+      .expect(200);
+    expect(res.body.role).toBe('admin');
+    const ug = await UserGroup.findOne({ where: { user_uuid: member.id, group_id: group.id } });
+    expect(ug.role).toBe('admin');
+  });
+
+  it('role change: still accepts a sub-shaped target -> 200 (back-compat)', async () => {
+    await request(makeApp(owner))
+      .put(`/api/groups/${group.id}/users/${encodeURIComponent(member.user_id)}/role`) // sub
+      .send({ role: 'admin' })
+      .expect(200);
+    const ug = await UserGroup.findOne({ where: { user_uuid: member.id, group_id: group.id } });
+    expect(ug.role).toBe('admin');
+  });
+
+  // ---- DELETE /:group_id/users/:target_user_id ----
+  it('remove: accepts a UUID-shaped target -> 200 and removes the membership', async () => {
+    await request(makeApp(owner))
+      .delete(`/api/groups/${group.id}/users/${member.id}`) // UUID
+      .expect(200);
+    const ug = await UserGroup.findOne({ where: { user_uuid: member.id, group_id: group.id, status: 'active' } });
+    expect(ug).toBeNull();
+  });
+
+  it('remove: the owner cannot remove THEMSELVES via their UUID -> 400 (self-guard on resolved identity)', async () => {
+    const res = await request(makeApp(owner))
+      .delete(`/api/groups/${group.id}/users/${owner.id}`) // owner's OWN uuid
+      .expect(400);
+    expect(res.body.error).toMatch(/cannot remove themselves/i);
+    // Still an owner — the guard fired, no fail-open.
+    const ug = await UserGroup.findOne({ where: { user_uuid: owner.id, group_id: group.id, status: 'active' } });
+    expect(ug.role).toBe('owner');
+  });
+
+  it('remove: the owner cannot remove themselves via their sub either -> 400', async () => {
+    await request(makeApp(owner))
+      .delete(`/api/groups/${group.id}/users/${encodeURIComponent(owner.user_id)}`) // owner's sub
+      .expect(400);
+  });
+
+  // ---- POST /:group_id/users/:target_user_id/approve + /reject ----
+  it('approve: accepts a UUID-shaped pending-member target -> 200', async () => {
+    const pending = await makeUser({ user_id: 'auth0|dk-pending', username: 'dk-pending' });
+    await addToGroup(pending, group, 'pending');
+    await request(makeApp(owner))
+      .post(`/api/groups/${group.id}/users/${pending.id}/approve`) // UUID
+      .expect(200);
+    const ug = await UserGroup.findOne({ where: { user_uuid: pending.id, group_id: group.id } });
+    expect(ug.role).toBe('member');
+  });
+
+  it('reject: accepts a UUID-shaped pending-member target -> 200 and removes it', async () => {
+    const pending = await makeUser({ user_id: 'auth0|dk-pending2', username: 'dk-pending2' });
+    await addToGroup(pending, group, 'pending');
+    await request(makeApp(owner))
+      .post(`/api/groups/${group.id}/users/${pending.id}/reject`) // UUID
+      .expect(200);
+    const ug = await UserGroup.findOne({ where: { user_uuid: pending.id, group_id: group.id } });
+    expect(ug).toBeNull();
+  });
+
+  // ---- POST /:group_id/transfer-ownership ----
+  it('transfer-ownership: accepts a UUID-shaped new_owner_user_id -> 200 and swaps roles', async () => {
+    const res = await request(makeApp(owner))
+      .post(`/api/groups/${group.id}/transfer-ownership`)
+      .send({ new_owner_user_id: member.id }) // UUID
+      .expect(200);
+    expect(res.body.success).toBe(true);
+    const ownerUg = await UserGroup.findOne({ where: { user_uuid: owner.id, group_id: group.id } });
+    const memberUg = await UserGroup.findOne({ where: { user_uuid: member.id, group_id: group.id } });
+    expect(ownerUg.role).toBe('admin');
+    expect(memberUg.role).toBe('owner');
+  });
+
+  it('transfer-ownership: still accepts a sub-shaped new_owner_user_id -> 200 (back-compat)', async () => {
+    await request(makeApp(owner))
+      .post(`/api/groups/${group.id}/transfer-ownership`)
+      .send({ new_owner_user_id: member.user_id }) // sub
+      .expect(200);
+    const memberUg = await UserGroup.findOne({ where: { user_uuid: member.id, group_id: group.id } });
+    expect(memberUg.role).toBe('owner');
+  });
+
+  it('transfer-ownership: rejects a self-transfer via the UUID shape -> 400 (guard on resolved identity)', async () => {
+    const res = await request(makeApp(owner))
+      .post(`/api/groups/${group.id}/transfer-ownership`)
+      .send({ new_owner_user_id: owner.id }) // owner's OWN uuid
+      .expect(400);
+    expect(res.body.error).toMatch(/yourself/i);
+    // No fail-open: owner is still owner.
+    const ownerUg = await UserGroup.findOne({ where: { user_uuid: owner.id, group_id: group.id } });
+    expect(ownerUg.role).toBe('owner');
+  });
+
+  it('transfer-ownership: rejects a self-transfer via the sub shape -> 400', async () => {
+    await request(makeApp(owner))
+      .post(`/api/groups/${group.id}/transfer-ownership`)
+      .send({ new_owner_user_id: owner.user_id }) // owner's sub
+      .expect(400);
   });
 });
