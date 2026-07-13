@@ -19,6 +19,7 @@ const {
   sequelize,
 } = require('../models');
 const { sendError } = require('../utils/errors');
+const { resolveTargetUser } = require('../utils/resolveTargetUser');
 const { Op } = require('sequelize');
 const router = express.Router();
 const { validateGroupCreate, validateGroupUpdate, validateUUID } = require('../middleware/validators');
@@ -411,9 +412,12 @@ router.post('/:group_id/users', async (req, res) => {
       return res.status(403).json({ error: 'Only owners and admins can add members to a group' });
     }
 
-    // V5: the client-supplied `user_id` (Auth0 string) is resolved to a Users row
-    // server-side here — never trusted directly as the UserGroup FK.
-    const user = await User.findOne({ where: { user_id } });
+    // V5: the client-supplied `user_id` is resolved to a Users row server-side
+    // here — never trusted directly as the UserGroup FK.
+    // Phase 87.3 (PR-A expand): dual-keyed — resolve by Users.id UUID first (the
+    // post-PR-C roster shape the FE friend-invite sender will pass in plan 06),
+    // falling back to the Auth0 sub (today's shape).
+    const user = await resolveTargetUser(user_id);
     const group = await Group.findByPk(req.params.group_id);
 
     if (!user || !group) {
@@ -468,8 +472,10 @@ router.put('/:group_id/users/:target_user_id/role', async (req, res) => {
       return res.status(400).json({ error: 'Invalid role. Must be member, admin, or owner' });
     }
     
-    // Prevent changing owner's role (owner can't demote themselves)
-    const targetUser = await User.findOne({ where: { user_id: target_user_id } });
+    // Prevent changing owner's role (owner can't demote themselves).
+    // Phase 87.3 (PR-A expand): dual-keyed target resolution — Users.id UUID
+    // first (post-PR-C roster shape), Auth0 sub fallback (today's shape).
+    const targetUser = await resolveTargetUser(target_user_id);
     if (!targetUser) {
       return res.status(404).json({ error: 'Target user not found' });
     }
@@ -778,10 +784,13 @@ router.post('/:group_id/users/:target_user_id/approve', async (req, res) => {
       return res.status(403).json({ error: 'Only owners and admins can approve members' });
     }
 
-    // V5 / D-11: resolve the client-supplied Auth0-string target to a Users row,
-    // then key UserGroup on user_uuid (never trust the raw param as the FK).
+    // V5 / D-11: resolve the client-supplied target to a Users row, then key
+    // UserGroup on user_uuid (never trust the raw param as the FK).
+    // Phase 87.3 (PR-A expand): dual-keyed — Users.id UUID first (post-PR-C
+    // shape), Auth0 sub fallback (today's shape). decodeURIComponent is a no-op
+    // for a UUID but preserved for the sub path.
     const decodedTargetId = decodeURIComponent(target_user_id);
-    const targetUser = await User.findOne({ where: { user_id: decodedTargetId } });
+    const targetUser = await resolveTargetUser(decodedTargetId);
     if (!targetUser) {
       return res.status(404).json({ error: 'Pending member not found' });
     }
@@ -818,10 +827,13 @@ router.post('/:group_id/users/:target_user_id/reject', async (req, res) => {
       return res.status(403).json({ error: 'Only owners and admins can reject members' });
     }
 
-    // V5 / D-11: resolve the client-supplied Auth0-string target to a Users row,
-    // then key UserGroup on user_uuid (never trust the raw param as the FK).
+    // V5 / D-11: resolve the client-supplied target to a Users row, then key
+    // UserGroup on user_uuid (never trust the raw param as the FK).
+    // Phase 87.3 (PR-A expand): dual-keyed — Users.id UUID first (post-PR-C
+    // shape), Auth0 sub fallback (today's shape). decodeURIComponent is a no-op
+    // for a UUID but preserved for the sub path.
     const decodedTargetId = decodeURIComponent(target_user_id);
-    const targetUser = await User.findOne({ where: { user_id: decodedTargetId } });
+    const targetUser = await resolveTargetUser(decodedTargetId);
     if (!targetUser) {
       return res.status(404).json({ error: 'Pending member not found' });
     }
@@ -907,13 +919,8 @@ router.post('/:group_id/transfer-ownership', async (req, res) => {
       return res.status(400).json({ error: 'new_owner_user_id is required' });
     }
 
-    // 2. Self-transfer guard
-    if (new_owner_user_id === userId) {
-      return res.status(400).json({ error: 'Cannot transfer ownership to yourself' });
-    }
-
     // D-11: resolve both parties' Users rows; UserGroup is keyed on user_uuid.
-    // 3. Requester must be the current active owner
+    // 2. Requester must be the current active owner
     const requesterUser = await User.findOne({ where: { user_id: userId } });
     if (!requesterUser) {
       return res.status(403).json({ error: 'Only the group owner can transfer ownership' });
@@ -925,11 +932,19 @@ router.post('/:group_id/transfer-ownership', async (req, res) => {
       return res.status(403).json({ error: 'Only the group owner can transfer ownership' });
     }
 
-    // 4. Target must be an active member (pending members are filtered out by status: 'active').
-    // V5: new_owner_user_id is a client-supplied Auth0 string — resolved server-side here.
-    const newOwnerUser = await User.findOne({ where: { user_id: new_owner_user_id } });
+    // 3. Target must be an active member (pending members are filtered out by status: 'active').
+    // Phase 87.3 (PR-A expand): new_owner_user_id is dual-keyed — Users.id UUID
+    // first (post-PR-C roster shape), Auth0 sub fallback (today's shape).
+    const newOwnerUser = await resolveTargetUser(new_owner_user_id);
     if (!newOwnerUser) {
       return res.status(404).json({ error: 'Target user is not an active member of this group' });
+    }
+
+    // 4. Self-transfer guard — compare canonical (resolved) identity, not the raw
+    // param, so it fires whether the client sent a UUID or a sub (a raw
+    // sub-vs-UUID compare would silently let a self-transfer through).
+    if (newOwnerUser.id === requesterUser.id) {
+      return res.status(400).json({ error: 'Cannot transfer ownership to yourself' });
     }
     const targetUg = await UserGroup.findOne({
       where: { user_uuid: newOwnerUser.id, group_id, status: 'active' },
@@ -966,22 +981,26 @@ router.delete('/:group_id/users/:target_user_id', async (req, res) => {
     }
     
     const { group_id, target_user_id } = req.params; // Target user to remove
-    
+
     const requestingUser = await User.findOne({ where: { user_id: userId } });
-    const targetUser = await User.findOne({ where: { user_id: target_user_id } });
-    
+    // Phase 87.3 (PR-A expand): dual-keyed target resolution — Users.id UUID
+    // first (post-PR-C roster shape), Auth0 sub fallback (today's shape).
+    const targetUser = await resolveTargetUser(target_user_id);
+
     if (!requestingUser || !targetUser) {
       return res.status(404).json({ error: 'User not found' });
     }
-    
+
     // Only owner or admin can remove users
     const hasPermission = await isOwnerOrAdmin(userId, group_id);
     if (!hasPermission) {
       return res.status(403).json({ error: 'Only owners and admins can remove users from groups' });
     }
-    
-    // Owner cannot remove themselves (they must transfer ownership first or delete the group)
-    if (userId === target_user_id) {
+
+    // Owner cannot remove themselves (they must transfer ownership first or
+    // delete the group). Compare canonical (resolved) identity, not the raw
+    // param, so the guard fires whether the client sent a UUID or a sub.
+    if (requestingUser.id === targetUser.id) {
       const requestingRole = await getUserRoleInGroup(userId, group_id);
       if (requestingRole === 'owner') {
         return res.status(400).json({ error: 'Group owner cannot remove themselves. Transfer ownership first or delete the group.' });
