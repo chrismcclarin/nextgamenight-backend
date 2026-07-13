@@ -1161,16 +1161,18 @@ router.get('/:group_id/library', async (req, res) => {
     }
 
     // 4. Load the member Users directly by UUID.
+    // Phase 87.3 PR-C (Task 2b): the sub column is no longer selected — the
+    // owners[]/members[] object literals below ALIAS user_id to the UUID.
     const users = await User.findAll({
       where: { id: { [Op.in]: memberUuids } },
-      attributes: ['id', 'user_id', 'username'],
+      attributes: ['id', 'username'],
     });
 
     const userUuids = users.map(u => u.id);
-    // Map UUID -> { username, auth0Id } for owner attribution
+    // Map UUID -> { username } for owner attribution
     const uuidToUser = {};
     for (const u of users) {
-      uuidToUser[u.id] = { username: u.username, user_id: u.user_id };
+      uuidToUser[u.id] = { username: u.username };
     }
 
     if (userUuids.length === 0) {
@@ -1210,9 +1212,15 @@ router.get('/:group_id/library', async (req, res) => {
 
       const owner = uuidToUser[ug.user_id];
       if (owner) {
+        // Phase 87.3 PR-C (Task 2b, UNIFORM ALIAS LOCKED — removal or
+        // one-side-only cleaning FORBIDDEN): owners[].user_id carries the
+        // owner's Users.id UUID (ug.user_id IS that UUID — UserGame is
+        // UUID-keyed). GroupLibrary joins owners[].user_id against
+        // members[].user_id WITHIN this one payload to drive the owner
+        // filter, so BOTH sides alias in this same edit (see members below).
         gameMap.get(game.id).owners.push({
           username: owner.username,
-          user_id: owner.user_id,
+          user_id: ug.user_id,
         });
       }
     }
@@ -1223,9 +1231,11 @@ router.get('/:group_id/library', async (req, res) => {
       game.owners.sort((a, b) => a.username.localeCompare(b.username));
     }
 
-    // 8. Build member list sorted alphabetically
+    // 8. Build member list sorted alphabetically.
+    // PR-C uniform alias (other half of the owners<->members intra-payload
+    // join): members[].user_id carries the member's Users.id UUID.
     const members = users
-      .map(u => ({ user_id: u.user_id, username: u.username }))
+      .map(u => ({ user_id: u.id, username: u.username }))
       .sort((a, b) => a.username.localeCompare(b.username));
 
     res.json({ games, members });

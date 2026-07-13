@@ -225,12 +225,23 @@ describe('List Routes', () => {
         .expect(200);
 
       expect(Array.isArray(response.body)).toBe(true);
-      if (response.body.length > 0) {
-        expect(response.body[0]).toHaveProperty('user_id');
-        expect(response.body[0]).toHaveProperty('name');
-        expect(response.body[0]).toHaveProperty('games_played');
-        expect(response.body[0]).toHaveProperty('games_won');
+      expect(response.body.length).toBeGreaterThan(0);
+      expect(response.body[0]).toHaveProperty('user_id');
+      expect(response.body[0]).toHaveProperty('name');
+      expect(response.body[0]).toHaveProperty('games_played');
+      expect(response.body[0]).toHaveProperty('games_won');
+      // Phase 87.3 PR-C (user D3, mechanical conversion): the emitted user_id
+      // VALUE is the player's Users.id UUID (name stable) — the internal
+      // aggregation keying stays sub-keyed, but no sub crosses the wire.
+      for (const player of response.body) {
+        expect(player.user_id).not.toMatch(/^(auth0|google-oauth2|apple)\|/);
+        expect(player.user_id).toMatch(
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+        );
       }
+      const p1 = response.body.find((p) => p.name === 'testuser1');
+      expect(p1).toBeDefined();
+      expect(p1.user_id).toBe(testUser1.id);
     });
 
     it('should return 403 if user not in group', async () => {

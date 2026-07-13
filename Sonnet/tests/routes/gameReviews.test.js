@@ -116,8 +116,10 @@ describe('GameReview Routes', () => {
         review_text: 'Amazing game!'
       });
 
+      // Phase 87.3 PR-C (deferred review #1/#12): the target is UUID-ONLY —
+      // callers address the user by their Users.id UUID, not the sub.
       const response = await request(makeApp(testUser1))
-        .get(`/api/game-reviews/user/${testUser1.user_id}/group/${testGroup.id}`)
+        .get(`/api/game-reviews/user/${testUser1.id}/group/${testGroup.id}`)
         .expect(200);
 
       expect(Array.isArray(response.body)).toBe(true);
@@ -125,6 +127,9 @@ describe('GameReview Routes', () => {
       expect(response.body[0]).toHaveProperty('rating');
       expect(response.body[0]).toHaveProperty('User');
       expect(response.body[0]).toHaveProperty('Game');
+      // PR-C (Req 1): the reviewer's nested User is sub-free — id/username only.
+      expect(response.body[0].User.id).toBe(testUser1.id);
+      expect(response.body[0].User.user_id).toBeUndefined();
     });
 
     it('should return empty array if user has no reviews', async () => {
@@ -132,7 +137,7 @@ describe('GameReview Routes', () => {
       await addToGroup(newUser, testGroup);
 
       const response = await request(makeApp(newUser))
-        .get(`/api/game-reviews/user/${newUser.user_id}/group/${testGroup.id}`)
+        .get(`/api/game-reviews/user/${newUser.id}/group/${testGroup.id}`)
         .expect(200);
 
       expect(Array.isArray(response.body)).toBe(true);
@@ -145,7 +150,7 @@ describe('GameReview Routes', () => {
       // non-member, so even requesting a member's reviews is denied — and no
       // ?user_id is passed, proving the gate no longer depends on it.
       const response = await request(makeApp(testUser2))
-        .get(`/api/game-reviews/user/${testUser1.user_id}/group/${testGroup.id}`)
+        .get(`/api/game-reviews/user/${testUser1.id}/group/${testGroup.id}`)
         .expect(403);
 
       expect(response.body.error).toBe('Access denied to this group');
@@ -159,10 +164,18 @@ describe('GameReview Routes', () => {
       expect(response.body.error).toBe('User not found');
     });
 
+    it('REJECTS a sub-shaped target user_id (87.3 PR-C, deferred #1/#12 — UUID-only lookup) -> 404', async () => {
+      const response = await request(makeApp(testUser1))
+        .get(`/api/game-reviews/user/${encodeURIComponent(testUser1.user_id)}/group/${testGroup.id}`)
+        .expect(404);
+
+      expect(response.body.error).toBe('User not found');
+    });
+
     it('should allow access when the caller is a member of the group', async () => {
       // Member caller, no ?user_id needed — authz is on req.user.
       const response = await request(makeApp(testUser1))
-        .get(`/api/game-reviews/user/${testUser1.user_id}/group/${testGroup.id}`)
+        .get(`/api/game-reviews/user/${testUser1.id}/group/${testGroup.id}`)
         .expect(200);
 
       expect(Array.isArray(response.body)).toBe(true);
@@ -170,7 +183,7 @@ describe('GameReview Routes', () => {
 
     it('should handle database errors when fetching reviews', async () => {
       const response = await request(makeApp(testUser1))
-        .get(`/api/game-reviews/user/${testUser1.user_id}/group/invalid-uuid`)
+        .get(`/api/game-reviews/user/${testUser1.id}/group/invalid-uuid`)
         .expect(500);
 
       expect(response.body).toHaveProperty('error');

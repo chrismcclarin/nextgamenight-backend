@@ -4,6 +4,7 @@ const { GameReview, User, Game } = require('../models');
 const router = express.Router();
 const { validateReviewCreate, validateUUID } = require('../middleware/validators');
 const { isActiveMember, isMemberOrHigher } = require('../services/authorizationService');
+const { resolveTargetUserUuidOnly } = require('../utils/resolveTargetUser');
 
 
 // Get reviews for a game in a specific group
@@ -11,18 +12,21 @@ router.get('/game/:game_id/group/:group_id', async (req, res) => {
   try {
     const { game_id, group_id } = req.params;
     const { user_id } = req.query;
-    
+
     if (user_id) {
       const hasAccess = await isActiveMember(user_id, group_id);
       if (!hasAccess) {
         return res.status(403).json({ error: 'Access denied to this group' });
       }
     }
-    
+
+    // Phase 87.3 PR-C (plan 09 Task 2b, Req 1): the reviewer's nested User
+    // include is sub-free — id/username only. Safe: gameDetail's review-author
+    // reads were cut to review.User.id by plan 06 (PR-B, merged first).
     const reviews = await GameReview.findAll({
       where: { game_id, group_id },
       include: [
-        { model: User, attributes: ['id', 'username', 'user_id'] },
+        { model: User, attributes: ['id', 'username'] },
         { model: Game, attributes: ['name'] }
       ],
       order: [['createdAt', 'DESC']]
@@ -53,15 +57,21 @@ router.get('/user/:user_id/group/:group_id', async (req, res) => {
       return res.status(403).json({ error: 'Access denied to this group' });
     }
 
-    const targetUser = await User.findOne({ where: { user_id: target_user_id } });
+    // Phase 87.3 PR-C (deferred review #1/#12, amended D1): the target lookup
+    // was SUB-ONLY — contracted UUID-only to match this plan's end-state (the
+    // FE client fn is dead code today; any future caller sources member ids
+    // from the aliased rosters, which now carry UUIDs). A sub-shaped target
+    // rejects as not-found.
+    const targetUser = await resolveTargetUserUuidOnly(target_user_id);
     if (!targetUser) {
       return res.status(404).json({ error: 'User not found' });
     }
-    
+
+    // PR-C (Req 1): nested User include sub-free — id/username only.
     const reviews = await GameReview.findAll({
       where: { user_id: targetUser.id, group_id },
       include: [
-        { model: User, attributes: ['id', 'username', 'user_id'] },
+        { model: User, attributes: ['id', 'username'] },
         { model: Game, attributes: ['name', 'image_url'] }
       ],
       order: [['createdAt', 'DESC']]
@@ -138,10 +148,10 @@ router.post('/', validateReviewCreate, async (req, res) => {
       });
     }
     
-    // Fetch complete review data
+    // Fetch complete review data. PR-C (Req 1): nested User include sub-free.
     const completeReview = await GameReview.findByPk(review.id, {
       include: [
-        { model: User, attributes: ['id', 'username', 'user_id'] },
+        { model: User, attributes: ['id', 'username'] },
         { model: Game, attributes: ['name', 'image_url'] }
       ]
     });

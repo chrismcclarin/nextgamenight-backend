@@ -256,7 +256,9 @@ router.get('/games/:group_id/:user_id', async (req, res) => {
     const sortField = validSorts.includes(sort) ? sort : 'last_played';
     const sortOrder = order.toLowerCase() === 'asc' ? 'ASC' : 'DESC';
     
-    // Get all events for the group with game information and winner/picker data
+    // Get all events for the group with game information and winner/picker data.
+    // Phase 87.3 PR-C (Task 2b): the sub column is no longer selected — the
+    // winners/pickers entries below ALIAS user_id to the Users.id UUID.
     const events = await Event.findAll({
       where: { group_id },
       include: [
@@ -264,8 +266,8 @@ router.get('/games/:group_id/:user_id', async (req, res) => {
           model: Game,
           attributes: ['id', 'name', 'image_url', 'theme', 'year_published', 'min_players', 'max_players', 'playing_time', 'description']
         },
-        { model: User, as: 'Winner', attributes: ['id', 'username', 'user_id'] },
-        { model: User, as: 'PickedBy', attributes: ['id', 'username', 'user_id'] }
+        { model: User, as: 'Winner', attributes: ['id', 'username'] },
+        { model: User, as: 'PickedBy', attributes: ['id', 'username'] }
       ],
       order: [['start_date', 'DESC']]
     });
@@ -338,13 +340,19 @@ router.get('/games/:group_id/:user_id', async (req, res) => {
         game.first_played = eventDate.toISOString();
       }
 
-      // Track winner for this event
+      // Track winner for this event.
+      // Phase 87.3 PR-C (Task 2b, ALIAS LOCKED — removal FORBIDDEN): each
+      // winners/pickers entry's user_id VALUE is the Users.id UUID (name
+      // stable, Req 2). GroupGamesList cross-payload-JOINS these user_id keys
+      // against roster member user_id keys (Task 2 aliases those to UUIDs in
+      // this SAME PR-C) — both join sides flip in lockstep; dropping the field
+      // would silently empty the winner/picker merge and filter-by-member.
       if (event.Winner) {
-        const existing = game.winners.find(w => w.user_id === event.Winner.user_id);
+        const existing = game.winners.find(w => w.user_id === event.Winner.id);
         if (existing) {
           existing.count++;
         } else {
-          game.winners.push({ id: event.Winner.id, username: event.Winner.username, user_id: event.Winner.user_id, count: 1, is_custom: false });
+          game.winners.push({ id: event.Winner.id, username: event.Winner.username, user_id: event.Winner.id, count: 1, is_custom: false });
         }
       } else if (event.winner_name) {
         const existing = game.winners.find(w => w.is_custom && w.username === event.winner_name);
@@ -355,13 +363,13 @@ router.get('/games/:group_id/:user_id', async (req, res) => {
         }
       }
 
-      // Track picker for this event
+      // Track picker for this event (same PR-C alias lock as winners above).
       if (event.PickedBy) {
-        const existing = game.pickers.find(p => p.user_id === event.PickedBy.user_id);
+        const existing = game.pickers.find(p => p.user_id === event.PickedBy.id);
         if (existing) {
           existing.count++;
         } else {
-          game.pickers.push({ id: event.PickedBy.id, username: event.PickedBy.username, user_id: event.PickedBy.user_id, count: 1, is_custom: false });
+          game.pickers.push({ id: event.PickedBy.id, username: event.PickedBy.username, user_id: event.PickedBy.id, count: 1, is_custom: false });
         }
       } else if (event.picked_by_name) {
         const existing = game.pickers.find(p => p.is_custom && p.username === event.picked_by_name);
@@ -537,11 +545,14 @@ router.get('/players/:group_id/:user_id', async (req, res) => {
       if (event.EventParticipations && Array.isArray(event.EventParticipations)) {
         event.EventParticipations.forEach(participation => {
           const player = participation.User;
+          // Phase 87.3 PR-C (user D3, mechanical read-only emitter): the
+          // aggregation's INTERNAL keying stays sub-keyed (playerKey below) —
+          // only the SERIALIZED user_id value flips to the Users.id UUID.
           const playerKey = player.user_id;
-          
+
           if (!playerStats[playerKey]) {
             playerStats[playerKey] = {
-              user_id: player.user_id,
+              user_id: player.id, // D3: emitted value is the UUID (name stable)
               name: player.username,
               games_played: 0,
               games_won: 0,
