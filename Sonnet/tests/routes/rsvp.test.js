@@ -379,35 +379,42 @@ describe('RSVP UUID keyspace authz + wire (Phase 87.1)', () => {
     expect(await EventBring.findByPk(bring.id)).toBeNull();
   });
 
-  it('POST response serializes user_id as the Auth0 sub, not a UUID (D-12)', async () => {
+  it('POST response flat user_id CARRIES the Users.id UUID, never the sub (PR-C, Req 2)', async () => {
     currentActor = owner.user_id;
     const res = await request(app)
       .post('/api/rsvp')
       .send({ event_id: event.id, status: 'yes' });
     expect([200, 201]).toContain(res.status);
-    expect(res.body.user_id).toBe(owner.user_id);
-    expect(res.body.user_uuid).toBeUndefined();
+    expect(res.body.user_id).toBe(owner.id); // UUID — name stable, value flipped
+    expect(res.body.user_id).not.toMatch(SUB_RE);
+    // PR-C nested strip: the nested User is sub-free (id/username only).
+    expect(res.body.User.id).toBe(owner.id);
+    expect(res.body.User.user_id).toBeUndefined();
   });
 
-  it('GET /event/:id list serializes each rsvp user_id as the Auth0 sub (D-12)', async () => {
+  it('GET /event/:id list: each rsvp flat user_id carries the UUID; nested User is sub-free (PR-C)', async () => {
     await makeEventRsvp(event, owner, { status: 'yes' });
     currentActor = owner.user_id;
     const res = await request(app).get(`/api/rsvp/event/${event.id}`);
     expect(res.status).toBe(200);
     const row = res.body.rsvps.find((r) => r.id);
     expect(row).toBeDefined();
-    expect(row.user_id).toBe(owner.user_id);
-    expect(row.user_uuid).toBeUndefined();
-    // D-05 INCLUDE-PIN (Phase 87.3 Task 1): the nested User.id the FE cutover
-    // (PR-B) will compare against MUST be a UUID, never the Auth0 sub. This is
-    // the regression net for PR-C's flat-field flip (plan 09).
+    // PR-C (Req 2 carry-UUID lock): flat user_id = nested User.id — the
+    // gameDetail roster-key -> rsvp-key join flips UUID-to-UUID in lockstep.
+    expect(row.user_id).toBe(owner.id);
+    expect(row.user_id).not.toMatch(SUB_RE);
+    // D-05 INCLUDE-PIN (updated for the PR-C contracted end state): the nested
+    // User.id the FE compares against MUST be the UUID; the nested sub user_id
+    // is now asserted ABSENT.
     expect(row.User).toBeDefined();
     expect(row.User.id).toMatch(UUID_RE);
     expect(row.User.id).not.toMatch(SUB_RE);
     expect(row.User.id).toBe(owner.id);
+    expect(row.User.user_id).toBeUndefined();
+    expect(row.User.username).toBeDefined();
   });
 
-  it('GET /user/:id returns a freshly UUID-keyed RSVP and serializes user_id as the Auth0 sub (D-12)', async () => {
+  it('GET /user/:id returns a freshly UUID-keyed RSVP with flat user_id = caller UUID (PR-C self-only site)', async () => {
     // Seed UUID-keyed only: user_id is a non-matching sentinel so a query keyed
     // on the Auth0 param would MISS — only a user_uuid-keyed query finds it.
     const rsvp = await EventRsvp.create({
@@ -422,8 +429,8 @@ describe('RSVP UUID keyspace authz + wire (Phase 87.1)', () => {
     expect(Array.isArray(res.body)).toBe(true);
     const row = res.body.find((r) => r.id === rsvp.id);
     expect(row).toBeDefined(); // proves the query keyed user_uuid, not the Auth0 param
-    expect(row.user_id).toBe(owner.user_id); // D-12: Auth0 sub, defined, not a UUID
-    expect(row.user_uuid).toBeUndefined();
+    expect(row.user_id).toBe(owner.id); // PR-C: caller's resolved UUID, never the sub
+    expect(row.user_id).not.toMatch(SUB_RE);
   });
 
   it('GET /user/:id with an unresolvable caller returns an empty list (fail-closed, no 500)', async () => {

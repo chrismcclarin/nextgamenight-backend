@@ -132,10 +132,10 @@ describe('EventBring UUID keyspace ownership + wire (Phase 87.1)', () => {
     // transactional re-fetch matched on the UUID keyspace (not an empty body).
     const row = res.body.find(r => r.game_id === game.id);
     expect(row).toBeDefined();
-    // D-12: the returned row serializes user_id as the caller's Auth0 sub, not a
-    // UUID, and does not leak a raw user_uuid on the wire.
-    expect(row.user_id).toBe(owner.user_id);
-    expect(row.user_uuid).toBeUndefined();
+    // PR-C (Req 2 carry-UUID lock): the returned row's flat user_id carries the
+    // caller's resolved Users.id UUID — name stable, never the sub.
+    expect(row.user_id).toBe(owner.id);
+    expect(row.user_id).not.toMatch(SUB_RE);
 
     // The persisted bring is keyed on user_uuid.
     const persisted = await EventBring.findOne({
@@ -154,8 +154,8 @@ describe('EventBring UUID keyspace ownership + wire (Phase 87.1)', () => {
     expect(res.status).toBe(403);
   });
 
-  // ---- (c) GET /event response-shape (D-12) ----
-  it('GET /event serializes each bring user_id as the Auth0 sub string, not a UUID (D-12)', async () => {
+  // ---- (c) GET /event response-shape (PR-C) ----
+  it('GET /event: each bring flat user_id carries the Users.id UUID; nested User is sub-free (PR-C)', async () => {
     await makeEventBring(event, owner, game);
     currentActor = owner.user_id;
     const res = await request(app).get(`/api/brings/event/${event.id}`);
@@ -163,14 +163,17 @@ describe('EventBring UUID keyspace ownership + wire (Phase 87.1)', () => {
     expect(Array.isArray(res.body)).toBe(true);
     const row = res.body.find(b => b.id);
     expect(row).toBeDefined();
-    expect(row.user_id).toBe(owner.user_id); // Auth0 sub, D-12
-    expect(row.user_uuid).toBeUndefined();   // no raw UUID leak
-    // D-05 INCLUDE-PIN (Phase 87.3 Task 1): the nested User.id the FE cutover
-    // (PR-B) will compare against MUST be a UUID, never the Auth0 sub — the
-    // regression net for PR-C's flat-field flip (plan 09).
+    // PR-C (Req 2 carry-UUID lock): flat user_id = nested User.id (UUID) —
+    // name stable, value flipped in lockstep with the roster alias.
+    expect(row.user_id).toBe(owner.id);
+    expect(row.user_id).not.toMatch(SUB_RE);
+    // D-05 INCLUDE-PIN (updated for PR-C): nested User.id is the UUID; the
+    // nested sub user_id is now asserted ABSENT (nested strip).
     expect(row.User).toBeDefined();
     expect(row.User.id).toMatch(UUID_RE);
     expect(row.User.id).not.toMatch(SUB_RE);
     expect(row.User.id).toBe(owner.id);
+    expect(row.User.user_id).toBeUndefined();
+    expect(row.User.username).toBeDefined();
   });
 });

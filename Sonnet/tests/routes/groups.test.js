@@ -325,18 +325,18 @@ describe('Group Routes', () => {
 });
 
 // ============================================================================
-// Phase 87.3 (PR-A expand, Task 3): the five group-admin mutations AND the
-// POST /:group_id/users friend-invite/add-member path resolve their target-user
-// identifier DUAL-KEYED — Users.id UUID first (the post-PR-C roster shape the FE
-// cutover in plan 05 will send), Auth0 sub fallback (today's shape). Both shapes
-// must work for the whole expand window, and the self-removal / self-transfer
-// guards must fire on the RESOLVED identity for BOTH shapes (a raw sub-vs-UUID
-// compare would silently fail-open).
+// Phase 87.3 PR-C (plan 09, amended D1 contraction): the five group-admin
+// mutations resolve their target-user identifier UUID-ONLY — the PR-A sub
+// fallback (the AF6 dual-key window) is CLOSED now that PR-B (plan 05) cut the
+// ManageMembers senders to member.id. The UUID shape succeeds; a sub-shaped
+// target rejects as not-found (accepted stale-bundle trade-off — never re-add
+// the fallback). The POST /:group_id/users friend-invite/add-member path is
+// the SOLE RETAINED dual-key (outside D1's endpoint list).
 //
 // Real-DB (factories). Run ALONE per the never-green-locally caveat:
 //   npm test -- tests/routes/groups.test.js
 // ============================================================================
-describe('Group admin mutations — dual-key target resolution (87.3 PR-A expand)', () => {
+describe('Group admin mutations — UUID-only target resolution (87.3 PR-C contraction)', () => {
   function makeApp(actor) {
     const app = express();
     app.use(express.json());
@@ -361,6 +361,8 @@ describe('Group admin mutations — dual-key target resolution (87.3 PR-A expand
   });
 
   // ---- POST /:group_id/users add-member/friend-invite path ----
+  // The SOLE retained dual-key after the amended-D1 contraction (outside D1's
+  // endpoint list): both identifier shapes keep working here.
   it('add-member: accepts a UUID-shaped target user_id (post-PR-C roster shape) -> 200', async () => {
     const newcomer = await makeUser({ user_id: 'auth0|dk-newcomer', username: 'dk-newcomer' });
     const res = await request(makeApp(owner))
@@ -372,7 +374,7 @@ describe('Group admin mutations — dual-key target resolution (87.3 PR-A expand
     expect(ug).not.toBeNull();
   });
 
-  it('add-member: still accepts a sub-shaped target user_id (expand-window back-compat) -> 200', async () => {
+  it('add-member: still accepts a sub-shaped target user_id (the retained dual-key) -> 200', async () => {
     const newcomer = await makeUser({ user_id: 'auth0|dk-newcomer2', username: 'dk-newcomer2' });
     await request(makeApp(owner))
       .post(`/api/groups/${group.id}/users`)
@@ -380,6 +382,13 @@ describe('Group admin mutations — dual-key target resolution (87.3 PR-A expand
       .expect(200);
     const ug = await UserGroup.findOne({ where: { user_uuid: newcomer.id, group_id: group.id } });
     expect(ug).not.toBeNull();
+  });
+
+  it('add-member: rejects a non-string user_id body (87.3 review #6 input hygiene) -> 400', async () => {
+    await request(makeApp(owner))
+      .post(`/api/groups/${group.id}/users`)
+      .send({ user_id: ['auth0|dk-array', 'auth0|dk-array2'] }) // array — must not coerce
+      .expect(400);
   });
 
   // ---- PUT /:group_id/users/:target_user_id/role ----
@@ -393,13 +402,13 @@ describe('Group admin mutations — dual-key target resolution (87.3 PR-A expand
     expect(ug.role).toBe('admin');
   });
 
-  it('role change: still accepts a sub-shaped target -> 200 (back-compat)', async () => {
+  it('role change: REJECTS a sub-shaped target (D1 contraction — sub fallback removed) -> 404, role unchanged', async () => {
     await request(makeApp(owner))
       .put(`/api/groups/${group.id}/users/${encodeURIComponent(member.user_id)}/role`) // sub
       .send({ role: 'admin' })
-      .expect(200);
+      .expect(404);
     const ug = await UserGroup.findOne({ where: { user_uuid: member.id, group_id: group.id } });
-    expect(ug.role).toBe('admin');
+    expect(ug.role).toBe('member'); // unchanged — no fail-open
   });
 
   // ---- DELETE /:group_id/users/:target_user_id ----
@@ -421,10 +430,21 @@ describe('Group admin mutations — dual-key target resolution (87.3 PR-A expand
     expect(ug.role).toBe('owner');
   });
 
-  it('remove: the owner cannot remove themselves via their sub either -> 400', async () => {
+  it('remove: REJECTS a sub-shaped target (D1 contraction) -> 404, membership intact', async () => {
     await request(makeApp(owner))
-      .delete(`/api/groups/${group.id}/users/${encodeURIComponent(owner.user_id)}`) // owner's sub
-      .expect(400);
+      .delete(`/api/groups/${group.id}/users/${encodeURIComponent(member.user_id)}`) // sub
+      .expect(404);
+    const ug = await UserGroup.findOne({ where: { user_uuid: member.id, group_id: group.id, status: 'active' } });
+    expect(ug).not.toBeNull(); // still a member — no fail-open
+  });
+
+  it('remove: a non-admin caller is 403d BEFORE any target resolution (87.3 review #3, WR-01 — no user-existence oracle)', async () => {
+    // A plain member probing an arbitrary (nonexistent) UUID must get the SAME
+    // uniform 403 as probing a real one — never a 404 that leaks existence.
+    const res = await request(makeApp(member))
+      .delete(`/api/groups/${group.id}/users/99999999-9999-4999-8999-999999999999`)
+      .expect(403);
+    expect(res.body.error).toMatch(/owners and admins/i);
   });
 
   // ---- POST /:group_id/users/:target_user_id/approve + /reject ----
@@ -448,50 +468,54 @@ describe('Group admin mutations — dual-key target resolution (87.3 PR-A expand
     expect(ug).toBeNull();
   });
 
-  // 87.3 code-review H2: approve/reject are the only two dual-keyed handlers with
-  // an extra decodeURIComponent before resolveTargetUser, and today's production
-  // FE sends the SUB to exactly these endpoints for the whole expand window — the
-  // sub-shape half of their regression net must exist, mirroring role/remove/transfer.
-  it('approve: still accepts a sub-shaped pending-member target -> 200 (expand-window back-compat)', async () => {
+  // 87.3 code-review H2 (flipped at PR-C per amended D1): approve/reject keep
+  // their sub-shape coverage, but the pinned behavior is now REJECTION — the
+  // sub fallback is removed, so a sub-shaped target 404s and mutates nothing.
+  it('approve: REJECTS a sub-shaped pending-member target (D1 contraction) -> 404, still pending', async () => {
     const pending = await makeUser({ user_id: 'auth0|dk-pending3', username: 'dk-pending3' });
     await addToGroup(pending, group, 'pending');
     await request(makeApp(owner))
       .post(`/api/groups/${group.id}/users/${encodeURIComponent(pending.user_id)}/approve`) // sub
-      .expect(200);
+      .expect(404);
     const ug = await UserGroup.findOne({ where: { user_uuid: pending.id, group_id: group.id } });
-    expect(ug.role).toBe('member');
+    expect(ug.role).toBe('pending'); // unchanged — no fail-open
   });
 
-  it('reject: still accepts a sub-shaped pending-member target -> 200 and removes it (back-compat)', async () => {
+  it('reject: REJECTS a sub-shaped pending-member target (D1 contraction) -> 404, row survives', async () => {
     const pending = await makeUser({ user_id: 'auth0|dk-pending4', username: 'dk-pending4' });
     await addToGroup(pending, group, 'pending');
     await request(makeApp(owner))
       .post(`/api/groups/${group.id}/users/${encodeURIComponent(pending.user_id)}/reject`) // sub
-      .expect(200);
+      .expect(404);
     const ug = await UserGroup.findOne({ where: { user_uuid: pending.id, group_id: group.id } });
-    expect(ug).toBeNull();
+    expect(ug).not.toBeNull(); // still present — no fail-open
   });
 
   // ---- POST /:group_id/transfer-ownership ----
-  it('transfer-ownership: accepts a UUID-shaped new_owner_user_id -> 200 and swaps roles', async () => {
+  it('transfer-ownership: accepts a UUID-shaped new_owner_user_id -> 200, swaps roles, echoes UUIDs (Req 2)', async () => {
     const res = await request(makeApp(owner))
       .post(`/api/groups/${group.id}/transfer-ownership`)
       .send({ new_owner_user_id: member.id }) // UUID
       .expect(200);
     expect(res.body.success).toBe(true);
+    // PR-C: both echoed identifiers carry the Users.id UUIDs, never a sub.
+    expect(res.body.new_owner_user_id).toBe(member.id);
+    expect(res.body.previous_owner_user_id).toBe(owner.id);
     const ownerUg = await UserGroup.findOne({ where: { user_uuid: owner.id, group_id: group.id } });
     const memberUg = await UserGroup.findOne({ where: { user_uuid: member.id, group_id: group.id } });
     expect(ownerUg.role).toBe('admin');
     expect(memberUg.role).toBe('owner');
   });
 
-  it('transfer-ownership: still accepts a sub-shaped new_owner_user_id -> 200 (back-compat)', async () => {
+  it('transfer-ownership: REJECTS a sub-shaped new_owner_user_id (D1 contraction) -> 404, roles unchanged', async () => {
     await request(makeApp(owner))
       .post(`/api/groups/${group.id}/transfer-ownership`)
       .send({ new_owner_user_id: member.user_id }) // sub
-      .expect(200);
+      .expect(404);
+    const ownerUg = await UserGroup.findOne({ where: { user_uuid: owner.id, group_id: group.id } });
     const memberUg = await UserGroup.findOne({ where: { user_uuid: member.id, group_id: group.id } });
-    expect(memberUg.role).toBe('owner');
+    expect(ownerUg.role).toBe('owner'); // unchanged — no fail-open
+    expect(memberUg.role).toBe('member');
   });
 
   it('transfer-ownership: rejects a self-transfer via the UUID shape -> 400 (guard on resolved identity)', async () => {
@@ -505,10 +529,12 @@ describe('Group admin mutations — dual-key target resolution (87.3 PR-A expand
     expect(ownerUg.role).toBe('owner');
   });
 
-  it('transfer-ownership: rejects a self-transfer via the sub shape -> 400', async () => {
+  it('transfer-ownership: rejects a non-string new_owner_user_id body (87.3 review #6 input hygiene) -> 400', async () => {
     await request(makeApp(owner))
       .post(`/api/groups/${group.id}/transfer-ownership`)
-      .send({ new_owner_user_id: owner.user_id }) // owner's sub
+      .send({ new_owner_user_id: [member.id] }) // array — must not coerce
       .expect(400);
+    const memberUg = await UserGroup.findOne({ where: { user_uuid: member.id, group_id: group.id } });
+    expect(memberUg.role).toBe('member');
   });
 });

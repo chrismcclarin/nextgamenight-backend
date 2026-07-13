@@ -73,7 +73,7 @@ describe('POST /invites/send — friend_user_id path (83.2 INVITE-01)', () => {
 
     const res = await request(app)
       .post('/api/invites/send')
-      .send({ group_id: group.id, friend_user_id: friend.user_id })
+      .send({ group_id: group.id, friend_user_id: friend.id }) // PR-C: senders pass the Users.id UUID (plan 06 cut)
       .expect(201);
 
     expect(res.body.success).toBe(true);
@@ -106,7 +106,7 @@ describe('POST /invites/send — friend_user_id path (83.2 INVITE-01)', () => {
 
     await request(app)
       .post('/api/invites/send')
-      .send({ group_id: group.id, friend_user_id: friend.user_id })
+      .send({ group_id: group.id, friend_user_id: friend.id }) // PR-C: senders pass the Users.id UUID (plan 06 cut)
       .expect(201);
   });
 
@@ -114,7 +114,7 @@ describe('POST /invites/send — friend_user_id path (83.2 INVITE-01)', () => {
     // No Friendship row at all.
     const res = await request(app)
       .post('/api/invites/send')
-      .send({ group_id: group.id, friend_user_id: friend.user_id })
+      .send({ group_id: group.id, friend_user_id: friend.id }) // PR-C: senders pass the Users.id UUID (plan 06 cut)
       .expect(403);
 
     expect(res.body.error).toMatch(/only invite your friends/i);
@@ -133,7 +133,7 @@ describe('POST /invites/send — friend_user_id path (83.2 INVITE-01)', () => {
 
     await request(app)
       .post('/api/invites/send')
-      .send({ group_id: group.id, friend_user_id: friend.user_id })
+      .send({ group_id: group.id, friend_user_id: friend.id }) // PR-C: senders pass the Users.id UUID (plan 06 cut)
       .expect(403);
   });
 
@@ -179,7 +179,7 @@ describe('POST /invites/send — friend_user_id path (83.2 INVITE-01)', () => {
 
     const res = await request(app)
       .post('/api/invites/send')
-      .send({ group_id: group.id, friend_user_id: friend.user_id })
+      .send({ group_id: group.id, friend_user_id: friend.id }) // PR-C: senders pass the Users.id UUID (plan 06 cut)
       .expect(403);
 
     expect(res.body.error).toMatch(/owners and admins/i);
@@ -204,7 +204,7 @@ describe('POST /invites/send — friend_user_id path (83.2 INVITE-01)', () => {
 
     const res = await request(app)
       .post('/api/invites/send')
-      .send({ group_id: group.id, friend_user_id: friend.user_id })
+      .send({ group_id: group.id, friend_user_id: friend.id }) // PR-C: senders pass the Users.id UUID (plan 06 cut)
       .expect(409);
 
     expect(res.body.error).toMatch(/already a member/i);
@@ -226,7 +226,7 @@ describe('POST /invites/send — friend_user_id path (83.2 INVITE-01)', () => {
 
     const res = await request(app)
       .post('/api/invites/send')
-      .send({ group_id: group.id, friend_user_id: friend.user_id })
+      .send({ group_id: group.id, friend_user_id: friend.id }) // PR-C: senders pass the Users.id UUID (plan 06 cut)
       .expect(409);
 
     expect(res.body.error).toMatch(/pending invite/i);
@@ -235,7 +235,7 @@ describe('POST /invites/send — friend_user_id path (83.2 INVITE-01)', () => {
   it('(h) a user cannot invite themselves via friend_user_id → 400 (WR-02)', async () => {
     const res = await request(app)
       .post('/api/invites/send')
-      .send({ group_id: group.id, friend_user_id: owner.user_id })
+      .send({ group_id: group.id, friend_user_id: owner.id }) // PR-C: UUID shape
       .expect(400);
 
     expect(res.body.error).toMatch(/yourself/i);
@@ -618,15 +618,14 @@ describe('GET /invites/pending — invited_by_name via the Inviter association (
 });
 
 // ============================================================================
-// Phase 87.3 (PR-A expand, Task 3): POST /send resolves its client-supplied
-// friend_user_id DUAL-KEYED — Users.id UUID first (the post-PR-C shape the
-// FriendInvitePanel sender will pass in plan 06), Auth0 sub fallback (today's
-// shape). Both shapes must pass the accepted-friendship gate, and the WR-02
-// self-invite guard must fire on the RESOLVED identity for BOTH shapes (a raw
-// sub-vs-UUID compare would silently fail-open). The resolved friend email is
-// still resolved server-side (no PII leak) regardless of identifier shape.
+// Phase 87.3 PR-C (plan 09, user D1 contraction): POST /send resolves its
+// client-supplied friend_user_id UUID-ONLY — the PR-A sub fallback (AF16) is
+// removed now that PR-B (plan 06, AF12b) cut both FE senders to the nested
+// `.id`. The UUID shape succeeds; a sub-shaped identifier no longer resolves
+// and fails CLOSED at the accepted-friendship gate (403 — never an invite).
+// The resolved friend email is still resolved server-side (no PII leak).
 // ============================================================================
-describe('POST /invites/send — friend_user_id dual-key resolution (87.3 PR-A expand)', () => {
+describe('POST /invites/send — friend_user_id UUID-only resolution (87.3 PR-C contraction)', () => {
   let owner;
   let friend;
   let group;
@@ -674,13 +673,17 @@ describe('POST /invites/send — friend_user_id dual-key resolution (87.3 PR-A e
     expect(invite.invited_email.toLowerCase()).toBe(friend.email.toLowerCase());
   });
 
-  it('still accepts a sub-shaped friend_user_id (expand-window back-compat) -> 201', async () => {
-    await request(app)
+  it('REJECTS a sub-shaped friend_user_id (D1 contraction — sub fallback removed) -> 403, fails closed, no invite', async () => {
+    // Pre-contraction this succeeded via the sub fallback. Post-PR-C the sub no
+    // longer resolves, so the friendship gate fails CLOSED. Accepted trade-off:
+    // a stale pre-PR-C bundle sending a sub gets a 403, never a wrong-target hit.
+    const res = await request(app)
       .post('/api/invites/send')
       .send({ group_id: group.id, friend_user_id: friend.user_id }) // Auth0 sub
-      .expect(201);
-    const invite = await GroupInvite.findOne({ where: { group_id: group.id, status: 'pending' } });
-    expect(invite.invited_email.toLowerCase()).toBe(friend.email.toLowerCase());
+      .expect(403);
+    expect(res.body.error).toMatch(/only invite your friends/i);
+    const count = await GroupInvite.count({ where: { group_id: group.id } });
+    expect(count).toBe(0);
   });
 
   it('rejects a self-invite via the UUID shape -> 400 (guard on resolved identity, no fail-open)', async () => {

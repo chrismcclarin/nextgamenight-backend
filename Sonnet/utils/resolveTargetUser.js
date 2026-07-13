@@ -53,4 +53,28 @@ async function resolveTargetUser(identifier) {
   return User.findOne({ where: { user_id: value } });
 }
 
-module.exports = { resolveTargetUser, isUuid };
+/**
+ * Phase 87.3 PR-C (plan 09, amended D1 contraction): UUID-ONLY target
+ * resolution. The PR-A dual-key expand window is CLOSED for the friend request
+ * endpoints (POST /friendships/request, POST /invites/send friend_user_id) and
+ * the five group-admin target-param mutations — PR-B (plans 05/06) cut every FE
+ * sender of those identifiers to the nested `.id` (a Users.id UUID), so a
+ * sub-shaped target is now rejected as not-found. Known ACCEPTED trade-off
+ * (owner decision): a stale pre-PR-C browser bundle still sending a sub 404s —
+ * do NOT re-add the sub fallback for it; a refresh resolves it.
+ *
+ * The sole retained dual-key caller after PR-C is the POST /:group_id/users
+ * friend-invite/add-member path (outside D1's endpoint list), which keeps
+ * using resolveTargetUser above.
+ *
+ * @param {string} identifier - a Users.id UUID (the only accepted shape)
+ * @returns {Promise<import('sequelize').Model|null>} the User instance or null.
+ */
+async function resolveTargetUserUuidOnly(identifier) {
+  if (identifier == null || identifier === '') return null;
+  const value = typeof identifier === 'string' ? identifier : String(identifier);
+  if (!isUuid(value)) return null; // sub-shaped (or garbage) → not found
+  return User.findByPk(value);
+}
+
+module.exports = { resolveTargetUser, resolveTargetUserUuidOnly, isUuid };

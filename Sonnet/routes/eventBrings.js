@@ -22,10 +22,12 @@ router.get('/event/:event_id', verifyAuth0Token, async (req, res) => {
       return res.status(403).json({ error: 'You must be a participant on this event to view brings' });
     }
 
+    // Phase 87.3 PR-C (plan 09, Req 1): nested User include no longer carries
+    // the sub — id/username only (PR-B cut every nested-sub reader to `.id`).
     const brings = await EventBring.findAll({
       where: { event_id },
       include: [
-        { model: User, attributes: ['id', 'username', 'user_id'] },
+        { model: User, attributes: ['id', 'username'] },
         { model: Game, attributes: ['id', 'name', 'thumbnail_url'] },
       ],
       order: [
@@ -34,14 +36,12 @@ router.get('/event/:event_id', verifyAuth0Token, async (req, res) => {
       ],
     });
 
-    // D-12 wire shim: serialize each row's user_id from the included User.user_id
-    // (Auth0 sub) and strip the raw user_uuid so it never leaks on the wire.
+    // PR-C (Req 2 carry-UUID lock): each row's flat user_id carries the nested
+    // User.id UUID — name stable, no drop (BringSummary/BringGamePicker key on
+    // the nested id; the flat field flips in lockstep with the roster alias).
     const shaped = brings.map((b) => {
       const json = b.toJSON();
-      // No `?? json.user_id` fallback — Plan 09 DROPPED the string column, so it is
-      // always undefined and would only mask a missing User include (loud if absent).
-      json.user_id = json.User?.user_id;
-      delete json.user_uuid;
+      json.user_id = json.User?.id;
       return json;
     });
 
@@ -140,13 +140,12 @@ router.put('/event/:event_id/my-brings', verifyAuth0Token, async (req, res) => {
       });
     });
 
-    // D-12 wire shim (write-path response): this endpoint is self-only, so every
-    // returned row belongs to the caller. Serialize user_id as the caller's Auth0
-    // sub and strip user_uuid so the raw UUID never leaks on the wire.
+    // PR-C (write-path response): this endpoint is self-only, so every returned
+    // row belongs to the caller. Serialize the flat user_id as the caller's
+    // resolved Users.id UUID (Req 2 — name stable, value UUID, never the sub).
     const shaped = result.map((r) => {
       const json = r.toJSON();
-      json.user_id = userId;
-      delete json.user_uuid;
+      json.user_id = caller.id;
       return json;
     });
 

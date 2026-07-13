@@ -4,50 +4,44 @@ const express = require('express');
 const { Op, UniqueConstraintError } = require('sequelize');
 const { User, Friendship } = require('../models');
 const { body, validationResult } = require('express-validator');
-const { resolveTargetUser } = require('../utils/resolveTargetUser');
+const { resolveTargetUserUuidOnly } = require('../utils/resolveTargetUser');
 
 const router = express.Router();
 
-// Shared Requester/Addressee include shape — used to resolve the Auth0-string
-// display ids for the D-10/D-12 wire shim (see toFriendshipWire).
+// Shared Requester/Addressee include shape — the nested objects the FE compares
+// against (nested `.id` UUID, D-05).
 const USER_INCLUDES = [
   {
     model: User,
     as: 'Requester',
     // BSEC-01 (D-03): email removed — a friend list must not expose other
-    // users' email addresses; username + user_id suffice for display.
-    attributes: ['id', 'username', 'user_id'],
+    // users' email addresses. Phase 87.3 PR-C (plan 09, Req 1): the sub
+    // `user_id` is removed from the nested include too — id + username are
+    // the FE's read surface (PR-B cut every nested-sub reader to `.id`).
+    attributes: ['id', 'username'],
   },
   {
     model: User,
     as: 'Addressee',
-    attributes: ['id', 'username', 'user_id'],
+    attributes: ['id', 'username'],
   },
 ];
 
 // ============================================
-// D-10/D-12 wire shim (Phase 87.1, BINT-02): the frozen frontend consumes
-// `requester_id` / `addressee_id` as Auth0 user_id STRINGS. During the UUID
-// cutover the string columns are still dual-written, but Plan 09 DROPS them —
-// so we serialize the Auth0 strings from the included Requester/Addressee User
-// rows (their `.user_id`) or explicit args, and STRIP the surrogate
-// `requester_uuid` / `addressee_uuid` FKs. That keeps every mutation/list
-// response byte-stable across the Plan 09 column drop and never leaks a UUID.
+// Phase 87.3 PR-C wire serializer (plan 09, SPEC Req 2 carry-UUID lock): the
+// flat `requester_id` / `addressee_id` field NAMES are retained but their
+// VALUES now carry the Users.id UUID (equal to the nested Requester.id /
+// Addressee.id) — no Auth0 sub crosses the wire. Params are named
+// `requesterUuid`/`addresseeUuid` so any leftover call site still passing a
+// sub under the old `requesterAuth0` key resolves to undefined and falls back
+// to the row's own UUID columns instead of silently leaking the sub.
 // ============================================
-function toFriendshipWire(friendship, { requesterAuth0, addresseeAuth0 } = {}) {
+function toFriendshipWire(friendship, { requesterUuid, addresseeUuid } = {}) {
   const plain = friendship.toJSON ? friendship.toJSON() : { ...friendship };
-  // No `?? plain.requester_id` / `?? plain.addressee_id` fallback — Plan 09 DROPPED
-  // those string columns from the model, so they are always undefined here and would
-  // only mask a missing Requester/Addressee include. If an include is absent the shim
-  // correctly emits undefined (loud) rather than a silently-wrong value.
-  const reqAuth0 =
-    requesterAuth0 ?? (plain.Requester && plain.Requester.user_id);
-  const addrAuth0 =
-    addresseeAuth0 ?? (plain.Addressee && plain.Addressee.user_id);
-  plain.requester_id = reqAuth0;
-  plain.addressee_id = addrAuth0;
-  delete plain.requester_uuid;
-  delete plain.addressee_uuid;
+  plain.requester_id =
+    requesterUuid ?? plain.requester_uuid ?? (plain.Requester && plain.Requester.id);
+  plain.addressee_id =
+    addresseeUuid ?? plain.addressee_uuid ?? (plain.Addressee && plain.Addressee.id);
   return plain;
 }
 
@@ -111,8 +105,8 @@ router.get('/', async (req, res) => {
     });
 
     // For accepted friendships, derive the "friend" field for frontend
-    // convenience. The friend-derive uses the UUID compare (not the Auth0
-    // string) but the emitted id fields stay Auth0 strings via toFriendshipWire.
+    // convenience. The friend-derive uses the UUID compare; the emitted flat
+    // id fields carry the Users.id UUID via toFriendshipWire (PR-C, Req 2).
     if (status === 'accepted') {
       const result = friendships.map((f) => {
         const plain = toFriendshipWire(f);
@@ -122,8 +116,8 @@ router.get('/', async (req, res) => {
       return res.json(result);
     }
 
-    // D-12: the raw pending/sent/default path must ALSO serialize Auth0 strings
-    // and strip the *_uuid columns — not just the accepted branch.
+    // PR-C: the raw pending/sent/default path rides the same UUID-carrying
+    // serializer as the accepted branch.
     res.json(friendships.map((f) => toFriendshipWire(f)));
   } catch (error) {
     console.error('Error fetching friendships:', error);
@@ -148,8 +142,11 @@ router.get('/search', async (req, res) => {
       where: { email: email.toLowerCase() },
       // BSEC-01 (D-03): email removed from the projection (the WHERE filter is
       // unaffected). The searcher supplied the email; echoing it back is
-      // unnecessary — user_id + username are enough to send a friend request.
-      attributes: ['id', 'username', 'user_id'],
+      // unnecessary. Phase 87.3 PR-C (BE-12, user D1 resolution): the flat sub
+      // `user_id` is DROPPED — the sole sanctioned drop of this phase. The only
+      // FE consumer (the friends page) reads `foundUser.id` (plan 06) and the
+      // friend-request send is UUID-only post-PR-C.
+      attributes: ['id', 'username'],
     });
 
     if (!user) {
@@ -191,14 +188,16 @@ router.post(
       // real local user (friend requests originate from /search, which only
       // returns local Users rows).
       //
-      // Phase 87.3 (PR-A expand): the target identifier is now dual-keyed —
-      // resolve by Users.id UUID first (the post-PR-C wire shape the FE cutover
-      // in plan 06 will send), falling back to the Auth0 sub (today's shape).
+      // Phase 87.3 PR-C (plan 09, user D1 contraction): the target identifier
+      // is UUID-ONLY — the PR-A sub fallback (AF7) is removed. Safe because
+      // PR-B (plan 06, AF12b) cut every FE sender of addressee_user_id to the
+      // nested `.id`. A sub-shaped target now rejects as not-found (accepted
+      // stale-bundle trade-off; do not re-add the fallback).
       const caller = await User.findOne({ where: { user_id: userId } });
       if (!caller) {
         return res.status(403).json({ error: 'Caller not found' });
       }
-      const addresseeUser = await resolveTargetUser(addressee_user_id);
+      const addresseeUser = await resolveTargetUserUuidOnly(addressee_user_id);
       if (!addresseeUser) {
         return res.status(404).json({ error: 'User not found' });
       }
@@ -240,13 +239,13 @@ router.post(
               addressee_uuid: addresseeUser.id,
               status: 'pending',
             });
-            // D-12 shim: emit Auth0 strings, strip the *_uuid columns. Source
-            // the addressee sub from the RESOLVED row (not the raw param) so the
-            // wire stays the Auth0 sub even when the client sent a UUID (87.3).
+            // PR-C: flat fields CARRY the resolved Users.id UUIDs (Req 2 —
+            // names stable, values UUID). This include-less path maps the
+            // UUIDs by the same requester/addressee direction the update wrote.
             return res.status(200).json(
               toFriendshipWire(existing, {
-                requesterAuth0: caller.user_id,
-                addresseeAuth0: addresseeUser.user_id,
+                requesterUuid: caller.id,
+                addresseeUuid: addresseeUser.id,
               })
             );
           default:
@@ -271,13 +270,13 @@ router.post(
           status: 'pending',
         });
 
-        // D-12 shim: emit Auth0 strings, strip the *_uuid columns. Source the
-        // subs from the RESOLVED rows so the wire is byte-stable across the 87.3
-        // expand window regardless of which identifier shape the client sent.
+        // PR-C: flat fields CARRY the resolved Users.id UUIDs (Req 2). The
+        // create() row has no includes, so the explicit resolved UUIDs are the
+        // source (they equal the row's requester_uuid/addressee_uuid).
         return res.status(201).json(
           toFriendshipWire(friendship, {
-            requesterAuth0: caller.user_id,
-            addresseeAuth0: addresseeUser.user_id,
+            requesterUuid: caller.id,
+            addresseeUuid: addresseeUser.id,
           })
         );
       } catch (createErr) {
@@ -285,10 +284,9 @@ router.post(
           // Concurrent duplicate won the race — re-find and return the winner with a
           // shape BYTE-IDENTICAL to the happy path (F5). The happy path serializes a
           // create() row with NO includes, so re-find WITHOUT USER_INCLUDES (nested
-          // Requester/Addressee objects would otherwise leak on ONLY this path). Both
-          // Auth0 strings are already known (caller.user_id === userId,
-          // addresseeUser.user_id === addressee_user_id); the winner may be in EITHER
-          // direction, so map requester/addressee by which uuid landed in requester_uuid.
+          // Requester/Addressee objects would otherwise leak on ONLY this path). The
+          // winner may be in EITHER direction, so map requester/addressee UUIDs by
+          // which uuid landed in requester_uuid (PR-C: the flats carry UUIDs).
           const raceRow = await Friendship.findOne({
             where: {
               [Op.or]: [
@@ -299,13 +297,10 @@ router.post(
           });
           if (raceRow) {
             const callerIsRequester = raceRow.requester_uuid === caller.id;
-            // Auth0 subs sourced from the resolved rows (87.3): the winner may be
-            // in EITHER direction, so map requester/addressee by which uuid landed
-            // in requester_uuid — never from the raw (possibly-UUID) param.
             return res.status(201).json(
               toFriendshipWire(raceRow, {
-                requesterAuth0: callerIsRequester ? caller.user_id : addresseeUser.user_id,
-                addresseeAuth0: callerIsRequester ? addresseeUser.user_id : caller.user_id,
+                requesterUuid: callerIsRequester ? caller.id : addresseeUser.id,
+                addresseeUuid: callerIsRequester ? addresseeUser.id : caller.id,
               })
             );
           }
@@ -356,9 +351,9 @@ router.post('/:id/accept', async (req, res) => {
 
     await friendship.update({ status: 'accepted' });
 
-    // D-12 shim: the caller IS the addressee, so addressee Auth0 = userId;
-    // requester Auth0 comes from the include. Strip the *_uuid columns.
-    res.status(200).json(toFriendshipWire(friendship, { addresseeAuth0: userId }));
+    // PR-C: the caller IS the addressee — pass the caller's resolved UUID; the
+    // requester UUID falls back to the row's requester_uuid (Req 2 carry-UUID).
+    res.status(200).json(toFriendshipWire(friendship, { addresseeUuid: caller.id }));
   } catch (error) {
     console.error('Error accepting friend request:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -398,8 +393,8 @@ router.post('/:id/decline', async (req, res) => {
 
     await friendship.update({ status: 'declined' });
 
-    // D-12 shim: caller IS the addressee; strip the *_uuid columns.
-    res.status(200).json(toFriendshipWire(friendship, { addresseeAuth0: userId }));
+    // PR-C: caller IS the addressee — pass the caller's resolved UUID.
+    res.status(200).json(toFriendshipWire(friendship, { addresseeUuid: caller.id }));
   } catch (error) {
     console.error('Error declining friend request:', error);
     res.status(500).json({ error: 'Internal server error' });
