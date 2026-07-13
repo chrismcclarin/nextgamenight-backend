@@ -73,12 +73,20 @@ describe('GameReview Routes', () => {
       expect(response.body.length).toBe(0);
     });
 
-    it('should return 403 if user_id provided but user not in group', async () => {
-      const response = await request(makeApp(testUser1))
-        .get(`/api/game-reviews/game/${testGame.id}/group/${testGroup.id}?user_id=${testUser2.user_id}`)
+    it('should return 403 if the CALLER is not a member — the spoofable ?user_id is ignored (PR-C review #6)', async () => {
+      // testUser2 is NOT in the group; naming a member in ?user_id no longer
+      // satisfies the gate (it authorized on the client-supplied param before).
+      const response = await request(makeApp(testUser2))
+        .get(`/api/game-reviews/game/${testGame.id}/group/${testGroup.id}?user_id=${testUser1.user_id}`)
         .expect(403);
 
       expect(response.body.error).toBe('Access denied to this group');
+    });
+
+    it('should return 401 when unauthenticated (no token identity)', async () => {
+      await request(makeApp(null))
+        .get(`/api/game-reviews/game/${testGame.id}/group/${testGroup.id}`)
+        .expect(401);
     });
 
     it('should allow access if user_id provided and user is in group', async () => {

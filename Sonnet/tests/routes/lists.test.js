@@ -5,10 +5,16 @@ const listRoutes = require('../../routes/lists');
 const { Event, Game, Group, User, UserGroup, EventParticipation } = require('../../models');
 const { makeUser, makeGroup, addToGroup } = require('../factories');
 
-// The list routes derive the actor from the URL :user_id param (not req.user),
-// so no auth stub is needed here.
+// Most list routes derive the actor from the URL :user_id param; the /players
+// route (hardened in 87.3 PR-C, review #7) authorizes on req.user like its
+// /games sibling — inject a mutable actor for those tests.
+let currentActor = null;
 const app = express();
 app.use(express.json());
+app.use((req, _res, next) => {
+  if (currentActor) req.user = { user_id: currentActor };
+  next();
+});
 app.use('/api/lists', listRoutes);
 
 describe('List Routes', () => {
@@ -219,7 +225,12 @@ describe('List Routes', () => {
   });
 
   describe('GET /api/lists/players/:group_id/:user_id', () => {
+    afterEach(() => {
+      currentActor = null;
+    });
+
     it('should get all players in a group with statistics', async () => {
+      currentActor = testUser1.user_id; // token-authorized (PR-C review #7)
       const response = await request(app)
         .get(`/api/lists/players/${testGroup.id}/${testUser1.user_id}`)
         .expect(200);
@@ -245,11 +256,21 @@ describe('List Routes', () => {
     });
 
     it('should return 403 if user not in group', async () => {
+      currentActor = testUser2.user_id; // authenticated but NOT a member
       const response = await request(app)
         .get(`/api/lists/players/${testGroup.id}/${testUser2.user_id}`)
         .expect(403);
 
       expect(response.body.error).toBe('Access denied to this group');
+    });
+
+    it("should return 403 when the param names ANOTHER user (spoof attempt)", async () => {
+      currentActor = testUser2.user_id;
+      const response = await request(app)
+        .get(`/api/lists/players/${testGroup.id}/${encodeURIComponent(testUser1.user_id)}`)
+        .expect(403);
+
+      expect(response.body.error).toBe("Forbidden: Cannot access other users' data");
     });
   });
 });

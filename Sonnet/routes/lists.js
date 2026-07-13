@@ -519,9 +519,22 @@ router.get('/player-games-by-id/:group_id/:player_user_id/:user_id', async (req,
 // 8. All players in a group (aggregated from all games)
 router.get('/players/:group_id/:user_id', async (req, res) => {
   try {
+    // Use verified user_id from token (same self-check as the /games sibling —
+    // the path param alone is spoofable: any known member sub read group stats;
+    // PR-C review #7).
+    const userId = req.user?.user_id;
+    if (!userId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
     const { group_id, user_id } = req.params;
-    
-    const hasAccess = await isActiveMember(user_id, group_id);
+
+    // Verify that the requested user_id matches the authenticated user
+    if (user_id !== userId) {
+      return res.status(403).json({ error: 'Forbidden: Cannot access other users\' data' });
+    }
+
+    const hasAccess = await isActiveMember(userId, group_id);
     if (!hasAccess) {
       return res.status(403).json({ error: 'Access denied to this group' });
     }

@@ -11,13 +11,17 @@ const { resolveTargetUserUuidOnly } = require('../utils/resolveTargetUser');
 router.get('/game/:game_id/group/:group_id', async (req, res) => {
   try {
     const { game_id, group_id } = req.params;
-    const { user_id } = req.query;
 
-    if (user_id) {
-      const hasAccess = await isActiveMember(user_id, group_id);
-      if (!hasAccess) {
-        return res.status(403).json({ error: 'Access denied to this group' });
-      }
+    // Authorize on the VERIFIED caller (req.user), not the client-supplied
+    // ?user_id (spoofable, and omitting it skipped the check entirely —
+    // FSEC-02, same fix as the sibling /user/:user_id/group/:group_id route).
+    const callerId = req.user?.user_id;
+    if (!callerId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    const hasAccess = await isActiveMember(callerId, group_id);
+    if (!hasAccess) {
+      return res.status(403).json({ error: 'Access denied to this group' });
     }
 
     // Phase 87.3 PR-C (plan 09 Task 2b, Req 1): the reviewer's nested User
@@ -34,7 +38,8 @@ router.get('/game/:game_id/group/:group_id', async (req, res) => {
     
     res.json(reviews);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    console.error('[gameReviews] request failed:', error.message);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -79,7 +84,8 @@ router.get('/user/:user_id/group/:group_id', async (req, res) => {
     
     res.json(reviews);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    console.error('[gameReviews] request failed:', error.message);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -158,7 +164,8 @@ router.post('/', validateReviewCreate, async (req, res) => {
     
     res.json(completeReview);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    console.error('[gameReviews] request failed:', error.message);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -190,7 +197,8 @@ router.delete('/:id', async (req, res) => {
     await review.destroy();
     res.json({ message: 'Review deleted successfully' });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    console.error('[gameReviews] request failed:', error.message);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
