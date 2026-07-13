@@ -68,6 +68,11 @@ app.use('/api/rsvp', rsvpRoutes);
 
 const USER_ID = 'auth0|rsvp-single-use-test';
 
+// D-05 include-pin shapes (Phase 87.3 Task 1): the nested User.id the FE cutover
+// (PR-B) compares against is a UUID; the Auth0 sub is provider-prefixed.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const SUB_RE = /^(auth0|google-oauth2|apple)\|/;
+
 async function respond(token, eventId, userId, status) {
   return request(app)
     .get('/api/rsvp/respond')
@@ -393,6 +398,13 @@ describe('RSVP UUID keyspace authz + wire (Phase 87.1)', () => {
     expect(row).toBeDefined();
     expect(row.user_id).toBe(owner.user_id);
     expect(row.user_uuid).toBeUndefined();
+    // D-05 INCLUDE-PIN (Phase 87.3 Task 1): the nested User.id the FE cutover
+    // (PR-B) will compare against MUST be a UUID, never the Auth0 sub. This is
+    // the regression net for PR-C's flat-field flip (plan 09).
+    expect(row.User).toBeDefined();
+    expect(row.User.id).toMatch(UUID_RE);
+    expect(row.User.id).not.toMatch(SUB_RE);
+    expect(row.User.id).toBe(owner.id);
   });
 
   it('GET /user/:id returns a freshly UUID-keyed RSVP and serializes user_id as the Auth0 sub (D-12)', async () => {
