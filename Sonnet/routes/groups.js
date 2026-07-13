@@ -198,7 +198,9 @@ router.get('/user/:user_id', async (req, res) => {
           model: User,
           // BSEC-01 / BE-043: drop `email` from this list-all read (PII leak).
           // The durable safe-by-default fix is the User defaultScope (D-03 / 83-06).
-          attributes: ['id', 'username', 'user_id'],
+          // Phase 87.3 PR-C: the sub column is no longer selected — the roster
+          // user_id field is ALIASED to the UUID below (locked decision).
+          attributes: ['id', 'username'],
           through: { where: { status: 'active' }, attributes: ['role', 'joined_at'] }
         },
         {
@@ -212,8 +214,20 @@ router.get('/user/:user_id', async (req, res) => {
         }
       ]
     });
-    
-    res.json(groups);
+
+    // Phase 87.3 PR-C ROSTER ALIAS (plan 09 Task 2, LOCKED decision — RESEARCH
+    // Open Q1 / Req 2): keep the `user_id` field NAME, set its VALUE to the
+    // member's Users.id UUID. Display-only FE refs and React keys keep working;
+    // no sub crosses the wire. Safe only inside the closed AF6 window: PR-B
+    // (plan 05) cut the ManageMembers mutation senders to member.id, and this
+    // same PR-C contracts those target routes UUID-only (Task 1).
+    const shapedGroups = groups.map((g) => {
+      const json = g.toJSON();
+      json.Users = (json.Users || []).map((u) => ({ ...u, user_id: u.id }));
+      return json;
+    });
+
+    res.json(shapedGroups);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -323,16 +337,25 @@ router.get('/:group_id/users', async (req, res) => {
         // BSEC-01 (D-03): email removed — the member-caller branch returns this
         // roster raw (group.Users), so email here leaked PII to group members.
         // The game-only branch already strips PII via stripMemberPII.
-        attributes: ['id', 'username', 'user_id'],
+        // Phase 87.3 PR-C: the sub column is no longer selected — the roster
+        // user_id field is ALIASED to the UUID below (locked decision).
+        attributes: ['id', 'username'],
         through: { where: { status: 'active' }, attributes: ['role', 'joined_at'] },
       }],
     });
     if (!group) return res.status(404).json({ error: 'Group not found' });
 
-    // Branch 1 — group-member caller. Existing behavior preserved verbatim.
+    // Phase 87.3 PR-C ROSTER ALIAS (locked decision, Req 2): user_id NAME kept,
+    // VALUE is the member's Users.id UUID. Both roster branches below emit the
+    // aliased shape so every roster consumer sees one uniform keyspace.
+    const aliasRosterEntry = (u) => ({ ...u, user_id: u.id });
+
+    // Branch 1 — group-member caller. Existing behavior preserved (aliased).
     const callerIsMember = await isActiveMember(callerAuth0Id, group_id);
     if (callerIsMember) {
-      return res.json(group.Users || []);
+      return res.json(
+        (group.Users || []).map((u) => aliasRosterEntry(u.toJSON ? u.toJSON() : u))
+      );
     }
 
     // Branch 2 — game-only caller. Must have at least one EventParticipation
@@ -372,7 +395,7 @@ router.get('/:group_id/users', async (req, res) => {
     // this" is visible per CONTEXT decision.
     const rosterFromGroup = (group.Users || [])
       .filter(u => coParticipantUuids.includes(u.id))
-      .map(u => stripMemberPII(u));
+      .map(u => aliasRosterEntry(stripMemberPII(u)));
 
     // CRITICAL — Phase 71.1 cross-plan contract for Plan 02:
     // The caller is a game-only participant — they have no UserGroup row, so
@@ -381,10 +404,12 @@ router.get('/:group_id/users', async (req, res) => {
     // frontend uses to (a) detect userScope='game-only' and (b) resolve the
     // caller's User.id UUID for the Leave-event DELETE path.
     const callerJson = callerUser.toJSON ? callerUser.toJSON() : callerUser;
-    const callerRow = stripMemberPII({
+    // PR-C: the injected caller row rides the same alias — its user_id carries
+    // the caller's Users.id UUID, never the sub.
+    const callerRow = aliasRosterEntry(stripMemberPII({
       ...callerJson,
       UserGroup: null, // explicit null — game-only signal
-    });
+    }));
 
     // Dedupe by id in case any future include-graph change accidentally
     // surfaces the caller via group.Users.

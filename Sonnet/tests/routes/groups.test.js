@@ -70,6 +70,9 @@ describe('Group Routes', () => {
       expect(me.id).toMatch(UUID_RE);
       expect(me.id).not.toMatch(SUB_RE);
       expect(me.id).toBe(testUser1.id);
+      // Phase 87.3 PR-C ROSTER ALIAS: user_id NAME retained, VALUE = the UUID.
+      expect(me.user_id).toBe(testUser1.id);
+      expect(me.user_id).not.toMatch(SUB_RE);
     });
 
     it('should auto-create the user row when it does not exist yet', async () => {
@@ -241,15 +244,14 @@ describe('Group Routes', () => {
     });
   });
 
-  // D-12 WIRE REGRESSION (W1, Phase 87.1): GET /:group_id/users (routes/groups.js:301)
-  // needs NO code change, but RESEARCH called for the shim to be pinned by a test.
-  // The group cutover (Task 2) moved every UserGroup gate onto user_uuid; this proves
-  // the roster wire contract — user_id serialized as the Auth0 sub STRING (the FE keys
-  // off it), NOT the internal Users.id UUID — survives that cutover unchanged.
-  describe('GET /api/groups/:group_id/users (D-12 roster wire shape)', () => {
+  // Phase 87.3 PR-C ROSTER ALIAS (plan 09 Task 2, LOCKED decision — flips the
+  // old D-12 sub-shim pin): the roster user_id field NAME is retained but its
+  // VALUE is now the member's Users.id UUID. No sub crosses the wire; the
+  // through-role (User.UserGroup.role) survives the alias mapping.
+  describe('GET /api/groups/:group_id/users (PR-C aliased roster wire shape)', () => {
     const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-    it('serializes roster user_id as the Auth0 sub string, NOT a v4 UUID', async () => {
+    it('serializes roster user_id ALIASED to the member UUID — never the Auth0 sub', async () => {
       const authSub = 'google-oauth2|108246800000000000001';
       const member = await makeUser({ user_id: authSub, username: 'd12rosteruser' });
       const grp = await Group.create({ group_id: `d12-roster-${Date.now()}`, name: 'D12 Roster Group' });
@@ -263,11 +265,17 @@ describe('Group Routes', () => {
       expect(Array.isArray(res.body)).toBe(true);
       const entry = res.body.find(u => u.username === 'd12rosteruser');
       expect(entry).toBeDefined();
-      // D-12: the roster wire contract is the Auth0 STRING sub.
-      expect(entry.user_id).toBe(authSub);
-      expect(entry.user_id).not.toMatch(UUID_V4);
-      // The internal UUID PK is a SEPARATE field and IS a v4 UUID.
+      // PR-C alias: user_id VALUE = the member's Users.id UUID (name stable).
+      expect(entry.user_id).toBe(member.id);
+      expect(entry.user_id).toMatch(UUID_V4);
+      expect(entry.user_id).not.toBe(authSub);
+      expect(entry.user_id).not.toMatch(SUB_RE);
+      // The UUID PK field is unchanged and equals the aliased user_id.
       expect(entry.id).toMatch(UUID_V4);
+      expect(entry.id).toBe(entry.user_id);
+      // The through-role survives the alias mapping (ManageMembers reads it).
+      expect(entry.UserGroup).toBeDefined();
+      expect(entry.UserGroup.role).toBe('owner');
     });
   });
 

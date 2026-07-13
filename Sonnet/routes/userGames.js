@@ -13,15 +13,24 @@ router.get('/user/:user_id', async (req, res) => {
     if (!userId) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
-    
-    // Verify that the requested user_id matches the authenticated user
-    if (req.params.user_id !== userId) {
-      return res.status(403).json({ error: 'Forbidden: Cannot access other users\' games' });
-    }
-    
+
+    // Resolve the CALLER from the verified JWT — the param is only ever
+    // compared against the caller's own identifiers below (self-only route).
     const user = await User.findOne({ where: { user_id: userId } });
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Self-gate: the requested :user_id must identify the AUTHENTICATED caller.
+    // Phase 87.3 PR-C (plan 09, Rule 2 deviation): accept the caller's Users.id
+    // UUID as well as their Auth0 sub. The self-identity response
+    // (GET /users/:user_id) now ALIASES user_id to the UUID, and BringGamePicker
+    // feeds `self.user_id` into this route — without the UUID arm every
+    // owned-games read from that surface would 403 post-PR-C (silent empty
+    // picker). Still strictly self-only: both arms compare the param against
+    // the JWT-resolved caller row, never against client-supplied identity.
+    if (req.params.user_id !== userId && req.params.user_id !== user.id) {
+      return res.status(403).json({ error: 'Forbidden: Cannot access other users\' games' });
     }
     
     const ownedGames = await UserGame.findAll({
