@@ -261,7 +261,9 @@ describe('Group leave cascade (Phase 71.1-02)', () => {
     it('cascades future-event rows for the removed user (same cascade as self-leave)', async () => {
       const app = makeApp(owner.user_id);
       const res = await request(app)
-        .delete(`/api/groups/${group.id}/users/${leaver.user_id}`)
+        // PR-C (amended D1): admin-removal target is UUID-only (leaverRow is
+        // the Users DB row; `leaver` is the factory fixture without .id).
+        .delete(`/api/groups/${group.id}/users/${leaverRow.id}`)
         .send();
       expect(res.status).toBe(200);
 

@@ -199,7 +199,9 @@ describe('Group role-gate BOLA positive+negative (Phase 87.1 D-11)', () => {
     it('POSITIVE: owner promotes a member → 200 and the role is updated', async () => {
       const app = appWith({ user_id: ownerU.user_id }, '/api/groups', groupRoutes);
       const res = await request(app)
-        .put(`/api/groups/${grp.id}/users/${memberU.user_id}/role`)
+        // PR-C (amended D1): admin-mutation targets are UUID-only — the sub
+        // fallback closed with the dual-key window.
+        .put(`/api/groups/${grp.id}/users/${memberU.id}/role`)
         .send({ role: 'admin' });
       expect(res.status).toBe(200);
       const ug = await UserGroup.findOne({ where: { user_uuid: memberU.id, group_id: grp.id } });
@@ -219,7 +221,8 @@ describe('Group role-gate BOLA positive+negative (Phase 87.1 D-11)', () => {
     it('POSITIVE: owner removes a member → 200 and the membership is gone', async () => {
       const app = appWith({ user_id: ownerU.user_id }, '/api/groups', groupRoutes);
       const res = await request(app)
-        .delete(`/api/groups/${grp.id}/users/${memberU.user_id}`)
+        // PR-C (amended D1): UUID-only target.
+        .delete(`/api/groups/${grp.id}/users/${memberU.id}`)
         .send();
       expect(res.status).toBe(200);
       const ug = await UserGroup.findOne({ where: { user_uuid: memberU.id, group_id: grp.id } });
@@ -243,7 +246,8 @@ describe('Group role-gate BOLA positive+negative (Phase 87.1 D-11)', () => {
       const app = appWith({ user_id: ownerU.user_id }, '/api/groups', groupRoutes);
       const res = await request(app)
         .post(`/api/groups/${grp.id}/transfer-ownership`)
-        .send({ new_owner_user_id: memberU.user_id });
+        // PR-C (amended D1): UUID-only target.
+        .send({ new_owner_user_id: memberU.id });
       expect(res.status).toBe(200);
       const newOwnerUg = await UserGroup.findOne({ where: { user_uuid: memberU.id, group_id: grp.id } });
       expect(newOwnerUg.role).toBe('owner');
