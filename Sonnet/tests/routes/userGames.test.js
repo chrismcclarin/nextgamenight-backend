@@ -74,3 +74,65 @@ describe('GET /user-games/user/:user_id — self-gate accepts BOTH caller identi
     expect(res.status).toBe(403);
   });
 });
+
+describe('userGames WRITE routes — same dual-armed self-gate (PR-C review #19)', () => {
+  let owner;
+  let other;
+  let game;
+
+  beforeEach(async () => {
+    owner = await makeUser({ username: 'ugw-owner' });
+    other = await makeUser({ username: 'ugw-other' });
+    game = await Game.create({ name: 'UG Write Game', is_custom: true });
+  });
+
+  afterEach(() => {
+    currentActor = null;
+  });
+
+  it('POST add-game accepts the caller UUID arm and writes to the CALLER row', async () => {
+    currentActor = owner.user_id;
+    const res = await request(app).post(
+      `/api/user-games/user/${owner.id}/game/${game.id}`
+    );
+    expect(res.status).toBe(200);
+    const row = await UserGame.findOne({ where: { user_id: owner.id, game_id: game.id } });
+    expect(row).not.toBeNull();
+  });
+
+  it("POST add-game with ANOTHER user's identifier is 403 (pre-fix it had NO gate)", async () => {
+    currentActor = other.user_id;
+    const res = await request(app).post(
+      `/api/user-games/user/${owner.id}/game/${game.id}`
+    );
+    expect(res.status).toBe(403);
+    const row = await UserGame.findOne({ where: { user_id: owner.id, game_id: game.id } });
+    expect(row).toBeNull();
+  });
+
+  it('DELETE remove-game accepts the caller UUID arm; another user 403s', async () => {
+    await UserGame.create({ user_id: owner.id, game_id: game.id });
+
+    currentActor = other.user_id;
+    const denied = await request(app).delete(
+      `/api/user-games/user/${owner.id}/game/${game.id}`
+    );
+    expect(denied.status).toBe(403);
+
+    currentActor = owner.user_id;
+    const ok = await request(app).delete(
+      `/api/user-games/user/${owner.id}/game/${game.id}`
+    );
+    expect(ok.status).toBe(200);
+    const row = await UserGame.findOne({ where: { user_id: owner.id, game_id: game.id } });
+    expect(row).toBeNull();
+  });
+
+  it("import-bgg-collection with ANOTHER user's UUID is 403 before any BGG call", async () => {
+    currentActor = other.user_id;
+    const res = await request(app)
+      .post(`/api/user-games/user/${owner.id}/import-bgg-collection`)
+      .send({ bgg_username: 'someone' });
+    expect(res.status).toBe(403);
+  });
+});
