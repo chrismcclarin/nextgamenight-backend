@@ -129,6 +129,9 @@ function collectSubHits(node, path = '$', hits = []) {
   }
   if (node && typeof node === 'object') {
     for (const [k, v] of Object.entries(node)) {
+      // KEYS are wire values too: a sub-keyed map (e.g. an aggregation
+      // serialized without Object.values) must red the sweep, not pass it.
+      if (SUB_MATCHER.test(k)) hits.push(`${path}.<key> = ${k}`);
       collectSubHits(v, `${path}.${k}`, hits);
     }
     return hits;
@@ -410,5 +413,42 @@ describe('Wire sweep (87.3-09 Req 1): no Auth0 sub crosses the wire outside the 
     );
     expectSubFree(crossSearch, 'GET /users/search/email/:email (non-self)');
     expect(crossSearch.body).not.toHaveProperty('user_id'); // BE-11 drop
+  });
+
+  it('users write echoes: PUT username, PATCH notification-preferences, DELETE phone, POST refresh (toSelfWire aliased on every echo)', async () => {
+    // PRC-H2: every self-write echoes the row via toSelfWire — pin each echo
+    // sub-free AND aliased so a single-call-site revert (res.json(user)) reds.
+    const rename = await request(app)
+      .put(`/api/users/${encodeURIComponent(owner.user_id)}/username`)
+      .send({ username: 'sweep-renamed' });
+    expectSubFree(rename, 'PUT /users/:user_id/username');
+    expect(rename.body.user_id).toBe(owner.id);
+
+    const prefs = await request(app)
+      .patch(`/api/users/${encodeURIComponent(owner.user_id)}/notification-preferences`)
+      .send({ preferences: { reminder: { email: true, sms: false } } });
+    expectSubFree(prefs, 'PATCH /users/:user_id/notification-preferences');
+    expect(prefs.body.user_id).toBe(owner.id);
+
+    const phoneGone = await request(app).delete(
+      `/api/users/${encodeURIComponent(owner.user_id)}/phone`
+    );
+    expectSubFree(phoneGone, 'DELETE /users/:user_id/phone');
+    expect(phoneGone.body.user_id).toBe(owner.id);
+
+    // auth0Service.getUserById is mocked to reject, so this exercises the
+    // Auth0-failure branch — which still echoes the local row via toSelfWire.
+    const refreshed = await request(app).post(
+      `/api/users/${encodeURIComponent(owner.user_id)}/refresh`
+    );
+    expectSubFree(refreshed, 'POST /users/:user_id/refresh (Auth0-failure branch)');
+    expect(refreshed.body.user_id).toBe(owner.id);
+  });
+
+  it('events write echo: PUT /events/:id response (formatEventWithCustomParticipants on the cleaned includes)', async () => {
+    const updated = await request(app)
+      .put(`/api/events/${futureEvent.id}`)
+      .send({ title: 'Sweep Updated' });
+    expectSubFree(updated, 'PUT /events/:id (write echo)');
   });
 });
