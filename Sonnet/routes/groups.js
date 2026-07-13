@@ -435,7 +435,9 @@ router.post(
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
+      // Same { error: string } envelope as the rest of the groups surface —
+      // the FE reads data.error (raw express-validator arrays render blank).
+      return res.status(400).json({ error: errors.array()[0].msg });
     }
     const { user_id } = req.body;
 
@@ -1012,7 +1014,7 @@ router.post(
     });
   } catch (error) {
     console.error('Error transferring group ownership:', error);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
   }
 );
