@@ -20,6 +20,25 @@ try {
   Sentry = null;
 }
 
+// ============================================================================
+// Phase 87.3 PR-C (plan 09, Req 1/Req 2 — the ALIAS lock): every User-row
+// serialization in this file ALIASES the `user_id` field to the row's Users.id
+// UUID — the field NAME stays (display refs/React keys keep working), the
+// Auth0 sub VALUE never crosses the wire. Applies to the self-profile read
+// (BE-10) and every self-write echo (POST /, PUT username, POST refresh,
+// PATCH notification-preferences, DELETE phone) — all are res.json-reachable
+// serializations the grep-derived inventory (Task 2b) put in scope. Verified:
+// no FE consumer reads `.user_id` off these responses as a sub (the identity
+// hook and providers read `.id`; the one server-arg consumer — BringGamePicker
+// -> GET /user-games/user/:id — is covered by that route's self-gate accepting
+// the caller's UUID shape, extended in this same PR).
+// ============================================================================
+const toSelfWire = (user) => {
+  const json = user && user.toJSON ? user.toJSON() : { ...user };
+  json.user_id = json.id;
+  return json;
+};
+
 // Search user by email
 // Searches both our database and Auth0
 router.get('/search/email/:email', validateUserSearch, async (req, res) => {
@@ -93,12 +112,15 @@ router.get('/search/email/:email', validateUserSearch, async (req, res) => {
     // WR-01 (BSEC-01/D-03): only the caller's OWN row gets the full contact-info
     // profile. For any other user, return identity fields plus the searched email
     // (which the caller already supplied) — never phone or integration PII.
+    // Phase 87.3 PR-C (BE-11): the non-self object DROPS the sub user_id — this
+    // endpoint has ZERO FE consumers (the FE email-search flow calls
+    // GET /friendships/search, BE-12); cleaned on its own merit. The self branch
+    // rides the toSelfWire alias (user_id = UUID) like every self read.
     const isSelf = req.user?.user_id === user.user_id;
     const payload = isSelf
-      ? user
+      ? toSelfWire(user)
       : {
           id: user.id,
-          user_id: user.user_id,
           username: user.username,
           email: user.email,
         };
@@ -428,7 +450,10 @@ router.get('/:user_id', requireParamMatchesToken('user_id'), async (req, res) =>
       return res.status(404).json({ error: 'User not found' });
     }
 
-    res.json(user);
+    // Phase 87.3 PR-C (BE-10, A3 + locked alias decision): the self-profile
+    // response aliases user_id to the Users.id UUID — the identity hook and
+    // providers read `.id`; no consumer needs the sub off this response.
+    res.json(toSelfWire(user));
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -516,7 +541,7 @@ router.post('/', async (req, res) => {
       await user.update({ username, email });
     }
 
-    res.json(user);
+    res.json(toSelfWire(user)); // PR-C: user_id aliased to the UUID
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -552,8 +577,8 @@ router.put('/:user_id/username', async (req, res) => {
     }
     
     await user.update({ username: username.trim() });
-    
-    res.json(user);
+
+    res.json(toSelfWire(user)); // PR-C: user_id aliased to the UUID
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -609,13 +634,13 @@ router.post('/:user_id/refresh', async (req, res) => {
         });
       }
       
-      res.json(user);
+      res.json(toSelfWire(user)); // PR-C: user_id aliased to the UUID
     } catch (auth0Error) {
       if (!user) {
         return res.status(404).json({ error: 'User not found and could not fetch from Auth0' });
       }
       // If Auth0 fails but user exists, return current user
-      res.json(user);
+      res.json(toSelfWire(user)); // PR-C: user_id aliased to the UUID
     }
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -705,7 +730,7 @@ router.patch('/:user_id/notification-preferences', async (req, res) => {
       }
     }
 
-    res.json(user);
+    res.json(toSelfWire(user)); // PR-C: user_id aliased to the UUID
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -913,7 +938,7 @@ router.delete('/:user_id/phone', async (req, res) => {
 
     // Re-read to return the post-cascade state to the client.
     await user.reload();
-    res.json(user);
+    res.json(toSelfWire(user)); // PR-C: user_id aliased to the UUID
   } catch (error) {
     console.error('[users] Phone removal cascade failed:', error.message);
     res.status(500).json({ error: error.message });

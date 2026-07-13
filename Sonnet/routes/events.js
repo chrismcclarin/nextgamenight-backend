@@ -308,11 +308,14 @@ router.get('/user/:user_id', requireParamMatchesToken('user_id'), async (req, re
           model: Group,
           attributes: ['id', 'name', 'profile_picture_url', 'background_color', 'background_image_url']
         },
-        { model: User, as: 'Winner', attributes: ['id', 'username', 'user_id'] },
+        // PR-C (87.3-09 Task 2b): Winner include sub-free — id/username only.
+        { model: User, as: 'Winner', attributes: ['id', 'username'] },
         { model: User, as: 'PickedBy', attributes: ['id', 'username'] },
         {
           model: EventParticipation,
-          include: [{ model: User, attributes: ['id', 'username', 'user_id'] }]
+          // PR-C (87.3-09 Task 2b): the nested EP.User include is sub-free —
+          // the flat participant field is already user_id: ep.User?.id (UUID).
+          include: [{ model: User, attributes: ['id', 'username'] }]
         }
       ],
       order: [['start_date', 'DESC']]
@@ -357,12 +360,15 @@ router.get('/group/:group_id', async (req, res) => {
           model: Group,
           attributes: ['id', 'name', 'profile_picture_url', 'background_color', 'background_image_url']
         },
-        { model: User, as: 'Winner', attributes: ['id', 'username', 'user_id'] },
+        // PR-C (87.3-09 Task 2b): Winner include sub-free — id/username only.
+        { model: User, as: 'Winner', attributes: ['id', 'username'] },
         { model: User, as: 'PickedBy', attributes: ['id', 'username'] },
         {
           model: EventParticipation,
           // BSEC-01 / BE-040: drop `email` from the participation roster (PII leak).
-          include: [{ model: User, attributes: ['id', 'username', 'user_id'] }]
+          // PR-C (87.3-09 Task 2b): the nested EP.User include is sub-free —
+          // the flat participant field is already user_id: ep.User?.id (UUID).
+          include: [{ model: User, attributes: ['id', 'username'] }]
         }
       ],
       order: [['start_date', 'DESC']]
@@ -417,11 +423,14 @@ router.get('/:event_id', async (req, res) => {
       include: [
         { model: Game, attributes: ['name', 'image_url', 'theme'] },
         { model: Group, attributes: ['id', 'name'] },
-        { model: User, as: 'Winner', attributes: ['id', 'username', 'user_id'] },
+        // PR-C (87.3-09 Task 2b): Winner include sub-free — id/username only.
+        { model: User, as: 'Winner', attributes: ['id', 'username'] },
         { model: User, as: 'PickedBy', attributes: ['id', 'username'] },
         {
           model: EventParticipation,
-          include: [{ model: User, attributes: ['id', 'username', 'user_id'] }]
+          // PR-C (87.3-09 Task 2b): the nested EP.User include is sub-free —
+          // the flat participant field is already user_id: ep.User?.id (UUID).
+          include: [{ model: User, attributes: ['id', 'username'] }]
         }
       ]
     });
@@ -576,11 +585,14 @@ router.post('/', validateEventCreate, async (req, res) => {
     const completeEvent = await Event.findByPk(event.id, {
       include: [
         { model: Game, attributes: ['name', 'image_url'] },
-        { model: User, as: 'Winner', attributes: ['id', 'username', 'user_id'] },
+        // PR-C (87.3-09 Task 2b): Winner include sub-free — id/username only.
+        { model: User, as: 'Winner', attributes: ['id', 'username'] },
         { model: User, as: 'PickedBy', attributes: ['id', 'username'] },
         {
           model: EventParticipation,
-          include: [{ model: User, attributes: ['id', 'username', 'user_id'] }]
+          // PR-C (87.3-09 Task 2b): the nested EP.User include is sub-free —
+          // the flat participant field is already user_id: ep.User?.id (UUID).
+          include: [{ model: User, attributes: ['id', 'username'] }]
         }
       ]
     });
@@ -943,11 +955,14 @@ router.put('/:id', validateUUID('id'), validateEventUpdate, async (req, res) => 
     const updatedEvent = await Event.findByPk(event.id, {
       include: [
         { model: Game, attributes: ['name', 'image_url'] },
-        { model: User, as: 'Winner', attributes: ['id', 'username', 'user_id'] },
+        // PR-C (87.3-09 Task 2b): Winner include sub-free — id/username only.
+        { model: User, as: 'Winner', attributes: ['id', 'username'] },
         { model: User, as: 'PickedBy', attributes: ['id', 'username'] },
         {
           model: EventParticipation,
-          include: [{ model: User, attributes: ['id', 'username', 'user_id'] }]
+          // PR-C (87.3-09 Task 2b): the nested EP.User include is sub-free —
+          // the flat participant field is already user_id: ep.User?.id (UUID).
+          include: [{ model: User, attributes: ['id', 'username'] }]
         }
       ]
     });

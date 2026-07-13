@@ -9,7 +9,7 @@ const { body, validationResult } = require('express-validator');
 const emailService = require('../services/emailService');
 
 const { isOwnerOrAdmin } = require('../services/authorizationService');
-const { resolveTargetUser } = require('../utils/resolveTargetUser');
+const { resolveTargetUserUuidOnly } = require('../utils/resolveTargetUser');
 
 const router = express.Router();
 
@@ -188,11 +188,13 @@ router.post(
         // the friend-target to Users.id before the gate. A missing Users row on
         // either side fails closed (treated as "no friendship").
         //
-        // Phase 87.3 (PR-A expand): friend_user_id is dual-keyed — Users.id UUID
-        // first (the post-PR-C shape the FriendInvitePanel sender will pass in
-        // plan 06), falling back to the Auth0 sub (today's shape).
+        // Phase 87.3 PR-C (plan 09, user D1 contraction): friend_user_id is
+        // UUID-ONLY — the PR-A sub fallback (AF16) is removed. Safe because
+        // PR-B (plan 06, AF12b) cut both FE senders (friends-page bulk invite,
+        // FriendInvitePanel) to the nested `.id`. A sub-shaped identifier now
+        // fails the resolve → the friendship gate 403s (fails closed).
         const callerUser = await User.findOne({ where: { user_id: userId } });
-        const friendUserRow = await resolveTargetUser(friend_user_id);
+        const friendUserRow = await resolveTargetUserUuidOnly(friend_user_id);
 
         // WR-02: you cannot invite yourself via the friend path. There is no
         // self-friendship row so the gate below also blocks it, but guard

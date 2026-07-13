@@ -45,7 +45,7 @@ describe('User Routes', () => {
   // tests/globalTeardown.js (BTEST-02).
 
   describe('POST /api/users (self-upsert — BE-049)', () => {
-    it('should create the authenticated user from the verified JWT', async () => {
+    it('should create the authenticated user from the verified JWT (PR-C: user_id aliased to the UUID)', async () => {
       const response = await request(makeApp('test-user-1'))
         .post('/api/users')
         .send({ username: 'testuser', email: 'test@example.com' })
@@ -54,11 +54,15 @@ describe('User Routes', () => {
       expect(response.body).toHaveProperty('id');
       expect(response.body.username).toBe('testuser');
       expect(response.body.email).toBe('test@example.com');
-      expect(response.body.user_id).toBe('test-user-1');
+      // Phase 87.3 PR-C: every User-row serialization aliases user_id to the
+      // Users.id UUID — the sub never crosses the wire.
+      expect(response.body.user_id).toBe(response.body.id);
+      const created = await User.findOne({ where: { user_id: 'test-user-1' } });
+      expect(response.body.id).toBe(created.id);
     });
 
     it('should update the authenticated user if their row already exists', async () => {
-      await User.create({
+      const existing = await User.create({
         user_id: 'test-user-2',
         username: 'oldusername',
         email: 'old@example.com'
@@ -69,14 +73,14 @@ describe('User Routes', () => {
         .send({ username: 'newusername', email: 'new@example.com' })
         .expect(200);
 
-      expect(response.body.user_id).toBe('test-user-2');
+      expect(response.body.user_id).toBe(existing.id); // PR-C alias
       expect(response.body.username).toBe('newusername');
       expect(response.body.email).toBe('new@example.com');
     });
 
     it('should IGNORE a forged body user_id and only touch the caller\'s own row (BE-049)', async () => {
       // Victim row the attacker tries to overwrite.
-      await User.create({
+      const victimRow = await User.create({
         user_id: 'auth0|victim-B',
         username: 'victim',
         email: 'victim@example.com'
@@ -88,8 +92,12 @@ describe('User Routes', () => {
         .send({ user_id: 'auth0|victim-B', username: 'hacked', email: 'hacked@evil.com' })
         .expect(200);
 
-      // The write landed on caller A's OWN row, not the victim's.
-      expect(response.body.user_id).toBe('auth0|caller-A');
+      // The write landed on caller A's OWN row, not the victim's (PR-C: the
+      // echoed user_id is the caller's UUID, not the victim's row).
+      expect(response.body.user_id).not.toBe(victimRow.id);
+      expect(response.body.user_id).toBe(response.body.id);
+      const callerRow = await User.findOne({ where: { user_id: 'auth0|caller-A' } });
+      expect(response.body.id).toBe(callerRow.id);
 
       const victim = await User.scope('withContactInfo').findOne({ where: { user_id: 'auth0|victim-B' } });
       expect(victim.username).toBe('victim');
@@ -107,7 +115,7 @@ describe('User Routes', () => {
   });
 
   describe('GET /api/users/:user_id', () => {
-    it('should get user by user_id', async () => {
+    it('should get user by user_id (PR-C: response user_id aliased to the UUID)', async () => {
       // Create test user
       const testUser = await User.create({
         user_id: 'test-user-3',
@@ -121,7 +129,10 @@ describe('User Routes', () => {
         .get(`/api/users/${testUser.user_id}`)
         .expect(200);
 
-      expect(response.body.user_id).toBe(testUser.user_id);
+      // Phase 87.3 PR-C (BE-10, locked alias): user_id NAME stays, VALUE is the
+      // Users.id UUID; `.id` remains the identity read the FE hook consumes.
+      expect(response.body.id).toBe(testUser.id);
+      expect(response.body.user_id).toBe(testUser.id);
       expect(response.body.username).toBe(testUser.username);
     });
 
@@ -133,9 +144,11 @@ describe('User Routes', () => {
         .get('/api/users/auth0|first-time-user')
         .expect(200);
 
-      expect(response.body.user_id).toBe('auth0|first-time-user');
       const created = await User.findOne({ where: { user_id: 'auth0|first-time-user' } });
       expect(created).not.toBeNull();
+      // PR-C alias: the echoed user_id is the freshly-provisioned row's UUID.
+      expect(response.body.user_id).toBe(created.id);
+      expect(response.body.id).toBe(created.id);
     });
 
     it('should include groups when user has groups', async () => {
@@ -170,8 +183,8 @@ describe('User Routes', () => {
   describe('GET /api/users/search/email/:email (WR-01 — cross-user PII)', () => {
     const enc = (e) => encodeURIComponent(e);
 
-    it('cross-user search returns identity + searched email but NEVER phone', async () => {
-      await User.create({
+    it('cross-user search returns identity + searched email but NEVER phone, and DROPS the sub user_id (PR-C BE-11)', async () => {
+      const victim = await User.create({
         user_id: 'auth0|wr01-victim',
         username: 'victim',
         email: 'wr01-victim@example.com',
@@ -182,14 +195,18 @@ describe('User Routes', () => {
         .get(`/api/users/search/email/${enc('wr01-victim@example.com')}`)
         .expect(200);
 
-      expect(response.body.user_id).toBe('auth0|wr01-victim');
+      // Phase 87.3 PR-C (BE-11, zero FE consumers): the non-self object no
+      // longer includes the sub user_id at all.
+      expect(response.body).not.toHaveProperty('user_id');
+      expect(response.body.id).toBe(victim.id);
       expect(response.body.username).toBe('victim');
       expect(response.body.email).toBe('wr01-victim@example.com'); // echoed (caller supplied it)
       expect(response.body).not.toHaveProperty('phone'); // the real leak — must be gone
+      expect(JSON.stringify(response.body)).not.toMatch(/(auth0|google-oauth2|apple)\|/);
     });
 
-    it('self search returns the full profile incl. phone', async () => {
-      await User.create({
+    it('self search returns the full profile incl. phone (PR-C: user_id aliased to the UUID)', async () => {
+      const selfRow = await User.create({
         user_id: 'auth0|wr01-self',
         username: 'selfie',
         email: 'wr01-self@example.com',
@@ -200,7 +217,7 @@ describe('User Routes', () => {
         .get(`/api/users/search/email/${enc('wr01-self@example.com')}`)
         .expect(200);
 
-      expect(response.body.user_id).toBe('auth0|wr01-self');
+      expect(response.body.user_id).toBe(selfRow.id); // PR-C alias — never the sub
       expect(response.body.phone).toBe('+15555559999'); // own row → full contact info
     });
   });

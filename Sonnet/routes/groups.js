@@ -19,8 +19,9 @@ const {
   sequelize,
 } = require('../models');
 const { sendError } = require('../utils/errors');
-const { resolveTargetUser } = require('../utils/resolveTargetUser');
+const { resolveTargetUser, resolveTargetUserUuidOnly } = require('../utils/resolveTargetUser');
 const { Op } = require('sequelize');
+const { body, validationResult } = require('express-validator');
 const router = express.Router();
 const { validateGroupCreate, validateGroupUpdate, validateUUID } = require('../middleware/validators');
 const {
@@ -197,7 +198,9 @@ router.get('/user/:user_id', async (req, res) => {
           model: User,
           // BSEC-01 / BE-043: drop `email` from this list-all read (PII leak).
           // The durable safe-by-default fix is the User defaultScope (D-03 / 83-06).
-          attributes: ['id', 'username', 'user_id'],
+          // Phase 87.3 PR-C: the sub column is no longer selected — the roster
+          // user_id field is ALIASED to the UUID below (locked decision).
+          attributes: ['id', 'username'],
           through: { where: { status: 'active' }, attributes: ['role', 'joined_at'] }
         },
         {
@@ -211,8 +214,20 @@ router.get('/user/:user_id', async (req, res) => {
         }
       ]
     });
-    
-    res.json(groups);
+
+    // Phase 87.3 PR-C ROSTER ALIAS (plan 09 Task 2, LOCKED decision — RESEARCH
+    // Open Q1 / Req 2): keep the `user_id` field NAME, set its VALUE to the
+    // member's Users.id UUID. Display-only FE refs and React keys keep working;
+    // no sub crosses the wire. Safe only inside the closed AF6 window: PR-B
+    // (plan 05) cut the ManageMembers mutation senders to member.id, and this
+    // same PR-C contracts those target routes UUID-only (Task 1).
+    const shapedGroups = groups.map((g) => {
+      const json = g.toJSON();
+      json.Users = (json.Users || []).map((u) => ({ ...u, user_id: u.id }));
+      return json;
+    });
+
+    res.json(shapedGroups);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -322,16 +337,25 @@ router.get('/:group_id/users', async (req, res) => {
         // BSEC-01 (D-03): email removed — the member-caller branch returns this
         // roster raw (group.Users), so email here leaked PII to group members.
         // The game-only branch already strips PII via stripMemberPII.
-        attributes: ['id', 'username', 'user_id'],
+        // Phase 87.3 PR-C: the sub column is no longer selected — the roster
+        // user_id field is ALIASED to the UUID below (locked decision).
+        attributes: ['id', 'username'],
         through: { where: { status: 'active' }, attributes: ['role', 'joined_at'] },
       }],
     });
     if (!group) return res.status(404).json({ error: 'Group not found' });
 
-    // Branch 1 — group-member caller. Existing behavior preserved verbatim.
+    // Phase 87.3 PR-C ROSTER ALIAS (locked decision, Req 2): user_id NAME kept,
+    // VALUE is the member's Users.id UUID. Both roster branches below emit the
+    // aliased shape so every roster consumer sees one uniform keyspace.
+    const aliasRosterEntry = (u) => ({ ...u, user_id: u.id });
+
+    // Branch 1 — group-member caller. Existing behavior preserved (aliased).
     const callerIsMember = await isActiveMember(callerAuth0Id, group_id);
     if (callerIsMember) {
-      return res.json(group.Users || []);
+      return res.json(
+        (group.Users || []).map((u) => aliasRosterEntry(u.toJSON ? u.toJSON() : u))
+      );
     }
 
     // Branch 2 — game-only caller. Must have at least one EventParticipation
@@ -371,7 +395,7 @@ router.get('/:group_id/users', async (req, res) => {
     // this" is visible per CONTEXT decision.
     const rosterFromGroup = (group.Users || [])
       .filter(u => coParticipantUuids.includes(u.id))
-      .map(u => stripMemberPII(u));
+      .map(u => aliasRosterEntry(stripMemberPII(u)));
 
     // CRITICAL — Phase 71.1 cross-plan contract for Plan 02:
     // The caller is a game-only participant — they have no UserGroup row, so
@@ -380,10 +404,12 @@ router.get('/:group_id/users', async (req, res) => {
     // frontend uses to (a) detect userScope='game-only' and (b) resolve the
     // caller's User.id UUID for the Leave-event DELETE path.
     const callerJson = callerUser.toJSON ? callerUser.toJSON() : callerUser;
-    const callerRow = stripMemberPII({
+    // PR-C: the injected caller row rides the same alias — its user_id carries
+    // the caller's Users.id UUID, never the sub.
+    const callerRow = aliasRosterEntry(stripMemberPII({
       ...callerJson,
       UserGroup: null, // explicit null — game-only signal
-    });
+    }));
 
     // Dedupe by id in case any future include-graph change accidentally
     // surfaces the caller via group.Users.
@@ -400,8 +426,19 @@ router.get('/:group_id/users', async (req, res) => {
 });
 
 // Add user to group (owner/admin only — BE-044)
-router.post('/:group_id/users', async (req, res) => {
+// 87.3 code-review #6: express-validator input hygiene on the mutation body —
+// a non-string (e.g. array) user_id is rejected 400 before any lookup.
+router.post(
+  '/:group_id/users',
+  [body('user_id').isString().trim().notEmpty().isLength({ max: 255 }).withMessage('user_id must be a non-empty string')],
+  async (req, res) => {
   try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      // Same { error: string } envelope as the rest of the groups surface —
+      // the FE reads data.error (raw express-validator arrays render blank).
+      return res.status(400).json({ error: errors.array()[0].msg });
+    }
     const { user_id } = req.body;
 
     // BE-044 (BSEC-01): gate behind owner/admin. Without this any authenticated
@@ -414,9 +451,9 @@ router.post('/:group_id/users', async (req, res) => {
 
     // V5: the client-supplied `user_id` is resolved to a Users row server-side
     // here — never trusted directly as the UserGroup FK.
-    // Phase 87.3 (PR-A expand): dual-keyed — resolve by Users.id UUID first (the
-    // post-PR-C roster shape the FE friend-invite sender will pass in plan 06),
-    // falling back to the Auth0 sub (today's shape).
+    // Phase 87.3 PR-C NOTE: this friend-invite/add-member path is the SOLE
+    // RETAINED dual-key after the amended-D1 contraction (it is outside D1's
+    // endpoint list) — Users.id UUID first, Auth0 sub fallback.
     const user = await resolveTargetUser(user_id);
     const group = await Group.findByPk(req.params.group_id);
 
@@ -442,7 +479,8 @@ router.post('/:group_id/users', async (req, res) => {
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
-});
+  }
+);
 
 // Update user role in group (only owner can do this)
 router.put('/:group_id/users/:target_user_id/role', async (req, res) => {
@@ -473,9 +511,11 @@ router.put('/:group_id/users/:target_user_id/role', async (req, res) => {
     }
     
     // Prevent changing owner's role (owner can't demote themselves).
-    // Phase 87.3 (PR-A expand): dual-keyed target resolution — Users.id UUID
-    // first (post-PR-C roster shape), Auth0 sub fallback (today's shape).
-    const targetUser = await resolveTargetUser(target_user_id);
+    // Phase 87.3 PR-C (plan 09, amended D1): UUID-ONLY target resolution — the
+    // PR-A sub fallback (AF6 window) is removed; PR-B (plan 05) cut the
+    // ManageMembers sender to member.id. A sub-shaped target now 404s
+    // (accepted stale-bundle trade-off; do not re-add the fallback).
+    const targetUser = await resolveTargetUserUuidOnly(target_user_id);
     if (!targetUser) {
       return res.status(404).json({ error: 'Target user not found' });
     }
@@ -786,11 +826,11 @@ router.post('/:group_id/users/:target_user_id/approve', async (req, res) => {
 
     // V5 / D-11: resolve the client-supplied target to a Users row, then key
     // UserGroup on user_uuid (never trust the raw param as the FK).
-    // Phase 87.3 (PR-A expand): dual-keyed — Users.id UUID first (post-PR-C
-    // shape), Auth0 sub fallback (today's shape). decodeURIComponent is a no-op
-    // for a UUID but preserved for the sub path.
+    // Phase 87.3 PR-C (amended D1): UUID-ONLY — the PR-A sub fallback is
+    // removed (PR-B/plan 05 cut the ManageMembers sender to member.id).
+    // decodeURIComponent is a no-op for a UUID but kept for URL hygiene.
     const decodedTargetId = decodeURIComponent(target_user_id);
-    const targetUser = await resolveTargetUser(decodedTargetId);
+    const targetUser = await resolveTargetUserUuidOnly(decodedTargetId);
     if (!targetUser) {
       return res.status(404).json({ error: 'Pending member not found' });
     }
@@ -829,11 +869,10 @@ router.post('/:group_id/users/:target_user_id/reject', async (req, res) => {
 
     // V5 / D-11: resolve the client-supplied target to a Users row, then key
     // UserGroup on user_uuid (never trust the raw param as the FK).
-    // Phase 87.3 (PR-A expand): dual-keyed — Users.id UUID first (post-PR-C
-    // shape), Auth0 sub fallback (today's shape). decodeURIComponent is a no-op
-    // for a UUID but preserved for the sub path.
+    // Phase 87.3 PR-C (amended D1): UUID-ONLY — the PR-A sub fallback is
+    // removed (PR-B/plan 05 cut the ManageMembers sender to member.id).
     const decodedTargetId = decodeURIComponent(target_user_id);
-    const targetUser = await resolveTargetUser(decodedTargetId);
+    const targetUser = await resolveTargetUserUuidOnly(decodedTargetId);
     if (!targetUser) {
       return res.status(404).json({ error: 'Pending member not found' });
     }
@@ -908,16 +947,22 @@ router.post('/:group_id/leave', async (req, res) => {
 
 // Transfer group ownership to another active member (owner only)
 // Atomically swaps the requesting owner -> 'admin' and target member -> 'owner' in a single transaction.
-router.post('/:group_id/transfer-ownership', async (req, res) => {
+// 87.3 code-review #6: express-validator input hygiene — a non-string (e.g.
+// array) new_owner_user_id is rejected 400 before any lookup.
+router.post(
+  '/:group_id/transfer-ownership',
+  [body('new_owner_user_id').isString().trim().notEmpty().isLength({ max: 255 }).withMessage('new_owner_user_id is required')],
+  async (req, res) => {
   try {
     const userId = req.user.user_id;
     const { group_id } = req.params;
-    const { new_owner_user_id } = req.body || {};
 
-    // 1. Body validation
-    if (!new_owner_user_id || typeof new_owner_user_id !== 'string') {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      // Preserve the pre-validator error envelope for the missing/invalid case.
       return res.status(400).json({ error: 'new_owner_user_id is required' });
     }
+    const { new_owner_user_id } = req.body;
 
     // D-11: resolve both parties' Users rows; UserGroup is keyed on user_uuid.
     // 2. Requester must be the current active owner
@@ -933,9 +978,9 @@ router.post('/:group_id/transfer-ownership', async (req, res) => {
     }
 
     // 3. Target must be an active member (pending members are filtered out by status: 'active').
-    // Phase 87.3 (PR-A expand): new_owner_user_id is dual-keyed — Users.id UUID
-    // first (post-PR-C roster shape), Auth0 sub fallback (today's shape).
-    const newOwnerUser = await resolveTargetUser(new_owner_user_id);
+    // Phase 87.3 PR-C (amended D1): UUID-ONLY — the PR-A sub fallback is
+    // removed (PR-B/plan 05 cut the ManageMembers transferTarget.id sender).
+    const newOwnerUser = await resolveTargetUserUuidOnly(new_owner_user_id);
     if (!newOwnerUser) {
       return res.status(404).json({ error: 'Target user is not an active member of this group' });
     }
@@ -962,14 +1007,17 @@ router.post('/:group_id/transfer-ownership', async (req, res) => {
     res.json({
       success: true,
       message: 'Ownership transferred',
-      new_owner_user_id,
-      previous_owner_user_id: userId,
+      // PR-C (Req 2, carry-UUID lock): both echoed identifiers carry the
+      // resolved Users.id UUIDs — names stable, no sub crosses the wire.
+      new_owner_user_id: newOwnerUser.id,
+      previous_owner_user_id: requesterUser.id,
     });
   } catch (error) {
     console.error('Error transferring group ownership:', error);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
-});
+  }
+);
 
 // Remove user from group (owner or admin can do this, but owner can't remove themselves)
 router.delete('/:group_id/users/:target_user_id', async (req, res) => {
@@ -982,19 +1030,23 @@ router.delete('/:group_id/users/:target_user_id', async (req, res) => {
     
     const { group_id, target_user_id } = req.params; // Target user to remove
 
-    const requestingUser = await User.findOne({ where: { user_id: userId } });
-    // Phase 87.3 (PR-A expand): dual-keyed target resolution — Users.id UUID
-    // first (post-PR-C roster shape), Auth0 sub fallback (today's shape).
-    const targetUser = await resolveTargetUser(target_user_id);
-
-    if (!requestingUser || !targetUser) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-
-    // Only owner or admin can remove users
+    // 87.3 code-review #3 (WR-01): authorize FIRST. Only owner/admin may remove
+    // — checking this BEFORE the target lookup keeps unauthorized callers off
+    // the user-resolution path entirely (no user-existence oracle: a non-admin
+    // probing arbitrary ids gets a uniform 403, never a 404-vs-400 signal).
     const hasPermission = await isOwnerOrAdmin(userId, group_id);
     if (!hasPermission) {
       return res.status(403).json({ error: 'Only owners and admins can remove users from groups' });
+    }
+
+    const requestingUser = await User.findOne({ where: { user_id: userId } });
+    // Phase 87.3 PR-C (amended D1): UUID-ONLY target resolution — the PR-A sub
+    // fallback (AF6 window) is removed; PR-B (plan 05) cut the ManageMembers
+    // remove sender to member.id. A sub-shaped target now 404s.
+    const targetUser = await resolveTargetUserUuidOnly(target_user_id);
+
+    if (!requestingUser || !targetUser) {
+      return res.status(404).json({ error: 'User not found' });
     }
 
     // Owner cannot remove themselves (they must transfer ownership first or
@@ -1111,16 +1163,18 @@ router.get('/:group_id/library', async (req, res) => {
     }
 
     // 4. Load the member Users directly by UUID.
+    // Phase 87.3 PR-C (Task 2b): the sub column is no longer selected — the
+    // owners[]/members[] object literals below ALIAS user_id to the UUID.
     const users = await User.findAll({
       where: { id: { [Op.in]: memberUuids } },
-      attributes: ['id', 'user_id', 'username'],
+      attributes: ['id', 'username'],
     });
 
     const userUuids = users.map(u => u.id);
-    // Map UUID -> { username, auth0Id } for owner attribution
+    // Map UUID -> { username } for owner attribution
     const uuidToUser = {};
     for (const u of users) {
-      uuidToUser[u.id] = { username: u.username, user_id: u.user_id };
+      uuidToUser[u.id] = { username: u.username };
     }
 
     if (userUuids.length === 0) {
@@ -1160,9 +1214,15 @@ router.get('/:group_id/library', async (req, res) => {
 
       const owner = uuidToUser[ug.user_id];
       if (owner) {
+        // Phase 87.3 PR-C (Task 2b, UNIFORM ALIAS LOCKED — removal or
+        // one-side-only cleaning FORBIDDEN): owners[].user_id carries the
+        // owner's Users.id UUID (ug.user_id IS that UUID — UserGame is
+        // UUID-keyed). GroupLibrary joins owners[].user_id against
+        // members[].user_id WITHIN this one payload to drive the owner
+        // filter, so BOTH sides alias in this same edit (see members below).
         gameMap.get(game.id).owners.push({
           username: owner.username,
-          user_id: owner.user_id,
+          user_id: ug.user_id,
         });
       }
     }
@@ -1173,9 +1233,11 @@ router.get('/:group_id/library', async (req, res) => {
       game.owners.sort((a, b) => a.username.localeCompare(b.username));
     }
 
-    // 8. Build member list sorted alphabetically
+    // 8. Build member list sorted alphabetically.
+    // PR-C uniform alias (other half of the owners<->members intra-payload
+    // join): members[].user_id carries the member's Users.id UUID.
     const members = users
-      .map(u => ({ user_id: u.user_id, username: u.username }))
+      .map(u => ({ user_id: u.id, username: u.username }))
       .sort((a, b) => a.username.localeCompare(b.username));
 
     res.json({ games, members });

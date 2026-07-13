@@ -13,15 +13,24 @@ router.get('/user/:user_id', async (req, res) => {
     if (!userId) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
-    
-    // Verify that the requested user_id matches the authenticated user
-    if (req.params.user_id !== userId) {
-      return res.status(403).json({ error: 'Forbidden: Cannot access other users\' games' });
-    }
-    
+
+    // Resolve the CALLER from the verified JWT — the param is only ever
+    // compared against the caller's own identifiers below (self-only route).
     const user = await User.findOne({ where: { user_id: userId } });
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Self-gate: the requested :user_id must identify the AUTHENTICATED caller.
+    // Phase 87.3 PR-C (plan 09, Rule 2 deviation): accept the caller's Users.id
+    // UUID as well as their Auth0 sub. The self-identity response
+    // (GET /users/:user_id) now ALIASES user_id to the UUID, and BringGamePicker
+    // feeds `self.user_id` into this route — without the UUID arm every
+    // owned-games read from that surface would 403 post-PR-C (silent empty
+    // picker). Still strictly self-only: both arms compare the param against
+    // the JWT-resolved caller row, never against client-supplied identity.
+    if (req.params.user_id !== userId && req.params.user_id !== user.id) {
+      return res.status(403).json({ error: 'Forbidden: Cannot access other users\' games' });
     }
     
     const ownedGames = await UserGame.findAll({
@@ -47,11 +56,31 @@ router.get('/user/:user_id', async (req, res) => {
 // Add game to user's owned games
 router.post('/user/:user_id/game/:game_id', async (req, res) => {
   try {
-    const user = await User.findOne({ where: { user_id: req.params.user_id } });
+    // Use verified user_id from token. (Pre-87.3 this route had NO self-gate:
+    // it looked the target up from the raw param, letting any authenticated
+    // caller write to any user's collection — PR-C review #19.)
+    const userId = req.user?.user_id;
+    if (!userId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    // Resolve the CALLER from the verified JWT; the param is only ever
+    // compared against the caller's own identifiers (self-only route).
+    const user = await User.findOne({ where: { user_id: userId } });
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Self-gate, dual-armed like the GET above (Rule 2 deviation): the self
+    // row's user_id now carries the Users.id UUID, so accept sub OR UUID —
+    // both compared against the JWT-resolved caller, never client identity.
+    if (req.params.user_id !== userId && req.params.user_id !== user.id) {
+      return res.status(403).json({ error: 'Forbidden: Cannot modify other users\' games' });
+    }
+
     const game = await Game.findByPk(req.params.game_id);
-    
-    if (!user || !game) {
-      return res.status(404).json({ error: 'User or Game not found' });
+    if (!game) {
+      return res.status(404).json({ error: 'Game not found' });
     }
     
     const [userGame, created] = await UserGame.findOrCreate({
@@ -78,14 +107,15 @@ router.delete('/user/:user_id/game/:game_id', async (req, res) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
     
-    // Verify that the requested user_id matches the authenticated user
-    if (req.params.user_id !== userId) {
-      return res.status(403).json({ error: 'Forbidden: Cannot modify other users\' games' });
-    }
-    
     const user = await User.findOne({ where: { user_id: userId } });
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Self-gate, dual-armed like the GET above: accept the caller's sub OR
+    // their Users.id UUID (the self row's user_id value post-PR-C).
+    if (req.params.user_id !== userId && req.params.user_id !== user.id) {
+      return res.status(403).json({ error: 'Forbidden: Cannot modify other users\' games' });
     }
     
     const userGame = await UserGame.findOne({
@@ -112,16 +142,17 @@ router.post('/user/:user_id/import-bgg-collection', validateAuth0UserId('user_id
       return res.status(401).json({ error: 'Unauthorized' });
     }
     
-    // Verify that the requested user_id matches the authenticated user
-    if (req.params.user_id !== userId) {
-      return res.status(403).json({ error: 'Forbidden: Cannot import games for other users' });
-    }
-    
     const { bgg_username } = req.body;
 
     const user = await User.findOne({ where: { user_id: userId } });
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Self-gate, dual-armed like the GET above: accept the caller's sub OR
+    // their Users.id UUID (validateAuth0UserId's charset admits both shapes).
+    if (req.params.user_id !== userId && req.params.user_id !== user.id) {
+      return res.status(403).json({ error: 'Forbidden: Cannot import games for other users' });
     }
 
     // Log import start (sanitized - no user ID)

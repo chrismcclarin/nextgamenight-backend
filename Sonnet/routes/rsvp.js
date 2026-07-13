@@ -464,18 +464,18 @@ router.post('/', verifyAuth0Token, validateRsvpCreate, async (req, res) => {
       console.error('[rsvp:POST] GCal cleanup dispatch error (non-fatal):', err.message)
     );
 
-    // Re-fetch with User include for response
+    // Re-fetch with User include for response. Phase 87.3 PR-C (plan 09, Req 1):
+    // the nested include no longer carries the sub — id/username only.
     const result = await EventRsvp.findByPk(rsvp.id, {
-      include: [{ model: User, attributes: ['id', 'username', 'user_id'] }],
+      include: [{ model: User, attributes: ['id', 'username'] }],
     });
 
-    // D-12 wire shim: serialize user_id as the Auth0 sub (from the included User)
-    // and strip the raw user_uuid so it never leaks on the wire.
+    // PR-C (Req 2 carry-UUID lock): the flat user_id field NAME is retained but
+    // its VALUE is the nested User.id (Users.id UUID) — no sub on the wire, no
+    // drop (gameDetail joins roster keys to this flat field in lockstep).
     const shaped = result.toJSON();
-    // No `?? userId` fallback — the User include above is always present, and the
-    // dropped string column would only mask a missing include (loud if absent).
-    shaped.user_id = shaped.User?.user_id;
-    delete shaped.user_uuid;
+    shaped.user_id = shaped.User?.id;
+    delete shaped.user_uuid; // one identifier pair on the wire
 
     return res.status(isCreate ? 201 : 200).json(shaped);
   } catch (error) {
@@ -500,10 +500,12 @@ router.get('/event/:event_id', verifyAuth0Token, async (req, res) => {
       return res.status(403).json({ error: 'You must be a participant on this event to view RSVPs' });
     }
 
-    // Fetch all RSVPs for this event
+    // Fetch all RSVPs for this event. Phase 87.3 PR-C (Req 1): the nested User
+    // include no longer carries the sub — id/username only (PR-B cut every
+    // nested-sub reader to `.id`).
     const rsvps = await EventRsvp.findAll({
       where: { event_id },
-      include: [{ model: User, attributes: ['id', 'username', 'user_id'] }],
+      include: [{ model: User, attributes: ['id', 'username'] }],
       order: [
         // Custom order: yes first, maybe second, no third
         [EventRsvp.sequelize.literal(`CASE WHEN "EventRsvp"."status" = 'yes' THEN 0 WHEN "EventRsvp"."status" = 'maybe' THEN 1 WHEN "EventRsvp"."status" = 'no' THEN 2 END`), 'ASC'],
@@ -519,14 +521,13 @@ router.get('/event/:event_id', verifyAuth0Token, async (req, res) => {
       }
     });
 
-    // D-12 wire shim: serialize each row's user_id from the included User.user_id
-    // (Auth0 sub) and strip the raw user_uuid so it never leaks on the wire.
+    // PR-C (Req 2 carry-UUID lock): each row's flat user_id carries the nested
+    // User.id UUID — name stable, value flipped in lockstep with the roster
+    // alias so gameDetail's roster-key -> rsvp-key join stays UUID-to-UUID.
     const shapedRsvps = rsvps.map((r) => {
       const json = r.toJSON();
-      // No `?? json.user_id` fallback — Plan 09 DROPPED the string column, so it is
-      // always undefined and would only mask a missing User include (loud if absent).
-      json.user_id = json.User?.user_id;
-      delete json.user_uuid;
+      json.user_id = json.User?.id;
+      delete json.user_uuid; // one identifier pair on the wire (value lives in user_id)
       return json;
     });
 
@@ -575,13 +576,13 @@ router.get('/user/:user_id', verifyAuth0Token, async (req, res) => {
       order: [[Event, 'start_date', 'DESC']],
     });
 
-    // D-12 wire shim: this endpoint is self-only (param === token above), so every
-    // returned row belongs to the caller. Serialize user_id as the caller's Auth0
-    // sub (this endpoint has NO User include to source from) and strip user_uuid.
+    // PR-C: this endpoint is self-only (param === token above), so every
+    // returned row belongs to the caller. Serialize the flat user_id as the
+    // caller's resolved Users.id UUID (no User include here to source from).
     const shaped = rsvps.map((r) => {
       const json = r.toJSON();
-      json.user_id = userId;
-      delete json.user_uuid;
+      json.user_id = caller.id;
+      delete json.user_uuid; // one identifier pair on the wire
       return json;
     });
 
