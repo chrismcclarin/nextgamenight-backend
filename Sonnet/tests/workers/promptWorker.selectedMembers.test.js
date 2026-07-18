@@ -108,7 +108,28 @@ describe('promptWorker.processPromptJob — selected_member_ids subset (87.1 A1,
     emailService.send.mockResolvedValue({ success: true });
   });
 
-  it('a selected_member_ids subset (Auth0 strings) emails EXACTLY those members — not the whole group', async () => {
+  // Phase 87.4 Plan 04 (D-11 case 1): UUID-keyed selected_member_ids (the
+  // post-backfill shape) emails EXACTLY those members via the fanout dual-read's
+  // `id IN (...)` arm.
+  it('D-11 case 1: a UUID-keyed selected_member_ids subset (Users.id) emails EXACTLY those members', async () => {
+    // Subset = m1, m2 (NOT m3), keyed by their Users.id UUIDs (post-backfill shape).
+    const { group, m1, m2, m3, settings, scheduleId } =
+      await seedGroupWithSchedule((a, b) => [a.id, b.id]);
+
+    const result = await processPromptJob(makeJob({ group, settings, scheduleId }));
+
+    expect(result.recipientCount).toBe(2);
+    expect(sentToAddresses()).toEqual([m1.email, m2.email].sort());
+    expect(sentToAddresses()).not.toContain(m3.email);
+
+    const prompt = await AvailabilityPrompt.findByPk(result.promptId);
+    expect(prompt).not.toBeNull();
+    expect(prompt.status).toBe('active');
+  });
+
+  // D-11 case 2: a legacy sub-keyed row (Railway pre-deploy residue) STILL fans out
+  // during the PR-1 dual-read window via the `user_id IN (...)` arm.
+  it('D-11 case 2: a legacy sub-keyed selected_member_ids subset (Auth0 strings) STILL emails EXACTLY those members (dual-read)', async () => {
     // Subset = m1, m2 (NOT m3), keyed by their Auth0 user_id STRINGS.
     const { group, m1, m2, m3, settings, scheduleId } =
       await seedGroupWithSchedule((a, b) => [a.user_id, b.user_id]);
@@ -128,7 +149,8 @@ describe('promptWorker.processPromptJob — selected_member_ids subset (87.1 A1,
     expect(prompt.status).toBe('active');
   });
 
-  it('no selected_member_ids (subset absent) emails the WHOLE active group', async () => {
+  // D-11 case 3: empty/null selected_member_ids preserves the whole-active-group default.
+  it('D-11 case 3: no selected_member_ids (subset absent) emails the WHOLE active group', async () => {
     const { group, m1, m2, m3, settings, scheduleId } = await seedGroupWithSchedule(null);
 
     const result = await processPromptJob(makeJob({ group, settings, scheduleId }));
