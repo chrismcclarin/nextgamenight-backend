@@ -51,8 +51,14 @@ module.exports = {
     let droppedCount = 0;
 
     await sequelize.transaction(async (t) => {
+      // PR2-L6 (87.4-review): FOR UPDATE — a concurrent old-instance app write during
+      // the pre-deploy window serializes against this sweep instead of racing its
+      // read-modify-write (lost-update guard; sister of the Plan 04 FOR UPDATE
+      // pattern in the schedule write handlers). Idempotency is unchanged: a re-run
+      // over already-converted rows still finds no sub-shaped entries and writes
+      // nothing.
       const rows = await sequelize.query(
-        'SELECT id, template_config FROM "GroupPromptSettings"',
+        'SELECT id, template_config FROM "GroupPromptSettings" FOR UPDATE',
         { type: QueryTypes.SELECT, transaction: t }
       );
 
