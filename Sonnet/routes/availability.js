@@ -5,6 +5,9 @@ const { UserAvailability, User } = require('../models');
 const availabilityService = require('../services/availabilityService');
 const { sendSafeError } = require('../utils/errorHandler');
 const { validateUUID, validateAuth0UserId } = require('../middleware/validators');
+// Phase 87.4 Plan 02 (SPEC Req 5, D-04): the self-param gate dual-accepts the
+// caller's OWN sub OR OWN resolved Users.id UUID via the ONE shared helper.
+const { matchesSelf } = require('../middleware/objectAuth');
 const router = express.Router();
 const { body, validationResult } = require('express-validator');
 
@@ -34,8 +37,8 @@ router.get('/user/:user_id',
         return res.status(401).json({ error: 'Unauthorized' });
       }
 
-      // Users can only view their own availability
-      if (req.params.user_id !== userId) {
+      // Users can only view their own availability (dual-accept: own sub OR own UUID)
+      if (!(await matchesSelf(req, req.params.user_id))) {
         return res.status(403).json({ error: 'Forbidden: Cannot access other users\' availability' });
       }
 
@@ -116,7 +119,7 @@ router.post('/user/:user_id/recurring',
         return res.status(401).json({ error: 'Unauthorized' });
       }
 
-      if (req.params.user_id !== userId) {
+      if (!(await matchesSelf(req, req.params.user_id))) {
         return res.status(403).json({ error: 'Forbidden: Cannot create availability for other users' });
       }
 
@@ -187,7 +190,7 @@ router.post('/user/:user_id/override',
         return res.status(401).json({ error: 'Unauthorized' });
       }
 
-      if (req.params.user_id !== userId) {
+      if (!(await matchesSelf(req, req.params.user_id))) {
         return res.status(403).json({ error: 'Forbidden: Cannot create availability for other users' });
       }
 
@@ -255,8 +258,11 @@ router.delete('/:id',
         return res.status(404).json({ error: 'Availability pattern not found' });
       }
 
-      // Users can only delete their own availability
-      if (availability.user_id !== userId) {
+      // Users can only delete their own availability. The row's user_id is still
+      // the sub (UserAvailability stays sub-keyed until Phase 87.5), so matchesSelf
+      // takes the sub arm here; a caller acting under a UUID self-param elsewhere
+      // still matches because matchesSelf resolves their own UUID from their sub.
+      if (!(await matchesSelf(req, availability.user_id))) {
         return res.status(403).json({ error: 'Forbidden: Cannot delete other users\' availability' });
       }
 
@@ -456,7 +462,7 @@ router.get('/user/:user_id/patterns',
         return res.status(401).json({ error: 'Unauthorized' });
       }
 
-      if (req.params.user_id !== userId) {
+      if (!(await matchesSelf(req, req.params.user_id))) {
         return res.status(403).json({ error: 'Forbidden: Cannot access other users\' availability patterns' });
       }
 

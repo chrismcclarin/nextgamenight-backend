@@ -3,6 +3,9 @@ const express = require('express');
 const crypto = require('crypto');
 const { Event, Game, User, Group, EventParticipation, UserGroup, EventRsvp, EventBring, EventBallotOption, EventBallotVote, EventAuditLog, PendingAuth0Deletion } = require('../models');
 const { sendError } = require('../utils/errors');
+// Phase 87.4 Plan 02 (KEYMISS mitigation): resolve a self-param that may be the
+// caller's own Users.id UUID (post-PR-2) to the sub-keyed Users row.
+const { isUuid } = require('../utils/resolveTargetUser');
 const { Op } = require('sequelize');
 const sequelize = require('../config/database');
 const router = express.Router();
@@ -182,7 +185,16 @@ const attachRsvpSummaries = async (events) => {
 // only calls this for the logged-in user (eventsAPI.getUserEvents on UserHome).
 router.get('/user/:user_id', requireParamMatchesToken('user_id'), async (req, res) => {
   try {
-    let user = await User.findOne({ where: { user_id: req.params.user_id } });
+    // Phase 87.4 Plan 02 (T-874-02-KEYMISS): requireParamMatchesToken already
+    // proved the param is the caller's OWN identity (sub OR own Users.id UUID).
+    // Resolve either shape to the row — a UUID param must hit the PK, not the
+    // still-sub-keyed Users.user_id column (which would miss and 404 the
+    // caller's own event list). The auto-create branch below only fires for the
+    // sub shape (req.user.user_id === param); a UUID-param caller already has a
+    // Users row (matchesSelf resolved their UUID from it), so user is non-null.
+    let user = isUuid(req.params.user_id)
+      ? await User.findByPk(req.params.user_id)
+      : await User.findOne({ where: { user_id: req.params.user_id } });
     
     // If user doesn't exist but we have authenticated user info, auto-create
     if (!user && req.user && req.user.user_id === req.params.user_id) {

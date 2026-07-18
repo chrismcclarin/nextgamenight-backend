@@ -3,6 +3,10 @@ const express = require('express');
 const { Event, Game, Group, User, EventParticipation, GameReview } = require('../models');
 const { Op, fn, col, literal } = require('sequelize');
 const { isActiveMember } = require('../services/authorizationService');
+// Phase 87.4 Plan 02 (SPEC Req 5, D-04): shared self-param dual-accept (own sub
+// OR own resolved Users.id UUID). isActiveMember below still keys on the token
+// sub (req.user.user_id), NOT the URL param — unchanged.
+const { matchesSelf } = require('../middleware/objectAuth');
 const router = express.Router();
 
 // 1. Games won by a specific player in a group (by name)
@@ -239,8 +243,11 @@ router.get('/games/:group_id/:user_id', async (req, res) => {
     
     const { group_id, user_id } = req.params;
     
-    // Verify that the requested user_id matches the authenticated user
-    if (user_id !== userId) {
+    // Verify the requested user_id is the caller's own identity (dual-accept:
+    // own sub OR own resolved UUID). The group-scoped data query below keys on
+    // group_id + isActiveMember(token sub), not this param, so no keyspace
+    // resolution of the param is needed.
+    if (!(await matchesSelf(req, user_id))) {
       return res.status(403).json({ error: 'Forbidden: Cannot access other users\' data' });
     }
     
@@ -486,35 +493,12 @@ router.get('/player-games/:group_id/:player_name/:user_id', async (req, res) => 
   }
 });
 
-// 7b. All games played by a specific player (by user_id)
-router.get('/player-games-by-id/:group_id/:player_user_id/:user_id', async (req, res) => {
-  try {
-    const { group_id, player_user_id, user_id } = req.params;
-    
-    const hasAccess = await isActiveMember(user_id, group_id);
-    if (!hasAccess) {
-      return res.status(403).json({ error: 'Access denied to this group' });
-    }
-    
-    const events = await Event.findAll({
-      where: { group_id },
-      include: [
-        { model: Game, attributes: ['name', 'theme', 'url'] },
-        { model: User, as: 'Players', attributes: ['id', 'username'] }
-      ],
-      order: [['start_date', 'DESC']]
-    });
-    
-    // Filter to only include events where this player participated
-    const playerEvents = events.filter(event => {
-      return event.Players && event.Players.some(p => p.user_id === player_user_id);
-    });
-    
-    res.json(playerEvents);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
+// 7b. [REMOVED — Phase 87.4 Plan 02, SPEC Req 6] The dead "games-played-by-id"
+// endpoint (path :group_id/:player_user_id/:user_id) was deleted. It filtered on
+// `p.user_id` from a `User, as: 'Players'` include that only selects
+// ['id','username'] (never user_id), so the predicate was always false and the
+// route always returned []. Zero consumers (no FE reference; confirmed via grep
+// of periodictabletop/src). Recoverable from git history if ever needed.
 
 // 8. All players in a group (aggregated from all games)
 router.get('/players/:group_id/:user_id', async (req, res) => {
@@ -529,8 +513,11 @@ router.get('/players/:group_id/:user_id', async (req, res) => {
 
     const { group_id, user_id } = req.params;
 
-    // Verify that the requested user_id matches the authenticated user
-    if (user_id !== userId) {
+    // Verify the requested user_id is the caller's own identity (dual-accept:
+    // own sub OR own resolved UUID). The group-scoped data query below keys on
+    // group_id + isActiveMember(token sub), not this param, so no keyspace
+    // resolution of the param is needed.
+    if (!(await matchesSelf(req, user_id))) {
       return res.status(403).json({ error: 'Forbidden: Cannot access other users\' data' });
     }
 

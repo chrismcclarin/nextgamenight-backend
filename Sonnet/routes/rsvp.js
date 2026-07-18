@@ -6,6 +6,9 @@ const { Op, UniqueConstraintError } = require('sequelize');
 const { EventRsvp, EventBring, Event, User, Game, Group, EventParticipation, SingleUseToken } = require('../models');
 const { validateRsvpCreate } = require('../middleware/validators');
 const { verifyAuth0Token } = require('../middleware/auth0');
+// Phase 87.4 Plan 02 (SPEC Req 5, D-04): shared self-param dual-accept (own sub
+// OR own resolved Users.id UUID).
+const { matchesSelf } = require('../middleware/objectAuth');
 const { enqueueCleanupJobForAttendee } = require('../services/gcalCleanupService');
 const router = express.Router();
 
@@ -544,9 +547,11 @@ router.get('/user/:user_id', verifyAuth0Token, async (req, res) => {
     const { user_id } = req.params;
     const userId = req.user.user_id;
 
-    // Only allow users to fetch their own RSVPs. The param-vs-token equality
-    // check stays on Auth0 strings (unchanged).
-    if (userId !== user_id) {
+    // Only allow users to fetch their own RSVPs. Dual-accept (SPEC Req 5): the
+    // self-param may be the caller's own sub (today) OR their own Users.id UUID
+    // (post-PR-2). The data query below keys on the caller's token-resolved
+    // user_uuid regardless, so no keyspace resolution of the param is needed here.
+    if (!(await matchesSelf(req, user_id))) {
       return res.status(403).json({ error: 'You can only view your own RSVPs' });
     }
 
