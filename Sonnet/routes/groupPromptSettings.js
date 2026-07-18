@@ -53,6 +53,12 @@ async function buildRosterUuidToSub(group_id) {
     where: { group_id, status: 'active' },
     include: [{ model: User, attributes: ['id', 'user_id'] }],
   });
+  // Defensive NO-OP (87.4-review): if the roster source is missing/empty (findAll
+  // returned a non-array), echo untranslated rather than throwing. A temporary
+  // write-echo shim must never 500 a successful write just because it could not
+  // build its translation map — an empty map passes every id through unchanged,
+  // which is exactly the untranslated wire shape we want on the miss path.
+  if (!Array.isArray(roster)) return new Map();
   return new Map(
     roster
       .filter((ug) => ug.User && ug.User.id && ug.User.user_id)
