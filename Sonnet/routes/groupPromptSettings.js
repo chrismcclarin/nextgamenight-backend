@@ -39,6 +39,42 @@ const generateTemplateName = async (scheduleData, game_id = null) => {
   return `${gameName} - ${dayName} ${time}`;
 };
 
+// TEMPORARY PR-1 shim — removed by Plan 11 (PR-2)
+// Phase 87.4 code-review M-5: the GET translate-on-read shim (roster-scoped UUID->sub
+// map; see the GET handler's full H-B / T-874-04-ORACLE rationale) is extended to the
+// write-path echoes (POST create, PATCH update, toggle) so the PR-1 wire shape is
+// sub-consistent on writes too — not just GET. Build the reverse map ONLY from the
+// group's active roster, NEVER a global User lookup keyed on the stored UUIDs (that
+// would be an authenticated UUID->Auth0-sub oracle). A stored id absent from the roster
+// (or an already-sub residue) passes through untranslated. Plan 11 removes every site
+// together (grep the marker string).
+async function buildRosterUuidToSub(group_id) {
+  const roster = await UserGroup.findAll({
+    where: { group_id, status: 'active' },
+    include: [{ model: User, attributes: ['id', 'user_id'] }],
+  });
+  // Defensive NO-OP (87.4-review): if the roster source is missing/empty (findAll
+  // returned a non-array), echo untranslated rather than throwing. A temporary
+  // write-echo shim must never 500 a successful write just because it could not
+  // build its translation map — an empty map passes every id through unchanged,
+  // which is exactly the untranslated wire shape we want on the miss path.
+  if (!Array.isArray(roster)) return new Map();
+  return new Map(
+    roster
+      .filter((ug) => ug.User && ug.User.id && ug.User.user_id)
+      .map((ug) => [ug.User.id, ug.User.user_id])
+  );
+}
+function translateScheduleEcho(rosterUuidToSub, schedule) {
+  if (!schedule || !Array.isArray(schedule.selected_member_ids)) return schedule;
+  return {
+    ...schedule,
+    selected_member_ids: schedule.selected_member_ids.map((v) =>
+      rosterUuidToSub.has(v) ? rosterUuidToSub.get(v) : v
+    ),
+  };
+}
+
 /**
  * GET /api/groups/:group_id/prompt-settings
  * Returns GroupPromptSettings for group, including schedules from template_config
@@ -143,6 +179,55 @@ router.get('/:group_id/prompt-settings', async (req, res) => {
       display_name: ug.User?.username || ug.User?.user_id,
     }));
 
+    // TEMPORARY PR-1 shim — removed by Plan 11 (PR-2)
+    // Phase 87.4 Plan 04 (D-06, owner decision 2026-07-17): the selected_member_ids
+    // backfill (migration 20260716000002) converts the STORED nested keyspace to
+    // Users.id UUIDs immediately at BE deploy. But during PR-1 the FE ecosystem (old
+    // bundles, stale tabs, and the still-sub members[].user_id field emitted above)
+    // speaks Auth0 subs. So serialize the backfilled UUID selected_member_ids back to
+    // subs on read to keep the PR-1 wire shape sub-consistent — a UUID-shaped
+    // selected_member_ids would render blank MemberSelector checkboxes and a
+    // subsequent save could silently widen a scoped prompt to whole-group fanout.
+    //
+    // SECURITY (H-B / T-874-04-ORACLE): build the reverse UUID->sub map ONLY from the
+    // group's active-member roster this handler already loaded (groupMembers) — NEVER
+    // a global User.findAll keyed on the stored UUIDs. selected_member_ids content is
+    // never membership-validated, so a global reverse lookup would be an authenticated
+    // UUID->Auth0-sub oracle (any user could PATCH a victim's public UUID into a
+    // schedule then GET it back as the victim's Auth0 sub — the exact PII this program
+    // protects). A stored UUID absent from the active roster passes through
+    // UNTRANSLATED (consistent with the unresolvable-entry rule — legitimate selections
+    // are always current roster members); it is NOT dropped.
+    //
+    // Both GET emission points carry selected_member_ids and are translated: (1) the
+    // top-level `schedules[]` projection AND (2) the raw `template_config`. Plan 11
+    // removes this shim in PR-2 when the read emission flips to UUID for BOTH
+    // selected_member_ids and members[].user_id together (grep target: the marker
+    // string on the line above).
+    const rosterUuidToSub = new Map(
+      groupMembers
+        .filter(ug => ug.User?.id && ug.User?.user_id)
+        .map(ug => [ug.User.id, ug.User.user_id])
+    );
+    const translateSelectedMemberIds = (memberIds) => {
+      if (!Array.isArray(memberIds)) return memberIds;
+      // Roster-scoped reverse map; a non-roster UUID (or an already-sub residue
+      // entry) is not in the map and passes through untranslated (no oracle).
+      return memberIds.map(v => (rosterUuidToSub.has(v) ? rosterUuidToSub.get(v) : v));
+    };
+    const translateSchedules = (scheduleArr) =>
+      Array.isArray(scheduleArr)
+        ? scheduleArr.map(s => (
+            Array.isArray(s.selected_member_ids)
+              ? { ...s, selected_member_ids: translateSelectedMemberIds(s.selected_member_ids) }
+              : s
+          ))
+        : scheduleArr;
+
+    const translatedTemplateConfig = settings?.template_config
+      ? { ...settings.template_config, schedules: translateSchedules(settings.template_config.schedules) }
+      : { schedules: [] };
+
     res.json({
       id: settings?.id || null,
       group_id,
@@ -150,8 +235,8 @@ router.get('/:group_id/prompt-settings', async (req, res) => {
       default_deadline_hours: settings?.default_deadline_hours || 72,
       default_token_expiry_hours: settings?.default_token_expiry_hours || 168,
       is_active: settings?.is_active ?? true,
-      template_config: settings?.template_config || { schedules: [] },
-      schedules: schedules.filter(s => !s.deleted_at), // Only return non-deleted schedules
+      template_config: translatedTemplateConfig, // TEMPORARY PR-1 shim — removed by Plan 11 (PR-2)
+      schedules: translateSchedules(schedules.filter(s => !s.deleted_at)), // Only return non-deleted schedules (TEMPORARY PR-1 shim — removed by Plan 11 (PR-2))
       games: groupGames || [],
       members: members || []
     });
@@ -305,9 +390,11 @@ router.post('/:group_id/prompt-settings/schedules', async (req, res) => {
       );
     }
 
+    // TEMPORARY PR-1 shim — removed by Plan 11 (PR-2)
+    const rosterUuidToSub = await buildRosterUuidToSub(group_id);
     res.status(201).json({
       message: 'Schedule created successfully',
-      schedule: newSchedule
+      schedule: translateScheduleEcho(rosterUuidToSub, newSchedule) // TEMPORARY PR-1 shim — removed by Plan 11 (PR-2)
     });
   } catch (error) {
     console.error('Error creating schedule:', error);
@@ -449,9 +536,11 @@ router.patch('/:group_id/prompt-settings/schedules/:schedule_id', async (req, re
       );
     }
 
+    // TEMPORARY PR-1 shim — removed by Plan 11 (PR-2)
+    const rosterUuidToSub = await buildRosterUuidToSub(group_id);
     res.json({
       message: 'Schedule updated successfully',
-      schedule: updatedSchedule
+      schedule: translateScheduleEcho(rosterUuidToSub, updatedSchedule) // TEMPORARY PR-1 shim — removed by Plan 11 (PR-2)
     });
   } catch (error) {
     console.error('Error updating schedule:', error);
@@ -644,9 +733,11 @@ router.patch('/:group_id/prompt-settings/schedules/:schedule_id/toggle', async (
       );
     }
 
+    // TEMPORARY PR-1 shim — removed by Plan 11 (PR-2)
+    const rosterUuidToSub = await buildRosterUuidToSub(group_id);
     res.json({
       message: `Schedule ${!currentActive ? 'activated' : 'paused'} successfully`,
-      schedule: toggled
+      schedule: translateScheduleEcho(rosterUuidToSub, toggled) // TEMPORARY PR-1 shim — removed by Plan 11 (PR-2)
     });
   } catch (error) {
     console.error('Error toggling schedule:', error);

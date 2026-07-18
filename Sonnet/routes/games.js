@@ -3,6 +3,9 @@ const express = require('express');
 const { Game, Event, EventParticipation, GameReview, User, UserGame, UserGroup } = require('../models');
 const { Op } = require('sequelize');
 const { requireParamMatchesToken } = require('../middleware/objectAuth');
+// Phase 87.4 Plan 02 (KEYMISS mitigation): resolve a UUID self-param to the
+// sub-keyed Users row.
+const { isUuid } = require('../utils/resolveTargetUser');
 const router = express.Router();
 
 // BSEC-02 / BE-098: this router is mounted under the global `/api` default-deny
@@ -404,9 +407,19 @@ router.get('/bgg/search', async (req, res) => {
 router.get('/for-event/:group_id/:user_id', requireParamMatchesToken('user_id'), async (req, res) => {
   try {
     const { group_id, user_id } = req.params;
-    
-    // Get user
-    const user = await User.findOne({ where: { user_id } });
+
+    // Get user. Phase 87.4 Plan 02 (T-874-02-KEYMISS): the self-gated param may
+    // be the caller's own Users.id UUID (post-PR-2) — resolve it to the PK rather
+    // than querying the still-sub-keyed Users.user_id column (which would miss and
+    // 404 the caller's own owned-games list).
+    // M-4 (87.4-review): reuse the caller's own row memoized by matchesSelf (via
+    // requireParamMatchesToken) for the UUID shape — no duplicate Users lookup. The
+    // sub shape sets no memo and resolves by the sub column here.
+    const user = req.selfUser
+      ? req.selfUser
+      : (isUuid(user_id)
+          ? await User.findByPk(user_id)
+          : await User.findOne({ where: { user_id } }));
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }

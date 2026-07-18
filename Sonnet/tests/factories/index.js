@@ -347,9 +347,9 @@ async function makeAvailabilitySuggestion(prompt, user, overrides = {}) {
     prompt_id: prompt.id,
     suggested_start: new Date(ts),
     suggested_end: new Date(ts + 2 * 60 * 60 * 1000), // +2h
-    participant_user_ids: [user.user_id], // Auth0 sub STRING array (RESEARCH JSONB scrub)
+    participant_user_ids: [user.id], // Phase 87.4 Plan 03 flip: Users.id UUID array (was Auth0 sub)
     participant_count: 1, // consistent with the single seeded participant
-    tentative_calendar_event_ids: { [user.user_id]: `gcal-hold-${ts}-${n}` }, // { sub: gcalId }
+    tentative_calendar_event_ids: { [user.user_id]: `gcal-hold-${ts}-${n}` }, // { sub: gcalId } — stays sub-keyed (5b, out of scope)
     preferred_count: 0,
     meets_minimum: false,
     score: 1.0,

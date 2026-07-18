@@ -60,6 +60,20 @@ const REKEY = [
 ];
 const REKEY_FILES = new Set(REKEY.map((r) => r.file));
 
+// Phase 87.4 (Plan 03 owns this registration so Plans 03 and 04 stay parallel in wave 2
+// with disjoint files). These are pure JSONB DATA migrations — NOT column re-keys — so
+// they have no legacy column to down()/re-add and operate on the sync-built schema as-is.
+// They are therefore EXCLUDED from the REKEY pre-migration-shape loop below, but STILL
+// withheld from the SequelizeMeta seed so the CLI's `db:migrate` replays them under the
+// migrate-cli-replay job (the `test` job builds schema via sync() and never migrates).
+const DATA_MIGRATIONS_874 = new Set([
+  '20260716000001-sweep-participant-user-ids-uuid.js',   // Plan 03 — participant_user_ids sub→UUID sweep
+  '20260716000002-backfill-selected-member-ids-uuid.js', // Plan 04 — selected_member_ids sub→UUID backfill
+]);
+
+// Every migration the CLI path is expected to apply + book in SequelizeMeta.
+const CLI_APPLIED_FILES = new Set([...REKEY_FILES, ...DATA_MIGRATIONS_874]);
+
 async function provision() {
   // Safety: sync({force:true}) DROPS every table. This script is CI/local-only and
   // must NEVER touch a production DB. Refuse under NODE_ENV=production (mirrors the
@@ -95,7 +109,7 @@ async function provision() {
     .readdirSync(MIGRATIONS_DIR)
     .filter((f) => f.endsWith('.js'))
     .sort();
-  const toSeed = allFiles.filter((f) => !REKEY_FILES.has(f));
+  const toSeed = allFiles.filter((f) => !CLI_APPLIED_FILES.has(f));
   for (const name of toSeed) {
     await sequelize.query(
       `INSERT INTO "SequelizeMeta" ("name") VALUES (:name) ON CONFLICT ("name") DO NOTHING`,
@@ -104,28 +118,29 @@ async function provision() {
   }
   console.log(
     `[premigration] SequelizeMeta seeded with ${toSeed.length} pre-existing migration(s); ` +
-      `${REKEY_FILES.size} re-key migrations left UNAPPLIED for the CLI to run.`
+      `${CLI_APPLIED_FILES.size} migration(s) left UNAPPLIED for the CLI to run ` +
+      `(${REKEY_FILES.size} re-key + ${DATA_MIGRATIONS_874.size} Phase-87.4 data migrations).`
   );
 }
 
 async function verify() {
   const rows = await sequelize.query(
     `SELECT name FROM "SequelizeMeta" WHERE name IN (:names)`,
-    { replacements: { names: [...REKEY_FILES] }, type: QueryTypes.SELECT }
+    { replacements: { names: [...CLI_APPLIED_FILES] }, type: QueryTypes.SELECT }
   );
   const found = new Set(rows.map((r) => r.name));
-  const missing = [...REKEY_FILES].filter((f) => !found.has(f));
+  const missing = [...CLI_APPLIED_FILES].filter((f) => !found.has(f));
   if (missing.length) {
     console.error(
-      `[premigration:verify] FAIL — ${missing.length} re-key migration(s) NOT recorded in ` +
+      `[premigration:verify] FAIL — ${missing.length} migration(s) NOT recorded in ` +
         `SequelizeMeta after db:migrate:\n  ${missing.join('\n  ')}`
     );
     process.exitCode = 1;
     return;
   }
   console.log(
-    `[premigration:verify] OK — all ${REKEY_FILES.size} re-key migrations recorded in SequelizeMeta ` +
-      `(the sequelize-cli path applied and booked them).`
+    `[premigration:verify] OK — all ${CLI_APPLIED_FILES.size} CLI migrations recorded in SequelizeMeta ` +
+      `(${REKEY_FILES.size} re-key + ${DATA_MIGRATIONS_874.size} Phase-87.4 data; the sequelize-cli path applied and booked them).`
   );
 }
 

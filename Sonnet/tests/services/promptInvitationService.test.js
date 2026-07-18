@@ -66,10 +66,27 @@ describe('promptInvitationService.notifyMembersOfPrompt — selected-member fano
     emailService.isConfigured.mockReturnValue(true);
   });
 
-  it('a selected_member_ids subset (Auth0 strings) reaches EXACTLY those members — not the whole group', async () => {
+  // Phase 87.4 Plan 04 (D-11 case 1): UUID-keyed selectedMemberIds (the post-backfill
+  // shape) reaches EXACTLY those members via the fanout dual-read's `id IN (...)` arm.
+  it('D-11 case 1: a UUID-keyed selectedMemberIds subset (Users.id) reaches EXACTLY those members', async () => {
     const { m1, m2, m3, prompt } = await seedPromptWithMembers();
 
-    // selected_member_ids stores Auth0 user_id STRINGS (m1, m2 — NOT m3).
+    // selectedMemberIds stores Users.id UUIDs (m1, m2 — NOT m3).
+    const result = await promptInvitationService.notifyMembersOfPrompt(prompt, {
+      selectedMemberIds: [m1.id, m2.id],
+    });
+
+    expect(result.sent).toBe(2);
+    expect(sentToAddresses()).toEqual([m1.email, m2.email].sort());
+    expect(sentToAddresses()).not.toContain(m3.email);
+  });
+
+  // D-11 case 2: a legacy sub-keyed subset (Railway pre-deploy residue) STILL fans out
+  // during the PR-1 dual-read window via the `user_id IN (...)` arm.
+  it('D-11 case 2: a legacy sub-keyed selectedMemberIds subset (Auth0 strings) STILL reaches EXACTLY those members (dual-read)', async () => {
+    const { m1, m2, m3, prompt } = await seedPromptWithMembers();
+
+    // selectedMemberIds stores Auth0 user_id STRINGS (m1, m2 — NOT m3).
     const result = await promptInvitationService.notifyMembersOfPrompt(prompt, {
       selectedMemberIds: [m1.user_id, m2.user_id],
     });
@@ -81,7 +98,8 @@ describe('promptInvitationService.notifyMembersOfPrompt — selected-member fano
     expect(sentToAddresses()).not.toContain(m3.email);
   });
 
-  it('no selectedMemberIds → every active member is invited (manual poll)', async () => {
+  // D-11 case 3: empty/null selectedMemberIds preserves the whole-active-group default.
+  it('D-11 case 3: no selectedMemberIds → every active member is invited (manual poll)', async () => {
     const { m1, m2, m3, prompt } = await seedPromptWithMembers();
 
     const result = await promptInvitationService.notifyMembersOfPrompt(prompt);

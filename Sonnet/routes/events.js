@@ -3,6 +3,9 @@ const express = require('express');
 const crypto = require('crypto');
 const { Event, Game, User, Group, EventParticipation, UserGroup, EventRsvp, EventBring, EventBallotOption, EventBallotVote, EventAuditLog, PendingAuth0Deletion } = require('../models');
 const { sendError } = require('../utils/errors');
+// Phase 87.4 Plan 02 (KEYMISS mitigation): resolve a self-param that may be the
+// caller's own Users.id UUID (post-PR-2) to the sub-keyed Users row.
+const { isUuid } = require('../utils/resolveTargetUser');
 const { Op } = require('sequelize');
 const sequelize = require('../config/database');
 const router = express.Router();
@@ -182,8 +185,23 @@ const attachRsvpSummaries = async (events) => {
 // only calls this for the logged-in user (eventsAPI.getUserEvents on UserHome).
 router.get('/user/:user_id', requireParamMatchesToken('user_id'), async (req, res) => {
   try {
-    let user = await User.findOne({ where: { user_id: req.params.user_id } });
-    
+    // Phase 87.4 Plan 02 (T-874-02-KEYMISS): requireParamMatchesToken already
+    // proved the param is the caller's OWN identity (sub OR own Users.id UUID).
+    // Resolve either shape to the row — a UUID param must hit the PK, not the
+    // still-sub-keyed Users.user_id column (which would miss and 404 the
+    // caller's own event list). The auto-create branch below only fires for the
+    // sub shape (req.user.user_id === param); a UUID-param caller already has a
+    // Users row (matchesSelf resolved their UUID from it), so user is non-null.
+    // M-4 (87.4-review): matchesSelf (via requireParamMatchesToken) already resolved
+    // and memoized the caller's own row on req.selfUser for the UUID shape — reuse it
+    // to avoid a duplicate Users lookup. The sub shape sets no memo (matchesSelf
+    // short-circuits before any DB hit), so it still resolves by the sub column here.
+    let user = req.selfUser
+      ? req.selfUser
+      : (isUuid(req.params.user_id)
+          ? await User.findByPk(req.params.user_id)
+          : await User.findOne({ where: { user_id: req.params.user_id } }));
+
     // If user doesn't exist but we have authenticated user info, auto-create
     if (!user && req.user && req.user.user_id === req.params.user_id) {
       // SPEC Req 6 (Phase 87.2 tombstone guard, self-keyed): a still-valid token

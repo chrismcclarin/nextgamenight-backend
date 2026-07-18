@@ -39,7 +39,8 @@ const request = require('supertest');
 const groupPromptSettingsRouter = require('../../routes/groupPromptSettings');
 const promptInvitationService = require('../../services/promptInvitationService');
 const emailService = require('../../services/emailService');
-const { AvailabilityPrompt } = require('../../models');
+const { AvailabilityPrompt, GroupPromptSettings, sequelize } = require('../../models');
+const backfillMigration = require('../../migrations/20260716000002-backfill-selected-member-ids-uuid');
 const { makeUser, makeGroup, addToGroup } = require('../factories');
 
 let currentActor = null;
@@ -131,5 +132,77 @@ describe('GET /api/groups/:group_id/prompt-settings — members Auth0-sub wire f
     // The unselected members are NOT reached.
     expect(toAddresses).not.toContain(m2.email);
     expect(toAddresses).not.toContain(owner.email);
+  });
+
+  // Phase 87.4 Plan 04 (D-06, owner decision 2026-07-17): the backfill converts the
+  // STORED selected_member_ids keyspace to Users.id UUIDs, but the GET handler's
+  // TEMPORARY PR-1 translate-on-read shim serializes them back to Auth0 subs on read
+  // so the PR-1 wire shape stays sub-consistent with members[].user_id (above). The
+  // reverse UUID->sub map is built ONLY from the active-member roster (no global
+  // Users query / no UUID->sub oracle). Removed by Plan 11 in PR-2.
+  it('PR-1 shim: selected_member_ids round-trips through the backfill and back out as SUBS on GET (roster member)', async () => {
+    // Store a schedule keyed by m1's Auth0 SUB (the pre-backfill shape).
+    await GroupPromptSettings.create({
+      group_id: group.id,
+      schedule_timezone: 'UTC',
+      template_config: {
+        schedules: [{
+          id: `sched-${group.id}`,
+          is_active: true,
+          game_id: null,
+          selected_member_ids: [m1.user_id], // Auth0 sub
+        }],
+      },
+    });
+
+    // Run the real backfill migration — converts m1.user_id (sub) -> m1.id (UUID)
+    // in the stored nested JSONB.
+    await backfillMigration.up(sequelize.getQueryInterface());
+
+    // The STORED keyspace is now the UUID (proves the backfill ran).
+    const stored = await GroupPromptSettings.findOne({ where: { group_id: group.id } });
+    expect(stored.template_config.schedules[0].selected_member_ids).toEqual([m1.id]);
+
+    // GET translates the backfilled UUID back to m1's Auth0 sub at BOTH emission
+    // points — the top-level schedules[] projection AND the raw template_config.
+    const res = await request(makeApp()).get(`/api/groups/${group.id}/prompt-settings`);
+    expect(res.status).toBe(200);
+
+    const schedFromProjection = res.body.schedules.find(s => s.id === `sched-${group.id}`);
+    expect(schedFromProjection.selected_member_ids).toEqual([m1.user_id]); // sub, not UUID
+    expect(schedFromProjection.selected_member_ids).not.toContain(m1.id);
+
+    const schedFromTemplateConfig = res.body.template_config.schedules.find(s => s.id === `sched-${group.id}`);
+    expect(schedFromTemplateConfig.selected_member_ids).toEqual([m1.user_id]); // sub, not UUID
+  });
+
+  // H-B (T-874-04-ORACLE): a stored UUID that is NOT in the active-member roster must
+  // pass through UNTRANSLATED on GET — the roster-scoped reverse map has no oracle
+  // behavior, so a non-member's Auth0 sub is never leaked.
+  it('PR-1 shim: a non-member UUID in stored selected_member_ids is NOT translated to a sub on GET', async () => {
+    // A user who is NOT a member of this group.
+    const nonMember = await makeUser({ username: 'not-in-group' });
+
+    await GroupPromptSettings.create({
+      group_id: group.id,
+      schedule_timezone: 'UTC',
+      template_config: {
+        schedules: [{
+          id: `sched-nonmember-${group.id}`,
+          is_active: true,
+          game_id: null,
+          selected_member_ids: [nonMember.id], // a UUID absent from the active roster
+        }],
+      },
+    });
+
+    const res = await request(makeApp()).get(`/api/groups/${group.id}/prompt-settings`);
+    expect(res.status).toBe(200);
+
+    const sched = res.body.schedules.find(s => s.id === `sched-nonmember-${group.id}`);
+    // Untranslated: the stored UUID passes through unchanged — it is NOT resolved to
+    // the non-member's Auth0 sub (no UUID->sub oracle).
+    expect(sched.selected_member_ids).toEqual([nonMember.id]);
+    expect(sched.selected_member_ids).not.toContain(nonMember.user_id);
   });
 });

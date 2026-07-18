@@ -6,6 +6,7 @@ const crypto = require('crypto');
 const { Op } = require('sequelize');
 const { AvailabilitySuggestion, AvailabilityPrompt, User, Group, Game } = require('../models');
 const googleCalendarService = require('./googleCalendarService');
+const { isUuid } = require('../utils/resolveTargetUser');
 
 // Environment configuration
 const TENTATIVE_HOLD_LIMIT = parseInt(process.env.TENTATIVE_HOLD_LIMIT || '3', 10);
@@ -134,8 +135,11 @@ async function createHoldsForTopSuggestions(promptId, options = {}) {
         userHoldIds: {}
       };
 
-      // Get users who are participants AND have calendar connected
-      const participantUserIds = suggestion.participant_user_ids || [];
+      // Get users who are participants AND have calendar connected.
+      // Phase 87.4 (D-05): participant_user_ids stores Users.id UUIDs. Filter out any
+      // non-UUID-shaped (deploy-window sub residue) entry before the id-keyed query
+      // so a sub-shaped string never reaches the UUID column (no Postgres 22P02).
+      const participantUserIds = (suggestion.participant_user_ids || []).filter(isUuid);
 
       if (participantUserIds.length === 0) {
         console.log(`No participants for suggestion ${suggestion.id}`);
@@ -145,7 +149,7 @@ async function createHoldsForTopSuggestions(promptId, options = {}) {
 
       const users = await User.findAll({
         where: {
-          user_id: {
+          id: {
             [Op.in]: participantUserIds
           },
           google_calendar_enabled: true,
@@ -260,11 +264,25 @@ async function cleanupHoldsOnEventCreation(suggestionId, promptId) {
       // backstop so a hold that was created on GCal but not yet persisted (crash /
       // partial failure between events.insert and suggestion.update) is still reaped.
       const storedIds = suggestion.tentative_calendar_event_ids || {};
-      const participantUserIds = suggestion.participant_user_ids || [];
       const holdIds = { ...storedIds };
-      for (const userId of participantUserIds) {
-        if (!holdIds[userId]) {
-          holdIds[userId] = deterministicHoldId(suggestion.id, userId);
+      // Phase 87.4 (D-05): participant_user_ids is now Users.id UUID-keyed, but
+      // tentative_calendar_event_ids stays sub-keyed (out of scope — it pairs with
+      // per-user gcal holds) and deterministicHoldId is computed from the sub. Bridge
+      // the UUID participants back to their Auth0 sub BEFORE matching the stored map /
+      // recomputing the hold id, otherwise a UUID would never match the sub-keyed map
+      // and would recompute the wrong id, silently orphaning the hold forever. Shape-
+      // guard the UUIDs so deploy-window sub residue is skipped here too.
+      const participantUuids = (suggestion.participant_user_ids || []).filter(isUuid);
+      if (participantUuids.length > 0) {
+        const participants = await User.findAll({
+          where: { id: { [Op.in]: participantUuids } },
+          attributes: ['id', 'user_id']
+        });
+        for (const participant of participants) {
+          const sub = participant.user_id;
+          if (!holdIds[sub]) {
+            holdIds[sub] = deterministicHoldId(suggestion.id, sub);
+          }
         }
       }
 

@@ -5,6 +5,9 @@ const router = express.Router();
 const { validateUserSearch } = require('../middleware/validators');
 const { writeOperationLimiter } = require('../middleware/rateLimiter');
 const { requireParamMatchesToken } = require('../middleware/objectAuth');
+// Phase 87.4 Plan 02 (KEYMISS mitigation): resolve a UUID self-param to the
+// sub-keyed Users row.
+const { isUuid } = require('../utils/resolveTargetUser');
 const auth0Service = require('../services/auth0Service');
 const smsService = require('../services/smsService');
 const accountDeletionService = require('../services/accountDeletionService');
@@ -243,10 +246,25 @@ router.get('/:user_id', requireParamMatchesToken('user_id'), async (req, res) =>
 
     // BSEC-01 (D-03): withContactInfo — self-gated own-profile read that
     // returns email and reconciles it against the Auth0 token.
-    let user = await User.scope('withContactInfo').findOne({
-      where: { user_id: req.params.user_id },
-      include: [{ model: Group }]
-    });
+    // Phase 87.4 Plan 02 (T-874-02-KEYMISS): the self-gated param may be the
+    // caller's own Users.id UUID (post-PR-2) — resolve it to the PK rather than
+    // querying the still-sub-keyed Users.user_id column (which would miss and
+    // wrongly enter the auto-create branch / 404 the caller's own profile).
+    // M-4 (87.4-review): this self-read genuinely needs the withContactInfo scope +
+    // Group include, which matchesSelf's memoized default-scope row does NOT carry, so
+    // it re-fetches. But it reuses req.selfUuid (the caller's own UUID matchesSelf
+    // already resolved) as the PK so the re-fetch is a keyed findByPk — no second
+    // sub-column lookup, and an uppercase UUID param resolves via the stored-lowercase
+    // memo (L-3). The sub shape (no memo) resolves by the sub column.
+    const selfPk = req.selfUuid || (isUuid(req.params.user_id) ? req.params.user_id : null);
+    let user = selfPk
+      ? await User.scope('withContactInfo').findByPk(selfPk, {
+          include: [{ model: Group }],
+        })
+      : await User.scope('withContactInfo').findOne({
+          where: { user_id: req.params.user_id },
+          include: [{ model: Group }],
+        });
     
     // Only auto-create if:
     // 1. User doesn't exist in our database

@@ -47,6 +47,7 @@ const {
   SingleUseToken,
   Feedback,
   EventBallotOption,
+  GroupPromptSettings,
   PendingAuth0Deletion,
   sequelize,
 } = require('../models');
@@ -191,6 +192,20 @@ async function applyDispositions(user, t) {
   const sub = user.user_id; // Auth0 sub string
   const email = user.email; // captured via withContactInfo scope (Step 0)
 
+  // M-2 (87.4-review): capture the deleting user's group_ids UP FRONT — before Step 1
+  // can auto-delete sole-member owned groups (which destroys their UserGroup rows) and
+  // before the User.destroy CASCADE (Step 7) removes the rest. The 5c GroupPromptSettings
+  // scrub is scoped to these group_ids so it takes a FOR UPDATE lock ONLY on this user's
+  // groups' settings rows, never every settings row app-wide (which would stall all
+  // schedule edits site-wide for the deletion txn). A UUID can only legitimately appear
+  // in a group's schedule selected_member_ids if the user is (was) a member of that group.
+  const userGroupRows = await UserGroup.findAll({
+    where: { user_uuid: uuid },
+    attributes: ['group_id'],
+    transaction: t,
+  });
+  const userGroupIds = [...new Set(userGroupRows.map((r) => r.group_id))];
+
   // 1. SOLE-MEMBER OWNED GROUP AUTO-DELETE (Pitfall 8).
   //    For each owned group whose ONLY UserGroup row (any status) is the owner's,
   //    replicate routes/groups.js:721-742 group-delete IN-TXN. Never call the route
@@ -252,10 +267,11 @@ async function applyDispositions(user, t) {
     { where: { created_by: sub }, transaction: t }
   );
 
-  // 5. JSONB SCRUBS (raw query, jsonb `-` operator; atomic, no read-modify-write race).
-  //    5a. participant_user_ids: remove the sub element AND recompute the denormalized
-  //        derived columns in the SAME UPDATE (Pitfall 6) so a now-below-minimum slot
-  //        cannot keep ranking as viable:
+  // 5. JSONB SCRUBS.
+  //    5a. participant_user_ids (raw query, jsonb `-` operator; atomic, no
+  //        read-modify-write race): remove the deleting user's element AND recompute the
+  //        denormalized derived columns in the SAME UPDATE (Pitfall 6) so a now-below-
+  //        minimum slot cannot keep ranking as viable:
   //          - participant_count = new array length
   //          - meets_minimum via the prompt's threshold. NOTE: min_participants is NOT a
   //            column on AvailabilityPrompts — the real threshold is the prompt's Game
@@ -267,26 +283,88 @@ async function applyDispositions(user, t) {
   //            but calculateScore applies none, so we match the real formula (no boost).
   //        preferred_count has NO persisted per-user array and is NOT derivable post-hoc
   //        — it is accepted stale-by-one until the next regeneration (documented here).
+  //        KEYSPACE (Phase 87.4 Plan 03 / D-05, Pitfall 7): participant_user_ids stores
+  //        Users.id UUIDs at steady state (writer + all readers flipped). But during the
+  //        PR-1 expand/contract deploy window a suggestion row can still hold the deleting
+  //        user's Auth0 SUB (a residue row written by an old bundle, not yet re-swept by
+  //        Plan 11's migration). M-1 (87.4-review): chain BOTH shapes (`- :uuid - :sub`)
+  //        and widen the guard to `(? :uuid OR ? :sub)` so a deploy-window sub residue is
+  //        also scrubbed and its count/score recomputed — jsonb `-` is a no-op when the
+  //        key is absent, so removing the sub from a pure-UUID row (or vice-versa) is
+  //        harmless. The recompute formula is keyspace-agnostic (count-based) and unchanged.
   await sequelize.query(
     `UPDATE "AvailabilitySuggestions" AS s
-        SET participant_user_ids = s.participant_user_ids - :sub,
-            participant_count = jsonb_array_length(s.participant_user_ids - :sub),
-            meets_minimum = (jsonb_array_length(s.participant_user_ids - :sub) >= COALESCE(g.min_players, 2)),
-            score = (jsonb_array_length(s.participant_user_ids - :sub) * 1.0 + s.preferred_count * 0.5)
+        SET participant_user_ids = s.participant_user_ids - :uuid - :sub,
+            participant_count = jsonb_array_length(s.participant_user_ids - :uuid - :sub),
+            meets_minimum = (jsonb_array_length(s.participant_user_ids - :uuid - :sub) >= COALESCE(g.min_players, 2)),
+            score = (jsonb_array_length(s.participant_user_ids - :uuid - :sub) * 1.0 + s.preferred_count * 0.5)
        FROM "AvailabilityPrompts" AS ap
        LEFT JOIN "Games" AS g ON g.id = ap.game_id
       WHERE ap.id = s.prompt_id
-        AND s.participant_user_ids ? :sub`,
-    { replacements: { sub }, transaction: t }
+        AND (s.participant_user_ids ? :uuid OR s.participant_user_ids ? :sub)`,
+    { replacements: { uuid, sub }, transaction: t }
   );
   //    5b. tentative_calendar_event_ids: remove the sub key (the gcal hold VALUE was
-  //        already read + deleted pre-txn in Step 2 of deleteAccount).
+  //        already read + deleted pre-txn in Step 2 of deleteAccount). STAYS sub-keyed
+  //        (out of scope, Anti-Pattern A1) — this map pairs with the still-sub-keyed
+  //        Google Calendar hold ids, so it is deliberately NOT re-keyed to the UUID.
   await sequelize.query(
     `UPDATE "AvailabilitySuggestions"
         SET tentative_calendar_event_ids = tentative_calendar_event_ids - :sub
       WHERE tentative_calendar_event_ids ? :sub`,
     { replacements: { sub }, transaction: t }
   );
+  //    5c. selected_member_ids scrub (Phase 87.4 Plan 06 / D-09 debt fold-in). The
+  //        deleting user's UUID can appear in the nested
+  //        GroupPromptSettings.template_config.schedules[].selected_member_ids arrays
+  //        (backfilled to Users.id UUIDs by Plan 04). GroupPromptSettings survives the
+  //        deletion (created_by_user_id is SET NULL, not CASCADE), so without an explicit
+  //        scrub the deleted user's UUID lingers in these arrays (T-874-06-D09,
+  //        privacy/integrity). This is a NESTED-JSONB array-of-objects mutation, so it is
+  //        an app-level read-modify-write (raw nested-path SQL rejected as brittle — same
+  //        shape as the Plan 04 backfill), NOT a top-level jsonb `-` operator.
+  //        RACE (T-874-06-RACE, Pitfall / T8): the same GroupPromptSettings rows are
+  //        read-modify-written by the schedule PATCH/POST handlers
+  //        (routes/groupPromptSettings.js:305-338) under a FOR UPDATE row lock. The scrub
+  //        therefore runs INSIDE the deletion transaction `t` and takes the SAME row-level
+  //        lock (lock: t.LOCK.UPDATE) on the settings rows, holding it across read->write
+  //        for the remainder of the transaction. A concurrent schedule edit blocks behind
+  //        this lock and cannot commit a re-added UUID between the scrub's read and write.
+  //        M-2 (87.4-review): scope the lock to the deleting user's groups (captured
+  //        up front) — an unscoped findAll FOR UPDATE would lock EVERY GroupPromptSettings
+  //        row app-wide for the rest of the deletion txn, stalling all schedule edits
+  //        site-wide. An empty group set skips the query entirely.
+  const promptSettingsRows = userGroupIds.length === 0
+    ? []
+    : await GroupPromptSettings.findAll({
+        where: { group_id: { [Op.in]: userGroupIds } },
+        transaction: t,
+        lock: t.LOCK.UPDATE,
+      });
+  for (const settings of promptSettingsRows) {
+    const schedules = settings.template_config && settings.template_config.schedules;
+    if (!Array.isArray(schedules)) continue;
+    let changed = false;
+    const updatedSchedules = schedules.map((s) => {
+      if (!s || !Array.isArray(s.selected_member_ids)) return s;
+      // M-1 belt-and-braces (87.4-review): scrub BOTH shapes. Steady state stores the
+      // UUID (Plan 04 backfill), but a deploy-window residue could hold the sub. A stale
+      // tab can also PATCH either shape back post-scrub — this is hardening, not the
+      // closure point (Plan 11's re-sweep + normalization is authoritative).
+      if (!s.selected_member_ids.includes(uuid) && !s.selected_member_ids.includes(sub)) return s;
+      changed = true;
+      return {
+        ...s,
+        selected_member_ids: s.selected_member_ids.filter((id) => id !== uuid && id !== sub),
+      };
+    });
+    if (changed) {
+      await settings.update(
+        { template_config: { ...settings.template_config, schedules: updatedSchedules } },
+        { transaction: t }
+      );
+    }
+  }
 
   // 6. INSERT the durable PendingAuth0Deletion marker (D-08 backstop) — BEFORE the
   //    User.destroy, inside the same transaction, so it commits atomically with the

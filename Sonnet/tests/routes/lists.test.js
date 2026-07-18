@@ -86,8 +86,16 @@ describe('List Routes', () => {
     });
   });
 
+  // Every route in this file now authorizes on req.user (token sub) like the
+  // /games + /players siblings (87.4 code-review H-1). Reset the shared actor
+  // after each test so a set actor never leaks into the next case.
+  afterEach(() => {
+    currentActor = null;
+  });
+
   describe('GET /api/lists/player-wins/:group_id/:player_name/:user_id', () => {
     it('should get games won by a specific player', async () => {
+      currentActor = testUser1.user_id; // token-authorized member (self-param dual-accept)
       const response = await request(app)
         .get(`/api/lists/player-wins/${testGroup.id}/testuser1/${testUser1.user_id}`)
         .expect(200);
@@ -96,6 +104,7 @@ describe('List Routes', () => {
     });
 
     it('should return 403 if user not in group', async () => {
+      currentActor = testUser2.user_id; // authenticated (self-param) but NOT a member
       const response = await request(app)
         .get(`/api/lists/player-wins/${testGroup.id}/testuser1/${testUser2.user_id}`)
         .expect(403);
@@ -106,6 +115,7 @@ describe('List Routes', () => {
 
   describe('GET /api/lists/player-wins-by-id/:group_id/:player_user_id/:user_id', () => {
     it('should get games won by a specific player by user_id', async () => {
+      currentActor = testUser1.user_id; // token-authorized member (self-param dual-accept)
       const response = await request(app)
         .get(`/api/lists/player-wins-by-id/${testGroup.id}/${testUser1.user_id}/${testUser1.user_id}`)
         .expect(200);
@@ -130,6 +140,7 @@ describe('List Routes', () => {
     });
 
     it('should return 403 if user not in group', async () => {
+      currentActor = testUser2.user_id; // authenticated (self-param) but NOT a member
       const response = await request(app)
         .get(`/api/lists/most-played/${testGroup.id}/${testUser2.user_id}`)
         .expect(403);
@@ -152,6 +163,7 @@ describe('List Routes', () => {
 
   describe('GET /api/lists/player-picks/:group_id/:player_name/:user_id', () => {
     it('should get games picked by a specific player', async () => {
+      currentActor = testUser1.user_id; // token-authorized member (self-param dual-accept)
       const response = await request(app)
         .get(`/api/lists/player-picks/${testGroup.id}/testuser1/${testUser1.user_id}`)
         .expect(200);
@@ -162,6 +174,7 @@ describe('List Routes', () => {
 
   describe('GET /api/lists/player-picks-by-id/:group_id/:player_user_id/:user_id', () => {
     it('should get games picked by a specific player by user_id', async () => {
+      currentActor = testUser1.user_id; // token-authorized member (self-param dual-accept)
       const response = await request(app)
         .get(`/api/lists/player-picks-by-id/${testGroup.id}/${testUser1.user_id}/${testUser1.user_id}`)
         .expect(200);
@@ -172,6 +185,7 @@ describe('List Routes', () => {
 
   describe('GET /api/lists/by-theme/:group_id/:theme/:user_id', () => {
     it('should get games by theme', async () => {
+      currentActor = testUser1.user_id; // token-authorized member (self-param dual-accept)
       const response = await request(app)
         .get(`/api/lists/by-theme/${testGroup.id}/Strategy/${testUser1.user_id}`)
         .expect(200);

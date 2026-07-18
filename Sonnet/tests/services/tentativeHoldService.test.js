@@ -34,10 +34,23 @@ const { deterministicHoldId } = service;
 
 // ---- fixtures ------------------------------------------------------------
 
+// Phase 87.4 (D-05): participant_user_ids stores Users.id UUIDs, and the readers
+// filter out any non-UUID-shaped element via isUuid before the id-keyed User query.
+// Fixtures therefore use UUID-shaped participant ids. The service still keys holds /
+// the deterministic id on the resolved user's Auth0 sub (user.user_id), so each UUID
+// maps to a sub ('user-1' / 'user-2') via the roster (User.findAll) lookup below.
+const UUID_1 = '11111111-1111-1111-1111-111111111111';
+const UUID_2 = '22222222-2222-2222-2222-222222222222';
+// UUID -> Auth0 sub roster, mirroring the post-flip User rows the readers resolve.
+const ROSTER = [
+  { id: UUID_1, user_id: 'user-1' },
+  { id: UUID_2, user_id: 'user-2' },
+];
+
 function makeSuggestion(overrides = {}) {
   const s = {
     id: 'sug-1',
-    participant_user_ids: ['user-1', 'user-2'],
+    participant_user_ids: [UUID_1, UUID_2],
     suggested_start: new Date('2026-02-15T18:00:00Z'),
     suggested_end: new Date('2026-02-15T20:00:00Z'),
     tentative_calendar_event_ids: null,
@@ -173,6 +186,8 @@ describe('cleanupHoldsOnEventCreation — recompute backstop (no orphans)', () =
     // holds exist on GCal under their deterministic ids.
     const suggestion = makeSuggestion({ tentative_calendar_event_ids: null });
     AvailabilitySuggestion.findAll.mockResolvedValue([suggestion]);
+    // Roster bridge: UUID participant ids -> Auth0 subs (the reader's User.findAll).
+    User.findAll.mockResolvedValue(ROSTER);
     User.findOne.mockImplementation(async ({ where }) => makeUser(where.user_id));
     googleCalendarService.deleteTentativeHold.mockResolvedValue(true);
 
@@ -193,6 +208,7 @@ describe('cleanupHoldsOnEventCreation — retain failed hold-ids on partial fail
   test('one failed + one successful delete → map retains the failed id (not nulled)', async () => {
     const suggestion = makeSuggestion({ tentative_calendar_event_ids: null });
     AvailabilitySuggestion.findAll.mockResolvedValue([suggestion]);
+    User.findAll.mockResolvedValue(ROSTER);
     User.findOne.mockImplementation(async ({ where }) => makeUser(where.user_id));
 
     const failId = deterministicHoldId('sug-1', 'user-1');
@@ -220,6 +236,7 @@ describe('cleanupHoldsOnEventCreation — retain failed hold-ids on partial fail
   test('all-success path still nulls the map', async () => {
     const suggestion = makeSuggestion({ tentative_calendar_event_ids: null });
     AvailabilitySuggestion.findAll.mockResolvedValue([suggestion]);
+    User.findAll.mockResolvedValue(ROSTER);
     User.findOne.mockImplementation(async ({ where }) => makeUser(where.user_id));
     googleCalendarService.deleteTentativeHold.mockResolvedValue(true);
 

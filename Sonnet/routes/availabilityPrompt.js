@@ -18,6 +18,7 @@ const {
 const emailService = require('../services/emailService');
 const { scheduleReminders, scheduleDeadlineJob } = require('../services/reminderService');
 const { sendError } = require('../utils/errors');
+const { isUuid } = require('../utils/resolveTargetUser');
 
 /**
  * GET /api/prompts/:promptId/respondents
@@ -748,17 +749,24 @@ router.get('/prompts/:promptId/heatmap', verifyAuth0Token, async (req, res) => {
       });
     }
 
-    // Resolve usernames for all participant Auth0 user_ids in one query.
+    // Resolve usernames for all participant ids in one query.
+    // Phase 87.4 (D-05): participant_user_ids stores Users.id UUIDs. Filter out any
+    // non-UUID-shaped (deploy-window sub residue) element BEFORE the id-keyed query
+    // so a sub-shaped string never reaches the UUID column (no Postgres 22P02) and is
+    // never counted — it is excluded consistently at the source (Pitfall 2 fix keys
+    // usernameByUserId by u.id so usernames still resolve, no blanks).
     const allParticipantIds = new Set();
     for (const s of suggestions) {
       const ids = Array.isArray(s.participant_user_ids) ? s.participant_user_ids : [];
-      for (const id of ids) allParticipantIds.add(id);
+      for (const id of ids) {
+        if (isUuid(id)) allParticipantIds.add(id);
+      }
     }
     const users = await User.findAll({
-      where: { user_id: Array.from(allParticipantIds) },
-      attributes: ['user_id', 'username'],
+      where: { id: Array.from(allParticipantIds) },
+      attributes: ['id', 'username'],
     });
-    const usernameByUserId = new Map(users.map(u => [u.user_id, u.username]));
+    const usernameByUserId = new Map(users.map(u => [u.id, u.username]));
 
     // Bucket suggestions by (date, hour) — keyed by ISO date string of the
     // suggestion's UTC suggested_start. Each hour bucket holds the two
@@ -772,7 +780,11 @@ router.get('/prompts/:promptId/heatmap', verifyAuth0Token, async (req, res) => {
       const hour = start.getUTCHours();
       const minute = start.getUTCMinutes();
       const key = `${dateStr}_${hour}`;
-      const ids = new Set(Array.isArray(s.participant_user_ids) ? s.participant_user_ids : []);
+      // Same UUID shape-guard as the username query above: exclude deploy-window
+      // sub residue from the availability counts so it is never counted.
+      const ids = new Set(
+        (Array.isArray(s.participant_user_ids) ? s.participant_user_ids : []).filter(isUuid)
+      );
       let bucket = hourBuckets.get(key);
       if (!bucket) {
         bucket = { dateStr, hour, halfA: null, halfB: null };
