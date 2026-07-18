@@ -12,14 +12,22 @@
 // still holding a provider-prefixed (sub-shaped, `LIKE '%|%'`) element. Once a row is
 // swept its elements are all UUIDs (no `|`), so re-running is a no-op.
 //
-// ORPHAN DROP + LOG (D-08): each element is remapped to its Users.id via a LATERAL
-// JOIN to "Users" on `u.user_id = elem`. An element whose sub has no Users row (a
-// departed member) has no join match and DROPS OUT of the aggregate. When EVERY element
-// is an orphan the inner JOIN yields zero rows and `jsonb_agg` returns SQL NULL — so we
-// COALESCE the aggregate to an empty JSONB array `[]`, NEVER NULL (a NULL
+// ORPHAN DROP + LOG (D-08): each SUB-shaped element is remapped to its Users.id via a
+// LATERAL JOIN to "Users" on `u.user_id = elem`. An element whose sub has no Users row
+// (a departed member) has no join match and DROPS OUT of the aggregate. When EVERY
+// element is an orphan the inner JOIN yields zero rows and `jsonb_agg` returns SQL NULL —
+// so we COALESCE the aggregate to an empty JSONB array `[]`, NEVER NULL (a NULL
 // participant_user_ids would poison the id-keyed readers and break
 // participant_count/meets_minimum). Orphan drops are logged by a count-diff of total
 // element lengths before/after (count only; no raw subs).
+//
+// UUID PRESERVATION (87.4 code-review L-2): a MIXED row (some already-UUID elements
+// alongside sub-shaped ones — latent today, but this migration is one-way) must NOT drop
+// its valid UUIDs just because they don't join the sub column. Each element is emitted as
+// COALESCE(u.id::text, CASE WHEN elem NOT LIKE '%|%' THEN elem END): a matched sub becomes
+// its UUID, an already-UUID (non-`|`) element passes through unchanged, and only an
+// unresolvable sub-shaped element (LIKE '%|%' with no Users row) drops. Idempotency is
+// unchanged — a fully-swept all-UUID row has no `|` element so the guard never selects it.
 //
 // RECOMPUTE (canonical formula — accountDeletionService.js:270-281; Don't-Hand-Roll):
 //   participant_count = jsonb_array_length(remapped array)   (0 for an all-orphan row)
@@ -63,7 +71,12 @@ module.exports = {
       const swept = await sequelize.query(
         `WITH remap AS (
            SELECT s.id AS sugg_id,
-                  COALESCE(jsonb_agg(u.id) FILTER (WHERE u.id IS NOT NULL), '[]'::jsonb) AS arr
+                  COALESCE(
+                    jsonb_agg(
+                      COALESCE(u.id::text, CASE WHEN elem.sub NOT LIKE '%|%' THEN elem.sub END)
+                    ) FILTER (WHERE u.id IS NOT NULL OR elem.sub NOT LIKE '%|%'),
+                    '[]'::jsonb
+                  ) AS arr
              FROM "AvailabilitySuggestions" s
              LEFT JOIN LATERAL jsonb_array_elements_text(s.participant_user_ids) AS elem(sub) ON TRUE
              LEFT JOIN "Users" u ON u.user_id = elem.sub
@@ -73,6 +86,15 @@ module.exports = {
             )
             GROUP BY s.id
          )
+         -- L-5 (87.4 code-review): the INNER join to "AvailabilityPrompts" (ap.id =
+         -- s.prompt_id) means a suggestion with an unjoinable prompt_id would be
+         -- silently skipped by this UPDATE while STILL being counted in beforeTotal
+         -- (which guards on participant_user_ids alone) — inflating the orphan-drop
+         -- log. This is safe ONLY because AvailabilitySuggestions.prompt_id is a
+         -- NOT NULL FK to AvailabilityPrompts with ON DELETE CASCADE: there is never
+         -- an orphaned/NULL prompt_id, so every guard-matched row also joins here and
+         -- beforeTotal stays exact. If that FK is ever relaxed, add the same prompt
+         -- join to the beforeTotal guard.
          UPDATE "AvailabilitySuggestions" AS s
             SET participant_user_ids = remap.arr,
                 participant_count    = jsonb_array_length(remap.arr),
