@@ -339,7 +339,20 @@ describe('deleteAccount — notice email (REQ-8)', () => {
 });
 
 describe('deleteAccount — GroupPromptSettings selected_member_ids scrub (5c / D-09)', () => {
+  // M-2 (87.4-review): the 5c scrub is now scoped to the deleting user's groups,
+  // captured up front via UserGroup.findAll WITHOUT a role filter. Distinguish that
+  // capture (returns the user's groups -> non-empty userGroupIds so the scrub runs)
+  // from the owner-gate / owned-rows queries (role: 'owner' -> none, so no blockers
+  // and no sole-member auto-delete).
+  function membershipCapturesGroup(groupId = 'g1') {
+    mockUGFindAll.mockImplementation(async (opts) => {
+      if (opts && opts.where && opts.where.role === 'owner') return [];
+      return [{ group_id: groupId }];
+    });
+  }
+
   test('scrubs the deleting user UUID from schedules[].selected_member_ids and saves', async () => {
+    membershipCapturesGroup();
     const settingsUpdate = jest.fn().mockResolvedValue(undefined);
     // One row: schedule[0] contains the deleting user's UUID (must be scrubbed),
     // schedule[1] does not (must be left untouched -> single write, filtered array).
@@ -357,11 +370,13 @@ describe('deleteAccount — GroupPromptSettings selected_member_ids scrub (5c / 
     const res = await deleteAccount({ userId: SUB });
     expect(res).toEqual({ status: 'deleted' });
 
-    // Loaded FOR UPDATE inside the deletion txn.
+    // Loaded FOR UPDATE inside the deletion txn, SCOPED to the user's groups (M-2).
     expect(mockGPSFindAll).toHaveBeenCalledTimes(1);
-    expect(mockGPSFindAll.mock.calls[0][0]).toEqual(
-      expect.objectContaining({ lock: 'UPDATE' })
-    );
+    const gpsArgs = mockGPSFindAll.mock.calls[0][0];
+    expect(gpsArgs).toEqual(expect.objectContaining({ lock: 'UPDATE' }));
+    // Scoped where clause: group_id IN (the captured group set) — NOT an app-wide lock.
+    expect(gpsArgs.where).toBeDefined();
+    expect(gpsArgs.where.group_id).toBeDefined();
 
     // The row was rewritten with the deleting user's UUID removed from schedule[0],
     // the other members and the untouched schedule preserved.
@@ -373,7 +388,33 @@ describe('deleteAccount — GroupPromptSettings selected_member_ids scrub (5c / 
     ]);
   });
 
+  // M-1 belt-and-braces (87.4-review): a deploy-window residue can hold the deleting
+  // user's SUB instead of the UUID — 5c must scrub that too.
+  test('scrubs the deleting user SUB (deploy-window residue) from selected_member_ids', async () => {
+    membershipCapturesGroup();
+    const settingsUpdate = jest.fn().mockResolvedValue(undefined);
+    mockGPSFindAll.mockResolvedValue([
+      {
+        template_config: {
+          schedules: [
+            { id: 's0', selected_member_ids: [SUB, '22222222-2222-2222-2222-222222222222'] },
+          ],
+        },
+        update: settingsUpdate,
+      },
+    ]);
+
+    const res = await deleteAccount({ userId: SUB });
+    expect(res).toEqual({ status: 'deleted' });
+    expect(settingsUpdate).toHaveBeenCalledTimes(1);
+    const patch = settingsUpdate.mock.calls[0][0];
+    expect(patch.template_config.schedules).toEqual([
+      { id: 's0', selected_member_ids: ['22222222-2222-2222-2222-222222222222'] },
+    ]);
+  });
+
   test('does not save a row that does not contain the deleting user UUID', async () => {
+    membershipCapturesGroup();
     const settingsUpdate = jest.fn().mockResolvedValue(undefined);
     mockGPSFindAll.mockResolvedValue([
       {
@@ -386,6 +427,40 @@ describe('deleteAccount — GroupPromptSettings selected_member_ids scrub (5c / 
 
     await deleteAccount({ userId: SUB });
     expect(settingsUpdate).not.toHaveBeenCalled();
+  });
+
+  // M-2 (87.4-review): a user in NO groups must not lock any GroupPromptSettings rows
+  // — the scoped findAll is skipped entirely (never an app-wide FOR UPDATE).
+  test('skips the GroupPromptSettings load entirely when the user belongs to no groups', async () => {
+    mockUGFindAll.mockResolvedValue([]); // no memberships -> empty userGroupIds
+    await deleteAccount({ userId: SUB });
+    expect(mockGPSFindAll).not.toHaveBeenCalled();
+  });
+});
+
+// M-1 (87.4-review): the 5a participant_user_ids scrub chains BOTH keyspaces so a
+// deploy-window sub residue is removed and its count/score recomputed.
+describe('deleteAccount — participant_user_ids scrub chains both keyspaces (5a / M-1)', () => {
+  test('the 5a UPDATE removes both :uuid and :sub and passes both replacements', async () => {
+    await deleteAccount({ userId: SUB });
+
+    const participantUpdate = mockSequelizeQuery.mock.calls.find(
+      ([sql]) =>
+        typeof sql === 'string' &&
+        sql.includes('"AvailabilitySuggestions"') &&
+        sql.includes('participant_user_ids') &&
+        sql.includes('SET')
+    );
+    expect(participantUpdate).toBeDefined();
+    const [sql, opts] = participantUpdate;
+    // Both keyspaces chained in the mutation AND the recompute expressions.
+    expect(sql).toContain('- :uuid - :sub');
+    // Guard widened to match either shape.
+    expect(sql).toMatch(/\?\s*:uuid\s+OR\s+.*\?\s*:sub/);
+    // Both replacements supplied.
+    expect(opts.replacements).toEqual(
+      expect.objectContaining({ uuid: UUID, sub: SUB })
+    );
   });
 });
 

@@ -192,6 +192,20 @@ async function applyDispositions(user, t) {
   const sub = user.user_id; // Auth0 sub string
   const email = user.email; // captured via withContactInfo scope (Step 0)
 
+  // M-2 (87.4-review): capture the deleting user's group_ids UP FRONT — before Step 1
+  // can auto-delete sole-member owned groups (which destroys their UserGroup rows) and
+  // before the User.destroy CASCADE (Step 7) removes the rest. The 5c GroupPromptSettings
+  // scrub is scoped to these group_ids so it takes a FOR UPDATE lock ONLY on this user's
+  // groups' settings rows, never every settings row app-wide (which would stall all
+  // schedule edits site-wide for the deletion txn). A UUID can only legitimately appear
+  // in a group's schedule selected_member_ids if the user is (was) a member of that group.
+  const userGroupRows = await UserGroup.findAll({
+    where: { user_uuid: uuid },
+    attributes: ['group_id'],
+    transaction: t,
+  });
+  const userGroupIds = [...new Set(userGroupRows.map((r) => r.group_id))];
+
   // 1. SOLE-MEMBER OWNED GROUP AUTO-DELETE (Pitfall 8).
   //    For each owned group whose ONLY UserGroup row (any status) is the owner's,
   //    replicate routes/groups.js:721-742 group-delete IN-TXN. Never call the route
@@ -269,23 +283,26 @@ async function applyDispositions(user, t) {
   //            but calculateScore applies none, so we match the real formula (no boost).
   //        preferred_count has NO persisted per-user array and is NOT derivable post-hoc
   //        — it is accepted stale-by-one until the next regeneration (documented here).
-  //        KEYSPACE (Phase 87.4 Plan 03 / D-05, Pitfall 7): participant_user_ids now
-  //        stores Users.id UUIDs (writer + all readers flipped). The surgery removes the
-  //        deleting user's UUID (`- :uuid`), NOT the sub — a `- :sub` here would never
-  //        match the stored UUID element, leaving it orphaned and inflating
-  //        participant_count/score (the accountDeletion integrity test asserts against
-  //        this). The recompute formula is keyspace-agnostic (count-based) and unchanged.
+  //        KEYSPACE (Phase 87.4 Plan 03 / D-05, Pitfall 7): participant_user_ids stores
+  //        Users.id UUIDs at steady state (writer + all readers flipped). But during the
+  //        PR-1 expand/contract deploy window a suggestion row can still hold the deleting
+  //        user's Auth0 SUB (a residue row written by an old bundle, not yet re-swept by
+  //        Plan 11's migration). M-1 (87.4-review): chain BOTH shapes (`- :uuid - :sub`)
+  //        and widen the guard to `(? :uuid OR ? :sub)` so a deploy-window sub residue is
+  //        also scrubbed and its count/score recomputed — jsonb `-` is a no-op when the
+  //        key is absent, so removing the sub from a pure-UUID row (or vice-versa) is
+  //        harmless. The recompute formula is keyspace-agnostic (count-based) and unchanged.
   await sequelize.query(
     `UPDATE "AvailabilitySuggestions" AS s
-        SET participant_user_ids = s.participant_user_ids - :uuid,
-            participant_count = jsonb_array_length(s.participant_user_ids - :uuid),
-            meets_minimum = (jsonb_array_length(s.participant_user_ids - :uuid) >= COALESCE(g.min_players, 2)),
-            score = (jsonb_array_length(s.participant_user_ids - :uuid) * 1.0 + s.preferred_count * 0.5)
+        SET participant_user_ids = s.participant_user_ids - :uuid - :sub,
+            participant_count = jsonb_array_length(s.participant_user_ids - :uuid - :sub),
+            meets_minimum = (jsonb_array_length(s.participant_user_ids - :uuid - :sub) >= COALESCE(g.min_players, 2)),
+            score = (jsonb_array_length(s.participant_user_ids - :uuid - :sub) * 1.0 + s.preferred_count * 0.5)
        FROM "AvailabilityPrompts" AS ap
        LEFT JOIN "Games" AS g ON g.id = ap.game_id
       WHERE ap.id = s.prompt_id
-        AND s.participant_user_ids ? :uuid`,
-    { replacements: { uuid }, transaction: t }
+        AND (s.participant_user_ids ? :uuid OR s.participant_user_ids ? :sub)`,
+    { replacements: { uuid, sub }, transaction: t }
   );
   //    5b. tentative_calendar_event_ids: remove the sub key (the gcal hold VALUE was
   //        already read + deleted pre-txn in Step 2 of deleteAccount). STAYS sub-keyed
@@ -313,21 +330,32 @@ async function applyDispositions(user, t) {
   //        lock (lock: t.LOCK.UPDATE) on the settings rows, holding it across read->write
   //        for the remainder of the transaction. A concurrent schedule edit blocks behind
   //        this lock and cannot commit a re-added UUID between the scrub's read and write.
-  const promptSettingsRows = await GroupPromptSettings.findAll({
-    transaction: t,
-    lock: t.LOCK.UPDATE,
-  });
+  //        M-2 (87.4-review): scope the lock to the deleting user's groups (captured
+  //        up front) — an unscoped findAll FOR UPDATE would lock EVERY GroupPromptSettings
+  //        row app-wide for the rest of the deletion txn, stalling all schedule edits
+  //        site-wide. An empty group set skips the query entirely.
+  const promptSettingsRows = userGroupIds.length === 0
+    ? []
+    : await GroupPromptSettings.findAll({
+        where: { group_id: { [Op.in]: userGroupIds } },
+        transaction: t,
+        lock: t.LOCK.UPDATE,
+      });
   for (const settings of promptSettingsRows) {
     const schedules = settings.template_config && settings.template_config.schedules;
     if (!Array.isArray(schedules)) continue;
     let changed = false;
     const updatedSchedules = schedules.map((s) => {
       if (!s || !Array.isArray(s.selected_member_ids)) return s;
-      if (!s.selected_member_ids.includes(uuid)) return s;
+      // M-1 belt-and-braces (87.4-review): scrub BOTH shapes. Steady state stores the
+      // UUID (Plan 04 backfill), but a deploy-window residue could hold the sub. A stale
+      // tab can also PATCH either shape back post-scrub — this is hardening, not the
+      // closure point (Plan 11's re-sweep + normalization is authoritative).
+      if (!s.selected_member_ids.includes(uuid) && !s.selected_member_ids.includes(sub)) return s;
       changed = true;
       return {
         ...s,
-        selected_member_ids: s.selected_member_ids.filter((id) => id !== uuid),
+        selected_member_ids: s.selected_member_ids.filter((id) => id !== uuid && id !== sub),
       };
     });
     if (changed) {
