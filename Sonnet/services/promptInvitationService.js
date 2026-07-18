@@ -13,6 +13,7 @@ const { Op } = require('sequelize');
 const { UserGroup, User, Group, Game } = require('../models');
 const magicTokenService = require('./magicTokenService');
 const emailService = require('./emailService');
+const { isUuid } = require('../utils/resolveTargetUser');
 
 let Sentry = null;
 if (process.env.SENTRY_DSN) {
@@ -106,7 +107,15 @@ async function notifyMembersOfPrompt(prompt, { selectedMemberIds, tokenExpiryHou
     required: true,
   };
   if (Array.isArray(selectedMemberIds) && selectedMemberIds.length > 0) {
-    userInclude.where = { user_id: { [Op.in]: selectedMemberIds } };
+    // TEMPORARY PR-1 dual-read (D-07): the selected_member_ids backfill (migration
+    // 20260716000002) flips the STORED keyspace to Users.id UUIDs at deploy, but the
+    // Railway pre-deploy residue window can still write subs after the backfill. So
+    // resolve each entry as UUID (id) OR sub (user_id). BOTH fanout sites flip
+    // together (Pitfall 4) — workers/promptWorker.js has the identical clause.
+    // Plan 11 contracts this to UUID-only ({ id: { [Op.in]: ... } }) in PR-2.
+    const uuids = selectedMemberIds.filter(isUuid);
+    const subs = selectedMemberIds.filter(v => !isUuid(v));
+    userInclude.where = { [Op.or]: [{ id: { [Op.in]: uuids } }, { user_id: { [Op.in]: subs } }] };
   }
   const memberships = await UserGroup.findAll({
     where: { group_id: prompt.group_id, status: 'active' },
