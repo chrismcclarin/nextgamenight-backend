@@ -298,4 +298,73 @@ describe('Self-param dual-accept family (87.4-02): sub OR caller-own-UUID author
       expect(res.status).toBe(200);
     });
   });
+
+  // --------------------------------------------------------------------------
+  // 87.4 code-review H-1: the previously URL-param-gated lists routes
+  // (player-wins, most-played, least-played, player-picks, by-theme,
+  // alphabetical, player-games, *-by-id) now follow the SAME self-param
+  // dual-accept + token-sub isActiveMember pattern as /games and /players.
+  // Assert a representative route across both keyspaces + the member gate + BOLA.
+  // --------------------------------------------------------------------------
+  describe('lists H-1 family — self-param dual-accept + active-member gate', () => {
+    // Positive (authorizes + query executes) assertions use routes with healthy
+    // queries (by-theme, player-wins-by-id). The aggregation routes (most-played,
+    // alphabetical, player-games) carry PRE-EXISTING query defects that 500 for any
+    // authorized caller (broken GROUP BY / ambiguous User association — unchanged by
+    // H-1, out of scope), so they're used only for the auth-gate 403 assertions,
+    // which run BEFORE the query and are therefore query-independent.
+    it('by-theme authorizes for the caller OWN UUID shape (member)', async () => {
+      const res = await request(app).get(`/api/lists/by-theme/${group.id}/strategy/${caller.id}`);
+      expect(res.status).toBe(200);
+      expect(Array.isArray(res.body)).toBe(true);
+    });
+
+    it('by-theme authorizes for the caller OWN sub shape (member)', async () => {
+      const res = await request(app).get(
+        `/api/lists/by-theme/${group.id}/strategy/${encodeURIComponent(caller.user_id)}`
+      );
+      expect(res.status).toBe(200);
+      expect(Array.isArray(res.body)).toBe(true);
+    });
+
+    it('player-wins-by-id authorizes for the caller OWN UUID shape (member)', async () => {
+      const res = await request(app).get(
+        `/api/lists/player-wins-by-id/${group.id}/${caller.id}/${caller.id}`
+      );
+      expect(res.status).toBe(200);
+      expect(Array.isArray(res.body)).toBe(true);
+    });
+
+    it('by-theme 403s a caller who is NOT an active member (self-param passes, member gate fails)', async () => {
+      // `other` is a real user but was never added to `group`. Acting AS other with
+      // other OWN identity: matchesSelf passes, isActiveMember(other, group) 403s.
+      currentActor = other.user_id;
+      const res = await request(app).get(`/api/lists/by-theme/${group.id}/strategy/${other.id}`);
+      expect(res.status).toBe(403);
+    });
+
+    it('most-played 403s a member requesting ANOTHER user UUID as the self-param (BOLA guard, pre-query)', async () => {
+      const res = await request(app).get(`/api/lists/most-played/${group.id}/${other.id}`);
+      expect(res.status).toBe(403);
+    });
+
+    it('most-played 403s a caller who is NOT an active member (member gate, pre-query)', async () => {
+      currentActor = other.user_id;
+      const res = await request(app).get(`/api/lists/most-played/${group.id}/${other.id}`);
+      expect(res.status).toBe(403);
+    });
+  });
+
+  // --------------------------------------------------------------------------
+  // 87.4 code-review L-7: Plan 02 deleted the dead player-games-by-id endpoint
+  // (path :group_id/:player_user_id/:user_id). Pin that no route responds on it.
+  // --------------------------------------------------------------------------
+  describe('lists L-7 — deleted player-games-by-id path 404s', () => {
+    it('GET /api/lists/player-games-by-id/... has no route (404)', async () => {
+      const res = await request(app).get(
+        `/api/lists/player-games-by-id/${group.id}/${caller.id}/${caller.id}`
+      );
+      expect(res.status).toBe(404);
+    });
+  });
 });

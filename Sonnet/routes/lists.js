@@ -4,21 +4,38 @@ const { Event, Game, Group, User, EventParticipation, GameReview } = require('..
 const { Op, fn, col, literal } = require('sequelize');
 const { isActiveMember } = require('../services/authorizationService');
 // Phase 87.4 Plan 02 (SPEC Req 5, D-04): shared self-param dual-accept (own sub
-// OR own resolved Users.id UUID). isActiveMember below still keys on the token
-// sub (req.user.user_id), NOT the URL param — unchanged.
+// OR own resolved Users.id UUID). Every route in this file now keys isActiveMember
+// on the token sub (req.user.user_id), NOT the URL :user_id param, and clamps the
+// :user_id self-param to the caller via matchesSelf. Phase 87.4 code-review H-1
+// folded the remaining URL-param-gated routes (player-wins, most-played, etc.) into
+// this same pattern — the /games and /players siblings are the precedent.
 const { matchesSelf } = require('../middleware/objectAuth');
 const router = express.Router();
 
 // 1. Games won by a specific player in a group (by name)
 router.get('/player-wins/:group_id/:player_name/:user_id', async (req, res) => {
   try {
+    // Use verified user_id from token (self-param dual-accept — same pattern as
+    // the /games and /players siblings; the path :user_id alone is spoofable).
+    const userId = req.user?.user_id;
+    if (!userId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
     const { group_id, player_name, user_id } = req.params;
-    
-    const hasAccess = await isActiveMember(user_id, group_id);
+
+    // Verify the requested user_id is the caller's own identity (dual-accept: own
+    // sub OR own resolved UUID). The group-scoped data query below keys on
+    // group_id + isActiveMember(token sub), not this param.
+    if (!(await matchesSelf(req, user_id))) {
+      return res.status(403).json({ error: 'Forbidden: Cannot access other users\' data' });
+    }
+
+    const hasAccess = await isActiveMember(userId, group_id);
     if (!hasAccess) {
       return res.status(403).json({ error: 'Access denied to this group' });
     }
-    
+
     const events = await Event.findAll({
       where: { group_id },
       include: [
@@ -31,11 +48,11 @@ router.get('/player-wins/:group_id/:player_name/:user_id', async (req, res) => {
       ],
       order: [['start_date', 'DESC']]
     });
-    
+
     // Filter to only include events where this player actually won
     const winningEvents = events.filter(event => {
       if (event.Winner && event.EventParticipations) {
-        const playerParticipation = event.EventParticipations.find(p => 
+        const playerParticipation = event.EventParticipations.find(p =>
           p.User.username === player_name
         );
         return playerParticipation && event.Winner.username === player_name;
@@ -52,13 +69,27 @@ router.get('/player-wins/:group_id/:player_name/:user_id', async (req, res) => {
 // 1b. Games won by a specific player in a group (by user_id)
 router.get('/player-wins-by-id/:group_id/:player_user_id/:user_id', async (req, res) => {
   try {
+    // Use verified user_id from token (self-param dual-accept — same pattern as
+    // the /games and /players siblings; the path :user_id alone is spoofable).
+    const userId = req.user?.user_id;
+    if (!userId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
     const { group_id, player_user_id, user_id } = req.params;
-    
-    const hasAccess = await isActiveMember(user_id, group_id);
+
+    // Verify the requested user_id is the caller's own identity (dual-accept: own
+    // sub OR own resolved UUID). The group-scoped data query below keys on
+    // group_id + isActiveMember(token sub), not this param.
+    if (!(await matchesSelf(req, user_id))) {
+      return res.status(403).json({ error: 'Forbidden: Cannot access other users\' data' });
+    }
+
+    const hasAccess = await isActiveMember(userId, group_id);
     if (!hasAccess) {
       return res.status(403).json({ error: 'Access denied to this group' });
     }
-    
+
     const events = await Event.findAll({
       where: { group_id },
       include: [
@@ -92,13 +123,27 @@ router.get('/player-wins-by-id/:group_id/:player_user_id/:user_id', async (req, 
 // 2. Games organized by most played to least played
 router.get('/most-played/:group_id/:user_id', async (req, res) => {
   try {
+    // Use verified user_id from token (self-param dual-accept — same pattern as
+    // the /games and /players siblings; the path :user_id alone is spoofable).
+    const userId = req.user?.user_id;
+    if (!userId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
     const { group_id, user_id } = req.params;
-    
-    const hasAccess = await isActiveMember(user_id, group_id);
+
+    // Verify the requested user_id is the caller's own identity (dual-accept: own
+    // sub OR own resolved UUID). The group-scoped data query below keys on
+    // group_id + isActiveMember(token sub), not this param.
+    if (!(await matchesSelf(req, user_id))) {
+      return res.status(403).json({ error: 'Forbidden: Cannot access other users\' data' });
+    }
+
+    const hasAccess = await isActiveMember(userId, group_id);
     if (!hasAccess) {
       return res.status(403).json({ error: 'Access denied to this group' });
     }
-    
+
     const games = await Event.findAll({
       where: { group_id },
       include: [{ model: Game, attributes: ['name', 'theme', 'url'] }],
@@ -119,13 +164,27 @@ router.get('/most-played/:group_id/:user_id', async (req, res) => {
 // 3. Games organized by least played to most played
 router.get('/least-played/:group_id/:user_id', async (req, res) => {
   try {
+    // Use verified user_id from token (self-param dual-accept — same pattern as
+    // the /games and /players siblings; the path :user_id alone is spoofable).
+    const userId = req.user?.user_id;
+    if (!userId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
     const { group_id, user_id } = req.params;
-    
-    const hasAccess = await isActiveMember(user_id, group_id);
+
+    // Verify the requested user_id is the caller's own identity (dual-accept: own
+    // sub OR own resolved UUID). The group-scoped data query below keys on
+    // group_id + isActiveMember(token sub), not this param.
+    if (!(await matchesSelf(req, user_id))) {
+      return res.status(403).json({ error: 'Forbidden: Cannot access other users\' data' });
+    }
+
+    const hasAccess = await isActiveMember(userId, group_id);
     if (!hasAccess) {
       return res.status(403).json({ error: 'Access denied to this group' });
     }
-    
+
     const games = await Event.findAll({
       where: { group_id },
       include: [{ model: Game, attributes: ['name', 'theme', 'url'] }],
@@ -146,13 +205,27 @@ router.get('/least-played/:group_id/:user_id', async (req, res) => {
 // 4. Games picked by a specific player (by name)
 router.get('/player-picks/:group_id/:player_name/:user_id', async (req, res) => {
   try {
+    // Use verified user_id from token (self-param dual-accept — same pattern as
+    // the /games and /players siblings; the path :user_id alone is spoofable).
+    const userId = req.user?.user_id;
+    if (!userId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
     const { group_id, player_name, user_id } = req.params;
-    
-    const hasAccess = await isActiveMember(user_id, group_id);
+
+    // Verify the requested user_id is the caller's own identity (dual-accept: own
+    // sub OR own resolved UUID). The group-scoped data query below keys on
+    // group_id + isActiveMember(token sub), not this param.
+    if (!(await matchesSelf(req, user_id))) {
+      return res.status(403).json({ error: 'Forbidden: Cannot access other users\' data' });
+    }
+
+    const hasAccess = await isActiveMember(userId, group_id);
     if (!hasAccess) {
       return res.status(403).json({ error: 'Access denied to this group' });
     }
-    
+
     const events = await Event.findAll({
       where: { group_id },
       include: [
@@ -161,7 +234,7 @@ router.get('/player-picks/:group_id/:player_name/:user_id', async (req, res) => 
       ],
       order: [['start_date', 'DESC']]
     });
-    
+
     // Filter to only include events where this player picked the game
     const pickedEvents = events.filter(event => {
       return event.PickedBy && event.PickedBy.username === player_name;
@@ -176,13 +249,27 @@ router.get('/player-picks/:group_id/:player_name/:user_id', async (req, res) => 
 // 4b. Games picked by a specific player (by user_id)
 router.get('/player-picks-by-id/:group_id/:player_user_id/:user_id', async (req, res) => {
   try {
+    // Use verified user_id from token (self-param dual-accept — same pattern as
+    // the /games and /players siblings; the path :user_id alone is spoofable).
+    const userId = req.user?.user_id;
+    if (!userId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
     const { group_id, player_user_id, user_id } = req.params;
-    
-    const hasAccess = await isActiveMember(user_id, group_id);
+
+    // Verify the requested user_id is the caller's own identity (dual-accept: own
+    // sub OR own resolved UUID). The group-scoped data query below keys on
+    // group_id + isActiveMember(token sub), not this param.
+    if (!(await matchesSelf(req, user_id))) {
+      return res.status(403).json({ error: 'Forbidden: Cannot access other users\' data' });
+    }
+
+    const hasAccess = await isActiveMember(userId, group_id);
     if (!hasAccess) {
       return res.status(403).json({ error: 'Access denied to this group' });
     }
-    
+
     const events = await Event.findAll({
       where: { group_id },
       include: [
@@ -191,7 +278,7 @@ router.get('/player-picks-by-id/:group_id/:player_user_id/:user_id', async (req,
       ],
       order: [['start_date', 'DESC']]
     });
-    
+
     // Filter to only include events where this player picked the game
     const pickedEvents = events.filter(event => {
       return event.PickedBy && event.PickedBy.user_id === player_user_id;
@@ -206,9 +293,23 @@ router.get('/player-picks-by-id/:group_id/:player_user_id/:user_id', async (req,
 // 5. Games by theme
 router.get('/by-theme/:group_id/:theme/:user_id', async (req, res) => {
   try {
+    // Use verified user_id from token (self-param dual-accept — same pattern as
+    // the /games and /players siblings; the path :user_id alone is spoofable).
+    const userId = req.user?.user_id;
+    if (!userId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
     const { group_id, theme, user_id } = req.params;
-    
-    const hasAccess = await isActiveMember(user_id, group_id);
+
+    // Verify the requested user_id is the caller's own identity (dual-accept: own
+    // sub OR own resolved UUID). The group-scoped data query below keys on
+    // group_id + isActiveMember(token sub), not this param.
+    if (!(await matchesSelf(req, user_id))) {
+      return res.status(403).json({ error: 'Forbidden: Cannot access other users\' data' });
+    }
+
+    const hasAccess = await isActiveMember(userId, group_id);
     if (!hasAccess) {
       return res.status(403).json({ error: 'Access denied to this group' });
     }
@@ -438,13 +539,27 @@ router.get('/games/:group_id/:user_id', async (req, res) => {
 // 6. All games sorted alphabetically (kept for backward compatibility)
 router.get('/alphabetical/:group_id/:user_id', async (req, res) => {
   try {
+    // Use verified user_id from token (self-param dual-accept — same pattern as
+    // the /games and /players siblings; the path :user_id alone is spoofable).
+    const userId = req.user?.user_id;
+    if (!userId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
     const { group_id, user_id } = req.params;
-    
-    const hasAccess = await isActiveMember(user_id, group_id);
+
+    // Verify the requested user_id is the caller's own identity (dual-accept: own
+    // sub OR own resolved UUID). The group-scoped data query below keys on
+    // group_id + isActiveMember(token sub), not this param.
+    if (!(await matchesSelf(req, user_id))) {
+      return res.status(403).json({ error: 'Forbidden: Cannot access other users\' data' });
+    }
+
+    const hasAccess = await isActiveMember(userId, group_id);
     if (!hasAccess) {
       return res.status(403).json({ error: 'Access denied to this group' });
     }
-    
+
     // Use the unified endpoint with alphabetical sort
     const games = await Event.findAll({
       where: { group_id },
@@ -466,13 +581,27 @@ router.get('/alphabetical/:group_id/:user_id', async (req, res) => {
 // 7. All games played by a specific player (by name)
 router.get('/player-games/:group_id/:player_name/:user_id', async (req, res) => {
   try {
+    // Use verified user_id from token (self-param dual-accept — same pattern as
+    // the /games and /players siblings; the path :user_id alone is spoofable).
+    const userId = req.user?.user_id;
+    if (!userId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
     const { group_id, player_name, user_id } = req.params;
-    
-    const hasAccess = await isActiveMember(user_id, group_id);
+
+    // Verify the requested user_id is the caller's own identity (dual-accept: own
+    // sub OR own resolved UUID). The group-scoped data query below keys on
+    // group_id + isActiveMember(token sub), not this param.
+    if (!(await matchesSelf(req, user_id))) {
+      return res.status(403).json({ error: 'Forbidden: Cannot access other users\' data' });
+    }
+
+    const hasAccess = await isActiveMember(userId, group_id);
     if (!hasAccess) {
       return res.status(403).json({ error: 'Access denied to this group' });
     }
-    
+
     const events = await Event.findAll({
       where: { group_id },
       include: [
