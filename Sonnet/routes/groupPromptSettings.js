@@ -3,6 +3,7 @@ const express = require('express');
 const crypto = require('crypto');
 const { Group, User, UserGroup, GroupPromptSettings, Game, sequelize } = require('../models');
 const { isOwnerOrAdmin, isActiveMember } = require('../services/authorizationService');
+const { isUuid } = require('../utils/resolveTargetUser');
 const {
   upsertSinglePromptScheduler,
   removePromptScheduler
@@ -39,40 +40,59 @@ const generateTemplateName = async (scheduleData, game_id = null) => {
   return `${gameName} - ${dayName} ${time}`;
 };
 
-// TEMPORARY PR-1 shim — removed by Plan 11 (PR-2)
-// Phase 87.4 code-review M-5: the GET translate-on-read shim (roster-scoped UUID->sub
-// map; see the GET handler's full H-B / T-874-04-ORACLE rationale) is extended to the
-// write-path echoes (POST create, PATCH update, toggle) so the PR-1 wire shape is
-// sub-consistent on writes too — not just GET. Build the reverse map ONLY from the
-// group's active roster, NEVER a global User lookup keyed on the stored UUIDs (that
-// would be an authenticated UUID->Auth0-sub oracle). A stored id absent from the roster
-// (or an already-sub residue) passes through untranslated. Plan 11 removes every site
-// together (grep the marker string).
-async function buildRosterUuidToSub(group_id) {
+// Phase 87.4 Plan 11 (PR-2): load the group's active-member roster (id + sub) so
+// the write-path normalization helper can resolve any incoming sub-shaped
+// selected_member_ids entry to its Users.id UUID. Loaded BEFORE the FOR UPDATE row
+// lock is taken in the write handlers — the lock is never held across this lookup.
+async function loadGroupRoster(group_id) {
   const roster = await UserGroup.findAll({
     where: { group_id, status: 'active' },
     include: [{ model: User, attributes: ['id', 'user_id'] }],
   });
-  // Defensive NO-OP (87.4-review): if the roster source is missing/empty (findAll
-  // returned a non-array), echo untranslated rather than throwing. A temporary
-  // write-echo shim must never 500 a successful write just because it could not
-  // build its translation map — an empty map passes every id through unchanged,
-  // which is exactly the untranslated wire shape we want on the miss path.
-  if (!Array.isArray(roster)) return new Map();
-  return new Map(
+  return Array.isArray(roster) ? roster : [];
+}
+
+// Phase 87.4 Plan 11 (PR-2): normalize incoming selected_member_ids to Users.id
+// UUIDs, scoped to the GROUP's own membership roster (default-deny — NOT a global
+// Users join). Used by BOTH schedule write handlers (POST create + PATCH update)
+// through this ONE shared helper so they cannot drift. A stale FE tab that loaded
+// members[].user_id before the PR-2 deploy still holds sub-valued ids in memory and
+// could save them AFTER the re-sweep migration ran; without this, the fanout's UUID
+// shape filter would then silently and permanently exclude those members. Instead we
+// self-heal on write:
+//   - an already-UUID entry (isUuid) is kept as-is;
+//   - a sub-shaped entry is resolved to its Users.id via the group roster;
+//   - an unresolvable entry (departed / non-member) is DROPPED and logged (COUNTS +
+//     resolved UUIDs only — NEVER the raw Auth0 sub; PII in logs).
+// This makes Plan 12's "no sub-shaped entries remain post-deploy" gate true by
+// construction on both persistence paths, not just at the point-in-time re-sweep.
+function normalizeSelectedMemberIds(selectedMemberIds, roster, group_id) {
+  if (!Array.isArray(selectedMemberIds)) return selectedMemberIds;
+  const subToUuid = new Map(
     roster
       .filter((ug) => ug.User && ug.User.id && ug.User.user_id)
-      .map((ug) => [ug.User.id, ug.User.user_id])
+      .map((ug) => [ug.User.user_id, ug.User.id])
   );
-}
-function translateScheduleEcho(rosterUuidToSub, schedule) {
-  if (!schedule || !Array.isArray(schedule.selected_member_ids)) return schedule;
-  return {
-    ...schedule,
-    selected_member_ids: schedule.selected_member_ids.map((v) =>
-      rosterUuidToSub.has(v) ? rosterUuidToSub.get(v) : v
-    ),
-  };
+  const normalized = [];
+  let droppedCount = 0;
+  for (const entry of selectedMemberIds) {
+    if (isUuid(entry)) {
+      normalized.push(entry); // already correct — no-op
+    } else if (subToUuid.has(entry)) {
+      normalized.push(subToUuid.get(entry)); // stale sub -> Users.id UUID (self-heal)
+    } else {
+      droppedCount += 1; // unresolvable sub — drop it
+    }
+  }
+  if (droppedCount > 0) {
+    // COUNTS + persisted UUIDs only — never the raw Auth0 sub (PII).
+    console.warn(
+      `[groupPromptSettings] normalizeSelectedMemberIds group=${group_id}: ` +
+        `dropped ${droppedCount} unresolvable entr${droppedCount === 1 ? 'y' : 'ies'}; ` +
+        `persisted ${normalized.length} UUID(s): [${normalized.join(', ')}]`
+    );
+  }
+  return normalized;
 }
 
 /**
@@ -157,13 +177,14 @@ router.get('/:group_id/prompt-settings', async (req, res) => {
     }
 
     // Get group members for recipient selection.
-    // A1 / T-87.1-13 (Phase 87.1): the FE MemberSelector stores members[].user_id
-    // back into selected_member_ids, which the invitation fanout filters on the
-    // Auth0-string keyspace. So members[].user_id MUST be the Auth0 sub. Reading
-    // ug.user_id off the UserGroup instance is an undefined-SILENT read once Plan 09
-    // strips the column — the FE would fall back to member.id (the User UUID),
-    // re-poisoning selected_member_ids with UUIDs and silently defeating the fanout.
-    // Fetch user_id on the User include and serialize the Auth0 sub from there.
+    // A1 / T-87.1-13, updated by Plan 11 (PR-2): members[].user_id now emits the
+    // member's Users.id UUID (keep the field NAME `user_id`, flip its VALUE sub→UUID —
+    // the name-stable alias convention). The FE MemberSelector stores members[].user_id
+    // (or member.id — they are the same UUID post-flip) into selected_member_ids, and
+    // the invitation fanout now filters selected_member_ids through the UUID shape check
+    // (isUuid) before its `id [Op.in]` clause. display_name falls back to `username ||
+    // null` (never the raw Auth0 sub) — the FE MemberSelector absorbs a null via its own
+    // display_name || username || email || user_id chain.
     const groupMembers = await UserGroup.findAll({
       where: { group_id, status: 'active' },
       include: [{
@@ -174,58 +195,19 @@ router.get('/:group_id/prompt-settings', async (req, res) => {
 
     const members = groupMembers.map(ug => ({
       id: ug.User?.id,
-      user_id: ug.User?.user_id,
+      user_id: ug.User?.id,
       username: ug.User?.username,
-      display_name: ug.User?.username || ug.User?.user_id,
+      display_name: ug.User?.username || null,
     }));
 
-    // TEMPORARY PR-1 shim — removed by Plan 11 (PR-2)
-    // Phase 87.4 Plan 04 (D-06, owner decision 2026-07-17): the selected_member_ids
-    // backfill (migration 20260716000002) converts the STORED nested keyspace to
-    // Users.id UUIDs immediately at BE deploy. But during PR-1 the FE ecosystem (old
-    // bundles, stale tabs, and the still-sub members[].user_id field emitted above)
-    // speaks Auth0 subs. So serialize the backfilled UUID selected_member_ids back to
-    // subs on read to keep the PR-1 wire shape sub-consistent — a UUID-shaped
-    // selected_member_ids would render blank MemberSelector checkboxes and a
-    // subsequent save could silently widen a scoped prompt to whole-group fanout.
-    //
-    // SECURITY (H-B / T-874-04-ORACLE): build the reverse UUID->sub map ONLY from the
-    // group's active-member roster this handler already loaded (groupMembers) — NEVER
-    // a global User.findAll keyed on the stored UUIDs. selected_member_ids content is
-    // never membership-validated, so a global reverse lookup would be an authenticated
-    // UUID->Auth0-sub oracle (any user could PATCH a victim's public UUID into a
-    // schedule then GET it back as the victim's Auth0 sub — the exact PII this program
-    // protects). A stored UUID absent from the active roster passes through
-    // UNTRANSLATED (consistent with the unresolvable-entry rule — legitimate selections
-    // are always current roster members); it is NOT dropped.
-    //
-    // Both GET emission points carry selected_member_ids and are translated: (1) the
-    // top-level `schedules[]` projection AND (2) the raw `template_config`. Plan 11
-    // removes this shim in PR-2 when the read emission flips to UUID for BOTH
-    // selected_member_ids and members[].user_id together (grep target: the marker
-    // string on the line above).
-    const rosterUuidToSub = new Map(
-      groupMembers
-        .filter(ug => ug.User?.id && ug.User?.user_id)
-        .map(ug => [ug.User.id, ug.User.user_id])
-    );
-    const translateSelectedMemberIds = (memberIds) => {
-      if (!Array.isArray(memberIds)) return memberIds;
-      // Roster-scoped reverse map; a non-roster UUID (or an already-sub residue
-      // entry) is not in the map and passes through untranslated (no oracle).
-      return memberIds.map(v => (rosterUuidToSub.has(v) ? rosterUuidToSub.get(v) : v));
-    };
-    const translateSchedules = (scheduleArr) =>
-      Array.isArray(scheduleArr)
-        ? scheduleArr.map(s => (
-            Array.isArray(s.selected_member_ids)
-              ? { ...s, selected_member_ids: translateSelectedMemberIds(s.selected_member_ids) }
-              : s
-          ))
-        : scheduleArr;
-
-    const translatedTemplateConfig = settings?.template_config
-      ? { ...settings.template_config, schedules: translateSchedules(settings.template_config.schedules) }
+    // Plan 11 (PR-2): the selected_member_ids read emission flips to the raw stored
+    // Users.id UUIDs directly — Plan 04's transitional translate-on-read shim (which
+    // serialized them back to Auth0 subs during the earlier rollout stage) is REMOVED,
+    // in the same unit as the members[].user_id flip above. The GET response now carries
+    // no sub-shaped value on either emission point (the top-level schedules[] projection
+    // and the raw template_config both emit the stored UUIDs unchanged).
+    const outputTemplateConfig = settings?.template_config
+      ? settings.template_config
       : { schedules: [] };
 
     res.json({
@@ -235,8 +217,8 @@ router.get('/:group_id/prompt-settings', async (req, res) => {
       default_deadline_hours: settings?.default_deadline_hours || 72,
       default_token_expiry_hours: settings?.default_token_expiry_hours || 168,
       is_active: settings?.is_active ?? true,
-      template_config: translatedTemplateConfig, // TEMPORARY PR-1 shim — removed by Plan 11 (PR-2)
-      schedules: translateSchedules(schedules.filter(s => !s.deleted_at)), // Only return non-deleted schedules (TEMPORARY PR-1 shim — removed by Plan 11 (PR-2))
+      template_config: outputTemplateConfig,
+      schedules: schedules.filter(s => !s.deleted_at), // Only return non-deleted schedules
       games: groupGames || [],
       members: members || []
     });
@@ -304,6 +286,17 @@ router.post('/:group_id/prompt-settings/schedules', async (req, res) => {
       game_id
     );
 
+    // Plan 11 (PR-2): normalize any incoming sub-shaped selected_member_ids to
+    // Users.id UUIDs against the group's own roster BEFORE the FOR UPDATE lock is
+    // taken (never hold the lock across a member lookup) — so a stale FE tab that
+    // still holds sub-valued members[].user_id cannot reintroduce sub residue that the
+    // fanout shape filter would then silently exclude. Unresolvable entries dropped +
+    // logged (counts/UUIDs only). Same shared helper runs on the PATCH route.
+    const roster = await loadGroupRoster(group_id);
+    const normalizedSelectedMemberIds = normalizeSelectedMemberIds(
+      selected_member_ids || [], roster, group_id
+    );
+
     // Create new schedule object
     const newSchedule = {
       id: crypto.randomUUID(),
@@ -315,7 +308,7 @@ router.post('/:group_id/prompt-settings/schedules', async (req, res) => {
       default_deadline_hours: default_deadline_hours || 72,
       default_token_expiry_hours: default_token_expiry_hours || 168,
       min_participants: min_participants || null,
-      selected_member_ids: selected_member_ids || [],
+      selected_member_ids: normalizedSelectedMemberIds,
       is_active: true,
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString()
@@ -390,11 +383,11 @@ router.post('/:group_id/prompt-settings/schedules', async (req, res) => {
       );
     }
 
-    // TEMPORARY PR-1 shim — removed by Plan 11 (PR-2)
-    const rosterUuidToSub = await buildRosterUuidToSub(group_id);
+    // Plan 11 (PR-2): echo the created schedule directly — selected_member_ids is
+    // already UUID-normalized (above) and no sub-shaped value is emitted on the wire.
     res.status(201).json({
       message: 'Schedule created successfully',
-      schedule: translateScheduleEcho(rosterUuidToSub, newSchedule) // TEMPORARY PR-1 shim — removed by Plan 11 (PR-2)
+      schedule: newSchedule
     });
   } catch (error) {
     console.error('Error creating schedule:', error);
@@ -432,6 +425,20 @@ router.patch('/:group_id/prompt-settings/schedules/:schedule_id', async (req, re
       if (req.body.schedule_day_of_week < 0 || req.body.schedule_day_of_week > 6) {
         return res.status(400).json({ error: 'schedule_day_of_week must be 0-6' });
       }
+    }
+
+    // Plan 11 (PR-2): if the PATCH carries selected_member_ids, normalize any incoming
+    // sub-shaped entry to its Users.id UUID against the group's roster BEFORE the FOR
+    // UPDATE lock is taken (never hold the lock across a member lookup) — same shared
+    // helper as the POST route, so a stale-tab save on EITHER route self-heals rather
+    // than reintroducing sub residue the fanout shape filter would silently exclude.
+    let normalizedSelectedMemberIds;
+    const patchesSelectedMembers = Object.prototype.hasOwnProperty.call(req.body, 'selected_member_ids');
+    if (patchesSelectedMembers) {
+      const roster = await loadGroupRoster(group_id);
+      normalizedSelectedMemberIds = normalizeSelectedMemberIds(
+        req.body.selected_member_ids, roster, group_id
+      );
     }
 
     // BINT-01 (T-87-09): serialize concurrent editors of this group's schedules
@@ -491,7 +498,11 @@ router.patch('/:group_id/prompt-settings/schedules/:schedule_id', async (req, re
       const allowedUpdates = {};
       for (const key of SCHEDULE_USER_FIELDS) {
         if (Object.prototype.hasOwnProperty.call(req.body, key)) {
-          allowedUpdates[key] = req.body[key];
+          // Plan 11 (PR-2): selected_member_ids is UUID-normalized above (before the
+          // lock); every other field passes through from the raw body.
+          allowedUpdates[key] = key === 'selected_member_ids'
+            ? normalizedSelectedMemberIds
+            : req.body[key];
         }
       }
 
@@ -536,11 +547,11 @@ router.patch('/:group_id/prompt-settings/schedules/:schedule_id', async (req, re
       );
     }
 
-    // TEMPORARY PR-1 shim — removed by Plan 11 (PR-2)
-    const rosterUuidToSub = await buildRosterUuidToSub(group_id);
+    // Plan 11 (PR-2): echo the updated schedule directly — selected_member_ids is
+    // already UUID-normalized (above) and no sub-shaped value is emitted on the wire.
     res.json({
       message: 'Schedule updated successfully',
-      schedule: translateScheduleEcho(rosterUuidToSub, updatedSchedule) // TEMPORARY PR-1 shim — removed by Plan 11 (PR-2)
+      schedule: updatedSchedule
     });
   } catch (error) {
     console.error('Error updating schedule:', error);
@@ -733,11 +744,11 @@ router.patch('/:group_id/prompt-settings/schedules/:schedule_id/toggle', async (
       );
     }
 
-    // TEMPORARY PR-1 shim — removed by Plan 11 (PR-2)
-    const rosterUuidToSub = await buildRosterUuidToSub(group_id);
+    // Plan 11 (PR-2): echo the toggled schedule directly — its stored
+    // selected_member_ids are already UUIDs; no sub-shaped value crosses the wire.
     res.json({
       message: `Schedule ${!currentActive ? 'activated' : 'paused'} successfully`,
-      schedule: translateScheduleEcho(rosterUuidToSub, toggled) // TEMPORARY PR-1 shim — removed by Plan 11 (PR-2)
+      schedule: toggled
     });
   } catch (error) {
     console.error('Error toggling schedule:', error);
