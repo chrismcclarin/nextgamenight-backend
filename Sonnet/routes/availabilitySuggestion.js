@@ -8,6 +8,10 @@ const heatmapService = require('../services/heatmapService');
 const eventCreationService = require('../services/eventCreationService');
 const { AvailabilityPrompt, AvailabilitySuggestion, User, UserGroup } = require('../models');
 const { isOwnerOrAdmin, isActiveMember } = require('../services/authorizationService');
+// Phase 87.4 code-review M-3: same canonical UUID shape the three sibling readers
+// (availabilityPrompt.js, tentativeHoldService.js, eventCreationService.js) use to
+// drop deploy-window Auth0-sub residue before it reaches the wire.
+const { isUuid } = require('../utils/resolveTargetUser');
 
 /**
  * GET /api/prompts/:promptId/suggestions
@@ -67,7 +71,10 @@ router.get('/prompts/:promptId/suggestions', verifyAuth0Token, async (req, res) 
         suggested_start: s.suggested_start,
         suggested_end: s.suggested_end,
         participant_count: s.participant_count,
-        participant_user_ids: s.participant_user_ids,
+        // M-3 (87.4-review): filter to UUID-shaped ids only — a deploy-window residue
+        // row would otherwise emit another member's Auth0 sub. Mirrors the three
+        // sibling readers' isUuid guard.
+        participant_user_ids: (Array.isArray(s.participant_user_ids) ? s.participant_user_ids : []).filter(isUuid),
         preferred_count: s.preferred_count,
         meets_minimum: s.meets_minimum,
         score: s.score,
