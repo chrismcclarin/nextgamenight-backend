@@ -107,7 +107,11 @@ router.get('/prompts/:promptId/respondents', verifyAuth0Token, async (req, res) 
     // AvailabilityResponse table is still sub-keyed (Phase 87.5 rekeys it). This
     // is the BE half of the respondents/remind trio; ResponseDashboard forwards
     // this UUID verbatim to the UUID-only remind endpoint (FE Plan 10).
-    const respondents = groupMembers.map(member => {
+    // PR2-L3 (87.4-review): drop roster rows whose User include is missing BEFORE
+    // serializing (the drop-on-miss convention availabilityService uses) — a row
+    // without its User would otherwise serialize user_id: undefined on the wire
+    // (React key `undefined`; /remind/undefined -> generic 404 in the FE).
+    const respondents = groupMembers.filter(member => member.User).map(member => {
       const memberAuthSub = member.User?.user_id;
       const response = responseMap.get(memberAuthSub);
       const hasResponded = !!response && response.submitted_at !== null;
@@ -130,9 +134,9 @@ router.get('/prompts/:promptId/respondents', verifyAuth0Token, async (req, res) 
 
       return {
         // Wire field emits the Users.id UUID (translated from the existing
-        // include). Falls back to omission-safe undefined if the include row is
-        // missing (defensive; roster members always carry a User row).
-        user_id: member.User?.id,
+        // include). Rows with a missing User include were dropped above (PR2-L3)
+        // — user_id is never undefined on the wire.
+        user_id: member.User.id,
         username: member.User?.username || 'Unknown',
         has_responded: hasResponded,
         slot_count: showSlotCount ? slotCount : null,

@@ -236,6 +236,16 @@ describe('GET /api/prompts/:promptId/respondents — UUID wire field + sub-keyed
     expect(nonResponderEntry).toBeDefined();
     expect(nonResponderEntry.user_id).toBe(nonResponder.id);
     expect(nonResponderEntry.has_responded).toBe(false);
+
+    // PR2-L3 (87.4-review): no serialized entry may carry an undefined user_id —
+    // roster rows with a missing User include are dropped BEFORE serialization.
+    // (A real missing-include row is unseedable here: UserGroup.user_uuid is a
+    // NOT NULL CASCADE FK to Users.id — this pins the wire contract instead.)
+    expect(res.body).toHaveLength(3); // owner + responder + nonResponder, none dropped
+    for (const r of res.body) {
+      expect(r.user_id).toBeDefined();
+      expect(typeof r.user_id).toBe('string');
+    }
   });
 });
 
