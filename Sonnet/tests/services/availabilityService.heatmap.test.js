@@ -69,9 +69,13 @@ describe('availabilityService.getGroupHeatmap', () => {
   const userB = { user_id: 'auth0|bbb', username: 'Bob', email: 'bob@test.com' };
   const userC = { user_id: 'auth0|ccc', username: 'Carol', email: 'carol@test.com' };
 
-  // Helper: mock calculateGroupOverlaps to return controlled data
+  // Helper: mock the INTERNAL overlap builder to return controlled data.
+  // Phase 87.4 Plan 08 rename split: getGroupHeatmap now consumes the sub-keyed
+  // `buildGroupOverlaps` (not the public, boundary-translating `calculateGroupOverlaps`),
+  // so the injection seam moved here. Coverage is unchanged — the mock data these
+  // tests inject is sub-keyed, exactly the shape the internal builder emits.
   function mockOverlaps(overlaps) {
-    jest.spyOn(availabilityService, 'calculateGroupOverlaps').mockResolvedValue(overlaps);
+    jest.spyOn(availabilityService, 'buildGroupOverlaps').mockResolvedValue(overlaps);
   }
 
   // Helper: mock Group.findByPk to return members
@@ -618,8 +622,9 @@ describe('availabilityService.getGroupHeatmap', () => {
   // Regression: Sun 17-23 PDT lands in next-Mon 00-06 UTC. The overlap query
   // must cover that range, otherwise late Sunday slots show 0 availability.
   // ===================================
-  it('queries calculateGroupOverlaps with window extended ±1 day for timezone coverage', async () => {
-    const spy = jest.spyOn(availabilityService, 'calculateGroupOverlaps').mockResolvedValue([]);
+  it('queries the overlap builder with window extended ±1 day for timezone coverage', async () => {
+    // Phase 87.4 Plan 08: getGroupHeatmap calls the internal sub-keyed builder.
+    const spy = jest.spyOn(availabilityService, 'buildGroupOverlaps').mockResolvedValue([]);
     mockGroupMembers([userA, userB], { 'auth0|aaa': true, 'auth0|bbb': true });
 
     await availabilityService.getGroupHeatmap('test-group-id', '2026-04-20', 'America/Los_Angeles');
@@ -629,6 +634,240 @@ describe('availabilityService.getGroupHeatmap', () => {
     // weekStart is 2026-04-20 (Mon). overlap window should be [04-19, 04-28).
     expect(startArg.toISOString().startsWith('2026-04-19')).toBe(true);
     expect(endArg.toISOString().startsWith('2026-04-28')).toBe(true);
+  });
+});
+
+// ============================================================================
+// Phase 87.4 Plan 08 (SPEC Req 2, D-03, PR-2): boundary sub->UUID translation.
+//
+// The 19 tests above use mock members where `id` defaults to `user_id` (sub),
+// so the boundary translation is an identity map and never exercises the actual
+// sub->UUID flip. These tests give members a DISTINCT Users.id UUID (id !=
+// user_id) and assert the RISKIEST part of the change is correct rather than
+// merely grepped for:
+//   - every emitted user_id is the Users.id UUID, never the Auth0 sub, never null
+//   - a member available via BOTH the overlap path AND the poll path is counted
+//     exactly ONCE in availableCount (dedup survives translation)
+//   - the membersWithoutData exclusion still holds after translation
+//   - gcal conflicts still attach for poll members after translation
+//   - an off-roster identity (map-miss) is DROPPED, not emitted as sub or null
+//   - the PUBLIC calculateGroupOverlaps wrapper (the GET /overlaps route path)
+//     translates its finished payload
+// These execute the REAL getGroupHeatmap boundary pass end-to-end.
+// ============================================================================
+describe('availabilityService boundary sub->UUID translation (Plan 08)', () => {
+  const UUID_A = '11111111-1111-4111-8111-111111111111';
+  const UUID_B = '22222222-2222-4222-8222-222222222222';
+  const UUID_Z = '99999999-9999-4999-8999-999999999999';
+
+  const SUB_RE = /\|/; // Auth0 subs are provider-prefixed (contain "|"); UUIDs never do.
+
+  // Recursively assert no value anywhere in the payload is an Auth0 sub or a null user_id.
+  function assertNoSubOrNullUserId(node) {
+    if (Array.isArray(node)) {
+      node.forEach(assertNoSubOrNullUserId);
+      return;
+    }
+    if (node && typeof node === 'object') {
+      for (const [k, v] of Object.entries(node)) {
+        if (k === 'user_id') {
+          expect(v).not.toBeNull();
+          expect(typeof v === 'string' && SUB_RE.test(v)).toBe(false);
+        }
+        assertNoSubOrNullUserId(v);
+      }
+    }
+  }
+
+  // Build a sub-keyed overlap slot exactly as the internal buildGroupOverlaps emits.
+  function subOverlapSlot(date, timeSlot, availableMembers, totalMembers) {
+    return {
+      date,
+      timeSlot,
+      endTime: timeSlot.endsWith(':00')
+        ? timeSlot.replace(':00', ':30')
+        : `${String(Number(timeSlot.slice(0, 2)) + 1).padStart(2, '0')}:00`,
+      availableCount: availableMembers.length,
+      totalMembers,
+      availableMembers: availableMembers.map(m => ({ user_id: m.user_id, username: m.username })),
+      unavailableCount: totalMembers - availableMembers.length,
+    };
+  }
+
+  // Configure Group.findByPk + UserAvailability.findAll for a roster whose
+  // members carry a DISTINCT Users.id UUID (id != sub).
+  function mockRoster(members, hasAvailability = {}) {
+    Group.findByPk.mockResolvedValue({ id: 'g-uuid', Users: members });
+    UserAvailability.findAll.mockImplementation(async ({ where }) => {
+      const uid = where.user_id;
+      if (uid && typeof uid === 'object') {
+        const symbols = Object.getOwnPropertySymbols(uid);
+        const ids = symbols.length ? uid[symbols[0]] : (uid.in || []);
+        return ids.filter(id => hasAvailability[id]).map(id => ({ id: 'rec', user_id: id, type: 'recurring_pattern' }));
+      }
+      if (hasAvailability[uid]) return [{ id: 'rec', user_id: uid, type: 'recurring_pattern' }];
+      return [];
+    });
+  }
+
+  function member(id, sub, username, extra = {}) {
+    return {
+      id, user_id: sub, username, email: `${username.toLowerCase()}@t.com`,
+      google_calendar_enabled: false, google_calendar_token: null,
+      google_calendar_refresh_token: null, timezone: 'UTC', ...extra,
+    };
+  }
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    // The first describe installs a persistent spy on buildGroupOverlaps — undo it
+    // so each test controls the seam explicitly.
+    jest.restoreAllMocks();
+    AvailabilityPrompt.findAll.mockResolvedValue([]);
+    AvailabilityResponse.findAll.mockResolvedValue([]);
+    googleCalendarService.getBusyTimesForDateRange.mockResolvedValue([]);
+  });
+
+  it('flips every emitted user_id to the Users.id UUID and counts a poll+overlap member exactly once', async () => {
+    const memberA = member(UUID_A, 'auth0|aaa', 'Alice');
+    const memberB = member(UUID_B, 'auth0|bbb', 'Bob');
+    mockRoster([memberA, memberB], { 'auth0|aaa': true, 'auth0|bbb': true });
+
+    // Overlap path: Alice available in BOTH 14:00 and 14:30 sub-slots.
+    jest.spyOn(availabilityService, 'buildGroupOverlaps').mockResolvedValue([
+      subOverlapSlot('2026-03-23', '14:00', [{ user_id: 'auth0|aaa', username: 'Alice' }], 2),
+      subOverlapSlot('2026-03-23', '14:30', [{ user_id: 'auth0|aaa', username: 'Alice' }], 2),
+    ]);
+
+    // Poll path: Alice ALSO responded available across 14:00-15:00 (same hour).
+    AvailabilityPrompt.findAll.mockResolvedValue([{ id: 'p1', group_id: 'g-uuid', status: 'active', week_identifier: '2026-W13' }]);
+    AvailabilityResponse.findAll.mockResolvedValue([{
+      user_id: 'auth0|aaa', prompt_id: 'p1',
+      time_slots: [
+        { start: '2026-03-23T14:00:00.000Z', end: '2026-03-23T14:30:00.000Z', preference: 'preferred' },
+        { start: '2026-03-23T14:30:00.000Z', end: '2026-03-23T15:00:00.000Z', preference: 'preferred' },
+      ],
+      User: { user_id: 'auth0|aaa', username: 'Alice' },
+    }]);
+
+    const result = await availabilityService.getGroupHeatmap('g-uuid', '2026-03-23', 'UTC');
+
+    const slot14 = result.slots.find(s => s.date === '2026-03-23' && s.hour === 14);
+    expect(slot14).toBeDefined();
+    // Counted once despite being available via BOTH paths.
+    expect(slot14.availableCount).toBe(1);
+    expect(slot14.availableMembers).toEqual([{ user_id: UUID_A, username: 'Alice' }]);
+    // No emitted user_id anywhere is a sub or null.
+    assertNoSubOrNullUserId(result);
+  });
+
+  it('emits UUIDs in membersWithoutData and still excludes data-less members after translation', async () => {
+    const memberA = member(UUID_A, 'auth0|aaa', 'Alice');       // has recurring
+    const memberZ = member(UUID_Z, 'auth0|zzz', 'Zoe');         // no data at all
+    mockRoster([memberA, memberZ], { 'auth0|aaa': true, 'auth0|zzz': false });
+
+    // Overlap data inflates BOTH (calculateGroupOverlaps defaults data-less to available).
+    jest.spyOn(availabilityService, 'buildGroupOverlaps').mockResolvedValue([
+      subOverlapSlot('2026-03-23', '14:00', [{ user_id: 'auth0|aaa', username: 'Alice' }, { user_id: 'auth0|zzz', username: 'Zoe' }], 2),
+      subOverlapSlot('2026-03-23', '14:30', [{ user_id: 'auth0|aaa', username: 'Alice' }, { user_id: 'auth0|zzz', username: 'Zoe' }], 2),
+    ]);
+
+    const result = await availabilityService.getGroupHeatmap('g-uuid', '2026-03-23', 'UTC');
+
+    // Zoe emitted as a UUID in membersWithoutData.
+    expect(result.membersWithoutData).toEqual([{ user_id: UUID_Z, username: 'Zoe' }]);
+    expect(result.membersWithoutDataCount).toBe(1);
+    expect(result.membersWithData).toBe(1);
+
+    // Zoe excluded from slot availableMembers; Alice present as UUID.
+    const slot14 = result.slots.find(s => s.date === '2026-03-23' && s.hour === 14);
+    expect(slot14.availableCount).toBe(1);
+    expect(slot14.availableMembers).toEqual([{ user_id: UUID_A, username: 'Alice' }]);
+    assertNoSubOrNullUserId(result);
+  });
+
+  it('attaches gcal conflicts with UUIDs after translation', async () => {
+    const memberA = member(UUID_A, 'auth0|aaa', 'Alice', { google_calendar_enabled: true, google_calendar_token: 'tok-a' });
+    mockRoster([memberA], { 'auth0|aaa': false });
+
+    jest.spyOn(availabilityService, 'buildGroupOverlaps').mockResolvedValue([]);
+    AvailabilityPrompt.findAll.mockResolvedValue([{ id: 'p1', group_id: 'g-uuid', status: 'active', week_identifier: '2026-W13' }]);
+    AvailabilityResponse.findAll.mockResolvedValue([{
+      user_id: 'auth0|aaa', prompt_id: 'p1',
+      time_slots: [
+        { start: '2026-03-23T19:00:00.000Z', end: '2026-03-23T19:30:00.000Z', preference: 'preferred' },
+        { start: '2026-03-23T19:30:00.000Z', end: '2026-03-23T20:00:00.000Z', preference: 'preferred' },
+      ],
+      User: { user_id: 'auth0|aaa', username: 'Alice' },
+    }]);
+    googleCalendarService.getBusyTimesForDateRange.mockResolvedValue([{ date: '2026-03-23', startTime: '19:00', endTime: '19:30' }]);
+
+    const result = await availabilityService.getGroupHeatmap('g-uuid', '2026-03-23', 'UTC');
+
+    const slot19 = result.slots.find(s => s.date === '2026-03-23' && s.hour === 19);
+    expect(slot19.availableCount).toBe(1);
+    expect(slot19.availableMembers).toEqual([{ user_id: UUID_A, username: 'Alice' }]);
+    expect(result.gcalConflicts).toEqual([
+      expect.objectContaining({ user_id: UUID_A, username: 'Alice', date: '2026-03-23', hour: 19 }),
+    ]);
+    assertNoSubOrNullUserId(result);
+  });
+
+  it('DROPS an off-roster (map-miss) identity instead of emitting a sub or null', async () => {
+    const memberA = member(UUID_A, 'auth0|aaa', 'Alice');
+    mockRoster([memberA], { 'auth0|aaa': true });
+
+    jest.spyOn(availabilityService, 'buildGroupOverlaps').mockResolvedValue([]);
+    AvailabilityPrompt.findAll.mockResolvedValue([{ id: 'p1', group_id: 'g-uuid', status: 'active', week_identifier: '2026-W13' }]);
+    // Both Alice (on roster) and Ghost (responded, then left the group) responded available.
+    AvailabilityResponse.findAll.mockResolvedValue([
+      {
+        user_id: 'auth0|aaa', prompt_id: 'p1',
+        time_slots: [
+          { start: '2026-03-23T14:00:00.000Z', end: '2026-03-23T14:30:00.000Z', preference: 'preferred' },
+          { start: '2026-03-23T14:30:00.000Z', end: '2026-03-23T15:00:00.000Z', preference: 'preferred' },
+        ],
+        User: { user_id: 'auth0|aaa', username: 'Alice' },
+      },
+      {
+        user_id: 'auth0|ghost', prompt_id: 'p1',
+        time_slots: [
+          { start: '2026-03-23T14:00:00.000Z', end: '2026-03-23T14:30:00.000Z', preference: 'preferred' },
+          { start: '2026-03-23T14:30:00.000Z', end: '2026-03-23T15:00:00.000Z', preference: 'preferred' },
+        ],
+        User: { user_id: 'auth0|ghost', username: 'Ghost' },
+      },
+    ]);
+
+    const result = await availabilityService.getGroupHeatmap('g-uuid', '2026-03-23', 'UTC');
+
+    const slot14 = result.slots.find(s => s.date === '2026-03-23' && s.hour === 14);
+    // Alice kept (UUID), Ghost dropped — count reflects the drop.
+    expect(slot14.availableCount).toBe(1);
+    expect(slot14.availableMembers).toEqual([{ user_id: UUID_A, username: 'Alice' }]);
+    const emittedIds = result.slots.flatMap(s => s.availableMembers.map(m => m.user_id));
+    expect(emittedIds).not.toContain('auth0|ghost');
+    assertNoSubOrNullUserId(result);
+  });
+
+  it('public calculateGroupOverlaps wrapper translates its finished payload (GET /overlaps path)', async () => {
+    const memberA = member(UUID_A, 'auth0|aaa', 'Alice');
+    const memberB = member(UUID_B, 'auth0|bbb', 'Bob');
+    Group.findByPk.mockResolvedValue({ id: 'g-uuid', Users: [memberA, memberB] });
+
+    // The internal builder returns sub-keyed slots; the public wrapper must flip them.
+    jest.spyOn(availabilityService, 'buildGroupOverlaps').mockResolvedValue([
+      subOverlapSlot('2026-03-23', '14:00', [{ user_id: 'auth0|aaa', username: 'Alice' }], 2),
+    ]);
+
+    const start = new Date('2026-03-23T00:00:00Z');
+    const end = new Date('2026-03-24T00:00:00Z');
+    const overlaps = await availabilityService.calculateGroupOverlaps('g-uuid', start, end, 'UTC');
+
+    expect(overlaps).toHaveLength(1);
+    expect(overlaps[0].availableMembers).toEqual([{ user_id: UUID_A, username: 'Alice' }]);
+    expect(overlaps[0].availableCount).toBe(1);
+    assertNoSubOrNullUserId(overlaps);
   });
 });
 
