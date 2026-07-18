@@ -196,8 +196,10 @@ router.get('/:group_id/prompt-settings', async (req, res) => {
     // (or member.id — they are the same UUID post-flip) into selected_member_ids, and
     // the invitation fanout now filters selected_member_ids through the UUID shape check
     // (isUuid) before its `id [Op.in]` clause. display_name falls back to `username ||
-    // null` (never the raw Auth0 sub) — the FE MemberSelector absorbs a null via its own
-    // display_name || username || email || user_id chain.
+    // 'Member'` (PR2-L5, 87.4-review — matches the prompt-heatmap route's convention),
+    // never the raw Auth0 sub and never null: this payload carries NO email, so a null
+    // here would bottom out at the FE MemberSelector's display_name || username ||
+    // email || user_id chain and render a raw UUID as the member's label.
     const groupMembers = await UserGroup.findAll({
       where: { group_id, status: 'active' },
       include: [{
@@ -210,7 +212,7 @@ router.get('/:group_id/prompt-settings', async (req, res) => {
       id: ug.User?.id,
       user_id: ug.User?.id,
       username: ug.User?.username,
-      display_name: ug.User?.username || null,
+      display_name: ug.User?.username || 'Member',
     }));
 
     // Plan 11 (PR-2): the selected_member_ids read emission flips to the raw stored

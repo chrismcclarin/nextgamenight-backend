@@ -84,8 +84,10 @@ describe('GET /api/groups/:group_id/prompt-settings — members UUID wire field 
   });
 
   // Plan 11 (PR-2): members[].user_id now emits the member's Users.id UUID (the
-  // name-stable alias flip). display_name falls back to `username || null` — never the
-  // raw Auth0 sub. No members[] field carries a sub-shaped value.
+  // name-stable alias flip). display_name falls back to `username || 'Member'`
+  // (PR2-L5) — never the raw Auth0 sub, never null (the payload carries no email, so
+  // a null would bottom out at the FE chain's user_id and render a raw UUID label).
+  // No members[] field carries a sub-shaped value.
   //
   // HISTORICAL: 87.1/PR-1 (T-87.1-13) required members[].user_id to be the Auth0 SUB so
   // the FE could round-trip it into selected_member_ids for a sub-keyed fanout. PR-2
@@ -106,10 +108,12 @@ describe('GET /api/groups/:group_id/prompt-settings — members UUID wire field 
     expect(m1Entry.id).toBe(m1.id);
 
     // No members[] field emits a sub-shaped value anywhere (user_id, id, username, or
-    // the display_name fallback). display_name is username || null — never the raw sub.
+    // the display_name fallback). display_name is username || 'Member' (PR2-L5) —
+    // never the raw sub, never null.
     for (const m of res.body.members) {
       expect(typeof m.user_id).toBe('string');
       expect(m.user_id).not.toMatch(/^auth0\|/);
+      expect(m.display_name).toBeTruthy(); // PR2-L5: never null on the wire
       for (const [, v] of Object.entries(m)) {
         if (typeof v === 'string') expect(v).not.toMatch(/^(auth0|google-oauth2|apple)\|/);
       }
