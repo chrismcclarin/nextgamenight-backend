@@ -9,50 +9,22 @@
 // COVERAGE CLAIM (stated precisely — never whole-API): Req 1 is proven for the
 // grep-derived IN-SCOPE endpoint inventory (Task 2b: every res.json-reachable
 // serialization in routes/ whose response carried a sub-typed user-reference
-// field — includes with attribute lists AND explicit response-object literals)
-// MINUS the named per-endpoint allowlist below. A red on any nested `user_id`
-// is a missed Task 1/2b nested-include strip to fix at its owning task — NEVER
-// an allowlist addition.
+// field — includes with attribute lists AND explicit response-object literals).
+// A red on any nested `user_id` is a missed nested-include strip to fix at its
+// owning task — NEVER an allowlist addition.
 //
 // ============================================================================
-// NAMED KNOWN-EMITTING ALLOWLIST — the ONLY sanctioned exclusions (both
-// deferred to Phase 87.4; per-endpoint, not blanket):
+// ALLOWLIST NOW EMPTY (Phase 87.4 Plan 11, PR-2).
 //
-// 1. groupPromptSettings surface (user D3 — deliberate bidirectional
-//    Auth0-keyspace contract; the FE round-trips member rosters and the
-//    selected_member_ids fanout in the SUB keyspace, and the in-code comment
-//    warns UUIDs would silently defeat the fanout. Cannot be flipped by
-//    serialization edits alone — converts in Phase 87.4 with a bidirectional
-//    keyspace migration):
-//      GET    /api/groups/:group_id/prompt-settings
-//      POST   /api/groups/:group_id/prompt-settings/schedules
-//      PATCH  /api/groups/:group_id/prompt-settings/schedules/:schedule_id
-//      DELETE /api/groups/:group_id/prompt-settings/schedules/:schedule_id
-//      PATCH  /api/groups/:group_id/prompt-settings/schedules/:schedule_id/toggle
-//
-// 2. Availability family (owner decision 2026-07-12 — the entire
-//    availability/prompt subsystem is removed from Phase 87.3 and rescoped to
-//    Phase 87.4; its serialization surfaces convert there with the rest of the
-//    subsystem):
-//      routes/availability.js self-availability CRUD + group overlap/heatmap:
-//        GET  /api/availability/user/:user_id
-//        POST /api/availability/user/:user_id/recurring
-//        POST /api/availability/user/:user_id/override
-//        GET  /api/availability/user/:user_id/patterns
-//        GET  /api/availability/group/:group_id/overlaps
-//        GET  /api/availability/group/:group_id/heatmap
-//      routes/availabilityPrompt.js prompts + respondents + heatmap:
-//        GET  /api/prompts/:promptId ; GET /api/prompts/:promptId/respondents
-//        GET  /api/prompts/:promptId/heatmap ; GET /api/groups/:groupId/prompts/*
-//      routes/availabilitySuggestion.js suggestions (+ convert):
-//        GET  /api/prompts/:promptId/suggestions ; POST .../refresh ; .../convert
-//      routes/availabilityResponse.js + availabilityPrefill.js (magic-token):
-//        POST /api/availability-responses ; GET /api/availability-responses/:promptId
-//        POST /api/availability-prefill/gcal ; POST /api/availability-prefill/saved
-//
-// These endpoints are NOT exercised for a sub-free assertion and NOT cleaned in
-// this phase — they are named here so the sweep has a sanctioned resolution
-// rather than overclaiming whole-API coverage. Follow-up: Phase 87.4.
+// The two former exclusions — the groupPromptSettings surface and the entire
+// availability/prompt subsystem — were deferred INTO Phase 87.4 by 87.3
+// (`.planning/deferred/phase-87.4.md`). Phase 87.4 converted every one of their
+// emissions to the Users.id UUID (Plans 04/08/09 + this plan's Task 1), so the
+// allowlist is now EMPTY and the availability + prompt-settings endpoints below
+// (formerly excluded) are exercised for a sub-free assertion in the second
+// describe block of this suite. "No Auth0 sub on the wire" is universal again
+// (outside DB internals + the auth boundary). A red is a regression to fix at
+// its owning task, never a re-added allowlist entry.
 // ============================================================================
 //
 // Real-DB (factories; sequelize.sync via tests/globalSetup.js; per-test
@@ -77,6 +49,24 @@ jest.mock('../../services/auth0Service', () => ({
   extractUserDetails: jest.fn(() => ({ email: null, username: null, user_id: null })),
 }));
 
+// Phase 87.4 Plan 11: the prompt-settings + availability-prompt routers reach for
+// Redis-backed BullMQ (promptScheduler, reminderService) and Resend (emailService).
+// Stub them so requiring/exercising the routers never boots Redis or hits the network.
+jest.mock('../../schedulers/promptScheduler', () => ({
+  upsertSinglePromptScheduler: jest.fn().mockResolvedValue(),
+  removePromptScheduler: jest.fn().mockResolvedValue(),
+}));
+jest.mock('../../services/reminderService', () => ({
+  scheduleReminders: jest.fn().mockResolvedValue({ scheduled: false }),
+  scheduleDeadlineJob: jest.fn().mockResolvedValue({ scheduled: false }),
+}));
+jest.mock('../../services/emailService', () => {
+  const actual = jest.requireActual('../../services/emailService');
+  actual.send = jest.fn().mockResolvedValue({ success: true });
+  actual.isConfigured = jest.fn().mockReturnValue(true);
+  return actual;
+});
+
 const request = require('supertest');
 const express = require('express');
 const { UniqueConstraintError } = require('sequelize');
@@ -90,12 +80,27 @@ const eventsRoutes = require('../../routes/events');
 const listsRoutes = require('../../routes/lists');
 const gameReviewsRoutes = require('../../routes/gameReviews');
 const ballotRoutes = require('../../routes/ballot');
+// Phase 87.4 Plan 11 (PR-2): the formerly-allowlisted availability + prompt-settings
+// surface is now swept. Mount the routers on a second app below.
+const availabilityRoutes = require('../../routes/availability');
+const availabilityPromptRoutes = require('../../routes/availabilityPrompt');
+const availabilitySuggestionRoutes = require('../../routes/availabilitySuggestion');
+const groupPromptSettingsRoutes = require('../../routes/groupPromptSettings');
+const availabilityResponseRoutes = require('../../routes/availabilityResponse');
+const availabilityPrefillRoutes = require('../../routes/availabilityPrefill');
+// Real magic-token minting for the two magic-token-authed endpoints (NOT Auth0).
+process.env.MAGIC_TOKEN_SECRET = process.env.MAGIC_TOKEN_SECRET || 'wire-sweep-test-secret';
+const magicTokenService = require('../../services/magicTokenService');
 
 const {
   Event,
   EventParticipation,
   Game,
   Friendship,
+  AvailabilityPrompt,
+  AvailabilityResponse,
+  GroupPromptSettings,
+  UserAvailability,
 } = require('../../models');
 const {
   makeUser,
@@ -108,6 +113,7 @@ const {
   makeGameReview,
   makeEventBallotOption,
   makeEventBallotVote,
+  makeAvailabilitySuggestion,
 } = require('../factories');
 
 // ---------------------------------------------------------------------------
@@ -450,5 +456,247 @@ describe('Wire sweep (87.3-09 Req 1): no Auth0 sub crosses the wire outside the 
       .put(`/api/events/${futureEvent.id}`)
       .send({ title: 'Sweep Updated' });
     expectSubFree(updated, 'PUT /events/:id (write echo)');
+  });
+});
+
+// ===========================================================================
+// Phase 87.4 Plan 11 (PR-2): the formerly-allowlisted availability + prompt-settings
+// surface. The allowlist is now EMPTY — every endpoint below is exercised for a
+// sub-free assertion. The two magic-token-authed endpoints
+// (availability-responses / availability-prefill) mint a REAL magic token (they do
+// NOT use Auth0). availability-prefill/gcal is CLEAN by construction (emits only
+// { slot_ids, count }) but returns 400 without a live Google Calendar connection —
+// its error body is still asserted sub-free via expectBodySubFree.
+// ===========================================================================
+
+// A second app carrying the availability + prompt-settings routers (matches the
+// server.js mount prefixes). The same req.user injection harness is reused.
+let availActor = null;
+const availApp = express();
+availApp.use(express.json());
+availApp.use((req, _res, next) => {
+  if (availActor) req.user = { user_id: availActor };
+  next();
+});
+availApp.use('/api/availability', availabilityRoutes);
+availApp.use('/api/groups', groupPromptSettingsRoutes);
+availApp.use('/api', availabilitySuggestionRoutes);
+availApp.use('/api', availabilityPromptRoutes);
+availApp.use('/api/availability-responses', availabilityResponseRoutes); // magic-token
+availApp.use('/api/availability-prefill', availabilityPrefillRoutes); // magic-token
+
+// Sub-free assertion that does NOT require a 2xx (for the magic gcal endpoint whose
+// success path needs a live Google connection — the 400 body must still be sub-free).
+function expectBodySubFree(res, label) {
+  const hits = collectSubHits(res.body);
+  if (hits.length > 0) {
+    throw new Error(
+      `Sub-shaped value(s) on the wire from ${label} (Req 1 violation):\n  ${hits.join('\n  ')}`
+    );
+  }
+}
+
+describe('Wire sweep (87.4-11 PR-2): availability + prompt-settings — allowlist emptied', () => {
+  let owner; // auth0|...
+  let member; // google-oauth2|...
+  let group;
+  let prompt;
+  let scheduleId;
+
+  beforeEach(async () => {
+    owner = await makeUser({ username: 'avail-owner', email_notifications_enabled: true });
+    member = await makeUser({
+      user_id: `google-oauth2|9021${Date.now()}`,
+      username: 'avail-member',
+      email_notifications_enabled: true,
+    });
+    group = await makeGroup({ name: 'Avail Sweep Group' });
+    await addToGroup(owner, group, 'owner');
+    await addToGroup(member, group, 'member');
+
+    // Active prompt created by the owner.
+    prompt = await AvailabilityPrompt.create({
+      group_id: group.id,
+      status: 'active',
+      prompt_date: new Date(),
+      deadline: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      week_identifier: `avail-${Date.now()}`,
+      created_by_user_id: owner.id,
+    });
+
+    // A member response (sub-keyed row — the emission must still not leak the sub).
+    await AvailabilityResponse.create({
+      prompt_id: prompt.id,
+      user_id: member.user_id, // AvailabilityResponse is still sub-keyed (Phase 87.5 rekeys)
+      time_slots: [{ start: new Date().toISOString(), end: new Date(Date.now() + 36e5).toISOString(), preference: 'preferred' }],
+      user_timezone: 'UTC',
+      submitted_at: new Date(),
+    });
+
+    // A recurring availability pattern for the owner (sub-keyed row) so patterns /
+    // heatmap / overlaps render non-empty and prove the emission carries the UUID.
+    await UserAvailability.create({
+      user_id: owner.user_id, // sub-keyed row (Phase 87.5 rekeys the column)
+      type: 'recurring_pattern',
+      pattern_data: { dayOfWeek: 3, startTime: '18:00', endTime: '22:00' },
+      start_date: '2026-01-01',
+      timezone: 'UTC',
+    });
+
+    // A suggestion (participant_user_ids UUID array post Plan 03) for the suggestions GET.
+    await makeAvailabilitySuggestion(prompt, member);
+
+    // A prompt-settings row with a schedule scoped to the member (stored UUID).
+    const settings = await GroupPromptSettings.create({
+      group_id: group.id,
+      schedule_timezone: 'UTC',
+      created_by_user_id: owner.id,
+      template_config: {
+        schedules: [{
+          id: `sched-${group.id}`,
+          is_active: true,
+          game_id: null,
+          selected_member_ids: [member.id], // stored UUID
+          schedule_day_of_week: 3,
+          schedule_time: '19:00',
+          schedule_timezone: 'UTC',
+        }],
+      },
+    });
+    scheduleId = settings.template_config.schedules[0].id;
+
+    availActor = owner.user_id;
+  });
+
+  afterEach(() => {
+    availActor = null;
+    jest.clearAllMocks();
+  });
+
+  it('prompt-settings: GET (members[].user_id UUID + selected_member_ids UUID, no sub)', async () => {
+    const res = await request(availApp).get(`/api/groups/${group.id}/prompt-settings`);
+    expectSubFree(res, 'GET /groups/:group_id/prompt-settings');
+    // Non-vacuous: members rendered, user_id is the UUID (== id), never a sub.
+    expect(res.body.members.length).toBeGreaterThanOrEqual(2);
+    for (const m of res.body.members) {
+      expect(m.user_id).toBe(m.id);
+      expect(m.user_id).not.toMatch(SUB_MATCHER);
+    }
+    // selected_member_ids emitted as the raw stored UUID (shim removed).
+    const sched = res.body.schedules.find((s) => s.id === scheduleId);
+    expect(sched.selected_member_ids).toEqual([member.id]);
+  });
+
+  it('prompt-settings: POST create + PATCH update + toggle + DELETE schedule echoes (sub-free)', async () => {
+    const create = await request(availApp)
+      .post(`/api/groups/${group.id}/prompt-settings/schedules`)
+      .send({ schedule_day_of_week: 4, schedule_time: '20:00', schedule_timezone: 'UTC', selected_member_ids: [member.user_id] });
+    expect(create.status).toBe(201);
+    expectSubFree(create, 'POST /groups/:group_id/prompt-settings/schedules');
+    // The sub-shaped input self-healed to the UUID on the echo.
+    expect(create.body.schedule.selected_member_ids).toEqual([member.id]);
+    const newId = create.body.schedule.id;
+
+    const patch = await request(availApp)
+      .patch(`/api/groups/${group.id}/prompt-settings/schedules/${newId}`)
+      .send({ selected_member_ids: [member.user_id] });
+    expectSubFree(patch, 'PATCH /groups/:group_id/prompt-settings/schedules/:id');
+    expect(patch.body.schedule.selected_member_ids).toEqual([member.id]);
+
+    const toggle = await request(availApp)
+      .patch(`/api/groups/${group.id}/prompt-settings/schedules/${newId}/toggle`);
+    expectSubFree(toggle, 'PATCH .../schedules/:id/toggle');
+
+    const del = await request(availApp)
+      .delete(`/api/groups/${group.id}/prompt-settings/schedules/${newId}`);
+    expectSubFree(del, 'DELETE .../schedules/:id');
+  });
+
+  it('availability self-CRUD: GET /user/:id, POST recurring, POST override, GET patterns (caller UUID emitted)', async () => {
+    const get = await request(availApp).get(`/api/availability/user/${encodeURIComponent(owner.user_id)}`);
+    expectSubFree(get, 'GET /availability/user/:user_id');
+
+    const recurring = await request(availApp)
+      .post(`/api/availability/user/${encodeURIComponent(owner.user_id)}/recurring`)
+      .send({ dayOfWeek: 5, startTime: '18:00', endTime: '21:00', start_date: '2026-01-01', timezone: 'UTC' });
+    expectSubFree(recurring, 'POST /availability/user/:user_id/recurring');
+    expect(recurring.body.user_id).not.toMatch(SUB_MATCHER);
+
+    const override = await request(availApp)
+      .post(`/api/availability/user/${encodeURIComponent(owner.user_id)}/override`)
+      .send({ date: '2026-08-01', startTime: '10:00', endTime: '12:00', isAvailable: true, timezone: 'UTC' });
+    expectSubFree(override, 'POST /availability/user/:user_id/override');
+
+    const patterns = await request(availApp).get(`/api/availability/user/${encodeURIComponent(owner.user_id)}/patterns`);
+    expectSubFree(patterns, 'GET /availability/user/:user_id/patterns');
+  });
+
+  it('availability group: GET overlaps + GET heatmap (member payload UUIDs)', async () => {
+    const overlaps = await request(availApp).get(`/api/availability/group/${group.id}/overlaps`);
+    expectSubFree(overlaps, 'GET /availability/group/:group_id/overlaps');
+
+    const heatmap = await request(availApp).get(`/api/availability/group/${group.id}/heatmap`);
+    expectSubFree(heatmap, 'GET /availability/group/:group_id/heatmap');
+  });
+
+  it('availability prompts: GET /prompts/:id, respondents, heatmap, group open list (UUID rosters)', async () => {
+    const detail = await request(availApp).get(`/api/prompts/${prompt.id}`);
+    expectSubFree(detail, 'GET /prompts/:promptId');
+
+    const respondents = await request(availApp).get(`/api/prompts/${prompt.id}/respondents`);
+    expectSubFree(respondents, 'GET /prompts/:promptId/respondents');
+    expect(respondents.body.length).toBeGreaterThanOrEqual(2); // non-vacuous
+    for (const r of respondents.body) expect(r.user_id).not.toMatch(SUB_MATCHER);
+
+    const heatmap = await request(availApp).get(`/api/prompts/${prompt.id}/heatmap`);
+    expectSubFree(heatmap, 'GET /prompts/:promptId/heatmap');
+
+    const open = await request(availApp).get(`/api/groups/${group.id}/prompts/open`);
+    expectSubFree(open, 'GET /groups/:groupId/prompts/open');
+  });
+
+  it('availability suggestions: GET /prompts/:id/suggestions (participant_user_ids UUID array)', async () => {
+    const suggestions = await request(availApp).get(`/api/prompts/${prompt.id}/suggestions`);
+    expectSubFree(suggestions, 'GET /prompts/:promptId/suggestions');
+  });
+
+  it('magic-token: availability-responses POST + GET (minted token, no Auth0) — sub-free', async () => {
+    const token = await magicTokenService.generateToken(
+      { user_id: member.user_id, username: member.username },
+      { id: prompt.id },
+      168
+    );
+
+    const post = await request(availApp)
+      .post('/api/availability-responses')
+      .send({
+        magic_token: token,
+        time_slots: [{ start: new Date().toISOString(), end: new Date(Date.now() + 36e5).toISOString(), preference: 'preferred' }],
+        user_timezone: 'UTC',
+      });
+    expectSubFree(post, 'POST /availability-responses (magic token)');
+
+    const get = await request(availApp).get(`/api/availability-responses/${prompt.id}?magic_token=${encodeURIComponent(token)}`);
+    expectSubFree(get, 'GET /availability-responses/:promptId (magic token)');
+  });
+
+  it('magic-token: availability-prefill saved (2xx) + gcal (400 body sub-free) — no sub either way', async () => {
+    const token = await magicTokenService.generateToken(
+      { user_id: member.user_id, username: member.username },
+      { id: prompt.id },
+      168
+    );
+
+    const saved = await request(availApp)
+      .post('/api/availability-prefill/saved')
+      .send({ magic_token: token, start_date: '2026-08-01', num_days: 7, timezone: 'UTC' });
+    expectSubFree(saved, 'POST /availability-prefill/saved (magic token)');
+
+    // gcal returns 400 without a live Google connection — CLEAN by construction
+    // (emits only { slot_ids, count }); assert its error body is sub-free.
+    const gcal = await request(availApp)
+      .post('/api/availability-prefill/gcal')
+      .send({ magic_token: token, start_date: '2026-08-01', num_days: 7, timezone: 'UTC' });
+    expectBodySubFree(gcal, 'POST /availability-prefill/gcal (magic token)');
   });
 });
