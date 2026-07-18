@@ -102,7 +102,13 @@ async function convertSuggestionToEvent(suggestionId, creatorUserId, options = {
   const transaction = await sequelize.transaction();
 
   try {
-    // 1. Fetch suggestion with FOR UPDATE lock to prevent race conditions
+    // 1. Fetch suggestion with FOR UPDATE lock to prevent race conditions.
+    // Scope the lock to the base AvailabilitySuggestion row (FOR UPDATE OF ...) — the
+    // include LEFT OUTER JOINs AvailabilityPrompt/Group/Game (nullable sides), and
+    // Postgres rejects a bare FOR UPDATE that spans the nullable side of an outer join
+    // (SQLSTATE 0A000). Locking only the base table preserves the race-prevention intent
+    // (the suggestion row is what we guard against concurrent conversion) while keeping
+    // the query valid on Postgres.
     const suggestion = await AvailabilitySuggestion.findByPk(suggestionId, {
       include: [{
         model: AvailabilityPrompt,
@@ -111,7 +117,7 @@ async function convertSuggestionToEvent(suggestionId, creatorUserId, options = {
           { model: Game, required: false }
         ]
       }],
-      lock: transaction.LOCK.UPDATE,
+      lock: { level: transaction.LOCK.UPDATE, of: AvailabilitySuggestion },
       transaction
     });
 
