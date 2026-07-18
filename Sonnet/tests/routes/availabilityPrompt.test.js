@@ -84,8 +84,11 @@ describe('POST /api/prompts/:promptId/remind/:userId — <24h cooldown envelope'
   });
 
   it('returns the reminder_cooldown envelope at 429 with the 24-hour prose', async () => {
+    // Phase 87.4 Plan 09: the remind endpoint is UUID-only — send the target's
+    // Users.id UUID. The cooldown find re-keys on the RESOLVED sub, so it still
+    // hits the sub-keyed AvailabilityResponse row seeded with target.user_id.
     const res = await request(makeApp(owner))
-      .post(`/api/prompts/${prompt.id}/remind/${encodeURIComponent(target.user_id)}`)
+      .post(`/api/prompts/${prompt.id}/remind/${encodeURIComponent(target.id)}`)
       .send({});
 
     expect(res.status).toBe(429);
@@ -151,7 +154,7 @@ describe('POST /api/prompts/:promptId/remind/:userId — concurrent-duplicate ab
       .mockRejectedValueOnce(uniqueErr);
 
     const res = await request(makeApp(owner))
-      .post(`/api/prompts/${prompt.id}/remind/${encodeURIComponent(target.user_id)}`)
+      .post(`/api/prompts/${prompt.id}/remind/${encodeURIComponent(target.id)}`)
       .send({});
 
     // Absorbed: success, not a 500.
@@ -167,13 +170,15 @@ describe('POST /api/prompts/:promptId/remind/:userId — concurrent-duplicate ab
   });
 });
 
-// Phase 87.1 / Plan 07 (D-11, T-87.1-13 corrected): the respondents endpoint reads
-// the member's Auth0 sub from the User include (member.User.user_id) for the
-// serialized wire field AND the AvailabilityResponse-map bridge — NOT off the
-// UserGroup instance, whose user_id column Plan 09 strips (an undefined-SILENT read
-// that would make every respondent show has_responded=false and break FE self-row /
-// remind buttons). This real-DB test pins the seam BEFORE Plan 09 lands.
-describe('GET /api/prompts/:promptId/respondents — Auth0-sub wire field + response bridge (87.1 D-11)', () => {
+// Phase 87.4 / Plan 09 (BINT-02, D-03): the respondents endpoint now emits the
+// member's Users.id UUID (member.User.id) as the serialized wire `user_id`,
+// translated from the endpoint's EXISTING groupMembers include (no duplicate
+// roster query). The AvailabilityResponse map + has_responded bridge stay
+// Auth0-sub-keyed internally (read from member.User.user_id) because the
+// response table is still sub-keyed (Phase 87.5 rekeys it). This real-DB test
+// pins BOTH facts: the wire carries the UUID, and the sub-keyed bridge still
+// resolves has_responded correctly for each member.
+describe('GET /api/prompts/:promptId/respondents — UUID wire field + sub-keyed response bridge (87.4 D-03)', () => {
   let owner;
   let responder;
   let nonResponder;
@@ -207,7 +212,7 @@ describe('GET /api/prompts/:promptId/respondents — Auth0-sub wire field + resp
     });
   });
 
-  it('serializes each respondent with the Auth0-sub user_id and bridges has_responded correctly', async () => {
+  it('serializes each respondent with the Users.id UUID and still bridges has_responded via the sub-keyed map', async () => {
     const res = await request(makeApp(owner))
       .get(`/api/prompts/${prompt.id}/respondents`)
       .send();
@@ -215,21 +220,32 @@ describe('GET /api/prompts/:promptId/respondents — Auth0-sub wire field + resp
     expect(res.status).toBe(200);
     expect(Array.isArray(res.body)).toBe(true);
 
-    const responderEntry = res.body.find((r) => r.user_id === responder.user_id);
-    const nonResponderEntry = res.body.find((r) => r.user_id === nonResponder.user_id);
+    // Wire field now carries the Users.id UUID (NOT the Auth0 sub).
+    const responderEntry = res.body.find((r) => r.user_id === responder.id);
+    const nonResponderEntry = res.body.find((r) => r.user_id === nonResponder.id);
 
-    // Wire field carries the Auth0 sub (NOT the Users.id UUID, NOT undefined).
+    // The flipped wire field is the member's Users.id UUID, never the sub.
     expect(responderEntry).toBeDefined();
-    expect(responderEntry.user_id).toBe(responder.user_id);
-    // Bridge into the Auth0-keyed AvailabilityResponse map resolved correctly.
+    expect(responderEntry.user_id).toBe(responder.id);
+    expect(res.body.some((r) => r.user_id === responder.user_id)).toBe(false);
+    // Bridge into the still-sub-keyed AvailabilityResponse map resolved correctly
+    // (proves the internal responseMap stayed sub-keyed while the wire flipped).
     expect(responderEntry.has_responded).toBe(true);
 
-    // The non-responder bridges to has_responded=false (would ALSO be false if the
-    // bridge regressed to an undefined UserGroup instance read — so the responder
-    // assertion above is the load-bearing one).
+    // The non-responder bridges to has_responded=false; its wire id is also the UUID.
     expect(nonResponderEntry).toBeDefined();
-    expect(nonResponderEntry.user_id).toBe(nonResponder.user_id);
+    expect(nonResponderEntry.user_id).toBe(nonResponder.id);
     expect(nonResponderEntry.has_responded).toBe(false);
+
+    // PR2-L3 (87.4-review): no serialized entry may carry an undefined user_id —
+    // roster rows with a missing User include are dropped BEFORE serialization.
+    // (A real missing-include row is unseedable here: UserGroup.user_uuid is a
+    // NOT NULL CASCADE FK to Users.id — this pins the wire contract instead.)
+    expect(res.body).toHaveLength(3); // owner + responder + nonResponder, none dropped
+    for (const r of res.body) {
+      expect(r.user_id).toBeDefined();
+      expect(typeof r.user_id).toBe('string');
+    }
   });
 });
 
@@ -268,8 +284,11 @@ describe('POST /api/prompts/:promptId/remind/:userId — non-member target rejec
   it('an admin reminding a non-member target → 400, no reminder email, no AvailabilityResponse row', async () => {
     const sendSpy = jest.spyOn(emailService, 'send').mockResolvedValue({ success: true });
 
+    // Phase 87.4 Plan 09: UUID-only endpoint — send the outsider's Users.id UUID
+    // (a real user, resolvable), so the request reaches the TARGET membership check
+    // and is rejected there (400), NOT short-circuited by the UUID-shape guard.
     const res = await request(makeApp(owner))
-      .post(`/api/prompts/${prompt.id}/remind/${encodeURIComponent(outsider.user_id)}`)
+      .post(`/api/prompts/${prompt.id}/remind/${encodeURIComponent(outsider.id)}`)
       .send({});
 
     expect(res.status).toBe(400);
@@ -281,5 +300,111 @@ describe('POST /api/prompts/:promptId/remind/:userId — non-member target rejec
       where: { prompt_id: prompt.id, user_id: outsider.user_id },
     });
     expect(rowCount).toBe(0);
+  });
+});
+
+// Phase 87.4 / Plan 09 (BINT-02, D-03): the remind endpoint is now UUID-only and
+// resolves the target BEFORE any AvailabilityResponse query, re-keying the
+// cooldown / already-responded / placeholder-create / race lookups on the
+// RESOLVED target's Auth0 sub (targetUser.user_id) so they still hit the
+// sub-keyed AvailabilityResponse table. These tests pin the three coupled facts:
+//   (1) a sub-form :userId is rejected as not-found (T-874-09-VALID);
+//   (2) a UUID :userId reminds successfully AND the email is sent to the target's
+//       REAL, DEFINED address — proving the contact-info-lifted re-fetch by the
+//       resolved PK ran (targetUser.email not undefined);
+//   (3) the 24h cooldown HOLDS for a UUID target — a first remind succeeds, a
+//       second within the window is rejected with the cooldown envelope (proving
+//       the cooldown query keyed the RESOLVED sub, not the raw UUID which would
+//       silently miss the sub-keyed table and let an admin spam reminders —
+//       T-874-09-COOLDOWN).
+describe('POST /api/prompts/:promptId/remind/:userId — UUID-only contract (87.4 D-03)', () => {
+  let owner;
+  let target;
+  let group;
+  let prompt;
+
+  beforeEach(async () => {
+    owner = await makeUser({ username: 'uuid-remind-owner' });
+    target = await makeUser({ username: 'uuid-remind-target' });
+    group = await makeGroup({ name: 'UUID Remind Group' });
+    await addToGroup(owner, group, 'owner');
+    await addToGroup(target, group, 'member');
+
+    prompt = await AvailabilityPrompt.create({
+      group_id: group.id,
+      prompt_date: new Date(),
+      deadline: new Date(Date.now() + 72 * 60 * 60 * 1000),
+      status: 'active',
+      week_identifier: '2026-W30',
+    });
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  it('rejects a sub-form :userId as not-found (UUID-only resolve returns null)', async () => {
+    const sendSpy = jest.spyOn(emailService, 'send').mockResolvedValue({ success: true });
+
+    // The still-PR-1-shaped Auth0 sub is no longer an accepted target shape.
+    const res = await request(makeApp(owner))
+      .post(`/api/prompts/${prompt.id}/remind/${encodeURIComponent(target.user_id)}`)
+      .send({});
+
+    expect(res.status).toBe(404);
+    expect(res.body.error).toMatch(/user not found/i);
+    expect(sendSpy).not.toHaveBeenCalled();
+    // No placeholder row created for a rejected target.
+    const rowCount = await AvailabilityResponse.count({
+      where: { prompt_id: prompt.id, user_id: target.user_id },
+    });
+    expect(rowCount).toBe(0);
+  });
+
+  it('reminds a UUID target and emails the target REAL (defined) address', async () => {
+    const sendSpy = jest.spyOn(emailService, 'send').mockResolvedValue({ success: true });
+
+    const res = await request(makeApp(owner))
+      .post(`/api/prompts/${prompt.id}/remind/${encodeURIComponent(target.id)}`)
+      .send({});
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+
+    // The contact-info-lifted re-fetch by the resolved PK ran: `to` is the target's
+    // seeded email, DEFINED (not undefined — which is what a default-scope resolve
+    // would leave it, defeating the send).
+    expect(sendSpy).toHaveBeenCalledTimes(1);
+    const sendArgs = sendSpy.mock.calls[0][0];
+    expect(sendArgs.to).toBeDefined();
+    expect(sendArgs.to).toBe(target.email);
+
+    // The placeholder response row was created keyed on the RESOLVED sub.
+    const row = await AvailabilityResponse.findOne({
+      where: { prompt_id: prompt.id, user_id: target.user_id },
+    });
+    expect(row).not.toBeNull();
+    expect(row.last_reminded_at).not.toBeNull();
+  });
+
+  it('holds the 24h cooldown for a UUID target (second remind within window rejected)', async () => {
+    jest.spyOn(emailService, 'send').mockResolvedValue({ success: true });
+
+    // First remind — succeeds and stamps last_reminded_at on the sub-keyed row.
+    const first = await request(makeApp(owner))
+      .post(`/api/prompts/${prompt.id}/remind/${encodeURIComponent(target.id)}`)
+      .send({});
+    expect(first.status).toBe(200);
+    expect(first.body.success).toBe(true);
+
+    // Second remind within 24h — the cooldown query keys the RESOLVED sub, finds
+    // the just-stamped row, and rejects. (If it keyed the raw UUID it would miss
+    // the sub-keyed row and wrongly succeed — the regression this test guards.)
+    const second = await request(makeApp(owner))
+      .post(`/api/prompts/${prompt.id}/remind/${encodeURIComponent(target.id)}`)
+      .send({});
+    expect(second.status).toBe(429);
+    expect(second.body.code).toBe('reminder_cooldown');
+    expect(second.body.message).toContain('24 hours');
   });
 });

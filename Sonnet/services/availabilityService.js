@@ -37,6 +37,70 @@ async function getGcalBusyCached(user, startDate, endDate, timezone) {
   return promise;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 87.4 Plan 08 (SPEC Req 2, D-03, PR-2) — boundary-only sub->UUID flip.
+//
+// Every availability WIRE emission must carry the member's Users.id UUID, not
+// their Auth0 sub. But the ENTIRE internal pipeline (availableMembers builder,
+// the noDataUserIds exclusion filter, the members00/members30 intersection,
+// overlapAvailable/finalAvailable keying, the pollResponseMap overlay, and the
+// gcalBusyByUser/gcalBusyMap/gcal-cache-key matching maps) stays sub-keyed —
+// translating any internal site mid-pipeline silently corrupts that matching
+// (double-counts a user under both a sub and a UUID key, desyncs gcal lookups,
+// breaks the noDataUserIds filter). So we build ONE roster map per request and
+// translate EXACTLY ONCE, in a single pass over each PUBLIC function's finished
+// return payload, right before it leaves the module. Phase 87.5 deletes this
+// translation layer once the availability tables are rekeyed to UUID
+// (.planning/deferred/phase-87.5.md).
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the per-request roster map from an already-loaded `group.Users` list:
+ * Auth0 sub (user_id column) -> Users.id UUID. No extra query — the roster is
+ * already loaded with both `id` and `user_id`, so this avoids the N+1 that a
+ * per-element User lookup inside the 7x14 slot loop would incur.
+ *
+ * @param {Array<{user_id: string, id: string}>} members
+ * @returns {Map<string, string>} sub -> UUID
+ */
+function buildSubToUuid(members) {
+  const map = new Map();
+  for (const m of (members || [])) {
+    if (m && m.user_id != null && m.id != null) {
+      map.set(m.user_id, m.id);
+    }
+  }
+  return map;
+}
+
+/**
+ * Boundary translation for a collection of objects each carrying a `user_id`
+ * (sub). Returns a NEW array with each `user_id` VALUE flipped sub->UUID via the
+ * roster map. Field NAME stays `user_id` (no `user_uuid` sibling — locked
+ * representation decision, INVENTORY §8 row 16).
+ *
+ * Map-miss rule (T5, coordinated with Plan 10's z.uuid() tighten): an entry
+ * whose sub is not in the roster map (edge — e.g. an ex-member off the loaded
+ * roster, or a stale poll responder) is DROPPED entirely. Never emit a raw sub,
+ * never emit null — Plan 10 tightens the FE availability schemas to z.uuid(),
+ * which rejects BOTH. Identity fields on the wire are therefore always a valid
+ * Users.id UUID when present, or absent.
+ *
+ * @param {Array<{user_id: string}>} collection
+ * @param {Map<string, string>} subToUuid
+ * @returns {Array<Object>}
+ */
+function translateUserIdCollection(collection, subToUuid) {
+  const out = [];
+  for (const entry of (collection || [])) {
+    if (!entry || entry.user_id == null) continue;
+    const uuid = subToUuid.get(entry.user_id);
+    if (uuid === undefined) continue; // unresolvable identity -> drop (never sub, never null)
+    out.push({ ...entry, user_id: uuid });
+  }
+  return out;
+}
+
 /**
  * Validate an IANA timezone string.
  * @param {string} tz
@@ -446,14 +510,26 @@ class AvailabilityService {
   }
 
   /**
-   * Calculate overlapping free time for all group members
+   * INTERNAL sub-keyed overlap builder (Phase 87.4 Plan 08 rename split).
+   *
+   * This is the original `calculateGroupOverlaps` computation, renamed. Its
+   * `availableMembers[].user_id` VALUES stay the Auth0 sub — UNTRANSLATED —
+   * because `getGroupHeatmap` consumes it directly to drive its own sub-keyed
+   * matching (noDataUserIds filter, members00/members30 intersection,
+   * pollResponseMap overlay, gcalConflicts attach). NEVER translate here.
+   *
+   * The PUBLIC `calculateGroupOverlaps` below delegates to this builder and
+   * applies the boundary translation for the GET /group/:group_id/overlaps
+   * route consumer. Phase 87.5 collapses this split back into one function once
+   * the availability tables are rekeyed to UUID (.planning/deferred/phase-87.5.md).
+   *
    * @param {string} groupId - Group ID
    * @param {Date|string} startDate - Start date
    * @param {Date|string} endDate - End date
    * @param {string} timezone - Timezone string
-   * @returns {Promise<Array>} Array of time slots with overlap information
+   * @returns {Promise<Array>} Array of time slots with overlap information (sub-keyed)
    */
-  async calculateGroupOverlaps(groupId, startDate, endDate, timezone = 'UTC', preloadedGroup = null, preloadedGcalBusyByUser = null) {
+  async buildGroupOverlaps(groupId, startDate, endDate, timezone = 'UTC', preloadedGroup = null, preloadedGcalBusyByUser = null) {
     try {
       const { Group, UserGroup } = require('../models');
 
@@ -542,6 +618,63 @@ class AvailabilityService {
       console.error('Error calculating group overlaps:', error);
       throw error;
     }
+  }
+
+  /**
+   * PUBLIC overlap function (Phase 87.4 Plan 08). Delegates to the sub-keyed
+   * `buildGroupOverlaps` builder, then applies the boundary translation ONCE so
+   * every emitted `user_id` VALUE is a Users.id UUID. This lives inside the
+   * function itself — NOT left to the calling route — because the function has
+   * two callers with opposite needs (getGroupHeatmap consumes the untranslated
+   * builder directly; the GET /group/:group_id/overlaps route consumes this
+   * translated result). Keeping the translation here means routes/availability.js
+   * needs no change and any future caller of the public name is safe by default.
+   * Phase 87.5 removes this pass once the availability tables are rekeyed to UUID.
+   *
+   * @param {string} groupId - Group ID
+   * @param {Date|string} startDate - Start date
+   * @param {Date|string} endDate - End date
+   * @param {string} timezone - Timezone string
+   * @returns {Promise<Array>} Array of time slots with overlap info (UUID-keyed emissions)
+   */
+  async calculateGroupOverlaps(groupId, startDate, endDate, timezone = 'UTC', preloadedGroup = null, preloadedGcalBusyByUser = null) {
+    const { Group, UserGroup } = require('../models');
+
+    // Resolve the roster ONCE so we can both (a) hand the builder a preloaded
+    // group (no duplicate findByPk in the success path) and (b) build the
+    // per-request subToUuid map for the boundary translation.
+    let group = preloadedGroup;
+    if (!group) {
+      try {
+        group = await Group.findByPk(groupId, {
+          include: [{
+            model: User,
+            through: UserGroup,
+            attributes: ['id', 'user_id', 'username', 'email', 'google_calendar_enabled', 'google_calendar_token', 'google_calendar_refresh_token', 'timezone'],
+          }],
+        });
+      } catch (dbError) {
+        console.error('Database error fetching group:', dbError);
+        throw new Error(`Database error: ${dbError.message}`);
+      }
+    }
+
+    const overlaps = await this.buildGroupOverlaps(groupId, startDate, endDate, timezone, group, preloadedGcalBusyByUser);
+
+    // Boundary translation: single pass over the finished builder output. The
+    // builder's output stays sub-keyed for getGroupHeatmap; this pass only
+    // affects the public route consumer.
+    const members = (group && group.Users) || [];
+    const subToUuid = buildSubToUuid(members);
+    return overlaps.map(slot => {
+      const availableMembers = translateUserIdCollection(slot.availableMembers, subToUuid);
+      return {
+        ...slot,
+        availableMembers,
+        availableCount: availableMembers.length,
+        unavailableCount: slot.totalMembers - availableMembers.length,
+      };
+    });
   }
 
   /**
@@ -639,7 +772,12 @@ class AvailabilityService {
 
     // 4. Get raw 30-min overlaps -- pass the preloaded group AND the gcal busy
     //    map so calculateUserAvailability doesn't re-fetch per-member.
-    const overlaps = await this.calculateGroupOverlaps(groupId, overlapStart, overlapEnd, timezone, group, gcalBusyByUser);
+    //    Phase 87.4 Plan 08: call the INTERNAL sub-keyed builder directly. The
+    //    heatmap's own matching below (noDataUserIds filter, members00/members30
+    //    intersection, pollResponseMap overlay, gcalConflicts) keys on the sub,
+    //    so this input MUST stay untranslated. The single UUID translation for
+    //    THIS function happens once, at its return boundary (step 9 below).
+    const overlaps = await this.buildGroupOverlaps(groupId, overlapStart, overlapEnd, timezone, group, gcalBusyByUser);
 
     // 5. Query active poll responses for this week
     // Derive ISO week string from weekStart to match prompt's week_identifier
@@ -900,16 +1038,31 @@ class AvailabilityService {
     const __renderMs = Date.now() - __t0;
     console.log(`heatmap render: ${__renderMs}ms group=${groupId} members=${totalMembers}`);
 
+    // 9. Boundary translation (Phase 87.4 Plan 08): the ENTIRE pipeline above
+    //    stayed sub-keyed. Build ONE roster map from the already-loaded
+    //    group.Users and flip every emitted user_id VALUE sub->UUID in a single
+    //    pass over this finished payload. Member-accounting counts
+    //    (membersWithData, membersWithoutDataCount, totalMembers) are computed
+    //    from the ORIGINAL arrays so an unresolvable-identity drop never skews
+    //    the counts — only the emitted identity collections drop the entry.
+    const subToUuid = buildSubToUuid(members);
+    const translatedMembersWithoutData = translateUserIdCollection(membersWithoutData, subToUuid);
+    const translatedGcalConflicts = translateUserIdCollection(gcalConflicts, subToUuid);
+    const translatedSlots = slots.map(slot => {
+      const availableMembers = translateUserIdCollection(slot.availableMembers, subToUuid);
+      return { ...slot, availableMembers, availableCount: availableMembers.length };
+    });
+
     return {
       weekStart: weekStartStr,
       weekEnd: weekEndStr,
       totalMembers: membersWithData,
       totalGroupMembers: totalMembers,
       membersWithData,
-      membersWithoutData,
+      membersWithoutData: translatedMembersWithoutData,
       membersWithoutDataCount: membersWithoutData.length,
-      gcalConflicts,
-      slots,
+      gcalConflicts: translatedGcalConflicts,
+      slots: translatedSlots,
     };
   }
 }

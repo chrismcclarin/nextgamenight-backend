@@ -54,6 +54,10 @@ const { processPromptJob } = require('../../workers/promptWorker');
 const emailService = require('../../services/emailService');
 const { GroupPromptSettings, AvailabilityPrompt } = require('../../models');
 const { makeUser, makeGroup, addToGroup } = require('../factories');
+// PR-2: the fanout contracts to a UUID-shape-filtered `id [Op.in]` clause using this
+// same isUuid predicate — a sub-shaped selected_member_ids entry fails isUuid and is
+// dropped before the query (never compared against the UUID id column).
+const { isUuid } = require('../../utils/resolveTargetUser');
 
 function sentToAddresses() {
   return emailService.send.mock.calls.map((call) => call[0].to).sort();
@@ -108,13 +112,15 @@ describe('promptWorker.processPromptJob — selected_member_ids subset (87.1 A1,
     emailService.send.mockResolvedValue({ success: true });
   });
 
-  // Phase 87.4 Plan 04 (D-11 case 1): UUID-keyed selected_member_ids (the
-  // post-backfill shape) emails EXACTLY those members via the fanout dual-read's
-  // `id IN (...)` arm.
+  // Phase 87.4 Plan 04 (D-11 case 1) / PR-2: UUID-keyed selected_member_ids (the
+  // post-backfill, post-contract shape) emails EXACTLY those members via the fanout's
+  // UUID-shape-filtered `id [Op.in]` clause.
   it('D-11 case 1: a UUID-keyed selected_member_ids subset (Users.id) emails EXACTLY those members', async () => {
     // Subset = m1, m2 (NOT m3), keyed by their Users.id UUIDs (post-backfill shape).
     const { group, m1, m2, m3, settings, scheduleId } =
       await seedGroupWithSchedule((a, b) => [a.id, b.id]);
+    // These entries are UUID-shaped, so the contract's isUuid filter keeps them.
+    expect(isUuid(m1.id) && isUuid(m2.id)).toBe(true);
 
     const result = await processPromptJob(makeJob({ group, settings, scheduleId }));
 
@@ -127,26 +133,56 @@ describe('promptWorker.processPromptJob — selected_member_ids subset (87.1 A1,
     expect(prompt.status).toBe('active');
   });
 
-  // D-11 case 2: a legacy sub-keyed row (Railway pre-deploy residue) STILL fans out
-  // during the PR-1 dual-read window via the `user_id IN (...)` arm.
-  it('D-11 case 2: a legacy sub-keyed selected_member_ids subset (Auth0 strings) STILL emails EXACTLY those members (dual-read)', async () => {
-    // Subset = m1, m2 (NOT m3), keyed by their Auth0 user_id STRINGS.
-    const { group, m1, m2, m3, settings, scheduleId } =
+  // PR-2 contract (Plan 11): the fanout is now a UUID-shape-filtered `id [Op.in]`
+  // clause — the dual-read window is CLOSED. A legacy sub-keyed selected_member_ids
+  // row is filtered out by isUuid BEFORE the query runs, so those members are silently
+  // EXCLUDED (no delivery), and the query never sees a sub-shaped value (no Postgres
+  // 22P02, no thrown/caught error).
+  //
+  // HISTORICAL: 87.1/PR-1 proved a sub-keyed subset STILL delivered during the D-07
+  // dual-read window (the `[Op.or]` `user_id IN (...)` arm). PR-2 contracted the fanout
+  // to the UUID shape filter after the Plan 04 backfill converted real rows to UUID, so
+  // a raw sub row is now stale and is dropped rather than crashing the query.
+  //
+  // This ALSO proves the whole-group guard reads the ORIGINAL unfiltered array: the
+  // seeded array is entirely sub-shaped (non-empty original), so the job still takes the
+  // selected-members branch and matches NOBODY — it does NOT fall back to the whole
+  // group (which would wrongly email all 3).
+  it('PR-2: a legacy all-sub selected_member_ids row is silently EXCLUDED (matches nobody, NOT the whole group)', async () => {
+    // Subset = m1, m2 keyed by their (now-stale) Auth0 user_id STRINGS.
+    const { group, m3, settings, scheduleId } =
       await seedGroupWithSchedule((a, b) => [a.user_id, b.user_id]);
 
     const result = await processPromptJob(makeJob({ group, settings, scheduleId }));
 
-    // A prompt was created and exactly the two selected members were emailed.
-    expect(result.recipientCount).toBe(2);
-    expect(sentToAddresses()).toEqual([m1.email, m2.email].sort());
-    // The unselected member must NOT be emailed — the re-key bug would email
-    // NOBODY (silent zero-match); this pins the exact selected subset.
+    // Nobody is emailed — the sub-shaped entries are filtered out before the query,
+    // and the whole-group guard (original non-empty array) keeps us in the
+    // selected-members branch, matching nobody rather than the whole group.
+    expect(result.recipientCount).toBe(0);
+    expect(sentToAddresses()).toEqual([]);
     expect(sentToAddresses()).not.toContain(m3.email);
 
-    // Sanity: the prompt row persisted and went active.
+    // Sanity: the prompt row still persisted and went active (the fanout completed
+    // normally — no thrown error).
     const prompt = await AvailabilityPrompt.findByPk(result.promptId);
     expect(prompt).not.toBeNull();
     expect(prompt.status).toBe('active');
+  });
+
+  // PR-2 contract: a MIXED array (one UUID + one stale sub) delivers to ONLY the
+  // UUID-shaped member — the sub entry is dropped by the shape filter, proving the
+  // filter operates per-entry and the query completes without a 22P02.
+  it('PR-2: a mixed UUID+sub selected_member_ids row delivers to ONLY the UUID member', async () => {
+    // m1 keyed by UUID (valid), m2 keyed by stale sub (dropped).
+    const { m1, m2, m3, group, settings, scheduleId } =
+      await seedGroupWithSchedule((a, b) => [a.id, b.user_id]);
+
+    const result = await processPromptJob(makeJob({ group, settings, scheduleId }));
+
+    expect(result.recipientCount).toBe(1);
+    expect(sentToAddresses()).toEqual([m1.email]);
+    expect(sentToAddresses()).not.toContain(m2.email);
+    expect(sentToAddresses()).not.toContain(m3.email);
   });
 
   // D-11 case 3: empty/null selected_member_ids preserves the whole-active-group default.

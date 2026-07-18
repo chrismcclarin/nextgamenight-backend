@@ -301,6 +301,16 @@ describe('groupPromptSettings on-write BullMQ hooks', () => {
       mockSettingsFindOne.mockResolvedValue(settingsRow);
       mockSettingsUpdate.mockResolvedValue(settingsRow);
 
+      // PR2-L1 (87.4-review): the write-path normalizer now default-denies any
+      // UUID-shaped entry NOT in the group's active roster. Seed the mocked roster
+      // (shape matches loadGroupRoster's UserGroup → User include) with the two
+      // fixture UUIDs so they survive the pick — without this the normalizer drops
+      // both and the PR2-M3 all-dropped guard 400s the request.
+      mockUserGroupFindAll.mockResolvedValue([
+        { User: { id: '22222222-2222-2222-2222-222222222222', user_id: 'auth0|fixture-member-2' } },
+        { User: { id: '33333333-3333-3333-3333-333333333333', user_id: 'auth0|fixture-member-3' } }
+      ]);
+
       // Supply a new value for every consumer-read field in one PATCH.
       const updates = {
         schedule_day_of_week: 5,
@@ -311,7 +321,12 @@ describe('groupPromptSettings on-write BullMQ hooks', () => {
         default_deadline_hours: 48,
         default_token_expiry_hours: 96,
         min_participants: 3,
-        selected_member_ids: ['m1', 'm2'],
+        // Must be UUID-shaped: the Plan 11 write-path normalizer keeps UUID entries
+        // as-is but DROPS non-UUID entries that don't resolve via the group roster.
+        selected_member_ids: [
+          '22222222-2222-2222-2222-222222222222',
+          '33333333-3333-3333-3333-333333333333'
+        ],
         is_active: true   // branch field — keeps it on the re-register path
       };
 
@@ -334,7 +349,10 @@ describe('groupPromptSettings on-write BullMQ hooks', () => {
       expect(calledSchedule.default_deadline_hours).toBe(48);
       expect(calledSchedule.default_token_expiry_hours).toBe(96);
       expect(calledSchedule.min_participants).toBe(3);
-      expect(calledSchedule.selected_member_ids).toEqual(['m1', 'm2']);
+      expect(calledSchedule.selected_member_ids).toEqual([
+        '22222222-2222-2222-2222-222222222222',
+        '33333333-3333-3333-3333-333333333333'
+      ]);
       expect(calledSchedule.is_active).toBe(true);
     });
 

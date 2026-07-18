@@ -96,26 +96,25 @@ async function notifyMembersOfPrompt(prompt, { selectedMemberIds, tokenExpiryHou
     if (game) gameName = game.name;
   }
 
-  // A1 (Phase 87.1, BINT-02): schedule.selected_member_ids stores Auth0 user_id
-  // STRINGS. Once Plan 09 re-keys UserGroup onto user_uuid, keying UserGroup.user_id
-  // with those strings silently matches NOBODY (the column is gone). Instead, keep
-  // UserGroup itself keyed on the group and scope the selected subset through the
-  // User include's user_id (still the Auth0 string) — so the filter stays on the
-  // keyspace the schedule actually stores.
+  // A1 (Phase 87.1, BINT-02): schedule.selected_member_ids now stores Users.id
+  // UUIDs (Plan 04 backfill + Plan 11 PR-2 re-sweep; FE writes UUIDs; both write
+  // handlers normalize sub residue before persist). Keep UserGroup keyed on the
+  // group and scope the selected subset through the User include's UUID `id`.
   const userInclude = {
     model: User.scope('withContactInfo'),
     required: true,
   };
   if (Array.isArray(selectedMemberIds) && selectedMemberIds.length > 0) {
-    // TEMPORARY PR-1 dual-read (D-07): the selected_member_ids backfill (migration
-    // 20260716000002) flips the STORED keyspace to Users.id UUIDs at deploy, but the
-    // Railway pre-deploy residue window can still write subs after the backfill. So
-    // resolve each entry as UUID (id) OR sub (user_id). BOTH fanout sites flip
+    // PR-2 contract (D-07): the dual-read window is CLOSED. Filter selectedMemberIds
+    // through the UUID shape check BEFORE the [Op.in] clause — a stale sub-shaped
+    // entry is silently EXCLUDED rather than compared against the UUID `id` column
+    // (that comparison throws Postgres 22P02 and would crash the WHOLE group's
+    // fanout, not just the stale entry). The whole-group guard above is evaluated on
+    // the ORIGINAL, unfiltered selectedMemberIds array, so an all-stale-sub row still
+    // takes THIS selected-members branch (filtered [Op.in] list empty → matches
+    // nobody) rather than falling back to the whole group. BOTH fanout sites contract
     // together (Pitfall 4) — workers/promptWorker.js has the identical clause.
-    // Plan 11 contracts this to UUID-only ({ id: { [Op.in]: ... } }) in PR-2.
-    const uuids = selectedMemberIds.filter(isUuid);
-    const subs = selectedMemberIds.filter(v => !isUuid(v));
-    userInclude.where = { [Op.or]: [{ id: { [Op.in]: uuids } }, { user_id: { [Op.in]: subs } }] };
+    userInclude.where = { id: { [Op.in]: selectedMemberIds.filter(isUuid) } };
   }
   const memberships = await UserGroup.findAll({
     where: { group_id: prompt.group_id, status: 'active' },

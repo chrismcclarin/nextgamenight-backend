@@ -11,6 +11,37 @@ const { matchesSelf } = require('../middleware/objectAuth');
 const router = express.Router();
 const { body, validationResult } = require('express-validator');
 
+// ---------------------------------------------------------------------------
+// Phase 87.4 Plan 08 (SPEC Req 2, D-03, PR-2): flip self-CRUD + patterns wire
+// emissions from the caller's Auth0 sub to their Users.id UUID. The
+// UserAvailability table stays sub-keyed internally (Phase 87.5 rekeys it); ONLY
+// the emitted user_id field translates. Field NAME stays `user_id`, VALUE flips.
+//
+// Map-miss rule (T5, aligns with Plan 10 z.uuid()): if the caller has no Users
+// row (should never happen for an authenticated caller), OMIT the user_id field
+// rather than leak the sub or emit null.
+// ---------------------------------------------------------------------------
+
+// Resolve the authenticated caller's own Users.id UUID from their sub.
+async function resolveCallerUuid(callerSub) {
+  const caller = await User.findOne({ where: { user_id: callerSub }, attributes: ['id'] });
+  return caller ? caller.id : null;
+}
+
+// Serialize a UserAvailability row with its user_id flipped to the caller's UUID
+// (or the field omitted on an unresolvable caller).
+function withEmittedUuid(row, callerUuid) {
+  const out = typeof row.toJSON === 'function' ? row.toJSON() : { ...row };
+  if (callerUuid) out.user_id = callerUuid;
+  else delete out.user_id;
+  return out;
+}
+
+// Convenience for the single-row create responses: resolve then serialize.
+async function emitWithCallerUuid(row, callerSub) {
+  return withEmittedUuid(row, await resolveCallerUuid(callerSub));
+}
+
 // Validation middleware
 const validate = (req, res, next) => {
   const errors = validationResult(req);
@@ -157,7 +188,7 @@ router.post('/user/:user_id/recurring',
         timezone: timezone || 'UTC',
       });
 
-      res.status(201).json(pattern);
+      res.status(201).json(await emitWithCallerUuid(pattern, userId));
     } catch (error) {
       sendSafeError(res, 500, error, 'Error creating recurring availability pattern');
     }
@@ -236,7 +267,7 @@ router.post('/user/:user_id/override',
         timezone: 'UTC',
       });
 
-      res.status(201).json(override);
+      res.status(201).json(await emitWithCallerUuid(override, userId));
     } catch (error) {
       sendSafeError(res, 500, error, 'Error creating availability override');
     }
@@ -471,7 +502,10 @@ router.get('/user/:user_id/patterns',
         order: [['createdAt', 'DESC']],
       });
 
-      res.json(patterns);
+      // Every row here is owned by the caller (query filters on their sub), so a
+      // single caller-UUID resolution covers the whole list.
+      const callerUuid = await resolveCallerUuid(userId);
+      res.json(patterns.map(p => withEmittedUuid(p, callerUuid)));
     } catch (error) {
       sendSafeError(res, 500, error, 'Error fetching availability patterns');
     }

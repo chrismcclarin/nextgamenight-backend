@@ -42,6 +42,7 @@ const emailService = require('../../services/emailService');
 const { AvailabilityPrompt, GroupPromptSettings, sequelize } = require('../../models');
 const backfillMigration = require('../../migrations/20260716000002-backfill-selected-member-ids-uuid');
 const { makeUser, makeGroup, addToGroup } = require('../factories');
+const { isUuid } = require('../../utils/resolveTargetUser');
 
 let currentActor = null;
 function makeApp() {
@@ -58,7 +59,7 @@ function makeApp() {
   return app;
 }
 
-describe('GET /api/groups/:group_id/prompt-settings — members Auth0-sub wire field + A1 loop (87.1)', () => {
+describe('GET /api/groups/:group_id/prompt-settings — members UUID wire field + A1 loop (87.4 PR-2)', () => {
   let owner;
   let m1;
   let m2;
@@ -82,38 +83,54 @@ describe('GET /api/groups/:group_id/prompt-settings — members Auth0-sub wire f
     currentActor = owner.user_id;
   });
 
-  it('serializes each member with the Auth0-sub user_id (not the Users.id UUID, not undefined)', async () => {
+  // Plan 11 (PR-2): members[].user_id now emits the member's Users.id UUID (the
+  // name-stable alias flip). display_name falls back to `username || 'Member'`
+  // (PR2-L5) — never the raw Auth0 sub, never null (the payload carries no email, so
+  // a null would bottom out at the FE chain's user_id and render a raw UUID label).
+  // No members[] field carries a sub-shaped value.
+  //
+  // HISTORICAL: 87.1/PR-1 (T-87.1-13) required members[].user_id to be the Auth0 SUB so
+  // the FE could round-trip it into selected_member_ids for a sub-keyed fanout. PR-2
+  // flips both together — members[].user_id is now the UUID and the fanout filters
+  // selected_member_ids through the UUID shape check.
+  it('serializes each member with the Users.id UUID user_id (not the Auth0 sub, not undefined)', async () => {
     const res = await request(makeApp()).get(`/api/groups/${group.id}/prompt-settings`);
 
     expect(res.status).toBe(200);
     expect(Array.isArray(res.body.members)).toBe(true);
 
-    const m1Entry = res.body.members.find((m) => m.user_id === m1.user_id);
+    const m1Entry = res.body.members.find((m) => m.user_id === m1.id);
     expect(m1Entry).toBeDefined();
-    // Auth0 sub, NOT the internal User UUID.
-    expect(m1Entry.user_id).toBe(m1.user_id);
-    expect(m1Entry.user_id).not.toBe(m1.id);
-    // The internal id is still exposed separately (unchanged wire shape).
+    // Users.id UUID, NOT the Auth0 sub (the PR-2 flip; inverted from the PR-1 assertion).
+    expect(m1Entry.user_id).toBe(m1.id);
+    expect(m1Entry.user_id).not.toBe(m1.user_id);
+    // The internal id is exposed and equals user_id post-flip (both the UUID now).
     expect(m1Entry.id).toBe(m1.id);
 
-    // Every member carries a defined Auth0-sub string (the silent-undefined
-    // regression would make these undefined post-Plan-09).
+    // No members[] field emits a sub-shaped value anywhere (user_id, id, username, or
+    // the display_name fallback). display_name is username || 'Member' (PR2-L5) —
+    // never the raw sub, never null.
     for (const m of res.body.members) {
       expect(typeof m.user_id).toBe('string');
-      expect(m.user_id).toMatch(/^auth0\|/);
+      expect(m.user_id).not.toMatch(/^auth0\|/);
+      expect(m.display_name).toBeTruthy(); // PR2-L5: never null on the wire
+      for (const [, v] of Object.entries(m)) {
+        if (typeof v === 'string') expect(v).not.toMatch(/^(auth0|google-oauth2|apple)\|/);
+      }
     }
   });
 
-  it('A1 loop guard: selected_member_ids sourced from the members payload reaches the fanout', async () => {
-    // 1) FE reads members from the settings endpoint and stores their user_id into
-    //    selected_member_ids.
+  it('A1 loop guard: selected_member_ids sourced from the members payload (UUID) reaches the fanout', async () => {
+    // 1) FE reads members from the settings endpoint and stores their user_id (now the
+    //    Users.id UUID post-flip) into selected_member_ids.
     const settingsRes = await request(makeApp()).get(`/api/groups/${group.id}/prompt-settings`);
     expect(settingsRes.status).toBe(200);
-    const m1PayloadId = settingsRes.body.members.find((m) => m.user_id === m1.user_id).user_id;
-    const selectedMemberIds = [m1PayloadId]; // exactly the value the FE would persist
+    const m1PayloadId = settingsRes.body.members.find((m) => m.user_id === m1.id).user_id;
+    expect(m1PayloadId).toBe(m1.id); // UUID, the value the FE persists
+    const selectedMemberIds = [m1PayloadId];
 
-    // 2) A prompt fires; the fanout filters UserGroup members through the User
-    //    include on those Auth0 strings.
+    // 2) A prompt fires; the fanout filters UserGroup members through the User include's
+    //    UUID `id` (isUuid shape filter).
     const prompt = await AvailabilityPrompt.create({
       group_id: group.id,
       status: 'active',
@@ -125,7 +142,7 @@ describe('GET /api/groups/:group_id/prompt-settings — members Auth0-sub wire f
     emailService.send.mockClear();
     const result = await promptInvitationService.notifyMembersOfPrompt(prompt, { selectedMemberIds });
 
-    // 3) The selected member is reached — the FE → settings → fanout loop holds.
+    // 3) The selected member is reached — the FE → settings → fanout loop holds on UUIDs.
     expect(result.sent).toBe(1);
     const toAddresses = emailService.send.mock.calls.map((c) => c[0].to);
     expect(toAddresses).toEqual([m1.email]);
@@ -134,13 +151,15 @@ describe('GET /api/groups/:group_id/prompt-settings — members Auth0-sub wire f
     expect(toAddresses).not.toContain(owner.email);
   });
 
-  // Phase 87.4 Plan 04 (D-06, owner decision 2026-07-17): the backfill converts the
-  // STORED selected_member_ids keyspace to Users.id UUIDs, but the GET handler's
-  // TEMPORARY PR-1 translate-on-read shim serializes them back to Auth0 subs on read
-  // so the PR-1 wire shape stays sub-consistent with members[].user_id (above). The
-  // reverse UUID->sub map is built ONLY from the active-member roster (no global
-  // Users query / no UUID->sub oracle). Removed by Plan 11 in PR-2.
-  it('PR-1 shim: selected_member_ids round-trips through the backfill and back out as SUBS on GET (roster member)', async () => {
+  // Plan 11 (PR-2): the GET response emits selected_member_ids as the raw stored
+  // Users.id UUIDs directly — Plan 04's temporary PR-1 translate-on-read shim (which
+  // serialized them back to Auth0 subs) is REMOVED. Both emission points (the top-level
+  // schedules[] projection AND the raw template_config) now carry the UUID unchanged.
+  //
+  // HISTORICAL: PR-1 proved the backfill converted the stored keyspace to UUIDs and the
+  // shim round-tripped them back out as subs so the wire stayed sub-consistent with the
+  // still-sub members[].user_id. PR-2 flips both to UUID together, so the shim is gone.
+  it('PR-2: selected_member_ids is emitted as raw stored UUIDs on GET (no sub translation)', async () => {
     // Store a schedule keyed by m1's Auth0 SUB (the pre-backfill shape).
     await GroupPromptSettings.create({
       group_id: group.id,
@@ -150,7 +169,7 @@ describe('GET /api/groups/:group_id/prompt-settings — members Auth0-sub wire f
           id: `sched-${group.id}`,
           is_active: true,
           game_id: null,
-          selected_member_ids: [m1.user_id], // Auth0 sub
+          selected_member_ids: [m1.user_id], // Auth0 sub (pre-backfill residue)
         }],
       },
     });
@@ -163,24 +182,22 @@ describe('GET /api/groups/:group_id/prompt-settings — members Auth0-sub wire f
     const stored = await GroupPromptSettings.findOne({ where: { group_id: group.id } });
     expect(stored.template_config.schedules[0].selected_member_ids).toEqual([m1.id]);
 
-    // GET translates the backfilled UUID back to m1's Auth0 sub at BOTH emission
-    // points — the top-level schedules[] projection AND the raw template_config.
+    // GET emits the raw stored UUID at BOTH emission points — no translation to a sub.
     const res = await request(makeApp()).get(`/api/groups/${group.id}/prompt-settings`);
     expect(res.status).toBe(200);
 
     const schedFromProjection = res.body.schedules.find(s => s.id === `sched-${group.id}`);
-    expect(schedFromProjection.selected_member_ids).toEqual([m1.user_id]); // sub, not UUID
-    expect(schedFromProjection.selected_member_ids).not.toContain(m1.id);
+    expect(schedFromProjection.selected_member_ids).toEqual([m1.id]); // UUID, not sub
+    expect(schedFromProjection.selected_member_ids).not.toContain(m1.user_id);
 
     const schedFromTemplateConfig = res.body.template_config.schedules.find(s => s.id === `sched-${group.id}`);
-    expect(schedFromTemplateConfig.selected_member_ids).toEqual([m1.user_id]); // sub, not UUID
+    expect(schedFromTemplateConfig.selected_member_ids).toEqual([m1.id]); // UUID, not sub
   });
 
-  // H-B (T-874-04-ORACLE): a stored UUID that is NOT in the active-member roster must
-  // pass through UNTRANSLATED on GET — the roster-scoped reverse map has no oracle
-  // behavior, so a non-member's Auth0 sub is never leaked.
-  it('PR-1 shim: a non-member UUID in stored selected_member_ids is NOT translated to a sub on GET', async () => {
-    // A user who is NOT a member of this group.
+  // Plan 11 (PR-2): with the shim gone, a stored UUID (roster member or not) is emitted
+  // verbatim — the sweep guarantees no sub crosses the wire because the stored value is
+  // already a UUID. Every entry is validated UUID-shaped via isUuid.
+  it('PR-2: a stored selected_member_ids UUID is emitted verbatim on GET', async () => {
     const nonMember = await makeUser({ username: 'not-in-group' });
 
     await GroupPromptSettings.create({
@@ -188,10 +205,10 @@ describe('GET /api/groups/:group_id/prompt-settings — members Auth0-sub wire f
       schedule_timezone: 'UTC',
       template_config: {
         schedules: [{
-          id: `sched-nonmember-${group.id}`,
+          id: `sched-uuid-${group.id}`,
           is_active: true,
           game_id: null,
-          selected_member_ids: [nonMember.id], // a UUID absent from the active roster
+          selected_member_ids: [m1.id, nonMember.id], // stored UUIDs
         }],
       },
     });
@@ -199,10 +216,11 @@ describe('GET /api/groups/:group_id/prompt-settings — members Auth0-sub wire f
     const res = await request(makeApp()).get(`/api/groups/${group.id}/prompt-settings`);
     expect(res.status).toBe(200);
 
-    const sched = res.body.schedules.find(s => s.id === `sched-nonmember-${group.id}`);
-    // Untranslated: the stored UUID passes through unchanged — it is NOT resolved to
-    // the non-member's Auth0 sub (no UUID->sub oracle).
-    expect(sched.selected_member_ids).toEqual([nonMember.id]);
-    expect(sched.selected_member_ids).not.toContain(nonMember.user_id);
+    const sched = res.body.schedules.find(s => s.id === `sched-uuid-${group.id}`);
+    expect(sched.selected_member_ids).toEqual([m1.id, nonMember.id]);
+    for (const v of sched.selected_member_ids) {
+      expect(isUuid(v)).toBe(true);
+      expect(v).not.toMatch(/^auth0\|/);
+    }
   });
 });

@@ -18,7 +18,7 @@ const {
 const emailService = require('../services/emailService');
 const { scheduleReminders, scheduleDeadlineJob } = require('../services/reminderService');
 const { sendError } = require('../utils/errors');
-const { isUuid } = require('../utils/resolveTargetUser');
+const { isUuid, resolveTargetUserUuidOnly } = require('../utils/resolveTargetUser');
 
 /**
  * GET /api/prompts/:promptId/respondents
@@ -70,7 +70,11 @@ router.get('/prompts/:promptId/respondents', verifyAuth0Token, async (req, res) 
         model: User,
         // BSEC-01 (D-03): email removed — the respondent list below only
         // serializes username; email was fetched but never used.
-        attributes: ['user_id', 'username']
+        // Phase 87.4 Plan 09 (BINT-02): `id` (Users.id UUID) added so the wire
+        // field can emit the UUID translated from THIS already-loaded include —
+        // no second group-roster query. `user_id` (Auth0 sub) stays loaded for
+        // the still-sub-keyed AvailabilityResponse bridge + visibility compare.
+        attributes: ['id', 'user_id', 'username']
       }]
     });
 
@@ -92,12 +96,22 @@ router.get('/prompts/:promptId/respondents', verifyAuth0Token, async (req, res) 
 
     // 6. Build respondent list with visibility rules.
     // D-11 / T-87.1-13 (corrected): `member` is a UserGroup instance whose OLD
-    // user_id column is stripped in Plan 09 — reading `member.user_id` would then
-    // be undefined-SILENT (every respondent shows has_responded=false; FE self-row
-    // + remind buttons break). The AvailabilityResponse map stays Auth0-keyed, so
-    // read the member's Auth0 sub from the User include (member.User.user_id) for
-    // the response-map bridge, the visibility compare, AND the serialized wire field.
-    const respondents = groupMembers.map(member => {
+    // user_id column is stripped — reading `member.user_id` would be
+    // undefined-SILENT. The AvailabilityResponse map stays Auth0-keyed, so read
+    // the member's Auth0 sub from the User include (member.User.user_id) for the
+    // response-map bridge and the visibility compare.
+    // Phase 87.4 Plan 09 (BINT-02, D-03): the SERIALIZED wire field `user_id`
+    // now emits the member's Users.id UUID (member.User.id) — translated from
+    // this same already-loaded include (no duplicate roster query). The internal
+    // responseMap + visibility compare stay sub-keyed because the
+    // AvailabilityResponse table is still sub-keyed (Phase 87.5 rekeys it). This
+    // is the BE half of the respondents/remind trio; ResponseDashboard forwards
+    // this UUID verbatim to the UUID-only remind endpoint (FE Plan 10).
+    // PR2-L3 (87.4-review): drop roster rows whose User include is missing BEFORE
+    // serializing (the drop-on-miss convention availabilityService uses) — a row
+    // without its User would otherwise serialize user_id: undefined on the wire
+    // (React key `undefined`; /remind/undefined -> generic 404 in the FE).
+    const respondents = groupMembers.filter(member => member.User).map(member => {
       const memberAuthSub = member.User?.user_id;
       const response = responseMap.get(memberAuthSub);
       const hasResponded = !!response && response.submitted_at !== null;
@@ -119,7 +133,10 @@ router.get('/prompts/:promptId/respondents', verifyAuth0Token, async (req, res) 
                             memberAuthSub === userId;
 
       return {
-        user_id: memberAuthSub,
+        // Wire field emits the Users.id UUID (translated from the existing
+        // include). Rows with a missing User include were dropped above (PR2-L3)
+        // — user_id is never undefined on the wire.
+        user_id: member.User.id,
         username: member.User?.username || 'Unknown',
         has_responded: hasResponded,
         slot_count: showSlotCount ? slotCount : null,
@@ -154,7 +171,7 @@ router.get('/prompts/:promptId/respondents', verifyAuth0Token, async (req, res) 
  */
 router.post('/prompts/:promptId/remind/:userId', verifyAuth0Token, async (req, res) => {
   try {
-    const { promptId, userId: targetUserId } = req.params;
+    const { promptId } = req.params;
     const userId = req.user.user_id;
 
     // 1. Get prompt with group and game
@@ -188,9 +205,56 @@ router.post('/prompts/:promptId/remind/:userId', verifyAuth0Token, async (req, r
       return res.status(400).json({ error: 'Cannot send reminders for closed prompts' });
     }
 
-    // 4. Check cooldown - find or create response record
+    // 4. Resolve the TARGET user UUID-only, BEFORE any AvailabilityResponse query.
+    // Phase 87.4 Plan 09 (BINT-02, D-03 / T-874-09-*): the respondents endpoint now
+    // emits Users.id UUIDs and ResponseDashboard forwards that UUID verbatim as
+    // :userId. This endpoint's SOLE sender is ResponseDashboard (a verified pure
+    // passthrough of respondent.user_id), so the target is UUID-ONLY —
+    // resolveTargetUserUuidOnly rejects a sub-shaped/garbage :userId as not-found.
+    //
+    // ORDERING IS THE CORRECTNESS FIX (T-874-09-COOLDOWN): the cooldown /
+    // already-responded / placeholder-create / race queries below key the
+    // still-sub-keyed AvailabilityResponse table on the RESOLVED target's Auth0 sub
+    // (targetUser.user_id), NOT the raw UUID :userId. Keying those on the raw UUID
+    // would match NOTHING in the sub-keyed table — silently defeating the 24h
+    // cooldown (an admin could spam reminders). Resolving FIRST and re-keying on the
+    // resolved sub keeps the cooldown enforced for a UUID target. (Phase 87.5 rekeys
+    // the AvailabilityResponse table to UUID and collapses this translation.)
+    const targetUserRow = await resolveTargetUserUuidOnly(req.params.userId);
+    if (!targetUserRow) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    // BSEC-01 (D-03): resolveTargetUserUuidOnly deliberately returns a DEFAULT-scope
+    // row (no email/phone). Re-fetch with the contact-info-lifted scope by the
+    // now-known, server-RESOLVED primary key (the routes/invites.js pattern) so the
+    // lifted read is never keyed on raw client input — targetUser.email is read at
+    // step 8 to send the reminder.
+    const targetUser = await User.scope('withContactInfo').findByPk(targetUserRow.id);
+    if (!targetUser) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    // The resolved target's Auth0 sub — the key the sub-keyed AvailabilityResponse
+    // table actually uses for this user.
+    const targetSub = targetUser.user_id;
+
+    // 5. Verify the TARGET user is in the group.
+    // T-87.1-19 (Phase 87.1): this checks the TARGET's membership (from the resolved
+    // identity), NOT the caller's — the caller's admin gate is step 2 above. Keying
+    // this on the caller would tautologize the check (the caller already passed step
+    // 2), letting an admin remind ANY user platform-wide and create placeholder
+    // AvailabilityResponse rows for non-members. Key user_uuid on the TARGET's
+    // Users.id. Preserved unweakened through the UUID-only flip (T-874-09-SPOOF).
+    const targetUserGroup = await UserGroup.findOne({
+      where: { group_id: prompt.group_id, user_uuid: targetUser.id, status: 'active' }
+    });
+    if (!targetUserGroup) {
+      return res.status(400).json({ error: 'User is not a member of this group' });
+    }
+
+    // 6. Check cooldown - find or create response record.
+    // Keyed on the RESOLVED target sub (see step 4) so it hits the sub-keyed rows.
     let response = await AvailabilityResponse.findOne({
-      where: { prompt_id: promptId, user_id: targetUserId }
+      where: { prompt_id: promptId, user_id: targetSub }
     });
 
     if (response?.last_reminded_at) {
@@ -211,31 +275,9 @@ router.post('/prompts/:promptId/remind/:userId', verifyAuth0Token, async (req, r
       }
     }
 
-    // 5. Check if user has already responded
+    // 7. Check if user has already responded
     if (response?.submitted_at) {
       return res.status(400).json({ error: 'User has already submitted their availability' });
-    }
-
-    // 6. Get target user.
-    // BSEC-01 (D-03): withContactInfo — targetUser.email is read to send the reminder.
-    const targetUser = await User.scope('withContactInfo').findOne({ where: { user_id: targetUserId } });
-    if (!targetUser) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-
-    // 7. Verify the TARGET user is in the group.
-    // T-87.1-19 (Phase 87.1): this checks the TARGET's membership (from
-    // req.params), NOT the caller's — the caller's admin gate is step 2 above.
-    // Keying this on the caller would tautologize the check (the caller already
-    // passed step 2), letting an admin remind ANY user platform-wide and create
-    // placeholder AvailabilityResponse rows for non-members. Key user_uuid on the
-    // TARGET's Users.id, reusing the targetUser fetched at step 6 (which already
-    // precedes and guards this check).
-    const targetUserGroup = await UserGroup.findOne({
-      where: { group_id: prompt.group_id, user_uuid: targetUser.id, status: 'active' }
-    });
-    if (!targetUserGroup) {
-      return res.status(400).json({ error: 'User is not a member of this group' });
     }
 
     // 8. Send reminder email
@@ -285,7 +327,7 @@ router.post('/prompts/:promptId/remind/:userId', verifyAuth0Token, async (req, r
       try {
         await AvailabilityResponse.create({
           prompt_id: promptId,
-          user_id: targetUserId,
+          user_id: targetSub, // resolved sub — the sub-keyed table's key (step 4)
           time_slots: [],
           user_timezone: 'UTC',
           submitted_at: null, // Not submitted yet
@@ -296,7 +338,7 @@ router.post('/prompts/:promptId/remind/:userId', verifyAuth0Token, async (req, r
           // Concurrent create won the race — re-find the racing row and stamp
           // last_reminded_at on it so the double-click degrades to success.
           const raceRow = await AvailabilityResponse.findOne({
-            where: { prompt_id: promptId, user_id: targetUserId }
+            where: { prompt_id: promptId, user_id: targetSub }
           });
           if (raceRow) {
             await raceRow.update({ last_reminded_at: new Date() });

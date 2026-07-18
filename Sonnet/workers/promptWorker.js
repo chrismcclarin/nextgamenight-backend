@@ -169,13 +169,11 @@ async function processPromptJob(job) {
   // Get active group members. If the schedule targets a specific subset of
   // members (selected_member_ids), filter to those — otherwise email everyone.
   //
-  // A1 (Pitfall 4): selected_member_ids stores Auth0 user_id STRINGS (verified).
-  // UserGroup is now re-keyed onto the user_uuid UUID FK (Plan 03), so keying
-  // `UserGroup.user_id = selectedMemberIds` would silently match NOBODY once the
-  // old string column is dropped — selected-subset schedules would target zero
-  // members with no loud error. Scope the subset through the User include's
-  // Auth0-string `user_id` instead; the UserGroup→User join itself resolves on
-  // user_uuid (the flipped association), so the keyspaces never cross.
+  // A1 (Pitfall 4): selected_member_ids now stores Users.id UUIDs. The Plan 04
+  // backfill + Plan 11 PR-2 re-sweep converted the stored keyspace, the FE writes
+  // UUIDs, and BOTH groupPromptSettings write handlers normalize any stale-tab sub
+  // residue to UUID before persist — so a sub-shaped entry is stale. The
+  // UserGroup→User join resolves on user_uuid (the flipped association).
   const userInclude = {
     // BSEC-01 (D-03): withContactInfo — user.email is read in the prompt
     // send loop; defaultScope would strip it and silently skip everyone.
@@ -183,15 +181,16 @@ async function processPromptJob(job) {
     required: true
   };
   if (selectedMemberIds.length > 0) {
-    // TEMPORARY PR-1 dual-read (D-07): the selected_member_ids backfill (migration
-    // 20260716000002) flips the STORED keyspace to Users.id UUIDs at deploy, but the
-    // Railway pre-deploy residue window can still write subs after the backfill. So
-    // resolve each entry as UUID (id) OR sub (user_id). BOTH fanout sites flip
-    // together (Pitfall 4) — services/promptInvitationService.js has the identical
-    // clause. Plan 11 contracts this to UUID-only ({ id: { [Op.in]: ... } }) in PR-2.
-    const uuids = selectedMemberIds.filter(isUuid);
-    const subs = selectedMemberIds.filter(v => !isUuid(v));
-    userInclude.where = { [Op.or]: [{ id: { [Op.in]: uuids } }, { user_id: { [Op.in]: subs } }] };
+    // PR-2 contract (D-07): the dual-read window is CLOSED. Filter selectedMemberIds
+    // through the UUID shape check BEFORE the [Op.in] clause — a stale sub-shaped
+    // entry is silently EXCLUDED rather than compared against the UUID `id` column
+    // (that comparison throws Postgres 22P02 and would crash the WHOLE group's
+    // fanout, not just the stale entry). The whole-group guard above is evaluated on
+    // the ORIGINAL, unfiltered selectedMemberIds array, so an all-stale-sub row still
+    // takes THIS selected-members branch (filtered [Op.in] list empty → matches
+    // nobody) rather than falling back to the whole group. BOTH fanout sites contract
+    // together (Pitfall 4) — services/promptInvitationService.js has the identical clause.
+    userInclude.where = { id: { [Op.in]: selectedMemberIds.filter(isUuid) } };
   }
   const memberships = await UserGroup.findAll({
     where: { group_id: groupId, status: 'active' },
