@@ -250,8 +250,15 @@ router.get('/:user_id', requireParamMatchesToken('user_id'), async (req, res) =>
     // caller's own Users.id UUID (post-PR-2) — resolve it to the PK rather than
     // querying the still-sub-keyed Users.user_id column (which would miss and
     // wrongly enter the auto-create branch / 404 the caller's own profile).
-    let user = isUuid(req.params.user_id)
-      ? await User.scope('withContactInfo').findByPk(req.params.user_id, {
+    // M-4 (87.4-review): this self-read genuinely needs the withContactInfo scope +
+    // Group include, which matchesSelf's memoized default-scope row does NOT carry, so
+    // it re-fetches. But it reuses req.selfUuid (the caller's own UUID matchesSelf
+    // already resolved) as the PK so the re-fetch is a keyed findByPk — no second
+    // sub-column lookup, and an uppercase UUID param resolves via the stored-lowercase
+    // memo (L-3). The sub shape (no memo) resolves by the sub column.
+    const selfPk = req.selfUuid || (isUuid(req.params.user_id) ? req.params.user_id : null);
+    let user = selfPk
+      ? await User.scope('withContactInfo').findByPk(selfPk, {
           include: [{ model: Group }],
         })
       : await User.scope('withContactInfo').findOne({

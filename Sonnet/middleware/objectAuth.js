@@ -64,8 +64,22 @@ async function matchesSelf(req, paramValue) {
   // UUID era: only a UUID-shaped param can be the caller's own Users.id. Resolve
   // the caller's UUID from their OWN sub (BOLA-safe) and require an exact match.
   if (isUuid(paramValue)) {
-    const me = await User.findOne({ where: { user_id: sub }, attributes: ['id'] });
-    return !!me && paramValue === me.id;
+    // M-4 (87.4-review): memoize the resolved self row on the request so the KEYMISS
+    // handlers (events/users/games) reuse it instead of re-querying Users — one lookup
+    // per request in the steady (UUID) state. `undefined` means "not yet resolved";
+    // `null` means "resolved, no such row" (so a genuine miss still short-circuits).
+    // Fetch the full default-scope row (not just id) because events.js/games.js need
+    // the whole row; users.js re-fetches only for its extra withContactInfo scope.
+    if (req.selfUser === undefined) {
+      req.selfUser = await User.findOne({ where: { user_id: sub } });
+      req.selfUuid = req.selfUser ? req.selfUser.id : null;
+    }
+    const me = req.selfUser;
+    // L-3 (87.4-review): the isUuid shape test is case-insensitive, so an uppercase
+    // own-UUID param passes shape — normalize both sides before the equality compare
+    // so it authorizes instead of a spurious 403 (Postgres uuid columns are stored
+    // lowercase; a UUID never collides across case, so this stays BOLA-safe).
+    return !!me && paramValue.toLowerCase() === me.id.toLowerCase();
   }
   return false;
 }

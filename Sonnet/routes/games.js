@@ -412,9 +412,14 @@ router.get('/for-event/:group_id/:user_id', requireParamMatchesToken('user_id'),
     // be the caller's own Users.id UUID (post-PR-2) — resolve it to the PK rather
     // than querying the still-sub-keyed Users.user_id column (which would miss and
     // 404 the caller's own owned-games list).
-    const user = isUuid(user_id)
-      ? await User.findByPk(user_id)
-      : await User.findOne({ where: { user_id } });
+    // M-4 (87.4-review): reuse the caller's own row memoized by matchesSelf (via
+    // requireParamMatchesToken) for the UUID shape — no duplicate Users lookup. The
+    // sub shape sets no memo and resolves by the sub column here.
+    const user = req.selfUser
+      ? req.selfUser
+      : (isUuid(user_id)
+          ? await User.findByPk(user_id)
+          : await User.findOne({ where: { user_id } }));
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
