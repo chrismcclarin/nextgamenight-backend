@@ -47,6 +47,7 @@ const {
   SingleUseToken,
   Feedback,
   EventBallotOption,
+  GroupPromptSettings,
   PendingAuth0Deletion,
   sequelize,
 } = require('../models');
@@ -252,10 +253,11 @@ async function applyDispositions(user, t) {
     { where: { created_by: sub }, transaction: t }
   );
 
-  // 5. JSONB SCRUBS (raw query, jsonb `-` operator; atomic, no read-modify-write race).
-  //    5a. participant_user_ids: remove the sub element AND recompute the denormalized
-  //        derived columns in the SAME UPDATE (Pitfall 6) so a now-below-minimum slot
-  //        cannot keep ranking as viable:
+  // 5. JSONB SCRUBS.
+  //    5a. participant_user_ids (raw query, jsonb `-` operator; atomic, no
+  //        read-modify-write race): remove the deleting user's element AND recompute the
+  //        denormalized derived columns in the SAME UPDATE (Pitfall 6) so a now-below-
+  //        minimum slot cannot keep ranking as viable:
   //          - participant_count = new array length
   //          - meets_minimum via the prompt's threshold. NOTE: min_participants is NOT a
   //            column on AvailabilityPrompts — the real threshold is the prompt's Game
@@ -267,26 +269,74 @@ async function applyDispositions(user, t) {
   //            but calculateScore applies none, so we match the real formula (no boost).
   //        preferred_count has NO persisted per-user array and is NOT derivable post-hoc
   //        — it is accepted stale-by-one until the next regeneration (documented here).
+  //        KEYSPACE (Phase 87.4 Plan 03 / D-05, Pitfall 7): participant_user_ids now
+  //        stores Users.id UUIDs (writer + all readers flipped). The surgery removes the
+  //        deleting user's UUID (`- :uuid`), NOT the sub — a `- :sub` here would never
+  //        match the stored UUID element, leaving it orphaned and inflating
+  //        participant_count/score (the accountDeletion integrity test asserts against
+  //        this). The recompute formula is keyspace-agnostic (count-based) and unchanged.
   await sequelize.query(
     `UPDATE "AvailabilitySuggestions" AS s
-        SET participant_user_ids = s.participant_user_ids - :sub,
-            participant_count = jsonb_array_length(s.participant_user_ids - :sub),
-            meets_minimum = (jsonb_array_length(s.participant_user_ids - :sub) >= COALESCE(g.min_players, 2)),
-            score = (jsonb_array_length(s.participant_user_ids - :sub) * 1.0 + s.preferred_count * 0.5)
+        SET participant_user_ids = s.participant_user_ids - :uuid,
+            participant_count = jsonb_array_length(s.participant_user_ids - :uuid),
+            meets_minimum = (jsonb_array_length(s.participant_user_ids - :uuid) >= COALESCE(g.min_players, 2)),
+            score = (jsonb_array_length(s.participant_user_ids - :uuid) * 1.0 + s.preferred_count * 0.5)
        FROM "AvailabilityPrompts" AS ap
        LEFT JOIN "Games" AS g ON g.id = ap.game_id
       WHERE ap.id = s.prompt_id
-        AND s.participant_user_ids ? :sub`,
-    { replacements: { sub }, transaction: t }
+        AND s.participant_user_ids ? :uuid`,
+    { replacements: { uuid }, transaction: t }
   );
   //    5b. tentative_calendar_event_ids: remove the sub key (the gcal hold VALUE was
-  //        already read + deleted pre-txn in Step 2 of deleteAccount).
+  //        already read + deleted pre-txn in Step 2 of deleteAccount). STAYS sub-keyed
+  //        (out of scope, Anti-Pattern A1) — this map pairs with the still-sub-keyed
+  //        Google Calendar hold ids, so it is deliberately NOT re-keyed to the UUID.
   await sequelize.query(
     `UPDATE "AvailabilitySuggestions"
         SET tentative_calendar_event_ids = tentative_calendar_event_ids - :sub
       WHERE tentative_calendar_event_ids ? :sub`,
     { replacements: { sub }, transaction: t }
   );
+  //    5c. selected_member_ids scrub (Phase 87.4 Plan 06 / D-09 debt fold-in). The
+  //        deleting user's UUID can appear in the nested
+  //        GroupPromptSettings.template_config.schedules[].selected_member_ids arrays
+  //        (backfilled to Users.id UUIDs by Plan 04). GroupPromptSettings survives the
+  //        deletion (created_by_user_id is SET NULL, not CASCADE), so without an explicit
+  //        scrub the deleted user's UUID lingers in these arrays (T-874-06-D09,
+  //        privacy/integrity). This is a NESTED-JSONB array-of-objects mutation, so it is
+  //        an app-level read-modify-write (raw nested-path SQL rejected as brittle — same
+  //        shape as the Plan 04 backfill), NOT a top-level jsonb `-` operator.
+  //        RACE (T-874-06-RACE, Pitfall / T8): the same GroupPromptSettings rows are
+  //        read-modify-written by the schedule PATCH/POST handlers
+  //        (routes/groupPromptSettings.js:305-338) under a FOR UPDATE row lock. The scrub
+  //        therefore runs INSIDE the deletion transaction `t` and takes the SAME row-level
+  //        lock (lock: t.LOCK.UPDATE) on the settings rows, holding it across read->write
+  //        for the remainder of the transaction. A concurrent schedule edit blocks behind
+  //        this lock and cannot commit a re-added UUID between the scrub's read and write.
+  const promptSettingsRows = await GroupPromptSettings.findAll({
+    transaction: t,
+    lock: t.LOCK.UPDATE,
+  });
+  for (const settings of promptSettingsRows) {
+    const schedules = settings.template_config && settings.template_config.schedules;
+    if (!Array.isArray(schedules)) continue;
+    let changed = false;
+    const updatedSchedules = schedules.map((s) => {
+      if (!s || !Array.isArray(s.selected_member_ids)) return s;
+      if (!s.selected_member_ids.includes(uuid)) return s;
+      changed = true;
+      return {
+        ...s,
+        selected_member_ids: s.selected_member_ids.filter((id) => id !== uuid),
+      };
+    });
+    if (changed) {
+      await settings.update(
+        { template_config: { ...settings.template_config, schedules: updatedSchedules } },
+        { transaction: t }
+      );
+    }
+  }
 
   // 6. INSERT the durable PendingAuth0Deletion marker (D-08 backstop) — BEFORE the
   //    User.destroy, inside the same transaction, so it commits atomically with the
