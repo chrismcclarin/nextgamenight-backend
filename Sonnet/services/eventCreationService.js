@@ -13,6 +13,7 @@ const {
 } = require('../models');
 const emailService = require('./emailService');
 const tentativeHoldService = require('./tentativeHoldService');
+const { isUuid } = require('../utils/resolveTargetUser');
 
 /**
  * Calculate duration in minutes between two dates
@@ -166,15 +167,19 @@ async function convertSuggestionToEvent(suggestionId, creatorUserId, options = {
     }, { transaction });
 
     // 4. Fetch users from participant_user_ids
-    // These are Auth0 user_id strings stored in the suggestion
-    const participantUserIds = suggestion.participant_user_ids || [];
+    // Phase 87.4 (D-05): participant_user_ids stores Users.id UUIDs. Filter out any
+    // non-UUID-shaped entry (deploy-window sub residue re-aggregated by old code
+    // after the sweep migration ran, before this prompt was refreshed/closed again)
+    // BEFORE the id-keyed query, so a sub-shaped string never reaches the UUID
+    // column and throws a Postgres 22P02 (mirrors Plan 11's fanout shape-filter).
+    const participantUserIds = (suggestion.participant_user_ids || []).filter(isUuid);
 
     let users = [];
     if (participantUserIds.length > 0) {
       // BSEC-01 (D-03): withContactInfo — these users flow into
       // sendConfirmationEmails which reads u.email to send confirmations.
       users = await User.scope('withContactInfo').findAll({
-        where: { user_id: participantUserIds },
+        where: { id: participantUserIds },
         transaction
       });
     }

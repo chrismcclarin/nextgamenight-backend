@@ -6,6 +6,7 @@ const {
   AvailabilitySuggestion,
   AvailabilityPrompt,
   Game,
+  User,
   sequelize
 } = require('../models');
 const { Op } = require('sequelize');
@@ -54,9 +55,14 @@ async function aggregateResponses(promptId) {
       minParticipants = prompt.Game.min_players || 2;
     }
 
-    // Fetch all responses for this prompt
+    // Fetch all responses for this prompt.
+    // Phase 87.4 (D-05): eager-load each responder's User so we can store the
+    // Users.id UUID (not the Auth0 sub) in participant_user_ids. The association
+    // (AvailabilityResponse.belongsTo(User)) already exists, so this adds no extra
+    // query — the join rides along with the single findAll.
     const responses = await AvailabilityResponse.findAll({
       where: { prompt_id: promptId },
+      include: [{ model: User, attributes: ['id', 'user_id'] }],
       transaction
     });
 
@@ -74,8 +80,18 @@ async function aggregateResponses(promptId) {
     // Key: "start|end" (ISO strings), Value: { participants: Set, preferredBy: Set }
     const slotMap = new Map();
 
+    // Phase 87.4 (D-05): participant_user_ids stores Users.id UUIDs, not Auth0 subs.
+    // Source each participant from response.User.id. A responder whose row has no
+    // resolvable Users row (a departed member — response.User null) is DROPPED from
+    // every slot (never stored as a null, never left as a sub); we log the total
+    // dropped-responder COUNT only (no raw subs, per T14).
+    let droppedResponderCount = 0;
     for (const response of responses) {
-      const userId = response.user_id;
+      const participantUuid = response.User ? response.User.id : null;
+      if (!participantUuid) {
+        droppedResponderCount++;
+        continue;
+      }
       const timeSlots = response.time_slots || [];
 
       for (const slot of timeSlots) {
@@ -92,13 +108,20 @@ async function aggregateResponses(promptId) {
         }
 
         const slotData = slotMap.get(key);
-        slotData.participants.add(userId);
+        slotData.participants.add(participantUuid);
 
         // Track preferred selections
         if (slot.preference === 'preferred') {
-          slotData.preferredBy.add(userId);
+          slotData.preferredBy.add(participantUuid);
         }
       }
+    }
+
+    if (droppedResponderCount > 0) {
+      console.log(
+        `[PU-UUID] Dropped ${droppedResponderCount} responder(s) with no resolvable Users row ` +
+        `from prompt ${promptId} suggestions (count only; no subs logged).`
+      );
     }
 
     // Delete existing suggestions for this prompt (full replace strategy)
