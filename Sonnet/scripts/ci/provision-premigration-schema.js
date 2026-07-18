@@ -69,6 +69,7 @@ const REKEY_FILES = new Set(REKEY.map((r) => r.file));
 const DATA_MIGRATIONS_874 = new Set([
   '20260716000001-sweep-participant-user-ids-uuid.js',   // Plan 03 — participant_user_ids sub→UUID sweep
   '20260716000002-backfill-selected-member-ids-uuid.js', // Plan 04 — selected_member_ids sub→UUID backfill
+  '20260716000003-resweep-selected-member-ids-uuid.js',  // Plan 11 — selected_member_ids PR-2 re-sweep (residue window close)
 ]);
 
 // Every migration the CLI path is expected to apply + book in SequelizeMeta.
