@@ -311,7 +311,12 @@ describe('groupPromptSettings on-write BullMQ hooks', () => {
         default_deadline_hours: 48,
         default_token_expiry_hours: 96,
         min_participants: 3,
-        selected_member_ids: ['m1', 'm2'],
+        // Must be UUID-shaped: the Plan 11 write-path normalizer keeps UUID entries
+        // as-is but DROPS non-UUID entries that don't resolve via the group roster.
+        selected_member_ids: [
+          '22222222-2222-2222-2222-222222222222',
+          '33333333-3333-3333-3333-333333333333'
+        ],
         is_active: true   // branch field — keeps it on the re-register path
       };
 
@@ -334,7 +339,10 @@ describe('groupPromptSettings on-write BullMQ hooks', () => {
       expect(calledSchedule.default_deadline_hours).toBe(48);
       expect(calledSchedule.default_token_expiry_hours).toBe(96);
       expect(calledSchedule.min_participants).toBe(3);
-      expect(calledSchedule.selected_member_ids).toEqual(['m1', 'm2']);
+      expect(calledSchedule.selected_member_ids).toEqual([
+        '22222222-2222-2222-2222-222222222222',
+        '33333333-3333-3333-3333-333333333333'
+      ]);
       expect(calledSchedule.is_active).toBe(true);
     });
 
