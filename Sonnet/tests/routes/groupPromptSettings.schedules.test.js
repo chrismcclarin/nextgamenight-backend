@@ -137,11 +137,13 @@ describe('groupPromptSettings write-path normalization — sub → UUID self-hea
     const schedules = await storedSchedules(group);
     expect(schedules[0].selected_member_ids).toEqual([m1.id]);
 
-    // The drop was logged — counts/UUIDs only, never the raw sub.
+    // The drop was logged — COUNTS ONLY (PR2-L2, owner decision 2026-07-18): never
+    // the raw sub, and never the persisted UUID selection list.
     expect(warnSpy).toHaveBeenCalled();
     const logged = warnSpy.mock.calls.map((c) => c.join(' ')).join('\n');
-    expect(logged).toMatch(/dropped 1/);
+    expect(logged).toMatch(/dropped=1/);
     expect(logged).not.toMatch(/auth0\|not-in-this-group/); // raw sub NEVER logged
+    expect(logged).not.toContain(m1.id); // persisted UUID list NEVER logged (PR2-L2)
     warnSpy.mockRestore();
   });
 
@@ -160,5 +162,125 @@ describe('groupPromptSettings write-path normalization — sub → UUID self-hea
 
     const schedules = await storedSchedules(group);
     expect(schedules[0].selected_member_ids).toEqual([m1.id, m2.id]);
+  });
+
+  // PR2-M2 (87.4-review): a present-but-non-array selected_member_ids (null/string/
+  // object) must 400 on BOTH write handlers — never bypass normalization and persist
+  // verbatim into the JSONB (echoed raw on GET; read as whole-group by the fanout).
+  it('POST create: a present-but-non-array selected_member_ids is rejected with 400 (PR2-M2)', async () => {
+    for (const bad of ['auth0|not-an-array', { 0: 'sneaky' }, null]) {
+      const res = await request(makeApp())
+        .post(`/api/groups/${group.id}/prompt-settings/schedules`)
+        .send({
+          schedule_day_of_week: 1,
+          schedule_time: '17:00',
+          schedule_timezone: 'UTC',
+          selected_member_ids: bad,
+        });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/must be an array/);
+    }
+    expect(await storedSchedules(group)).toHaveLength(0); // nothing persisted
+  });
+
+  it('PATCH update: a present-but-non-array selected_member_ids is rejected with 400, prior value preserved (PR2-M2)', async () => {
+    const created = await request(makeApp())
+      .post(`/api/groups/${group.id}/prompt-settings/schedules`)
+      .send({
+        schedule_day_of_week: 2,
+        schedule_time: '18:00',
+        schedule_timezone: 'UTC',
+        selected_member_ids: [m1.id],
+      });
+    expect(created.status).toBe(201);
+    const scheduleId = created.body.schedule.id;
+
+    const res = await request(makeApp())
+      .patch(`/api/groups/${group.id}/prompt-settings/schedules/${scheduleId}`)
+      .send({ selected_member_ids: 'auth0|stale-string' });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/must be an array/);
+
+    const schedules = await storedSchedules(group);
+    expect(schedules.find((s) => s.id === scheduleId).selected_member_ids).toEqual([m1.id]);
+  });
+
+  // PR2-M3 (87.4-review): a NON-EMPTY selection whose entries ALL drop must never
+  // persist as [] — empty means "whole group" to the fanout, silently WIDENING an
+  // explicit subset (the read-path fanout guards exactly this shape).
+  it('POST create: a non-empty selection whose entries ALL drop is rejected with 400 (PR2-M3)', async () => {
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const res = await request(makeApp())
+      .post(`/api/groups/${group.id}/prompt-settings/schedules`)
+      .send({
+        schedule_day_of_week: 3,
+        schedule_time: '19:30',
+        schedule_timezone: 'UTC',
+        selected_member_ids: ['auth0|departed-member-1', 'auth0|departed-member-2'],
+      });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/no longer in this group/);
+    expect(await storedSchedules(group)).toHaveLength(0); // never persisted as []
+    warnSpy.mockRestore();
+  });
+
+  it('PATCH update: an all-dropped selection is rejected with 400 and the prior selection is preserved (PR2-M3)', async () => {
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const created = await request(makeApp())
+      .post(`/api/groups/${group.id}/prompt-settings/schedules`)
+      .send({
+        schedule_day_of_week: 4,
+        schedule_time: '20:30',
+        schedule_timezone: 'UTC',
+        selected_member_ids: [m1.id],
+      });
+    expect(created.status).toBe(201);
+    const scheduleId = created.body.schedule.id;
+
+    const res = await request(makeApp())
+      .patch(`/api/groups/${group.id}/prompt-settings/schedules/${scheduleId}`)
+      .send({ selected_member_ids: ['auth0|every-selected-member-departed'] });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/no longer in this group/);
+
+    // The explicit subset was preserved — never widened to whole-group.
+    const schedules = await storedSchedules(group);
+    expect(schedules.find((s) => s.id === scheduleId).selected_member_ids).toEqual([m1.id]);
+    warnSpy.mockRestore();
+  });
+
+  // PR2-L1 (87.4-review): default-deny is now uniform across BOTH keyspaces — a
+  // UUID-shaped entry NOT in the group's active roster is dropped exactly like an
+  // unresolvable sub (previously any well-formed UUID persisted unchecked).
+  it('POST create: a UUID-shaped entry NOT in the group roster is dropped like an unresolvable sub (PR2-L1)', async () => {
+    const outsider = await makeUser({ username: 'sched-outsider' }); // real user, NOT in the group
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const res = await request(makeApp())
+      .post(`/api/groups/${group.id}/prompt-settings/schedules`)
+      .send({
+        schedule_day_of_week: 5,
+        schedule_time: '21:30',
+        schedule_timezone: 'UTC',
+        selected_member_ids: [outsider.id, m1.id], // one non-roster UUID + one member
+      });
+
+    expect(res.status).toBe(201);
+    expect(res.body.schedule.selected_member_ids).toEqual([m1.id]);
+
+    const schedules = await storedSchedules(group);
+    expect(schedules[0].selected_member_ids).toEqual([m1.id]);
+
+    // COUNTS ONLY in the log (PR2-L2): no raw sub, no UUID selection list.
+    const logged = warnSpy.mock.calls.map((c) => c.join(' ')).join('\n');
+    expect(logged).toMatch(/dropped=1/);
+    expect(logged).not.toContain(outsider.id);
+    expect(logged).not.toContain(m1.id);
+    warnSpy.mockRestore();
   });
 });

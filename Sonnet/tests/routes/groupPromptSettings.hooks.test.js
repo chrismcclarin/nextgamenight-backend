@@ -301,6 +301,16 @@ describe('groupPromptSettings on-write BullMQ hooks', () => {
       mockSettingsFindOne.mockResolvedValue(settingsRow);
       mockSettingsUpdate.mockResolvedValue(settingsRow);
 
+      // PR2-L1 (87.4-review): the write-path normalizer now default-denies any
+      // UUID-shaped entry NOT in the group's active roster. Seed the mocked roster
+      // (shape matches loadGroupRoster's UserGroup → User include) with the two
+      // fixture UUIDs so they survive the pick — without this the normalizer drops
+      // both and the PR2-M3 all-dropped guard 400s the request.
+      mockUserGroupFindAll.mockResolvedValue([
+        { User: { id: '22222222-2222-2222-2222-222222222222', user_id: 'auth0|fixture-member-2' } },
+        { User: { id: '33333333-3333-3333-3333-333333333333', user_id: 'auth0|fixture-member-3' } }
+      ]);
+
       // Supply a new value for every consumer-read field in one PATCH.
       const updates = {
         schedule_day_of_week: 5,

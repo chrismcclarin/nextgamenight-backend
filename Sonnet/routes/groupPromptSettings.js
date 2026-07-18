@@ -60,24 +60,36 @@ async function loadGroupRoster(group_id) {
 // could save them AFTER the re-sweep migration ran; without this, the fanout's UUID
 // shape filter would then silently and permanently exclude those members. Instead we
 // self-heal on write:
-//   - an already-UUID entry (isUuid) is kept as-is;
+//   - an already-UUID entry is kept ONLY if it belongs to the group's active roster
+//     (PR2-L1, 87.4-review: default-deny is uniform across BOTH keyspaces — a
+//     non-member/random UUID is dropped exactly like an unresolvable sub);
 //   - a sub-shaped entry is resolved to its Users.id via the group roster;
-//   - an unresolvable entry (departed / non-member) is DROPPED and logged (COUNTS +
-//     resolved UUIDs only — NEVER the raw Auth0 sub; PII in logs).
+//   - an unresolvable entry (departed / non-member) is DROPPED and logged (COUNTS
+//     ONLY — never the raw Auth0 sub, and never the persisted UUID selection list;
+//     PR2-L2, owner decision 2026-07-18: member-selection associations stay out of
+//     Railway logs).
 // This makes Plan 12's "no sub-shaped entries remain post-deploy" gate true by
 // construction on both persistence paths, not just at the point-in-time re-sweep.
 function normalizeSelectedMemberIds(selectedMemberIds, roster, group_id) {
   if (!Array.isArray(selectedMemberIds)) return selectedMemberIds;
-  const subToUuid = new Map(
-    roster
-      .filter((ug) => ug.User && ug.User.id && ug.User.user_id)
-      .map((ug) => [ug.User.user_id, ug.User.id])
+  const activeRosterUsers = roster.filter(
+    (ug) => ug.User && ug.User.id && ug.User.user_id
   );
+  const subToUuid = new Map(
+    activeRosterUsers.map((ug) => [ug.User.user_id, ug.User.id])
+  );
+  // PR2-L1 (87.4-review): roster UUID set — a UUID-shaped entry must ALSO belong to
+  // the group's active roster or it is dropped, same as an unresolvable sub.
+  const rosterUuids = new Set(activeRosterUsers.map((ug) => ug.User.id));
   const normalized = [];
   let droppedCount = 0;
   for (const entry of selectedMemberIds) {
     if (isUuid(entry)) {
-      normalized.push(entry); // already correct — no-op
+      if (rosterUuids.has(entry)) {
+        normalized.push(entry); // roster member, already correct — no-op
+      } else {
+        droppedCount += 1; // non-roster UUID — default-deny (PR2-L1)
+      }
     } else if (subToUuid.has(entry)) {
       normalized.push(subToUuid.get(entry)); // stale sub -> Users.id UUID (self-heal)
     } else {
@@ -85,11 +97,12 @@ function normalizeSelectedMemberIds(selectedMemberIds, roster, group_id) {
     }
   }
   if (droppedCount > 0) {
-    // COUNTS + persisted UUIDs only — never the raw Auth0 sub (PII).
+    // PR2-L2 (87.4-review, owner decision 2026-07-18): COUNTS ONLY — never the raw
+    // Auth0 sub (PII) and never the persisted UUID list (member-selection
+    // associations stay out of logs).
     console.warn(
       `[groupPromptSettings] normalizeSelectedMemberIds group=${group_id}: ` +
-        `dropped ${droppedCount} unresolvable entr${droppedCount === 1 ? 'y' : 'ies'}; ` +
-        `persisted ${normalized.length} UUID(s): [${normalized.join(', ')}]`
+        `dropped=${droppedCount}, persisted=${normalized.length}`
     );
   }
   return normalized;
@@ -291,11 +304,30 @@ router.post('/:group_id/prompt-settings/schedules', async (req, res) => {
     // taken (never hold the lock across a member lookup) — so a stale FE tab that
     // still holds sub-valued members[].user_id cannot reintroduce sub residue that the
     // fanout shape filter would then silently exclude. Unresolvable entries dropped +
-    // logged (counts/UUIDs only). Same shared helper runs on the PATCH route.
+    // logged (counts only). Same shared helper runs on the PATCH route.
+    //
+    // PR2-M2 (87.4-review): a present-but-non-array selected_member_ids (null /
+    // string / object) would bypass normalization, persist verbatim into the JSONB
+    // blob, echo raw on GET, and read as "no subset" (whole-group) at the fanout —
+    // reject it up front.
+    const hasSelectedMemberIds = Object.prototype.hasOwnProperty.call(
+      req.body, 'selected_member_ids'
+    );
+    if (hasSelectedMemberIds && !Array.isArray(selected_member_ids)) {
+      return res.status(400).json({ error: 'selected_member_ids must be an array' });
+    }
     const roster = await loadGroupRoster(group_id);
     const normalizedSelectedMemberIds = normalizeSelectedMemberIds(
       selected_member_ids || [], roster, group_id
     );
+    // PR2-M3 (87.4-review): a NON-EMPTY selection whose entries ALL dropped (e.g. a
+    // stale tab whose selected members every one departed) must never persist as [] —
+    // an empty selected_member_ids means "whole group" to the fanout, silently
+    // WIDENING an explicit subset. Reject; the client re-fetches a fresh roster.
+    if (hasSelectedMemberIds && selected_member_ids.length > 0
+      && normalizedSelectedMemberIds.length === 0) {
+      return res.status(400).json({ error: 'selected members are no longer in this group' });
+    }
 
     // Create new schedule object
     const newSchedule = {
@@ -435,10 +467,21 @@ router.patch('/:group_id/prompt-settings/schedules/:schedule_id', async (req, re
     let normalizedSelectedMemberIds;
     const patchesSelectedMembers = Object.prototype.hasOwnProperty.call(req.body, 'selected_member_ids');
     if (patchesSelectedMembers) {
+      // PR2-M2 (87.4-review): present-but-non-array → 400 (see the POST handler —
+      // a non-array would bypass normalization and persist verbatim into the JSONB).
+      if (!Array.isArray(req.body.selected_member_ids)) {
+        return res.status(400).json({ error: 'selected_member_ids must be an array' });
+      }
       const roster = await loadGroupRoster(group_id);
       normalizedSelectedMemberIds = normalizeSelectedMemberIds(
         req.body.selected_member_ids, roster, group_id
       );
+      // PR2-M3 (87.4-review): non-empty input that normalized to EMPTY must not
+      // persist a silently-widened whole-group selection (see the POST handler).
+      if (req.body.selected_member_ids.length > 0
+        && normalizedSelectedMemberIds.length === 0) {
+        return res.status(400).json({ error: 'selected members are no longer in this group' });
+      }
     }
 
     // BINT-01 (T-87-09): serialize concurrent editors of this group's schedules
