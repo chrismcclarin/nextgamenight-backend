@@ -340,9 +340,12 @@ describe('accountDeletion integrity — full disposition table on real Postgres 
     expect(await Feedback.count({ where: { user_id: target.user_id } })).toBe(0);
     expect(await Feedback.count({ where: { user_email: target.email } })).toBe(0);
 
-    // JSONB scrub — target sub removed from both shapes, participant_count recomputed.
+    // JSONB scrub — target UUID removed from participant_user_ids (Plan 03 flip: the
+    // column now holds Users.id UUIDs, so the 5a surgery removes target.id), count
+    // recomputed. tentative_calendar_event_ids stays sub-keyed (5b), target sub removed.
     const suggAfter = await AvailabilitySuggestion.findByPk(tSuggestion.id);
     expect(suggAfter).not.toBeNull();
+    expect(suggAfter.participant_user_ids).not.toContain(target.id);
     expect(suggAfter.participant_user_ids).not.toContain(target.user_id);
     expect(suggAfter.participant_user_ids).toEqual([]);
     expect(suggAfter.participant_count).toBe(0);
@@ -391,9 +394,9 @@ describe('accountDeletion integrity — full disposition table on real Postgres 
     const cFbAfter = await Feedback.findByPk(cFeedback.id);
     expect(cFbAfter.user_id).toBe(control.user_id);
     expect(cFbAfter.user_email).toBe(control.email);
-    // control's suggestion untouched (still holds control's sub).
+    // control's suggestion untouched (still holds control's UUID — Plan 03 flip).
     const cSuggAfter = await AvailabilitySuggestion.findByPk(cSuggestion.id);
-    expect(cSuggAfter.participant_user_ids).toContain(control.user_id);
+    expect(cSuggAfter.participant_user_ids).toContain(control.id);
     expect(cSuggAfter.participant_count).toBe(1);
 
     // External boundaries were exercised (target had Google tokens) but never blocked.
@@ -455,5 +458,79 @@ describe('accountDeletion integrity — full disposition table on real Postgres 
     // No external side effects fired on a blocked run.
     expect(mockDeleteUser).not.toHaveBeenCalled();
     expect(mockEmailSend).not.toHaveBeenCalled();
+  });
+
+  test('Phase 87.4 D-09 — deletion scrubs the UUID from participant_user_ids AND selected_member_ids; a second member survives with correct counts', async () => {
+    // A group the target does NOT own (so target is freely deletable). Both the target
+    // and a second member appear in a shared suggestion + a shared prompt-settings
+    // schedule, so we can prove the scrub removes ONLY the target's UUID.
+    const owner = await makeUser();
+    const target = await makeUser();
+    const secondMember = await makeUser();
+
+    const group = await makeGroup();
+    await addToGroup(owner, group, 'owner');
+    await addToGroup(target, group, 'member');
+    await addToGroup(secondMember, group, 'member');
+
+    const prompt = await makePrompt(group);
+
+    // Multi-member suggestion: participant_user_ids holds BOTH members' Users.id UUIDs
+    // (Plan 03 flip). participant_count = 2 to match.
+    const suggestion = await makeAvailabilitySuggestion(prompt, target, {
+      participant_user_ids: [target.id, secondMember.id],
+      participant_count: 2,
+    });
+
+    // GroupPromptSettings with a schedule whose selected_member_ids lists both members'
+    // UUIDs (Plan 04 backfill shape).
+    const settings = await makeGroupPromptSettings(group, owner, {
+      template_config: {
+        schedules: [
+          {
+            id: 'sched-d09',
+            is_active: true,
+            selected_member_ids: [target.id, secondMember.id],
+          },
+          {
+            id: 'sched-empty',
+            is_active: true,
+            selected_member_ids: [], // untouched control schedule
+          },
+        ],
+      },
+    });
+
+    // Pre-delete: both UUIDs present in both keyspaces.
+    const suggBefore = await AvailabilitySuggestion.findByPk(suggestion.id);
+    expect(suggBefore.participant_user_ids).toEqual(
+      expect.arrayContaining([target.id, secondMember.id])
+    );
+    const settingsBefore = await GroupPromptSettings.findByPk(settings.id);
+    expect(settingsBefore.template_config.schedules[0].selected_member_ids).toEqual(
+      expect.arrayContaining([target.id, secondMember.id])
+    );
+
+    // DELETE the target.
+    const result = await deleteAccount({ userId: target.user_id });
+    expect(result).toEqual({ status: 'deleted' });
+
+    // participant_user_ids: target UUID gone, second member survives, count recomputed.
+    const suggAfter = await AvailabilitySuggestion.findByPk(suggestion.id);
+    expect(suggAfter.participant_user_ids).not.toContain(target.id);
+    expect(suggAfter.participant_user_ids).toContain(secondMember.id);
+    expect(suggAfter.participant_user_ids).toEqual([secondMember.id]);
+    expect(suggAfter.participant_count).toBe(1);
+
+    // selected_member_ids: target UUID gone from the schedule, second member survives.
+    const settingsAfter = await GroupPromptSettings.findByPk(settings.id);
+    const scrubbed = settingsAfter.template_config.schedules.find((s) => s.id === 'sched-d09');
+    expect(scrubbed.selected_member_ids).not.toContain(target.id);
+    expect(scrubbed.selected_member_ids).toContain(secondMember.id);
+    expect(scrubbed.selected_member_ids).toEqual([secondMember.id]);
+    // The unrelated empty schedule is preserved intact (no collateral change).
+    const untouched = settingsAfter.template_config.schedules.find((s) => s.id === 'sched-empty');
+    expect(untouched).toBeTruthy();
+    expect(untouched.selected_member_ids).toEqual([]);
   });
 });
