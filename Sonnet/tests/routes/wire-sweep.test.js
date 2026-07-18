@@ -462,7 +462,10 @@ describe('Wire sweep (87.3-09 Req 1): no Auth0 sub crosses the wire outside the 
 // ===========================================================================
 // Phase 87.4 Plan 11 (PR-2): the formerly-allowlisted availability + prompt-settings
 // surface. The allowlist is now EMPTY — every endpoint below is exercised for a
-// sub-free assertion. The two magic-token-authed endpoints
+// sub-free assertion, INCLUDING the three the first cut of this suite skipped
+// while claiming complete exercise (PR2-H1, 87.4-review): POST
+// /prompts/:promptId/suggestions/refresh, POST /suggestions/:suggestionId/convert,
+// and GET /groups/:groupId/prompts/active. The two magic-token-authed endpoints
 // (availability-responses / availability-prefill) mint a REAL magic token (they do
 // NOT use Auth0). availability-prefill/gcal is CLEAN by construction (emits only
 // { slot_ids, count }) but returns 400 without a live Google Calendar connection —
@@ -658,6 +661,44 @@ describe('Wire sweep (87.4-11 PR-2): availability + prompt-settings — allowlis
   it('availability suggestions: GET /prompts/:id/suggestions (participant_user_ids UUID array)', async () => {
     const suggestions = await request(availApp).get(`/api/prompts/${prompt.id}/suggestions`);
     expectSubFree(suggestions, 'GET /prompts/:promptId/suggestions');
+  });
+
+  // PR2-H1 (87.4-review): the three formerly-excluded endpoints the coverage claim
+  // named but this suite never requested — POST suggestions/refresh, POST
+  // suggestions/:id/convert, GET prompts/active. Each is now exercised for real.
+  it('availability suggestions: POST /prompts/:id/suggestions/refresh (admin actor) — response sub-free at any status (PR2-H1)', async () => {
+    // Body is asserted sub-free WHATEVER the status (counts/message shape), then
+    // non-vacuously: the seeded member response aggregates into >=1 suggestion.
+    const refresh = await request(availApp).post(`/api/prompts/${prompt.id}/suggestions/refresh`);
+    expectBodySubFree(refresh, 'POST /prompts/:promptId/suggestions/refresh');
+    expect(refresh.status).toBe(200);
+    expect(refresh.body.success).toBe(true);
+    expect(refresh.body.suggestion_count).toBeGreaterThan(0);
+  });
+
+  it('availability suggestions: POST /suggestions/:id/convert creates the event — 201 body sub-free (PR2-H1)', async () => {
+    // Fresh suggestion with NO tentative gcal holds (post-commit hold cleanup then
+    // has nothing to reach Google for; test users hold no calendar tokens anyway).
+    const convertible = await makeAvailabilitySuggestion(prompt, member, {
+      tentative_calendar_event_ids: {},
+    });
+
+    const convert = await request(availApp)
+      .post(`/api/suggestions/${convertible.id}/convert`)
+      .send({ send_emails: false });
+    expect(convert.status).toBe(201);
+    expectSubFree(convert, 'POST /suggestions/:suggestionId/convert');
+    // Non-vacuous: a real event with the seeded UUID participant was created.
+    expect(convert.body.event_id).toBeDefined();
+    expect(convert.body.event.participant_count).toBe(1);
+  });
+
+  it('availability prompts: GET /groups/:groupId/prompts/active returns the raw prompt row sub-free (PR2-H1)', async () => {
+    const active = await request(availApp).get(`/api/groups/${group.id}/prompts/active`);
+    expectSubFree(active, 'GET /groups/:groupId/prompts/active');
+    // Non-vacuous: the seeded active prompt is the one returned.
+    expect(active.body.prompt).toBeTruthy();
+    expect(active.body.prompt.id).toBe(prompt.id);
   });
 
   it('magic-token: availability-responses POST + GET (minted token, no Auth0) — sub-free', async () => {
