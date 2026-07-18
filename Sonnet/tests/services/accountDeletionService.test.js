@@ -36,6 +36,7 @@ const mockSequelizeQuery = jest.fn();
 const mockSequelizeTransaction = jest.fn();
 const mockMarkerFindOne = jest.fn();
 const mockMarkerCreate = jest.fn();
+const mockGPSFindAll = jest.fn();
 
 const mockDeleteCalEvent = jest.fn();
 const mockDeleteHolds = jest.fn();
@@ -68,6 +69,11 @@ jest.mock('../../models', () => ({
   Feedback: { update: jest.fn().mockResolvedValue([0]) },
   EventBallotOption: { update: jest.fn().mockResolvedValue([0]) },
   AvailabilitySuggestion: { findAll: jest.fn().mockResolvedValue([]) },
+  // Phase 87.4 Plan 06 (5c scrub): the deletion txn loads GroupPromptSettings rows
+  // FOR UPDATE and scrubs the deleting user's UUID from the nested
+  // template_config.schedules[].selected_member_ids arrays. Mock findAll so the
+  // scrub no-ops by default; individual tests override mockGPSFindAll to exercise it.
+  GroupPromptSettings: { findAll: (...a) => mockGPSFindAll(...a) },
   PendingAuth0Deletion: {
     findOne: (...a) => mockMarkerFindOne(...a),
     create: (...a) => mockMarkerCreate(...a),
@@ -128,6 +134,7 @@ beforeEach(() => {
   mockSequelizeQuery.mockResolvedValue([]);
   mockMarkerFindOne.mockResolvedValue({ update: jest.fn().mockResolvedValue(undefined) });
   mockMarkerCreate.mockResolvedValue({ id: 'marker-1' });
+  mockGPSFindAll.mockResolvedValue([]); // no prompt-settings rows -> 5c scrub no-ops
 
   mockDeleteCalEvent.mockResolvedValue({ deleted: true });
   mockDeleteHolds.mockResolvedValue({ deleted: 0, failed: 0 });
@@ -328,6 +335,57 @@ describe('deleteAccount — notice email (REQ-8)', () => {
     mockEmailSend.mockRejectedValue(new Error('Resend down'));
     const res = await deleteAccount({ userId: SUB });
     expect(res).toEqual({ status: 'deleted' });
+  });
+});
+
+describe('deleteAccount — GroupPromptSettings selected_member_ids scrub (5c / D-09)', () => {
+  test('scrubs the deleting user UUID from schedules[].selected_member_ids and saves', async () => {
+    const settingsUpdate = jest.fn().mockResolvedValue(undefined);
+    // One row: schedule[0] contains the deleting user's UUID (must be scrubbed),
+    // schedule[1] does not (must be left untouched -> single write, filtered array).
+    const settingsRow = {
+      template_config: {
+        schedules: [
+          { id: 's0', selected_member_ids: [UUID, '22222222-2222-2222-2222-222222222222'] },
+          { id: 's1', selected_member_ids: ['33333333-3333-3333-3333-333333333333'] },
+        ],
+      },
+      update: settingsUpdate,
+    };
+    mockGPSFindAll.mockResolvedValue([settingsRow]);
+
+    const res = await deleteAccount({ userId: SUB });
+    expect(res).toEqual({ status: 'deleted' });
+
+    // Loaded FOR UPDATE inside the deletion txn.
+    expect(mockGPSFindAll).toHaveBeenCalledTimes(1);
+    expect(mockGPSFindAll.mock.calls[0][0]).toEqual(
+      expect.objectContaining({ lock: 'UPDATE' })
+    );
+
+    // The row was rewritten with the deleting user's UUID removed from schedule[0],
+    // the other members and the untouched schedule preserved.
+    expect(settingsUpdate).toHaveBeenCalledTimes(1);
+    const patch = settingsUpdate.mock.calls[0][0];
+    expect(patch.template_config.schedules).toEqual([
+      { id: 's0', selected_member_ids: ['22222222-2222-2222-2222-222222222222'] },
+      { id: 's1', selected_member_ids: ['33333333-3333-3333-3333-333333333333'] },
+    ]);
+  });
+
+  test('does not save a row that does not contain the deleting user UUID', async () => {
+    const settingsUpdate = jest.fn().mockResolvedValue(undefined);
+    mockGPSFindAll.mockResolvedValue([
+      {
+        template_config: {
+          schedules: [{ id: 's0', selected_member_ids: ['22222222-2222-2222-2222-222222222222'] }],
+        },
+        update: settingsUpdate,
+      },
+    ]);
+
+    await deleteAccount({ userId: SUB });
+    expect(settingsUpdate).not.toHaveBeenCalled();
   });
 });
 
