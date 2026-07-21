@@ -952,7 +952,21 @@ router.put('/:id', validateUUID('id'), validateEventUpdate, async (req, res) => 
       // DELETE endpoint pattern). One row per removed user so EVT-08
       // silent-welcome-back suppression on QR re-join works the same whether
       // the user was removed via Edit Event or via the per-row Remove control.
-      for (const removedUuid of removedUserIds) {
+      //
+      // 87.5 Req 9: the audit actor is the caller's Users.id UUID (no FK on the
+      // column — audit rows survive account deletion). Resolve it ONCE, hoisted
+      // above the per-removed-user loop: the caller's own UUID is the same on
+      // every iteration (only removedUuid, the per-row payload, varies), so
+      // resolving inside the loop would fire N redundant User.findOne queries.
+      const actorUuid = req.selfUuid || (await User.findOne({ where: { user_id: userId }, attributes: ['id'] }))?.id;
+      if (!actorUuid) {
+        // Resolve-miss: no Users row matched the caller's own sub. Should not
+        // happen for an authenticated caller; log explicitly (rather than
+        // silently skipping inside the non-fatal catch below) so the lost audit
+        // rows are observable in logs.
+        console.error(`[events:put-participants] audit actor resolve-miss for caller sub=${userId} — skipping ${removedUserIds.length} audit write(s)`);
+      }
+      for (const removedUuid of actorUuid ? removedUserIds : []) {
         try {
           const removeNowMs = Date.now();
           const startMs = event.start_date ? new Date(event.start_date).getTime() : 0;
@@ -961,7 +975,7 @@ router.put('/:id', validateUUID('id'), validateEventUpdate, async (req, res) => 
           await EventAuditLog.create({
             event_id: event.id,
             group_id: event.group_id,
-            actor_user_id: userId,
+            actor_user_id: actorUuid,
             action: 'remove_participant',
             was_after_start: wasAfterStart,
             was_within_15min_grace: wasWithin15MinGrace,
@@ -1472,7 +1486,17 @@ router.delete('/:event_id/participations/:user_id', validateUUID('event_id'), va
     // suppressed_email is moot here (we don't send any email on this action),
     // recorded as false. was_after_start / was_within_15min_grace use the
     // same comparisons as the delete-event handler so reports stay consistent.
-    try {
+    //
+    // 87.5 Req 9: record the caller's Users.id UUID (no FK — audit rows survive
+    // account deletion). callerDbUser was already resolved above (~L1442) for the
+    // self-leave gate, so reuse its id rather than re-querying.
+    const actorUuid = callerDbUser?.id;
+    if (!actorUuid) {
+      // Resolve-miss: an organizer with no Users row of their own reached here
+      // (isOrganizer true, callerDbUser null). Log rather than silently skip.
+      console.error(`[events:remove-participant] audit actor resolve-miss for caller sub=${userId} — skipping audit write`);
+    }
+    if (actorUuid) try {
       const removeNowMs = Date.now();
       const startMs = event.start_date ? new Date(event.start_date).getTime() : 0;
       const wasAfterStart = startMs > 0 && removeNowMs >= startMs;
@@ -1481,7 +1505,7 @@ router.delete('/:event_id/participations/:user_id', validateUUID('event_id'), va
       await EventAuditLog.create({
         event_id: event.id,
         group_id: event.group_id,
-        actor_user_id: userId,
+        actor_user_id: actorUuid,
         action: 'remove_participant',
         was_after_start: wasAfterStart,
         was_within_15min_grace: wasWithin15MinGrace,
@@ -1649,11 +1673,21 @@ router.delete('/:id', async (req, res) => {
     // This is OUTSIDE the cancellationEmailsAllowed guard intentionally —
     // silent late-deletes still need to be answerable by support.
     // Non-fatal: never block the delete on audit log failure.
-    try {
+    //
+    // 87.5 Req 9: record the caller's Users.id UUID (no FK — audit rows survive
+    // account deletion). No callerDbUser in scope on this handler, so resolve the
+    // caller's own UUID from their sub.
+    const actorUuid = req.selfUuid || (await User.findOne({ where: { user_id: userId }, attributes: ['id'] }))?.id;
+    if (!actorUuid) {
+      // Resolve-miss: no Users row matched the caller's own sub. Log explicitly
+      // rather than silently skipping inside the non-fatal catch below.
+      console.error(`[events:delete] audit actor resolve-miss for caller sub=${userId} — skipping audit write`);
+    }
+    if (actorUuid) try {
       await EventAuditLog.create({
         event_id: event.id,
         group_id: event.group_id,
-        actor_user_id: userId,
+        actor_user_id: actorUuid,
         action: 'delete',
         was_after_start: wasAfterStart,
         was_within_15min_grace: wasWithin15MinGrace,

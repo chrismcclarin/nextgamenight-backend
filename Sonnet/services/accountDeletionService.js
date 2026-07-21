@@ -29,8 +29,11 @@
 //
 // SURVIVING EXCEPTIONS (completeness-by-enumeration — these are INTENTIONALLY NOT
 // touched, per SPEC out-of-scope):
-//   - EventAuditLog.actor_user_id (Auth0 string, no FK) — legitimate-interest audit
-//     trail; SPEC-accepted exception.
+//   - EventAuditLog.actor_user_id (Users.id UUID going forward — 87.5 write-forward,
+//     Req 9; column type stays STRING but records the caller's UUID, no backfill as
+//     the table was empty in prod) — deliberately NO FK so audit rows survive account
+//     deletion; legitimate-interest audit trail, SPEC-accepted exception. This column
+//     is untouched by the deletion flow — only its keyspace description changed.
 //   - EmailMetrics.email_hash — SHA-256-hashed, no direct user link; SPEC-accepted.
 //   - TokenAnalytics (token_id/jti + ip + user_agent, NO user key) — once this user's
 //     MagicToken rows are hard-deleted (below), the jti->user join path is severed, so
