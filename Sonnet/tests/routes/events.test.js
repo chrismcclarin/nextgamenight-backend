@@ -2,6 +2,10 @@
 const request = require('supertest');
 const express = require('express');
 const eventRoutes = require('../../routes/events');
+// Phase 87.5 (BINT-02, PR-1): the POST /events production ballot-creation path stamps
+// created_by_uuid; this suite exercises it AND the routes/ballot.js replace/wipe gate
+// as the same creator, so it mounts BOTH routers on a shared app for that one test.
+const ballotRoutes = require('../../routes/ballot');
 const { Event, Game, User, Group, EventParticipation, EventRsvp, EventBallotOption, UserGroup, sequelize } = require('../../models');
 const { makeUser, makeGroup, addToGroup } = require('../factories');
 const { QueryTypes } = require('sequelize');
@@ -231,6 +235,64 @@ describe('Event Routes', () => {
       // Validation runs before Event.create — no ballot-less event persisted.
       const after = await Event.count({ where: { group_id: testGroup.id } });
       expect(after).toBe(before);
+    });
+
+    // Phase 87.5 (BINT-02, PR-1, T-875-04-PRODPATH): POST /events with embedded
+    // ballot_options is the REAL production ballot-creation path (the FE births every
+    // ballot here). It must stamp created_by_uuid with the creator's Users.id UUID so
+    // the routes/ballot.js creator-authz branch is actually reachable in production. We
+    // use a plain MEMBER creator (not owner/admin) so a passing replace gate proves the
+    // CREATOR branch specifically, not the owner/admin branch.
+    it('stamps created_by_uuid = creator UUID and a non-admin creator passes the replace/wipe gate', async () => {
+      const memberCreator = await makeUser({ username: 'events-ballot-creator' });
+      await addToGroup(memberCreator, testGroup, 'member');
+
+      // One app injecting the member creator; mount BOTH routers so the same caller
+      // hits the events create path AND the ballot replace gate.
+      const combined = express();
+      combined.use(express.json());
+      combined.use((req, _res, next) => {
+        req.user = { user_id: memberCreator.user_id, email: memberCreator.email };
+        next();
+      });
+      combined.use('/api/events', eventRoutes);
+      combined.use('/api/ballot', ballotRoutes);
+
+      const createRes = await request(combined)
+        .post('/api/events')
+        .send({
+          group_id: testGroup.id,
+          game_id: testGame.id,
+          start_date: new Date(Date.now() + 5 * 86400000).toISOString(),
+          duration_minutes: 120,
+          rsvp_deadline: new Date(Date.now() + 2 * 86400000).toISOString(),
+          ballot_options: [
+            { game_name: 'Events Path A' },
+            { game_name: 'Events Path B' },
+          ],
+        })
+        .expect(200);
+
+      const eventId = createRes.body.id;
+      expect(eventId).toBeDefined();
+
+      // Every option born via POST /events carries the creator's UUID — not the sub, not NULL.
+      const rows = await EventBallotOption.findAll({ where: { event_id: eventId } });
+      expect(rows.length).toBeGreaterThanOrEqual(2);
+      expect(rows.every(o => o.created_by_uuid === memberCreator.id)).toBe(true);
+      expect(rows.some(o => o.created_by_uuid === null)).toBe(false);
+
+      // The member creator (NOT an owner/admin) passes the routes/ballot.js replace
+      // gate — proving the creator-authz branch is live for the production path — and
+      // the replacement PRESERVES the creator's UUID (identity never lost/overwritten).
+      const replaceRes = await request(combined)
+        .put(`/api/ballot/${eventId}/options`)
+        .send({ options: [{ game_name: 'Replace A' }, { game_name: 'Replace B' }] });
+      expect(replaceRes.status).toBe(200);
+
+      const afterRows = await EventBallotOption.findAll({ where: { event_id: eventId } });
+      expect(afterRows.map(o => o.game_name).sort()).toEqual(['Replace A', 'Replace B']);
+      expect(afterRows.every(o => o.created_by_uuid === memberCreator.id)).toBe(true);
     });
   });
 

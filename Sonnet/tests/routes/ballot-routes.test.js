@@ -396,8 +396,28 @@ describe('Phase 87 ballot integrity (DB-backed)', () => {
     expect(rows.every(o => o.created_by_uuid === owner.id)).toBe(false);
   });
 
-  // ---- (d) CREATED_BY ON THE PRODUCTION CREATION PATH ----
-  it('stamps created_by=event-creator on a ballot born via POST /events', async () => {
+  it('KEEPS created_by_uuid NULL when an owner/admin replaces a NULL-creator ballot', async () => {
+    // A creatorless (legacy NULL) ballot must STAY creatorless on replace — the
+    // owner/admin editor's identity must never be stamped as the creator, so the
+    // row remains permanently owner/admin-only (D-05). Guards the write-site
+    // distinction between "no ballot exists" (stamp actor) and "ballot exists with
+    // no creator" (preserve NULL) — a plain `?? callerUuid` conflates the two.
+    await seedOptions(2, null); // NULL-creator ballot
+
+    const res = await request(makeApp(owner))
+      .put(`/api/ballot/${event.id}/options`)
+      .send({ options: [{ game_name: 'Admin Rebuild 1' }, { game_name: 'Admin Rebuild 2' }] });
+
+    expect(res.status).toBe(200);
+    const rows = await EventBallotOption.findAll({ where: { event_id: event.id } });
+    expect(rows).toHaveLength(2);
+    // The replaced rows carry NO creator — NOT the owner editor's UUID.
+    expect(rows.every(o => o.created_by_uuid === null)).toBe(true);
+    expect(rows.some(o => o.created_by_uuid === owner.id)).toBe(false);
+  });
+
+  // ---- (d) CREATED_BY_UUID ON THE PRODUCTION CREATION PATH ----
+  it('stamps created_by_uuid=event-creator on a ballot born via POST /events', async () => {
     const res = await request(makeApp(owner))
       .post('/api/events')
       .send({
