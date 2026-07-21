@@ -32,6 +32,30 @@ module.exports = {
 
       // (1) RESIDUE RE-BACKFILL — close the PR-1 deploy-window gap (see sibling header).
       if (table.user_id) {
+        // (0) DEDUPE deploy-window duplicates BEFORE the re-backfill (WR-05).
+        // Constraint this guards: during the PR-1 deploy window, old-bundle writes
+        // land with user_uuid = NULL while the OLD (prompt_id, user_id) unique was
+        // already dropped by 20260720000002 — and NULL user_uuid never collides on
+        // the NEW (prompt_id, user_uuid) unique. So a deploy-window double-submit
+        // can create two NULL-uuid rows for the same (prompt_id, user_id); the
+        // re-backfill below would then set BOTH to the same UUID and violate the
+        // (prompt_id, user_uuid) unique, rolling back the whole PR-2 transaction.
+        // Keep only the newest row per (prompt_id, user_id) among NULL-uuid rows.
+        // The id tiebreaker (UUID PK, orderable in Postgres) guarantees exactly one
+        // survivor even when two duplicates share an identical updatedAt.
+        const [, dedupeMeta] = await sequelize.query(
+          `DELETE FROM "AvailabilityResponses" a
+             USING "AvailabilityResponses" b
+            WHERE a.user_uuid IS NULL AND b.user_uuid IS NULL
+              AND a.prompt_id = b.prompt_id AND a.user_id = b.user_id
+              AND (a."updatedAt" < b."updatedAt"
+                   OR (a."updatedAt" = b."updatedAt" AND a.id < b.id))`,
+          { transaction: t }
+        );
+        console.log(
+          `[AR-DROP] deploy-window duplicate NULL-uuid rows deleted: ${dedupeMeta ? dedupeMeta.rowCount : 0}`
+        );
+
         const [, backfillMeta] = await sequelize.query(
           `UPDATE "AvailabilityResponses" t SET user_uuid = u.id
              FROM "Users" u
