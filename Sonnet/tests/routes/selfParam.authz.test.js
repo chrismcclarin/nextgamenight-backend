@@ -341,10 +341,10 @@ describe('Self-param dual-accept family (87.4-02): sub OR caller-own-UUID author
   describe('lists H-1 family — self-param dual-accept + active-member gate', () => {
     // Positive (authorizes + query executes) assertions use routes with healthy
     // queries (by-theme, player-wins-by-id). The aggregation routes (most-played,
-    // alphabetical, player-games) carry PRE-EXISTING query defects that 500 for any
-    // authorized caller (broken GROUP BY / ambiguous User association — unchanged by
-    // H-1, out of scope), so they're used only for the auth-gate 403 assertions,
-    // which run BEFORE the query and are therefore query-independent.
+    // least-played, alphabetical, player-games) carried PRE-EXISTING query defects
+    // that 500'd for any authorized caller and were DELETED in 87.5-06 (SPEC Req
+    // 9/10); the auth-gate assertions they used to host are now re-pointed onto the
+    // surviving /by-theme route, which shares the identical self-param gate.
     it('by-theme authorizes for the caller OWN UUID shape (member)', async () => {
       const res = await request(app).get(`/api/lists/by-theme/${group.id}/strategy/${caller.id}`);
       expect(res.status).toBe(200);
@@ -375,15 +375,19 @@ describe('Self-param dual-accept family (87.4-02): sub OR caller-own-UUID author
       expect(res.status).toBe(403);
     });
 
-    it('most-played 403s a member requesting ANOTHER user UUID as the self-param (BOLA guard, pre-query)', async () => {
-      const res = await request(app).get(`/api/lists/most-played/${group.id}/${other.id}`);
+    // 87.5-06 (SPEC Req 9/10): most-played was deleted along with least-played,
+    // alphabetical, and player-games. Its former BOLA-guard coverage (a member
+    // requesting ANOTHER user's UUID as the self-param must 403 before the query)
+    // is re-pointed to the surviving /by-theme route, which carries the SAME
+    // matchesSelf gate — so the security assertion is preserved, not dropped.
+    it('by-theme 403s a member requesting ANOTHER user UUID as the self-param (BOLA guard, pre-query)', async () => {
+      const res = await request(app).get(`/api/lists/by-theme/${group.id}/strategy/${other.id}`);
       expect(res.status).toBe(403);
     });
 
-    it('most-played 403s a caller who is NOT an active member (member gate, pre-query)', async () => {
-      currentActor = other.user_id;
+    it('most-played 404s — route deleted in 87.5-06 (no stale 403 against a gone route)', async () => {
       const res = await request(app).get(`/api/lists/most-played/${group.id}/${other.id}`);
-      expect(res.status).toBe(403);
+      expect(res.status).toBe(404);
     });
   });
 
