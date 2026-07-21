@@ -30,6 +30,10 @@ const {
   sequelize,
 } = require('../../models');
 const { generateToken } = require('../../services/magicTokenService');
+// Phase 87.5 Plan 02 — self-CRUD wire + sub-shaped-self-param proofs live here too.
+const { stubAuth } = require('../helpers/authStub');
+const availabilityRoutes = require('../../routes/availability');
+const { makeUser } = require('../factories');
 
 const app = express();
 app.use(express.json());
@@ -365,7 +369,7 @@ describe('POST /api/availability-prefill/saved', () => {
     // Local Mon 19:00 PDT == UTC Tue 02:00. So the expected slot IDs are
     // 2026-05-19T02:00, 02:30, 03:00, 03:30, 04:00, 04:30 (UTC).
     await UserAvailability.create({
-      user_id: recurringUser.user_id,
+      user_uuid: recurringUser.id, // Phase 87.5: table rekeyed to user_uuid (Users.id)
       type: 'recurring_pattern',
       pattern_data: { dayOfWeek: 1, startTime: '19:00', endTime: '22:00', timezone: TZ },
       start_date: '2026-05-01',
@@ -379,7 +383,7 @@ describe('POST /api/availability-prefill/saved', () => {
     // override-beats-recurring result is the recurring 6 slots MINUS
     // 20:00 and 20:30 local = 4 slots.
     await UserAvailability.create({
-      user_id: overrideUser.user_id,
+      user_uuid: overrideUser.id, // Phase 87.5: table rekeyed to user_uuid (Users.id)
       type: 'recurring_pattern',
       pattern_data: { dayOfWeek: 1, startTime: '19:00', endTime: '22:00', timezone: TZ },
       start_date: '2026-05-01',
@@ -388,7 +392,7 @@ describe('POST /api/availability-prefill/saved', () => {
       timezone: TZ,
     });
     await UserAvailability.create({
-      user_id: overrideUser.user_id,
+      user_uuid: overrideUser.id, // Phase 87.5: table rekeyed to user_uuid (Users.id)
       type: 'specific_override',
       pattern_data: { date: '2026-05-18', startTime: '20:00', endTime: '21:00', isAvailable: false },
       start_date: '2026-05-18',
@@ -596,6 +600,108 @@ describe('POST /api/availability-prefill/saved', () => {
     expect(first.status).toBe(200);
     expect(second.status).toBe(200);
     expect(second.body.count).toBe(first.body.count);
+  });
+});
+
+// =====================================================================
+// Phase 87.5 Plan 02 (BINT-02) — routes/availability.js self-CRUD wire + rollout-window proofs.
+//
+// After the UserAvailability rekey (user_uuid FK) and the deletion of the 87.4
+// emission-translation helpers, two behaviors must be proven BEHAVIORALLY (not
+// just by symbol-absence greps):
+//
+//   T-875-02-WIRE: the create-response and GET /patterns rows must still emit a
+//   `user_id` field (the FE availability schema only optionally reads it, so a
+//   silently-omitted key would still parse and ship undetected) whose VALUE is
+//   the caller's Users.id UUID — proving the wire contract did not narrow when
+//   the emit helpers were deleted.
+//
+//   T-875-02-SELF: the create + findAll caller-UUID resolution must work when
+//   the self-param arrives SUB-shaped (the shape 100% of production traffic sends
+//   during the D-02 rollout window, before the FE PR switches to UUID-shaped
+//   self-params). objectAuth.matchesSelf only memoizes req.selfUuid on its
+//   UUID-shaped arm; a regression to `req.selfUuid`-only resolution would 404/500
+//   every sub-shaped caller in prod. Driving a sub-shaped param here catches that.
+// =====================================================================
+describe('routes/availability.js self-CRUD — UUID wire + sub-shaped rollout window (87.5-02)', () => {
+  function makeApp(actor) {
+    const a = express();
+    a.use(express.json());
+    a.use(stubAuth(actor ? { user_id: actor.user_id } : undefined));
+    a.use('/api/availability', availabilityRoutes);
+    return a;
+  }
+
+  const recurringBody = {
+    dayOfWeek: 2,
+    startTime: '19:00',
+    endTime: '21:00',
+    start_date: '2026-06-01',
+    timezone: 'UTC',
+  };
+
+  // The global beforeEach in tests/setup.js TRUNCATEs all tables, so seed fresh here.
+  let user;
+  beforeEach(async () => {
+    user = await makeUser();
+  });
+
+  it('T-875-02-WIRE: create-response and GET /patterns emit user_id === caller Users.id UUID', async () => {
+    const appMe = makeApp(user);
+
+    // Create a recurring pattern. Self-param is the caller's own sub (frozen-FE shape).
+    const createRes = await request(appMe)
+      .post(`/api/availability/user/${encodeURIComponent(user.user_id)}/recurring`)
+      .send(recurringBody);
+
+    expect(createRes.status).toBe(201);
+    // The wire field NAME is unchanged (`user_id`) and its VALUE is the caller's UUID.
+    expect(createRes.body).toHaveProperty('user_id');
+    expect(createRes.body.user_id).toBe(user.id);
+    // UUID, never the Auth0 sub.
+    expect(createRes.body.user_id).not.toBe(user.user_id);
+    expect(String(createRes.body.user_id)).not.toContain('|');
+    // Wire shape stays identical to pre-rekey — the internal user_uuid key is not leaked.
+    expect(createRes.body).not.toHaveProperty('user_uuid');
+
+    // GET /patterns must emit the same user_id UUID on every row.
+    const listRes = await request(appMe)
+      .get(`/api/availability/user/${encodeURIComponent(user.user_id)}/patterns`);
+
+    expect(listRes.status).toBe(200);
+    expect(Array.isArray(listRes.body)).toBe(true);
+    expect(listRes.body.length).toBeGreaterThan(0);
+    for (const row of listRes.body) {
+      expect(row).toHaveProperty('user_id');
+      expect(row.user_id).toBe(user.id);
+      expect(row).not.toHaveProperty('user_uuid');
+    }
+  });
+
+  it('T-875-02-SELF: create + GET /patterns resolve the caller UUID from a SUB-shaped self-param (rollout window)', async () => {
+    const appMe = makeApp(user);
+
+    // Sub-shaped self-param — matchesSelf takes its sub arm and never memoizes
+    // req.selfUuid, so a req.selfUuid-only resolver would fail here.
+    const createRes = await request(appMe)
+      .post(`/api/availability/user/${encodeURIComponent(user.user_id)}/override`)
+      .send({ date: '2026-06-02', startTime: '18:00', endTime: '20:00', isAvailable: true });
+
+    expect(createRes.status).toBe(201);
+    expect(createRes.body.user_id).toBe(user.id);
+
+    // The write actually landed on user_uuid = caller's Users.id (not a null key).
+    const persisted = await UserAvailability.findOne({ where: { user_uuid: user.id } });
+    expect(persisted).not.toBeNull();
+    expect(persisted.user_uuid).toBe(user.id);
+
+    // GET /patterns (sub-shaped self-param) resolves the caller UUID and returns the row.
+    const listRes = await request(appMe)
+      .get(`/api/availability/user/${encodeURIComponent(user.user_id)}/patterns`);
+
+    expect(listRes.status).toBe(200);
+    expect(listRes.body.length).toBe(1);
+    expect(listRes.body[0].user_id).toBe(user.id);
   });
 });
 

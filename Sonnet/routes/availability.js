@@ -12,34 +12,40 @@ const router = express.Router();
 const { body, validationResult } = require('express-validator');
 
 // ---------------------------------------------------------------------------
-// Phase 87.4 Plan 08 (SPEC Req 2, D-03, PR-2): flip self-CRUD + patterns wire
-// emissions from the caller's Auth0 sub to their Users.id UUID. The
-// UserAvailability table stays sub-keyed internally (Phase 87.5 rekeys it); ONLY
-// the emitted user_id field translates. Field NAME stays `user_id`, VALUE flips.
+// Phase 87.5 Plan 02 (BINT-02, BE PR-1 — D-04, D-06): the UserAvailability table
+// is rekeyed to the Users.id UUID (user_uuid FK). Self-CRUD writes/reads key on
+// user_uuid directly and the row carries the UUID, so the 87.4 emission-
+// translation layer is gone — the wire emit reads user_uuid off the row (field
+// NAME stays `user_id`, VALUE = the UUID).
 //
-// Map-miss rule (T5, aligns with Plan 10 z.uuid()): if the caller has no Users
-// row (should never happen for an authenticated caller), OMIT the user_id field
-// rather than leak the sub or emit null.
+// Caller-UUID resolution is still required for the WRITE key and the
+// findAll/patterns read. It prefers `req.selfUuid` (memoized by
+// objectAuth.matchesSelf, but ONLY on the UUID-shaped self-param arm) and falls
+// back to a sub-based Users lookup for the D-02 rollout window — during which
+// every production caller still sends a sub-shaped self-param, so `req.selfUuid`
+// is unset and this fallback is what fires. Fails closed (404) when no caller
+// UUID resolves rather than writing or querying with a null key.
 // ---------------------------------------------------------------------------
 
-// Resolve the authenticated caller's own Users.id UUID from their sub.
-async function resolveCallerUuid(callerSub) {
-  const caller = await User.findOne({ where: { user_id: callerSub }, attributes: ['id'] });
-  return caller ? caller.id : null;
+// Resolve the authenticated caller's own Users.id UUID. Memoizes onto
+// req.selfUuid. Returns null if the caller has no Users row (fail-closed).
+async function resolveSelfUuid(req) {
+  if (req.selfUuid !== undefined) return req.selfUuid; // already resolved (may be null)
+  const sub = req.user && req.user.user_id;
+  if (!sub) { req.selfUuid = null; return null; }
+  const caller = await User.findOne({ where: { user_id: sub }, attributes: ['id'] });
+  req.selfUuid = caller ? caller.id : null;
+  return req.selfUuid;
 }
 
-// Serialize a UserAvailability row with its user_id flipped to the caller's UUID
-// (or the field omitted on an unresolvable caller).
-function withEmittedUuid(row, callerUuid) {
+// Serialize a UserAvailability row for the wire: the table is rekeyed to
+// user_uuid, so emit that value under the UNCHANGED `user_id` field name and
+// drop the internal user_uuid key (keeps the wire shape identical to pre-rekey).
+function serializeAvailabilityRow(row) {
   const out = typeof row.toJSON === 'function' ? row.toJSON() : { ...row };
-  if (callerUuid) out.user_id = callerUuid;
-  else delete out.user_id;
+  out.user_id = out.user_uuid != null ? out.user_uuid : null;
+  delete out.user_uuid;
   return out;
-}
-
-// Convenience for the single-row create responses: resolve then serialize.
-async function emitWithCallerUuid(row, callerSub) {
-  return withEmittedUuid(row, await resolveCallerUuid(callerSub));
 }
 
 // Validation middleware
@@ -174,8 +180,15 @@ router.post('/user/:user_id/recurring',
         return res.status(400).json({ error: 'Start date must be before end date' });
       }
 
+      // Rekey (D-04/D-06): write the row on the caller's Users.id UUID. Fail
+      // closed if the caller has no Users row rather than writing a null key.
+      const callerUuid = await resolveSelfUuid(req);
+      if (!callerUuid) {
+        return res.status(404).json({ error: 'User not found' });
+      }
+
       const pattern = await UserAvailability.create({
-        user_id: userId,
+        user_uuid: callerUuid,
         type: 'recurring_pattern',
         pattern_data: {
           dayOfWeek,
@@ -188,7 +201,7 @@ router.post('/user/:user_id/recurring',
         timezone: timezone || 'UTC',
       });
 
-      res.status(201).json(await emitWithCallerUuid(pattern, userId));
+      res.status(201).json(serializeAvailabilityRow(pattern));
     } catch (error) {
       sendSafeError(res, 500, error, 'Error creating recurring availability pattern');
     }
@@ -252,8 +265,15 @@ router.post('/user/:user_id/override',
         return res.status(400).json({ error: 'Invalid date format. Expected YYYY-MM-DD.' });
       }
 
+      // Rekey (D-04/D-06): write the row on the caller's Users.id UUID. Fail
+      // closed if the caller has no Users row rather than writing a null key.
+      const callerUuid = await resolveSelfUuid(req);
+      if (!callerUuid) {
+        return res.status(404).json({ error: 'User not found' });
+      }
+
       const override = await UserAvailability.create({
-        user_id: userId,
+        user_uuid: callerUuid,
         type: 'specific_override',
         pattern_data: {
           date,
@@ -267,7 +287,7 @@ router.post('/user/:user_id/override',
         timezone: 'UTC',
       });
 
-      res.status(201).json(await emitWithCallerUuid(override, userId));
+      res.status(201).json(serializeAvailabilityRow(override));
     } catch (error) {
       sendSafeError(res, 500, error, 'Error creating availability override');
     }
@@ -289,11 +309,12 @@ router.delete('/:id',
         return res.status(404).json({ error: 'Availability pattern not found' });
       }
 
-      // Users can only delete their own availability. The row's user_id is still
-      // the sub (UserAvailability stays sub-keyed until Phase 87.5), so matchesSelf
-      // takes the sub arm here; a caller acting under a UUID self-param elsewhere
-      // still matches because matchesSelf resolves their own UUID from their sub.
-      if (!(await matchesSelf(req, availability.user_id))) {
+      // Users can only delete their own availability. Phase 87.5: the row is
+      // rekeyed to user_uuid (Users.id UUID), so gate on that. matchesSelf takes
+      // its UUID arm — resolving the caller's OWN Users.id from their token sub
+      // (BOLA-safe) and comparing — so this works whether the caller acts under a
+      // sub-shaped or UUID-shaped self-param.
+      if (!(await matchesSelf(req, availability.user_uuid))) {
         return res.status(403).json({ error: 'Forbidden: Cannot delete other users\' availability' });
       }
 
@@ -497,15 +518,22 @@ router.get('/user/:user_id/patterns',
         return res.status(403).json({ error: 'Forbidden: Cannot access other users\' availability patterns' });
       }
 
+      // Rekey (D-04/D-06): the table is keyed on user_uuid. Resolve the caller's
+      // Users.id UUID (works for both sub-shaped and UUID-shaped self-params) and
+      // query on it. Fail closed if the caller has no Users row.
+      const callerUuid = await resolveSelfUuid(req);
+      if (!callerUuid) {
+        return res.status(404).json({ error: 'User not found' });
+      }
+
       const patterns = await UserAvailability.findAll({
-        where: { user_id: userId },
+        where: { user_uuid: callerUuid },
         order: [['createdAt', 'DESC']],
       });
 
-      // Every row here is owned by the caller (query filters on their sub), so a
-      // single caller-UUID resolution covers the whole list.
-      const callerUuid = await resolveCallerUuid(userId);
-      res.json(patterns.map(p => withEmittedUuid(p, callerUuid)));
+      // Each row already carries the caller's UUID in user_uuid; serialize it
+      // onto the unchanged `user_id` wire field.
+      res.json(patterns.map(p => serializeAvailabilityRow(p)));
     } catch (error) {
       sendSafeError(res, 500, error, 'Error fetching availability patterns');
     }
