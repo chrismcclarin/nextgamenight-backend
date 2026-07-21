@@ -1,6 +1,6 @@
 // tests/edge-cases/concurrentSubmissions.test.js
 // Edge case tests for concurrent duplicate availability response submissions
-// Tests that the upsert pattern (unique constraint on prompt_id + user_id) resolves
+// Tests that the upsert pattern (unique constraint on prompt_id + user_uuid) resolves
 // to exactly one DB record even when two requests arrive simultaneously.
 
 require('dotenv').config({ path: '.env.test' });
@@ -114,11 +114,12 @@ describe('Concurrent availability response submissions', () => {
     const successCount = [res1, res2].filter(r => r.status === 200 || r.status === 201).length;
     expect(successCount).toBeGreaterThanOrEqual(1);
 
-    // Critical assertion: exactly one DB record for this user/prompt combination
+    // Critical assertion: exactly one DB record for this user/prompt combination.
+    // Phase 87.5 (D-04): the route now writes user_uuid (Users.id), so count on it.
     const dbCount = await AvailabilityResponse.count({
       where: {
         prompt_id: testPrompt.id,
-        user_id: testUser.user_id
+        user_uuid: testUser.id
       }
     });
 

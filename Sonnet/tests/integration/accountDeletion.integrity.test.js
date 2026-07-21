@@ -101,7 +101,7 @@ async function makeEventParticipation(event, user, overrides = {}) {
 }
 async function makeUserAvailability(user, overrides = {}) {
   return UserAvailability.create({
-    user_id: user.user_id, // Auth0 sub keyspace (FK -> Users.user_id, CASCADE)
+    user_uuid: user.id, // Phase 87.5 (D-04): re-keyed FK -> Users.id, CASCADE
     type: 'recurring_pattern',
     pattern_data: { dayOfWeek: 3, startTime: '18:00', endTime: '22:00', timezone: 'UTC' },
     start_date: '2026-01-01',
@@ -122,7 +122,7 @@ async function makePrompt(group, overrides = {}) {
 async function makeAvailabilityResponse(prompt, user, overrides = {}) {
   return AvailabilityResponse.create({
     prompt_id: prompt.id,
-    user_id: user.user_id, // Auth0 sub keyspace (FK -> Users.user_id, CASCADE)
+    user_uuid: user.id, // Phase 87.5 (D-04): re-keyed FK -> Users.id, CASCADE
     time_slots: [{ start: '2026-01-01T18:00:00Z', end: '2026-01-01T22:00:00Z', preference: 'preferred' }],
     user_timezone: 'UTC',
     submitted_at: new Date(),

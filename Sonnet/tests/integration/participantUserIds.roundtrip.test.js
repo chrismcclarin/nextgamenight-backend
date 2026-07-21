@@ -89,7 +89,7 @@ async function makePrompt(group, overrides = {}) {
 async function makeResponse(prompt, user, timeSlots, overrides = {}) {
   return AvailabilityResponse.create({
     prompt_id: prompt.id,
-    user_id: user.user_id, // Auth0 sub keyspace (FK -> Users.user_id)
+    user_uuid: user.id, // Phase 87.5 (D-04): re-keyed onto Users.id (user_uuid)
     time_slots: timeSlots,
     user_timezone: 'UTC',
     submitted_at: new Date(),

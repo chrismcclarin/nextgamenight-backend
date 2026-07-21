@@ -88,7 +88,7 @@ async function seedClosablePrompt() {
   });
   await AvailabilityResponse.create({
     prompt_id: prompt.id,
-    user_id: ACTOR,
+    user_uuid: owner.id, // Phase 87.5 (D-04): table re-keyed onto user_uuid
     time_slots: [{ start: '2026-07-10T18:00:00Z', end: '2026-07-10T21:00:00Z', preference: 'preferred' }],
     user_timezone: 'UTC',
     submitted_at: new Date(),
@@ -98,7 +98,7 @@ async function seedClosablePrompt() {
     suggested_start: new Date('2026-07-10T18:00:00Z'),
     suggested_end: new Date('2026-07-10T21:00:00Z'),
     participant_count: 1,
-    participant_user_ids: [ACTOR],
+    participant_user_ids: [owner.id], // Users.id UUIDs (87.4 D-05)
     preferred_count: 1,
     meets_minimum: true,
     score: 5,
