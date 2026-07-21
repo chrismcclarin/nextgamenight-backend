@@ -12,24 +12,17 @@ const UserAvailability = sequelize.define('UserAvailability', {
   // on — a protective FK to the Users UUID PK, ON DELETE CASCADE. Ships in BOTH this
   // model (sync() builds the FK on the CI/test DB) AND migration 20260720000001 (prod via
   // migrate:apply). allowNull:false — all writers key user_uuid after the Plan 02/03
-  // consumer flips. The old `user_id` Auth0-string column is RETAINED nullable as the
-  // D-07 rollback net (physical DB column dropped in the BE PR-2 contract migration,
-  // Plan 07) so sync() builds the true post-migration schema the replay job expects.
+  // consumer flips. The old `user_id` Auth0-string attribute has been REMOVED from this
+  // model (BE PR-2 cutover, Plan 07): its physical DB column is dropped by migration
+  // 20260721000001, so leaving the attribute declared would make Sequelize's default
+  // attribute enumeration SELECT the dropped column and 500 every read. Mirrors the 87.1
+  // UserGroup cutover.
   user_uuid: {
     type: DataTypes.UUID,
     allowNull: false,
     references: {
       model: 'Users',
       key: 'id',
-    },
-    onDelete: 'CASCADE',
-  },
-  user_id: {
-    type: DataTypes.STRING,
-    allowNull: true, // RETAINED rollback net, relaxed to nullable (migration DROP NOT NULL)
-    references: {
-      model: 'Users',
-      key: 'user_id',
     },
     onDelete: 'CASCADE',
   },
@@ -67,9 +60,6 @@ const UserAvailability = sequelize.define('UserAvailability', {
   indexes: [
     {
       fields: ['user_uuid']
-    },
-    {
-      fields: ['user_id']
     },
     {
       fields: ['type']
