@@ -93,34 +93,26 @@ describe('List Routes', () => {
     currentActor = null;
   });
 
-  describe('GET /api/lists/player-wins/:group_id/:player_name/:user_id', () => {
-    it('should get games won by a specific player', async () => {
-      currentActor = testUser1.user_id; // token-authorized member (self-param dual-accept)
-      const response = await request(app)
+  // 87.5 code-review WR-02: the player-wins routes (by name + by-id) were deleted
+  // under the Plan-06 dead-route policy — player-wins-by-id filtered on a user_id
+  // never selected in its includes (always returned []); player-wins (by name)
+  // was functional but had zero FE callers. These now assert the routes are gone
+  // (404), mirroring the 87.5-06 deletion precedent below.
+  describe('GET /api/lists/player-wins/:group_id/:player_name/:user_id (deleted 87.5 WR-02)', () => {
+    it('404s — route deleted', async () => {
+      currentActor = testUser1.user_id;
+      await request(app)
         .get(`/api/lists/player-wins/${testGroup.id}/testuser1/${testUser1.user_id}`)
-        .expect(200);
-
-      expect(Array.isArray(response.body)).toBe(true);
-    });
-
-    it('should return 403 if user not in group', async () => {
-      currentActor = testUser2.user_id; // authenticated (self-param) but NOT a member
-      const response = await request(app)
-        .get(`/api/lists/player-wins/${testGroup.id}/testuser1/${testUser2.user_id}`)
-        .expect(403);
-
-      expect(response.body.error).toBe('Access denied to this group');
+        .expect(404);
     });
   });
 
-  describe('GET /api/lists/player-wins-by-id/:group_id/:player_user_id/:user_id', () => {
-    it('should get games won by a specific player by user_id', async () => {
-      currentActor = testUser1.user_id; // token-authorized member (self-param dual-accept)
-      const response = await request(app)
+  describe('GET /api/lists/player-wins-by-id/:group_id/:player_user_id/:user_id (deleted 87.5 WR-02)', () => {
+    it('404s — route deleted', async () => {
+      currentActor = testUser1.user_id;
+      await request(app)
         .get(`/api/lists/player-wins-by-id/${testGroup.id}/${testUser1.user_id}/${testUser1.user_id}`)
-        .expect(200);
-
-      expect(Array.isArray(response.body)).toBe(true);
+        .expect(404);
     });
   });
 
@@ -146,25 +138,25 @@ describe('List Routes', () => {
     });
   });
 
-  describe('GET /api/lists/player-picks/:group_id/:player_name/:user_id', () => {
-    it('should get games picked by a specific player', async () => {
-      currentActor = testUser1.user_id; // token-authorized member (self-param dual-accept)
-      const response = await request(app)
+  // 87.5 code-review WR-02: the player-picks routes (by name + by-id) were deleted
+  // under the Plan-06 dead-route policy — player-picks-by-id filtered on a user_id
+  // never selected in its include (always returned []); player-picks (by name) was
+  // functional but had zero FE callers. Assert the routes are gone (404).
+  describe('GET /api/lists/player-picks/:group_id/:player_name/:user_id (deleted 87.5 WR-02)', () => {
+    it('404s — route deleted', async () => {
+      currentActor = testUser1.user_id;
+      await request(app)
         .get(`/api/lists/player-picks/${testGroup.id}/testuser1/${testUser1.user_id}`)
-        .expect(200);
-
-      expect(Array.isArray(response.body)).toBe(true);
+        .expect(404);
     });
   });
 
-  describe('GET /api/lists/player-picks-by-id/:group_id/:player_user_id/:user_id', () => {
-    it('should get games picked by a specific player by user_id', async () => {
-      currentActor = testUser1.user_id; // token-authorized member (self-param dual-accept)
-      const response = await request(app)
+  describe('GET /api/lists/player-picks-by-id/:group_id/:player_user_id/:user_id (deleted 87.5 WR-02)', () => {
+    it('404s — route deleted', async () => {
+      currentActor = testUser1.user_id;
+      await request(app)
         .get(`/api/lists/player-picks-by-id/${testGroup.id}/${testUser1.user_id}/${testUser1.user_id}`)
-        .expect(200);
-
-      expect(Array.isArray(response.body)).toBe(true);
+        .expect(404);
     });
   });
 
