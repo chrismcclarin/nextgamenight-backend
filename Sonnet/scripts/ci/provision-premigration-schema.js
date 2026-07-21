@@ -83,6 +83,15 @@ const DATA_MIGRATIONS_874 = new Set([
 // PR-2 contract-drop filenames to this same set.
 const DATA_MIGRATIONS_875 = new Set([
   '20260720000004-finalize-d08-notnull-drop-legacy.js', // Plan 01 — D-08 finalize (SET NOT NULL 7 + DROP 8 legacy)
+  // Plan 07 — BE PR-2 contract DROPs of the 3 fresh retained legacy sub columns. Pure DDL/data
+  // (residue re-backfill + orphan handling + SET NOT NULL + DROP COLUMN) on the sync-built
+  // schema — no legacy column to down()/re-add, so EXCLUDED from the REKEY loop but STILL
+  // withheld from the SequelizeMeta seed so the CLI replays them (SHARED-E). Provision's REKEY
+  // step re-adds these legacy columns as the pre-migration shape; the CLI then replays the
+  // Plan-01 rekeys → D-08 finalize → these drops, so the full 87.5 chain replays green.
+  '20260721000001-drop-useravailability-legacy-sub.js',   // Plan 07 — DROP UserAvailabilities.user_id + SET NOT NULL user_uuid
+  '20260721000002-drop-availabilityresponse-legacy-sub.js', // Plan 07 — DROP AvailabilityResponses.user_id + SET NOT NULL user_uuid
+  '20260721000003-drop-eventballotoption-legacy-sub.js',  // Plan 07 — DROP EventBallotOptions.created_by (created_by_uuid stays nullable)
 ]);
 
 // Every migration the CLI path is expected to apply + book in SequelizeMeta.
