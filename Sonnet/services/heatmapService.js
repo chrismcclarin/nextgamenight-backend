@@ -6,7 +6,6 @@ const {
   AvailabilitySuggestion,
   AvailabilityPrompt,
   Game,
-  User,
   sequelize
 } = require('../models');
 const { Op } = require('sequelize');
@@ -56,13 +55,11 @@ async function aggregateResponses(promptId) {
     }
 
     // Fetch all responses for this prompt.
-    // Phase 87.4 (D-05): eager-load each responder's User so we can store the
-    // Users.id UUID (not the Auth0 sub) in participant_user_ids. The association
-    // (AvailabilityResponse.belongsTo(User)) already exists, so this adds no extra
-    // query — the join rides along with the single findAll.
+    // Phase 87.5 (BINT-02, D-04): AvailabilityResponse is re-keyed onto Users.id —
+    // the Users.id UUID stored in participant_user_ids is now the native
+    // `user_uuid` column, so no User join is needed to source it.
     const responses = await AvailabilityResponse.findAll({
       where: { prompt_id: promptId },
-      include: [{ model: User, attributes: ['id', 'user_id'] }],
       transaction
     });
 
@@ -80,14 +77,14 @@ async function aggregateResponses(promptId) {
     // Key: "start|end" (ISO strings), Value: { participants: Set, preferredBy: Set }
     const slotMap = new Map();
 
-    // Phase 87.4 (D-05): participant_user_ids stores Users.id UUIDs, not Auth0 subs.
-    // Source each participant from response.User.id. A responder whose row has no
-    // resolvable Users row (a departed member — response.User null) is DROPPED from
-    // every slot (never stored as a null, never left as a sub); we log the total
-    // dropped-responder COUNT only (no raw subs, per T14).
+    // Phase 87.5 (D-04): participant_user_ids stores Users.id UUIDs — sourced
+    // directly from the response's native user_uuid FK column. user_uuid is a
+    // NOT NULL CASCADE FK, so an orphaned response is impossible; the guard below
+    // stays defensive (a falsy user_uuid is DROPPED, never stored as null / a sub),
+    // and we log the dropped COUNT only (no raw ids, per T14).
     let droppedResponderCount = 0;
     for (const response of responses) {
-      const participantUuid = response.User ? response.User.id : null;
+      const participantUuid = response.user_uuid || null;
       if (!participantUuid) {
         droppedResponderCount++;
         continue;
@@ -119,7 +116,7 @@ async function aggregateResponses(promptId) {
 
     if (droppedResponderCount > 0) {
       console.log(
-        `[PU-UUID] Dropped ${droppedResponderCount} responder(s) with no resolvable Users row ` +
+        `[PU-UUID] Dropped ${droppedResponderCount} responder(s) with no user_uuid ` +
         `from prompt ${promptId} suggestions (count only; no subs logged).`
       );
     }

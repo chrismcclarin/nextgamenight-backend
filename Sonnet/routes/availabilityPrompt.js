@@ -83,37 +83,34 @@ router.get('/prompts/:promptId/respondents', verifyAuth0Token, async (req, res) 
       where: { prompt_id: promptId }
     });
 
-    // Create a map of responses by user_id
+    // Create a map of responses by user_uuid (Users.id) — Phase 87.5 (BINT-02,
+    // D-04) re-keyed AvailabilityResponse onto user_uuid.
     const responseMap = new Map();
     responses.forEach(r => {
-      responseMap.set(r.user_id, r);
+      responseMap.set(r.user_uuid, r);
     });
 
-    // 5. Check if current user has responded (for blind voting visibility)
-    const userHasResponded = responseMap.has(userId);
+    // 5. Check if current user has responded (for blind voting visibility).
+    // Keyed on the caller's Users.id (requester.id) — the same UUID the map uses.
+    const userHasResponded = responseMap.has(requester.id);
     const pollClosed = prompt.status === 'closed' || prompt.status === 'converted' ||
                        new Date(prompt.deadline) < new Date();
 
     // 6. Build respondent list with visibility rules.
-    // D-11 / T-87.1-13 (corrected): `member` is a UserGroup instance whose OLD
-    // user_id column is stripped — reading `member.user_id` would be
-    // undefined-SILENT. The AvailabilityResponse map stays Auth0-keyed, so read
-    // the member's Auth0 sub from the User include (member.User.user_id) for the
-    // response-map bridge and the visibility compare.
-    // Phase 87.4 Plan 09 (BINT-02, D-03): the SERIALIZED wire field `user_id`
-    // now emits the member's Users.id UUID (member.User.id) — translated from
-    // this same already-loaded include (no duplicate roster query). The internal
-    // responseMap + visibility compare stay sub-keyed because the
-    // AvailabilityResponse table is still sub-keyed (Phase 87.5 rekeys it). This
-    // is the BE half of the respondents/remind trio; ResponseDashboard forwards
-    // this UUID verbatim to the UUID-only remind endpoint (FE Plan 10).
+    // `member` is a UserGroup instance whose legacy user_id column is stripped —
+    // read identity from the User include (member.User.id, the Users.id UUID).
+    // Phase 87.5 (BINT-02, D-04): the AvailabilityResponse table is now re-keyed
+    // onto user_uuid, so the response-map bridge AND the visibility compare both
+    // key on member.User.id (the UUID), and the SERIALIZED wire field `user_id`
+    // emits that same UUID. This is the BE half of the respondents/remind trio;
+    // ResponseDashboard forwards this UUID verbatim to the UUID-only remind endpoint.
     // PR2-L3 (87.4-review): drop roster rows whose User include is missing BEFORE
     // serializing (the drop-on-miss convention availabilityService uses) — a row
     // without its User would otherwise serialize user_id: undefined on the wire
     // (React key `undefined`; /remind/undefined -> generic 404 in the FE).
     const respondents = groupMembers.filter(member => member.User).map(member => {
-      const memberAuthSub = member.User?.user_id;
-      const response = responseMap.get(memberAuthSub);
+      const memberUuid = member.User.id;
+      const response = responseMap.get(memberUuid);
       const hasResponded = !!response && response.submitted_at !== null;
 
       // Calculate slot count
@@ -130,7 +127,7 @@ router.get('/prompts/:promptId/respondents', verifyAuth0Token, async (req, res) 
                             pollClosed ||
                             userHasResponded ||
                             isAdmin ||
-                            memberAuthSub === userId;
+                            memberUuid === requester.id;
 
       return {
         // Wire field emits the Users.id UUID (translated from the existing
@@ -212,14 +209,13 @@ router.post('/prompts/:promptId/remind/:userId', verifyAuth0Token, async (req, r
     // passthrough of respondent.user_id), so the target is UUID-ONLY —
     // resolveTargetUserUuidOnly rejects a sub-shaped/garbage :userId as not-found.
     //
-    // ORDERING IS THE CORRECTNESS FIX (T-874-09-COOLDOWN): the cooldown /
+    // ORDERING (T-874-09-COOLDOWN): resolve the target FIRST so the cooldown /
     // already-responded / placeholder-create / race queries below key the
-    // still-sub-keyed AvailabilityResponse table on the RESOLVED target's Auth0 sub
-    // (targetUser.user_id), NOT the raw UUID :userId. Keying those on the raw UUID
-    // would match NOTHING in the sub-keyed table — silently defeating the 24h
-    // cooldown (an admin could spam reminders). Resolving FIRST and re-keying on the
-    // resolved sub keeps the cooldown enforced for a UUID target. (Phase 87.5 rekeys
-    // the AvailabilityResponse table to UUID and collapses this translation.)
+    // AvailabilityResponse table on the resolved target's Users.id UUID
+    // (targetUser.id). Phase 87.5 (D-04) re-keyed the table onto user_uuid, so the
+    // resolve validates the target exists (rejecting a sub-shaped/garbage :userId
+    // as not-found) AND yields the UUID we key on — keeping the 24h cooldown
+    // enforced (an admin cannot spam reminders by defeating the key).
     const targetUserRow = await resolveTargetUserUuidOnly(req.params.userId);
     if (!targetUserRow) {
       return res.status(404).json({ error: 'User not found' });
@@ -233,9 +229,9 @@ router.post('/prompts/:promptId/remind/:userId', verifyAuth0Token, async (req, r
     if (!targetUser) {
       return res.status(404).json({ error: 'User not found' });
     }
-    // The resolved target's Auth0 sub — the key the sub-keyed AvailabilityResponse
-    // table actually uses for this user.
-    const targetSub = targetUser.user_id;
+    // The resolved target's Users.id UUID — the key the re-keyed AvailabilityResponse
+    // table now uses for this user (Phase 87.5, D-04).
+    const targetUuid = targetUser.id;
 
     // 5. Verify the TARGET user is in the group.
     // T-87.1-19 (Phase 87.1): this checks the TARGET's membership (from the resolved
@@ -252,9 +248,9 @@ router.post('/prompts/:promptId/remind/:userId', verifyAuth0Token, async (req, r
     }
 
     // 6. Check cooldown - find or create response record.
-    // Keyed on the RESOLVED target sub (see step 4) so it hits the sub-keyed rows.
+    // Keyed on the RESOLVED target UUID (see step 4) — the user_uuid column.
     let response = await AvailabilityResponse.findOne({
-      where: { prompt_id: promptId, user_id: targetSub }
+      where: { prompt_id: promptId, user_uuid: targetUuid }
     });
 
     if (response?.last_reminded_at) {
@@ -327,7 +323,7 @@ router.post('/prompts/:promptId/remind/:userId', verifyAuth0Token, async (req, r
       try {
         await AvailabilityResponse.create({
           prompt_id: promptId,
-          user_id: targetSub, // resolved sub — the sub-keyed table's key (step 4)
+          user_uuid: targetUuid, // resolved UUID — the re-keyed table's key (step 4)
           time_slots: [],
           user_timezone: 'UTC',
           submitted_at: null, // Not submitted yet
@@ -338,7 +334,7 @@ router.post('/prompts/:promptId/remind/:userId', verifyAuth0Token, async (req, r
           // Concurrent create won the race — re-find the racing row and stamp
           // last_reminded_at on it so the double-click degrades to success.
           const raceRow = await AvailabilityResponse.findOne({
-            where: { prompt_id: promptId, user_id: targetSub }
+            where: { prompt_id: promptId, user_uuid: targetUuid }
           });
           if (raceRow) {
             await raceRow.update({ last_reminded_at: new Date() });
@@ -773,9 +769,9 @@ router.get('/prompts/:promptId/heatmap', verifyAuth0Token, async (req, res) => {
     // totalMembers = distinct users with submitted responses on this prompt.
     const submittedResponses = await AvailabilityResponse.findAll({
       where: { prompt_id: promptId, submitted_at: { [Op.ne]: null } },
-      attributes: ['user_id'],
+      attributes: ['user_uuid'],
     });
-    const totalMembers = new Set(submittedResponses.map(r => r.user_id)).size;
+    const totalMembers = new Set(submittedResponses.map(r => r.user_uuid)).size;
 
     if (!suggestions.length) {
       return res.json({

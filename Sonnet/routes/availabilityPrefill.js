@@ -208,6 +208,12 @@ router.post('/saved', magicTokenLimiter, async (req, res) => {
     endDate.setUTCDate(endDate.getUTCDate() + numDaysInt);
 
     // ---- Run calculation; filter saved-only available slots ----
+    // Phase 87.5 (BINT-02, D-04) rekey audit: the saved-availability read is
+    // delegated to availabilityService.calculateUserAvailability, which keys its
+    // UserAvailability query on user_uuid (Users.id) via the passed user's `.id`
+    // (flipped in Plan 02). userForCalc carries `id` from user.toJSON(), so this
+    // endpoint is UUID-native through delegation — no direct sub-keyed query lives
+    // here to flip.
     const slots = await availabilityService.calculateUserAvailability(
       userForCalc, startDate, endDate, timezone
     );
