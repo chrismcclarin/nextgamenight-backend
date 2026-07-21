@@ -6,6 +6,7 @@ const { google } = require('googleapis');
 const { User, SingleUseToken, PendingAuth0Deletion } = require('../models');
 const { sendError, AppError } = require('../utils/errors');
 const { resolveAllowedFrontendUrl } = require('../config/allowedOrigins');
+const { matchesSelf } = require('../middleware/objectAuth');
 const router = express.Router();
 
 // OAuth state nonce lifetime: the consent round-trip is short; 30 min is generous.
@@ -295,7 +296,7 @@ router.get('/google/status/:user_id', async (req, res) => {
     }
 
     // Verify that the requested user_id matches the authenticated user
-    if (req.params.user_id !== userId) {
+    if (!(await matchesSelf(req, req.params.user_id))) {
       return res.status(403).json({ error: 'Forbidden: Cannot access other users\' calendar status' });
     }
 

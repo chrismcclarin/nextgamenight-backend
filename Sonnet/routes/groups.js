@@ -20,6 +20,7 @@ const {
 } = require('../models');
 const { sendError } = require('../utils/errors');
 const { resolveTargetUser, resolveTargetUserUuidOnly } = require('../utils/resolveTargetUser');
+const { matchesSelf } = require('../middleware/objectAuth');
 const { Op } = require('sequelize');
 const { body, validationResult } = require('express-validator');
 const router = express.Router();
@@ -125,7 +126,7 @@ router.get('/user/:user_id', async (req, res) => {
     }
 
     // Verify that the requested user_id matches the authenticated user
-    if (req.params.user_id !== userId) {
+    if (!(await matchesSelf(req, req.params.user_id))) {
       return res.status(403).json({ error: 'Forbidden: Cannot access other users\' groups' });
     }
 
