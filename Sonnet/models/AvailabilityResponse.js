@@ -18,15 +18,30 @@ const AvailabilityResponse = sequelize.define('AvailabilityResponse', {
     onDelete: 'CASCADE',
     // Response deleted when prompt deleted
   },
+  // Phase 87.5 (BINT-02, BE PR-1 — D-01): user_uuid is the identity FK the model keys
+  // on — a protective FK to the Users UUID PK, ON DELETE CASCADE. Ships in BOTH this
+  // model (sync() builds the FK on the CI/test DB) AND migration 20260720000002 (prod).
+  // allowNull:false — all writers key user_uuid after the Plan 02/03 consumer flips. The
+  // old `user_id` Auth0-string column is RETAINED nullable as the D-07 rollback net
+  // (dropped in the BE PR-2 contract migration, Plan 07).
+  user_uuid: {
+    type: DataTypes.UUID,
+    allowNull: false,
+    references: {
+      model: 'Users',
+      key: 'id',
+    },
+    onDelete: 'CASCADE',
+    // Response deleted when user deleted
+  },
   user_id: {
     type: DataTypes.STRING,
-    allowNull: false,
+    allowNull: true, // RETAINED rollback net, relaxed to nullable (migration DROP NOT NULL)
     references: {
       model: 'Users',
       key: 'user_id',  // Auth0 string ID, not UUID
     },
     onDelete: 'CASCADE',
-    // Response deleted when user deleted
   },
   time_slots: {
     type: DataTypes.JSONB,
@@ -78,12 +93,17 @@ const AvailabilityResponse = sequelize.define('AvailabilityResponse', {
       fields: ['prompt_id']
     },
     {
+      fields: ['user_uuid']
+    },
+    {
       fields: ['user_id']
     },
     {
+      // Phase 87.5: uniqueness re-keyed onto the UUID (migration 20260720000002 drops the
+      // old (prompt_id, user_id) unique and builds this one).
       unique: true,
-      fields: ['prompt_id', 'user_id'],
-      name: 'availability_responses_prompt_user_unique'
+      fields: ['prompt_id', 'user_uuid'],
+      name: 'availability_responses_prompt_user_uuid_unique'
     }
   ]
 });
