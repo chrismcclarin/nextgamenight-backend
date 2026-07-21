@@ -24,11 +24,15 @@ const mockEventParticipationDestroy = jest.fn();
 const mockEventAuditLogCreate = jest.fn();
 const mockGameFindByPk = jest.fn();
 const mockGroupFindByPk = jest.fn();
+const mockUserFindOne = jest.fn();
 
 jest.mock('../../models', () => ({
   Event: { findByPk: (...args) => mockEventFindByPk(...args) },
   Game: { findByPk: (...args) => mockGameFindByPk(...args) },
-  User: {},
+  // 87.5 Req 9: the delete handler now resolves the caller's Users.id UUID via
+  // User.findOne to record it as the audit actor (was the Auth0 sub). Mock it so
+  // the resolve returns a UUID-shaped id.
+  User: { findOne: (...args) => mockUserFindOne(...args) },
   Group: { findByPk: (...args) => mockGroupFindByPk(...args) },
   EventParticipation: { destroy: (...args) => mockEventParticipationDestroy(...args) },
   UserGroup: {},
@@ -106,6 +110,10 @@ app.use('/api/events', eventsRoutes);
 const TEST_EVENT_ID = '11111111-1111-1111-1111-111111111111';
 const TEST_GROUP_ID = '22222222-2222-2222-2222-222222222222';
 const TEST_GAME_ID = '33333333-3333-3333-3333-333333333333';
+// The caller's Auth0 sub is 'auth0|tester' (injected below); their resolved
+// Users.id is this UUID. 87.5 Req 9: the audit actor must be the UUID, not the sub.
+const TEST_CALLER_UUID = '44444444-4444-4444-4444-444444444444';
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function buildEvent({ startOffsetMs }) {
   const startDate = new Date(Date.now() + startOffsetMs);
@@ -153,6 +161,8 @@ beforeEach(() => {
   mockEventRsvpDestroy.mockResolvedValue(1);
   mockEventParticipationDestroy.mockResolvedValue(1);
   mockEventAuditLogCreate.mockResolvedValue({});
+  // 87.5 Req 9: caller's own sub ('auth0|tester') resolves to their Users.id UUID.
+  mockUserFindOne.mockResolvedValue({ id: TEST_CALLER_UUID });
 });
 
 // ---- Tests ----
@@ -175,7 +185,10 @@ describe('Event lifecycle: cancellation cutoff', () => {
     expect(auditRow.was_after_start).toBe(false);
     expect(auditRow.was_within_15min_grace).toBe(false);
     expect(auditRow.suppressed_email).toBe(false);
-    expect(auditRow.actor_user_id).toBe('auth0|tester');
+    // 87.5 Req 9: the audit actor is the caller's Users.id UUID, NOT the Auth0 sub.
+    expect(auditRow.actor_user_id).toBe(TEST_CALLER_UUID);
+    expect(auditRow.actor_user_id).toMatch(UUID_RE);
+    expect(auditRow.actor_user_id).not.toBe('auth0|tester');
     expect(auditRow.event_snapshot.id).toBe(TEST_EVENT_ID);
     expect(event.destroy).toHaveBeenCalled();
   });
