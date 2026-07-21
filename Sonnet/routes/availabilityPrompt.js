@@ -555,12 +555,35 @@ router.get('/groups/:groupId/prompts/active', verifyAuth0Token, async (req, res)
 router.get('/prompts/:promptId', verifyAuth0Token, async (req, res) => {
   try {
     const { promptId } = req.params;
-    const { AvailabilityPrompt } = require('../models');
+    const userId = req.user.user_id;
     const prompt = await AvailabilityPrompt.findByPk(promptId);
     if (!prompt) {
       return res.status(404).json({ error: 'Prompt not found' });
     }
-    res.json({ prompt });
+
+    // WR-04 (87.5 code-review): this was the ONLY route in this file with no
+    // membership gate, and it serialized the raw prompt row including
+    // created_by_user_id — which the /prompts/open sibling deliberately strips
+    // (T-71.2-02). Mirror the respondents-sibling gate exactly: resolve the
+    // caller once to Users.id, key an active UserGroup membership on the prompt's
+    // group_id, and fail closed (403). A missing Users row fails closed too —
+    // never a raw 500 from an undefined where-value. (No creator-fallback: the
+    // in-file membership-gate convention — respondents + /prompts/open — gates
+    // access on membership alone; creator only ever affects can_close/heatmap.)
+    const requester = await User.findOne({ where: { user_id: userId } });
+    const requesterGroup = requester
+      ? await UserGroup.findOne({
+        where: { group_id: prompt.group_id, user_uuid: requester.id, status: 'active' }
+      })
+      : null;
+    if (!requesterGroup) {
+      return res.status(403).json({ error: 'You must be a member of this group' });
+    }
+
+    // T-71.2-02: strip the raw creator UUID from the wire, same as /prompts/open.
+    const json = prompt.toJSON();
+    delete json.created_by_user_id;
+    res.json({ prompt: json });
   } catch (error) {
     console.error('Error fetching prompt:', error);
     res.status(500).json({ error: 'Failed to fetch prompt' });
