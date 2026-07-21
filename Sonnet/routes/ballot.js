@@ -216,6 +216,17 @@ router.post('/:eventId/options', validateBallotOptions, async (req, res) => {
     const userId = req.user.user_id;
     const { options } = req.body;
 
+    // Phase 87.5 (BINT-02, PR-1): resolve the verified caller to Users.id ONCE.
+    // The creator FK is now created_by_uuid (UUID), so the authz compare + the
+    // first-creation stamp both key on this UUID, never the Auth0 sub. A null
+    // resolve → callerUuid null → isCreator false → the ballot falls to
+    // owner/admin-only (never a client-asserted creator identity).
+    const caller = await User.findOne({
+      where: { user_id: userId },
+      attributes: ['id'],
+    });
+    const callerUuid = caller ? caller.id : null;
+
     // Find event
     const event = await Event.findByPk(eventId);
     if (!event) {
@@ -229,18 +240,20 @@ router.post('/:eventId/options', validateBallotOptions, async (req, res) => {
 
     // Phase 87 (T-87-01): read the ballot's current creator BEFORE any destroy
     // so we can enforce creator-based replace/wipe authz AND preserve the
-    // original creator on replace.
+    // original creator on replace. Phase 87.5: project created_by_uuid — the UUID
+    // creator FK the authz compares against. Projecting the old created_by would
+    // read undefined for created_by_uuid and silently kill creator authz.
     const existing = await EventBallotOption.findOne({
       where: { event_id: eventId },
-      attributes: ['created_by'],
+      attributes: ['created_by_uuid'],
     });
 
-    // Authz on the verified Auth0 sub (Phase 83 default-deny — never a
-    // client-supplied id). isCreator REQUIRES current membership too, so a
+    // Authz on the caller's server-resolved Users.id (Phase 83 default-deny —
+    // never a client-supplied id). isCreator REQUIRES current membership too, so a
     // creator later removed from the group cannot replace/wipe (EoP fix).
     const isAdmin = await isOwnerOrAdmin(userId, event.group_id);
     const isMember = await isMemberOrHigher(userId, event.group_id);
-    const isCreator = !!existing && existing.created_by !== null && existing.created_by === userId;
+    const isCreator = !!existing && existing.created_by_uuid !== null && existing.created_by_uuid === callerUuid;
 
     if (existing) {
       // Replacing/wiping an existing ballot: creator (still a member) OR
@@ -254,10 +267,10 @@ router.post('/:eventId/options', validateBallotOptions, async (req, res) => {
       return res.status(403).json({ error: 'Pending members cannot create ballot options', required_role: 'member' });
     }
 
-    // Preserve the ballot's original creator on replace; stamp the actor on
-    // first-ever creation. An owner/admin edit must NOT overwrite created_by
-    // with the editor's id (#8).
-    const preservedCreator = existing?.created_by ?? userId;
+    // Preserve the ballot's original creator UUID on replace; stamp the actor's
+    // UUID on first-ever creation. An owner/admin edit must NOT overwrite
+    // created_by_uuid with the editor's id (#8).
+    const preservedCreator = existing?.created_by_uuid ?? callerUuid;
 
     // BulkCreate new options
     const optionRows = options.map((opt, index) => ({
@@ -265,7 +278,7 @@ router.post('/:eventId/options', validateBallotOptions, async (req, res) => {
       game_id: opt.game_id || null,
       game_name: opt.game_name,
       display_order: index,
-      created_by: preservedCreator,
+      created_by_uuid: preservedCreator,
     }));
 
     // Atomic replace (T-87-02): destroy + bulkCreate (+ status flip) in ONE
@@ -310,6 +323,15 @@ router.put('/:eventId/options', validateBallotOptions, async (req, res) => {
     const userId = req.user.user_id;
     const { options } = req.body;
 
+    // Phase 87.5 (BINT-02, PR-1): resolve the verified caller to Users.id ONCE for
+    // the UUID-keyed creator authz + preserve-on-replace below (see the POST handler
+    // note). A null resolve → callerUuid null → isCreator false → owner/admin-only.
+    const caller = await User.findOne({
+      where: { user_id: userId },
+      attributes: ['id'],
+    });
+    const callerUuid = caller ? caller.id : null;
+
     // Find event
     const event = await Event.findByPk(eventId);
     if (!event) {
@@ -323,18 +345,20 @@ router.put('/:eventId/options', validateBallotOptions, async (req, res) => {
 
     // Phase 87 (T-87-01): read the ballot's current creator BEFORE any destroy
     // so we can enforce creator-based replace/wipe authz AND preserve the
-    // original creator on replace.
+    // original creator on replace. Phase 87.5: project created_by_uuid — the UUID
+    // creator FK the authz compares against (projecting created_by would read
+    // undefined for created_by_uuid and silently kill creator authz).
     const existing = await EventBallotOption.findOne({
       where: { event_id: eventId },
-      attributes: ['created_by'],
+      attributes: ['created_by_uuid'],
     });
 
-    // Authz on the verified Auth0 sub (Phase 83 default-deny — never a
-    // client-supplied id). isCreator REQUIRES current membership too, so a
+    // Authz on the caller's server-resolved Users.id (Phase 83 default-deny —
+    // never a client-supplied id). isCreator REQUIRES current membership too, so a
     // creator later removed from the group cannot replace/wipe (EoP fix).
     const isAdmin = await isOwnerOrAdmin(userId, event.group_id);
     const isMember = await isMemberOrHigher(userId, event.group_id);
-    const isCreator = !!existing && existing.created_by !== null && existing.created_by === userId;
+    const isCreator = !!existing && existing.created_by_uuid !== null && existing.created_by_uuid === callerUuid;
 
     if (existing) {
       // Replacing/wiping an existing ballot: creator (still a member) OR
@@ -348,10 +372,10 @@ router.put('/:eventId/options', validateBallotOptions, async (req, res) => {
       return res.status(403).json({ error: 'Pending members cannot update ballot options', required_role: 'member' });
     }
 
-    // Preserve the ballot's original creator on replace; stamp the actor if
-    // there were no existing options. An owner/admin edit must NOT overwrite
-    // created_by with the editor's id (#8).
-    const preservedCreator = existing?.created_by ?? userId;
+    // Preserve the ballot's original creator UUID on replace; stamp the actor's
+    // UUID if there were no existing options. An owner/admin edit must NOT
+    // overwrite created_by_uuid with the editor's id (#8).
+    const preservedCreator = existing?.created_by_uuid ?? callerUuid;
 
     // BulkCreate replacement options
     const optionRows = options.map((opt, index) => ({
@@ -359,7 +383,7 @@ router.put('/:eventId/options', validateBallotOptions, async (req, res) => {
       game_id: opt.game_id || null,
       game_name: opt.game_name,
       display_order: index,
-      created_by: preservedCreator,
+      created_by_uuid: preservedCreator,
     }));
 
     // Atomic replace (T-87-02): destroy + bulkCreate in ONE managed

@@ -495,6 +495,19 @@ router.post('/', validateEventCreate, async (req, res) => {
       return res.status(403).json({ error: 'Pending members cannot perform this action', required_role: 'member' });
     }
 
+    // Phase 87.5 (BINT-02, PR-1): resolve the verified caller to Users.id ONCE so the
+    // atomic ballot-materialization block below can stamp created_by_uuid (the UUID
+    // creator FK) instead of the Auth0 sub. This is the REAL production ballot-creation
+    // path — the FE births every ballot here — so without the UUID stamp the ballot
+    // creator-authz branch in routes/ballot.js would be dead in production (every ballot
+    // would carry created_by_uuid=NULL and fall to owner/admin-only). A null resolve
+    // stamps NULL (owner/admin-only), never a client-asserted identity.
+    const callerRow = await User.findOne({
+      where: { user_id: userId },
+      attributes: ['id'],
+    });
+    const callerUuid = callerRow ? callerRow.id : null;
+
     // Phase 87 (adversarial review #6/#7): a caller-supplied ballot (>=2 options
     // + a deadline) must resolve to >=2 DISTINCT non-empty trimmed game_names.
     // The in-transaction de-dup below drops duplicates; if that would collapse
@@ -583,13 +596,14 @@ router.post('/', validateEventCreate, async (req, res) => {
             game_id: opt.game_id || null,
             game_name: opt.game_name.trim(),
             display_order: index,
-            // Phase 87 (BINT-01, T-87-04): stamp the ballot creator from the
-            // verified Auth0 sub (Phase 83 default-deny) — NEVER a client-supplied
-            // id. This is the REAL production ballot-creation path (the FE births
-            // every ballot via POST /events with embedded ballot_options), so
-            // without this every ballot is created_by=NULL and the "creator can
-            // replace/wipe" branch of Req 7 is dead in production.
-            created_by: req.user.user_id,
+            // Phase 87.5 (BINT-02, T-87-04, PR-1): stamp the ballot creator from the
+            // caller's server-resolved Users.id UUID (Phase 83 default-deny) — NEVER a
+            // client-supplied id, and NO LONGER the Auth0 sub. This is the REAL
+            // production ballot-creation path (the FE births every ballot via POST
+            // /events with embedded ballot_options), so without the UUID stamp every
+            // ballot would carry created_by_uuid=NULL and the "creator can replace/wipe"
+            // branch of Req 7 would be dead in production after the PR-1 cutover.
+            created_by_uuid: callerUuid,
           }));
           await EventBallotOption.bulkCreate(optionRows, { transaction: t });
           event.ballot_status = 'open';
