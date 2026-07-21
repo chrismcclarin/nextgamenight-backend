@@ -47,16 +47,20 @@ async function main() {
       process.exit(0);
     }
 
-    // Proceed with deletion inside a transaction
+    // Proceed with deletion inside a transaction.
+    // NOTE (Phase 87.5 Plan 07): the UserGroups and AvailabilityResponses deletes below were
+    // re-keyed from the Auth0-string `user_id` column onto the UUID `user_uuid` FK column,
+    // because those legacy sub columns are DROPPED by this milestone (UserGroups.user_id by
+    // Plan 01's D-08 finalize; AvailabilityResponses.user_id by this plan's contract-drop).
+    // All three child-table deletes now key on the ghost users' UUID PKs (`ghostIds`).
     const ghostIds = ghostUsers.map(g => g.id);
-    const ghostUserIds = ghostUsers.map(g => g.user_id);
 
     const transaction = await sequelize.transaction();
     try {
-      // 1. Delete from UserGroups (uses Auth0 string user_id)
+      // 1. Delete from UserGroups (user_uuid UUID FK → Users.id, since 87.1; user_id dropped by D-08)
       const [, ugMeta] = await sequelize.query(`
-        DELETE FROM "UserGroups" WHERE user_id IN (:userIds)
-      `, { replacements: { userIds: ghostUserIds }, type: QueryTypes.DELETE, transaction });
+        DELETE FROM "UserGroups" WHERE user_uuid IN (:ids)
+      `, { replacements: { ids: ghostIds }, type: QueryTypes.DELETE, transaction });
       console.log(`Deleted UserGroup records for ghost users.`);
 
       // 2. Delete from EventParticipations (uses UUID id)
@@ -65,10 +69,10 @@ async function main() {
       `, { replacements: { ids: ghostIds }, type: QueryTypes.DELETE, transaction });
       console.log(`Deleted EventParticipation records for ghost users.`);
 
-      // 3. Delete from AvailabilityResponses (uses Auth0 string user_id)
+      // 3. Delete from AvailabilityResponses (user_uuid UUID FK → Users.id, since 87.5; user_id dropped by Plan 07)
       const [, arMeta] = await sequelize.query(`
-        DELETE FROM "AvailabilityResponses" WHERE user_id IN (:userIds)
-      `, { replacements: { userIds: ghostUserIds }, type: QueryTypes.DELETE, transaction });
+        DELETE FROM "AvailabilityResponses" WHERE user_uuid IN (:ids)
+      `, { replacements: { ids: ghostIds }, type: QueryTypes.DELETE, transaction });
       console.log(`Deleted AvailabilityResponse records for ghost users.`);
 
       // 4. Delete the ghost users themselves
