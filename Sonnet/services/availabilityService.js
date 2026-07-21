@@ -17,7 +17,12 @@ function __gcalCacheKey(userId, startDate, endDate, timezone) {
 }
 
 async function getGcalBusyCached(user, startDate, endDate, timezone) {
-  const key = __gcalCacheKey(user.user_id, startDate, endDate, timezone);
+  // Phase 87.5 (BINT-02, D-04): key the in-process cache on the Users.id UUID.
+  // Keying on the Auth0 sub (`user.user_id`) would collide to `undefined|...`
+  // for every user once the legacy column drops in Plan 07, silently serving
+  // one member's busy data to another. `.id` is present on every caller shape
+  // (roster member, single-user route row, prefill toJSON clone).
+  const key = __gcalCacheKey(user.id, startDate, endDate, timezone);
   const now = Date.now();
   const hit = __gcalBusyCache.get(key);
   if (hit && hit.expiresAt > now) {
@@ -38,68 +43,14 @@ async function getGcalBusyCached(user, startDate, endDate, timezone) {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 87.4 Plan 08 (SPEC Req 2, D-03, PR-2) — boundary-only sub->UUID flip.
-//
-// Every availability WIRE emission must carry the member's Users.id UUID, not
-// their Auth0 sub. But the ENTIRE internal pipeline (availableMembers builder,
-// the noDataUserIds exclusion filter, the members00/members30 intersection,
-// overlapAvailable/finalAvailable keying, the pollResponseMap overlay, and the
-// gcalBusyByUser/gcalBusyMap/gcal-cache-key matching maps) stays sub-keyed —
-// translating any internal site mid-pipeline silently corrupts that matching
-// (double-counts a user under both a sub and a UUID key, desyncs gcal lookups,
-// breaks the noDataUserIds filter). So we build ONE roster map per request and
-// translate EXACTLY ONCE, in a single pass over each PUBLIC function's finished
-// return payload, right before it leaves the module. Phase 87.5 deletes this
-// translation layer once the availability tables are rekeyed to UUID
-// (.planning/deferred/phase-87.5.md).
+// Phase 87.5 (BINT-02, BE PR-1 — D-04): the availability tables are now rekeyed
+// to the Users.id UUID (user_uuid FK). Every read/write and the ENTIRE internal
+// getGroupHeatmap roster pipeline keys on that UUID end to end, so the 87.4
+// boundary sub->UUID translation helpers and their single-pass return-payload
+// flips are deleted, and the former internal/public overlap split is collapsed
+// back into ONE UUID-native calculateGroupOverlaps. The wire field NAME stays
+// `user_id` (value = the UUID).
 // ---------------------------------------------------------------------------
-
-/**
- * Build the per-request roster map from an already-loaded `group.Users` list:
- * Auth0 sub (user_id column) -> Users.id UUID. No extra query — the roster is
- * already loaded with both `id` and `user_id`, so this avoids the N+1 that a
- * per-element User lookup inside the 7x14 slot loop would incur.
- *
- * @param {Array<{user_id: string, id: string}>} members
- * @returns {Map<string, string>} sub -> UUID
- */
-function buildSubToUuid(members) {
-  const map = new Map();
-  for (const m of (members || [])) {
-    if (m && m.user_id != null && m.id != null) {
-      map.set(m.user_id, m.id);
-    }
-  }
-  return map;
-}
-
-/**
- * Boundary translation for a collection of objects each carrying a `user_id`
- * (sub). Returns a NEW array with each `user_id` VALUE flipped sub->UUID via the
- * roster map. Field NAME stays `user_id` (no `user_uuid` sibling — locked
- * representation decision, INVENTORY §8 row 16).
- *
- * Map-miss rule (T5, coordinated with Plan 10's z.uuid() tighten): an entry
- * whose sub is not in the roster map (edge — e.g. an ex-member off the loaded
- * roster, or a stale poll responder) is DROPPED entirely. Never emit a raw sub,
- * never emit null — Plan 10 tightens the FE availability schemas to z.uuid(),
- * which rejects BOTH. Identity fields on the wire are therefore always a valid
- * Users.id UUID when present, or absent.
- *
- * @param {Array<{user_id: string}>} collection
- * @param {Map<string, string>} subToUuid
- * @returns {Array<Object>}
- */
-function translateUserIdCollection(collection, subToUuid) {
-  const out = [];
-  for (const entry of (collection || [])) {
-    if (!entry || entry.user_id == null) continue;
-    const uuid = subToUuid.get(entry.user_id);
-    if (uuid === undefined) continue; // unresolvable identity -> drop (never sub, never null)
-    out.push({ ...entry, user_id: uuid });
-  }
-  return out;
-}
 
 /**
  * Validate an IANA timezone string.
@@ -399,12 +350,12 @@ class AvailabilityService {
       try {
         manualPatterns = await UserAvailability.findAll({
           where: {
-            user_id: user.user_id,
+            user_uuid: user.id,
           },
           order: [['createdAt', 'ASC']],
         });
       } catch (dbError) {
-        console.error(`Database error fetching availability patterns for user ${user.user_id}:`, dbError);
+        console.error(`Database error fetching availability patterns for user ${user.id}:`, dbError);
         // Return empty array if database query fails - don't crash the whole calculation
         manualPatterns = [];
       }
@@ -496,7 +447,7 @@ class AvailabilityService {
             }
           });
         } catch (error) {
-          console.error(`Error fetching Google Calendar busy times for user ${user.user_id}:`, error.message);
+          console.error(`Error fetching Google Calendar busy times for user ${user.id}:`, error.message);
           // Continue without calendar data if there's an error
         }
       }
@@ -510,26 +461,21 @@ class AvailabilityService {
   }
 
   /**
-   * INTERNAL sub-keyed overlap builder (Phase 87.4 Plan 08 rename split).
-   *
-   * This is the original `calculateGroupOverlaps` computation, renamed. Its
-   * `availableMembers[].user_id` VALUES stay the Auth0 sub — UNTRANSLATED —
-   * because `getGroupHeatmap` consumes it directly to drive its own sub-keyed
-   * matching (noDataUserIds filter, members00/members30 intersection,
-   * pollResponseMap overlay, gcalConflicts attach). NEVER translate here.
-   *
-   * The PUBLIC `calculateGroupOverlaps` below delegates to this builder and
-   * applies the boundary translation for the GET /group/:group_id/overlaps
-   * route consumer. Phase 87.5 collapses this split back into one function once
-   * the availability tables are rekeyed to UUID (.planning/deferred/phase-87.5.md).
+   * Group overlap builder (Phase 87.5, BINT-02 — collapsed). UUID-native end to
+   * end: every emitted `availableMembers[].user_id` VALUE is the member's
+   * Users.id UUID (field NAME stays `user_id`). getGroupHeatmap consumes this
+   * directly and its internal roster maps key on the SAME UUID; the GET
+   * /group/:group_id/overlaps route consumes it unchanged. The 87.4
+   * internal/public overlap split is gone — the tables are rekeyed, so there is
+   * no sub-to-UUID pass left to isolate.
    *
    * @param {string} groupId - Group ID
    * @param {Date|string} startDate - Start date
    * @param {Date|string} endDate - End date
    * @param {string} timezone - Timezone string
-   * @returns {Promise<Array>} Array of time slots with overlap information (sub-keyed)
+   * @returns {Promise<Array>} Array of time slots with overlap information (UUID-keyed)
    */
-  async buildGroupOverlaps(groupId, startDate, endDate, timezone = 'UTC', preloadedGroup = null, preloadedGcalBusyByUser = null) {
+  async calculateGroupOverlaps(groupId, startDate, endDate, timezone = 'UTC', preloadedGroup = null, preloadedGcalBusyByUser = null) {
     try {
       const { Group, UserGroup } = require('../models');
 
@@ -563,16 +509,16 @@ class AvailabilityService {
       // Calculate availability for each member using their stored timezone.
       // If the caller pre-fetched gcal busy data (HEAT-03 perf hoist), pass
       // the per-member slice through so calculateUserAvailability skips its
-      // own gcal fetch.
+      // own gcal fetch. The gcal busy map is keyed on the member's Users.id UUID.
       const memberAvailabilities = await Promise.all(
         members.map(member => {
           const preloadedBusy = preloadedGcalBusyByUser
-            ? preloadedGcalBusyByUser.get(member.user_id)
+            ? preloadedGcalBusyByUser.get(member.id)
             : undefined;
           return this.calculateUserAvailability(member, startDate, endDate, member.timezone || 'UTC', preloadedBusy)
             .then(availability => ({ member, availability }))
             .catch(error => {
-              console.error(`Error calculating availability for member ${member.user_id}:`, error);
+              console.error(`Error calculating availability for member ${member.id}:`, error);
               return { member, availability: [] };
             });
         })
@@ -585,15 +531,17 @@ class AvailabilityService {
       const overlaps = allSlots.map(slot => {
         const key = `${slot.date}_${slot.startTime}`;
         const availableMembers = [];
-        
+
         memberAvailabilities.forEach(({ member, availability }) => {
-          const memberSlot = availability.find(s => 
+          const memberSlot = availability.find(s =>
             s.date === slot.date && s.startTime === slot.startTime
           );
-          
+
           if (memberSlot && memberSlot.isAvailable) {
             availableMembers.push({
-              user_id: member.user_id,
+              // Wire field NAME stays `user_id`; VALUE is the member's Users.id
+              // UUID (the table is rekeyed to user_uuid — Phase 87.5).
+              user_id: member.id,
               username: member.username,
               // BSEC-01 (D-03): email removed from the availability heatmap
               // response — it leaked members' emails to every viewer. The
@@ -618,63 +566,6 @@ class AvailabilityService {
       console.error('Error calculating group overlaps:', error);
       throw error;
     }
-  }
-
-  /**
-   * PUBLIC overlap function (Phase 87.4 Plan 08). Delegates to the sub-keyed
-   * `buildGroupOverlaps` builder, then applies the boundary translation ONCE so
-   * every emitted `user_id` VALUE is a Users.id UUID. This lives inside the
-   * function itself — NOT left to the calling route — because the function has
-   * two callers with opposite needs (getGroupHeatmap consumes the untranslated
-   * builder directly; the GET /group/:group_id/overlaps route consumes this
-   * translated result). Keeping the translation here means routes/availability.js
-   * needs no change and any future caller of the public name is safe by default.
-   * Phase 87.5 removes this pass once the availability tables are rekeyed to UUID.
-   *
-   * @param {string} groupId - Group ID
-   * @param {Date|string} startDate - Start date
-   * @param {Date|string} endDate - End date
-   * @param {string} timezone - Timezone string
-   * @returns {Promise<Array>} Array of time slots with overlap info (UUID-keyed emissions)
-   */
-  async calculateGroupOverlaps(groupId, startDate, endDate, timezone = 'UTC', preloadedGroup = null, preloadedGcalBusyByUser = null) {
-    const { Group, UserGroup } = require('../models');
-
-    // Resolve the roster ONCE so we can both (a) hand the builder a preloaded
-    // group (no duplicate findByPk in the success path) and (b) build the
-    // per-request subToUuid map for the boundary translation.
-    let group = preloadedGroup;
-    if (!group) {
-      try {
-        group = await Group.findByPk(groupId, {
-          include: [{
-            model: User,
-            through: UserGroup,
-            attributes: ['id', 'user_id', 'username', 'email', 'google_calendar_enabled', 'google_calendar_token', 'google_calendar_refresh_token', 'timezone'],
-          }],
-        });
-      } catch (dbError) {
-        console.error('Database error fetching group:', dbError);
-        throw new Error(`Database error: ${dbError.message}`);
-      }
-    }
-
-    const overlaps = await this.buildGroupOverlaps(groupId, startDate, endDate, timezone, group, preloadedGcalBusyByUser);
-
-    // Boundary translation: single pass over the finished builder output. The
-    // builder's output stays sub-keyed for getGroupHeatmap; this pass only
-    // affects the public route consumer.
-    const members = (group && group.Users) || [];
-    const subToUuid = buildSubToUuid(members);
-    return overlaps.map(slot => {
-      const availableMembers = translateUserIdCollection(slot.availableMembers, subToUuid);
-      return {
-        ...slot,
-        availableMembers,
-        availableCount: availableMembers.length,
-        unavailableCount: slot.totalMembers - availableMembers.length,
-      };
-    });
   }
 
   /**
@@ -755,29 +646,28 @@ class AvailabilityService {
     //      (b) eliminates the redundant `gcalBusyMap` second-fetch loop below,
     //      (c) hits the 60s in-process cache for warm reloads of the same week.
     const gcalEnabledMembers = members.filter(m => m.google_calendar_enabled && m.google_calendar_token);
-    const gcalBusyByUser = new Map(); // user_id -> Array<{date,startTime,endTime}>
+    const gcalBusyByUser = new Map(); // Users.id UUID -> Array<{date,startTime,endTime}>
     if (gcalEnabledMembers.length > 0) {
       const results = await Promise.all(gcalEnabledMembers.map(member =>
         getGcalBusyCached(member, overlapStart, overlapEnd, member.timezone || timezone)
           .then(busy => ({ member, busy }))
           .catch(err => {
-            console.warn(`Failed to fetch gcal for ${member.user_id}:`, err.message);
+            console.warn(`Failed to fetch gcal for ${member.id}:`, err.message);
             return { member, busy: [] };
           })
       ));
       for (const { member, busy } of results) {
-        gcalBusyByUser.set(member.user_id, busy);
+        gcalBusyByUser.set(member.id, busy);
       }
     }
 
     // 4. Get raw 30-min overlaps -- pass the preloaded group AND the gcal busy
     //    map so calculateUserAvailability doesn't re-fetch per-member.
-    //    Phase 87.4 Plan 08: call the INTERNAL sub-keyed builder directly. The
-    //    heatmap's own matching below (noDataUserIds filter, members00/members30
-    //    intersection, pollResponseMap overlay, gcalConflicts) keys on the sub,
-    //    so this input MUST stay untranslated. The single UUID translation for
-    //    THIS function happens once, at its return boundary (step 9 below).
-    const overlaps = await this.buildGroupOverlaps(groupId, overlapStart, overlapEnd, timezone, group, gcalBusyByUser);
+    //    Phase 87.5: the overlap builder is UUID-native — its
+    //    availableMembers[].user_id VALUES are Users.id UUIDs, matching every
+    //    heatmap roster map below (noDataUserIds filter, members00/members30
+    //    intersection, pollResponseMap overlay, gcalConflicts). No translation.
+    const overlaps = await this.calculateGroupOverlaps(groupId, overlapStart, overlapEnd, timezone, group, gcalBusyByUser);
 
     // 5. Query active poll responses for this week
     // Derive ISO week string from weekStart to match prompt's week_identifier
@@ -789,7 +679,16 @@ class AvailabilityService {
     const weekNum = Math.ceil(((thursday - yearStart) / 86400000 + 1) / 7);
     const isoWeek = `${thursday.getUTCFullYear()}-W${String(weekNum).padStart(2, '0')}`;
 
-    let pollResponseMap = new Map(); // user_id -> { username, slots: Set<"date_HH:MM"> }
+    let pollResponseMap = new Map(); // Users.id UUID -> { username, slots: Set<"date_HH:MM"> }
+
+    // Roster membership set (Users.id UUIDs). Used to gate poll responses to
+    // CURRENT members only — an AvailabilityResponse survives a member leaving
+    // the group (the User row and their response persist), and the response
+    // query is prompt-scoped, not membership-scoped. Pre-87.4 such an ex-member
+    // leaked into the heatmap; 87.4's boundary translation dropped them as a
+    // roster map-miss. Post-collapse we preserve that member-only invariant
+    // explicitly here (no user-facing behavior change — v2.0 hardening tenet).
+    const rosterUuids = new Set(members.map(m => m.id));
 
     const prompts = await AvailabilityPrompt.findAll({
       where: {
@@ -805,14 +704,16 @@ class AvailabilityService {
       const prompt = prompts[0];
       const responses = await AvailabilityResponse.findAll({
         where: { prompt_id: prompt.id },
-        include: [{ model: User, attributes: ['user_id', 'username'] }],
+        include: [{ model: User, attributes: ['id', 'username'] }],
       });
 
       for (const response of responses) {
-        const userId = response.user_id;
+        const userUuid = response.user_uuid;
+        // Skip responses from users no longer on the group roster (member-only invariant).
+        if (!rosterUuids.has(userUuid)) continue;
         const username = response.User?.username || 'Unknown';
-        if (!pollResponseMap.has(userId)) {
-          pollResponseMap.set(userId, { username, slots: new Set() });
+        if (!pollResponseMap.has(userUuid)) {
+          pollResponseMap.set(userUuid, { username, slots: new Set() });
         }
         // Convert response time_slots to date_HH:MM keys
         for (const slot of response.time_slots || []) {
@@ -820,7 +721,7 @@ class AvailabilityService {
           const dateStr = this.formatDateISO(slotStart);
           const hh = String(slotStart.getUTCHours()).padStart(2, '0');
           const mm = String(slotStart.getUTCMinutes()).padStart(2, '0');
-          pollResponseMap.get(userId).slots.add(`${dateStr}_${hh}:${mm}`);
+          pollResponseMap.get(userUuid).slots.add(`${dateStr}_${hh}:${mm}`);
         }
       }
     }
@@ -829,15 +730,15 @@ class AvailabilityService {
     // Reuses the already-fetched gcalBusyByUser from step 3.5 -- no new network
     // calls. Only includes users with poll responses (the conflict-detection
     // path in the bucketing loop below only consults this map for those users).
-    const gcalBusyMap = new Map(); // user_id -> { username, busySlots: Set<"date_HH:MM"> }
+    const gcalBusyMap = new Map(); // Users.id UUID -> { username, busySlots: Set<"date_HH:MM"> }
     for (const member of members) {
-      if (!gcalBusyByUser.has(member.user_id)) continue;
-      if (!pollResponseMap.has(member.user_id)) continue;
+      if (!gcalBusyByUser.has(member.id)) continue;
+      if (!pollResponseMap.has(member.id)) continue;
       const busySet = new Set();
-      for (const busy of gcalBusyByUser.get(member.user_id)) {
+      for (const busy of gcalBusyByUser.get(member.id)) {
         busySet.add(`${busy.date}_${busy.startTime}`);
       }
-      gcalBusyMap.set(member.user_id, { username: member.username, busySlots: busySet });
+      gcalBusyMap.set(member.id, { username: member.username, busySlots: busySet });
     }
 
     // Check each member for availability data sources (including poll responses).
@@ -846,27 +747,28 @@ class AvailabilityService {
     const { Op } = require('sequelize');
     const candidatesNeedingDbCheck = members.filter(m => {
       const hasGcal = m.google_calendar_enabled && m.google_calendar_token;
-      const hasPollResponse = pollResponseMap.has(m.user_id);
+      const hasPollResponse = pollResponseMap.has(m.id);
       return !hasGcal && !hasPollResponse;
     });
 
     const recurringByUser = new Set();
     if (candidatesNeedingDbCheck.length > 0) {
-      const ids = candidatesNeedingDbCheck.map(m => m.user_id);
+      const ids = candidatesNeedingDbCheck.map(m => m.id);
       const rows = await UserAvailability.findAll({
-        where: { user_id: { [Op.in]: ids } },
-        attributes: ['user_id'],
+        where: { user_uuid: { [Op.in]: ids } },
+        attributes: ['user_uuid'],
       });
-      for (const r of rows) recurringByUser.add(r.user_id);
+      for (const r of rows) recurringByUser.add(r.user_uuid);
     }
 
     const membersWithoutData = [];
     for (const member of members) {
       const hasGcal = member.google_calendar_enabled && member.google_calendar_token;
-      const hasPollResponse = pollResponseMap.has(member.user_id);
-      const hasRecurring = recurringByUser.has(member.user_id);
+      const hasPollResponse = pollResponseMap.has(member.id);
+      const hasRecurring = recurringByUser.has(member.id);
       if (!hasGcal && !hasRecurring && !hasPollResponse) {
-        membersWithoutData.push({ user_id: member.user_id, username: member.username });
+        // Wire field NAME stays `user_id`; VALUE is the member's Users.id UUID.
+        membersWithoutData.push({ user_id: member.id, username: member.username });
       }
     }
 
@@ -1038,31 +940,19 @@ class AvailabilityService {
     const __renderMs = Date.now() - __t0;
     console.log(`heatmap render: ${__renderMs}ms group=${groupId} members=${totalMembers}`);
 
-    // 9. Boundary translation (Phase 87.4 Plan 08): the ENTIRE pipeline above
-    //    stayed sub-keyed. Build ONE roster map from the already-loaded
-    //    group.Users and flip every emitted user_id VALUE sub->UUID in a single
-    //    pass over this finished payload. Member-accounting counts
-    //    (membersWithData, membersWithoutDataCount, totalMembers) are computed
-    //    from the ORIGINAL arrays so an unresolvable-identity drop never skews
-    //    the counts — only the emitted identity collections drop the entry.
-    const subToUuid = buildSubToUuid(members);
-    const translatedMembersWithoutData = translateUserIdCollection(membersWithoutData, subToUuid);
-    const translatedGcalConflicts = translateUserIdCollection(gcalConflicts, subToUuid);
-    const translatedSlots = slots.map(slot => {
-      const availableMembers = translateUserIdCollection(slot.availableMembers, subToUuid);
-      return { ...slot, availableMembers, availableCount: availableMembers.length };
-    });
-
+    // 9. Return (Phase 87.5): the ENTIRE pipeline above is UUID-native — every
+    //    emitted user_id VALUE is already the member's Users.id UUID (field NAME
+    //    unchanged). No boundary translation pass remains.
     return {
       weekStart: weekStartStr,
       weekEnd: weekEndStr,
       totalMembers: membersWithData,
       totalGroupMembers: totalMembers,
       membersWithData,
-      membersWithoutData: translatedMembersWithoutData,
+      membersWithoutData,
       membersWithoutDataCount: membersWithoutData.length,
-      gcalConflicts: translatedGcalConflicts,
-      slots: translatedSlots,
+      gcalConflicts,
+      slots,
     };
   }
 }
