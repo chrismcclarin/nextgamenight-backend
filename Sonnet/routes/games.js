@@ -72,7 +72,17 @@ router.get('/search-all', async (req, res) => {
     // Local search: find games the user/group has used
     if (user_id) {
       try {
-        const user = await User.findOne({ where: { user_id } });
+        // 87.5-06 (T-875-06-SEARCHALL / KEYMISS): this is a PUBLIC route with no
+        // auth gate, so the ?user_id query-param is the only place the caller's
+        // identifier is interpreted. Plan 11 flips the FE searchAll senders from
+        // the caller's Auth0 sub to their Users.id UUID — so resolve BOTH shapes
+        // (findByPk on the UUID, findOne on the sub), matching the dual-resolution
+        // precedent already on the sibling /games/for-event route. A sub-only
+        // lookup would silently miss a UUID-identified caller and return zero
+        // local results while BGG results keep rendering.
+        const user = isUuid(user_id)
+          ? await User.findByPk(user_id)
+          : await User.findOne({ where: { user_id } });
         if (user) {
           // Get all active group_ids for the user. Phase 87.1 (BINT-02): the
           // subject user was resolved from the ?user_id query-param above (this
