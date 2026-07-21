@@ -86,9 +86,12 @@ function addDaysUTC(yyyyMmDd, days) {
  *   Failure: { error: string, action: string }
  */
 router.post('/validate', magicTokenLimiter, async (req, res) => {
+  // Phase 87.5 (WR-01): hoisted above the try so `token` is in scope inside the
+  // catch block's trackValidation({ tokenId: extractTokenId(token) }) call.
+  // Previously declared inside try — a server error made the catch throw a
+  // ReferenceError, the 500 was never sent, and the request hung.
+  const { token, formLoadedAt } = req.body || {};
   try {
-    const { token, formLoadedAt } = req.body;
-
     if (!token) {
       // Status STAYS 400 (Pitfall 2 — token_invalid is anchored to 400, not 401).
       // `action` moves under details; call-site emit (never a bare async throw).

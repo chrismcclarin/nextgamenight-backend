@@ -10,10 +10,23 @@ if (!process.env.MAGIC_TOKEN_SECRET) {
   process.env.MAGIC_TOKEN_SECRET = 'test-secret-key-for-jwt-signing-minimum-32-chars-long';
 }
 
+// Phase 87.5 (WR-01): mock magicTokenService so a single validate call can be
+// forced to throw, exercising the outer catch block. Defaults delegate to the
+// real implementation via requireActual, so every other test keeps using real
+// token generation/validation unchanged.
+jest.mock('../../services/magicTokenService', () => {
+  const actual = jest.requireActual('../../services/magicTokenService');
+  return {
+    ...actual,
+    validateToken: jest.fn((...args) => actual.validateToken(...args)),
+  };
+});
+
 const request = require('supertest');
 const express = require('express');
 const jwt = require('jsonwebtoken');
 const magicAuthRoutes = require('../../routes/magicAuth');
+const { validateToken: mockedValidateToken } = require('../../services/magicTokenService');
 const { User, Group, AvailabilityPrompt, MagicToken, TokenAnalytics, sequelize } = require('../../models');
 const { generateToken } = require('../../services/magicTokenService');
 
@@ -174,6 +187,22 @@ describe('Magic Auth API', () => {
       });
 
       expect(analytics.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it('returns 500 (not a hung request) when validation throws server-side', async () => {
+      // Phase 87.5 (WR-01) regression guard: force the outer catch to run. Before
+      // the fix `token` was declared inside the try, so extractTokenId(token) in
+      // the catch threw a ReferenceError, the 500 was never sent, and the request
+      // hung. With `token` hoisted above the try, the catch cleanly returns 500.
+      mockedValidateToken.mockRejectedValueOnce(new Error('boom'));
+
+      const res = await request(app)
+        .post('/api/magic-auth/validate')
+        .send({ token: 'any.non.empty.token' });
+
+      expect(res.status).toBe(500);
+      expect(res.body.error).toBe('Validation failed');
+      expect(res.body.action).toBe('request_new');
     });
 
     it('end-to-end: generate token -> validate token -> get user info', async () => {
