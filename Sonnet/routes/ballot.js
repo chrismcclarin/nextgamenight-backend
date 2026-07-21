@@ -268,9 +268,12 @@ router.post('/:eventId/options', validateBallotOptions, async (req, res) => {
     }
 
     // Preserve the ballot's original creator UUID on replace; stamp the actor's
-    // UUID on first-ever creation. An owner/admin edit must NOT overwrite
-    // created_by_uuid with the editor's id (#8).
-    const preservedCreator = existing?.created_by_uuid ?? callerUuid;
+    // UUID ONLY on first-ever creation (no existing ballot). An owner/admin edit must
+    // NOT overwrite created_by_uuid with the editor's id (#8). Use an explicit
+    // existing-row check, NOT `?? callerUuid`: a NULL-creator ballot (legacy D-05 row)
+    // exists but has a null creator, and it must STAY creatorless on replace (remain
+    // permanently owner/admin-only) — `?? callerUuid` would wrongly stamp the editor.
+    const preservedCreator = existing ? existing.created_by_uuid : callerUuid;
 
     // BulkCreate new options
     const optionRows = options.map((opt, index) => ({
@@ -373,9 +376,12 @@ router.put('/:eventId/options', validateBallotOptions, async (req, res) => {
     }
 
     // Preserve the ballot's original creator UUID on replace; stamp the actor's
-    // UUID if there were no existing options. An owner/admin edit must NOT
-    // overwrite created_by_uuid with the editor's id (#8).
-    const preservedCreator = existing?.created_by_uuid ?? callerUuid;
+    // UUID ONLY if there were no existing options. An owner/admin edit must NOT
+    // overwrite created_by_uuid with the editor's id (#8). Use an explicit existing-row
+    // check, NOT `?? callerUuid`: a NULL-creator ballot (legacy D-05 row) exists but has
+    // a null creator, and it must STAY creatorless on replace (remain permanently
+    // owner/admin-only) — `?? callerUuid` would wrongly stamp the editor.
+    const preservedCreator = existing ? existing.created_by_uuid : callerUuid;
 
     // BulkCreate replacement options
     const optionRows = options.map((opt, index) => ({
