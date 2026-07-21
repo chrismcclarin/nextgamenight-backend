@@ -4,6 +4,7 @@ const { UserGame, User, Game } = require('../models');
 const bggService = require('../services/bggService');
 const router = express.Router();
 const { validateBGGUsername, validateAuth0UserId } = require('../middleware/validators');
+const { matchesSelf } = require('../middleware/objectAuth');
 
 // Get all games owned by a user
 router.get('/user/:user_id', async (req, res) => {
@@ -14,25 +15,23 @@ router.get('/user/:user_id', async (req, res) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
-    // Resolve the CALLER from the verified JWT — the param is only ever
-    // compared against the caller's own identifiers below (self-only route).
-    const user = await User.findOne({ where: { user_id: userId } });
+    // Self-gate (87.5-05, SPEC Req 4/5): the requested :user_id must identify the
+    // AUTHENTICATED caller. Folded onto the shared matchesSelf dual-accept — it
+    // resolves the caller's OWN row from the token (BOLA-safe UUID arm), subsuming
+    // the former bespoke `param !== user.id` compare so the two can no longer drift.
+    if (!(await matchesSelf(req, req.params.user_id))) {
+      return res.status(403).json({ error: 'Forbidden: Cannot access other users\' games' });
+    }
+
+    // Resolve the CALLER row for the rest of the handler. On the UUID arm matchesSelf
+    // already memoized it as req.selfUser (reuse — no redundant query); on the sub arm
+    // it short-circuits DB-free, so fall back to the lookup (sub-shaped traffic is 100%
+    // of production during the D-02 rollout window).
+    const user = req.selfUser ?? await User.findOne({ where: { user_id: userId } });
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    // Self-gate: the requested :user_id must identify the AUTHENTICATED caller.
-    // Phase 87.3 PR-C (plan 09, Rule 2 deviation): accept the caller's Users.id
-    // UUID as well as their Auth0 sub. The self-identity response
-    // (GET /users/:user_id) now ALIASES user_id to the UUID, and BringGamePicker
-    // feeds `self.user_id` into this route — without the UUID arm every
-    // owned-games read from that surface would 403 post-PR-C (silent empty
-    // picker). Still strictly self-only: both arms compare the param against
-    // the JWT-resolved caller row, never against client-supplied identity.
-    if (req.params.user_id !== userId && req.params.user_id !== user.id) {
-      return res.status(403).json({ error: 'Forbidden: Cannot access other users\' games' });
-    }
-    
     const ownedGames = await UserGame.findAll({
       where: { user_id: user.id },
       include: [{ 
@@ -64,18 +63,18 @@ router.post('/user/:user_id/game/:game_id', async (req, res) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
-    // Resolve the CALLER from the verified JWT; the param is only ever
-    // compared against the caller's own identifiers (self-only route).
-    const user = await User.findOne({ where: { user_id: userId } });
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
+    // Self-gate (87.5-05): folded onto the shared matchesSelf dual-accept — resolves
+    // the caller's OWN row from the token (BOLA-safe), subsuming the former bespoke
+    // `param !== user.id` compare.
+    if (!(await matchesSelf(req, req.params.user_id))) {
+      return res.status(403).json({ error: 'Forbidden: Cannot modify other users\' games' });
     }
 
-    // Self-gate, dual-armed like the GET above (Rule 2 deviation): the self
-    // row's user_id now carries the Users.id UUID, so accept sub OR UUID —
-    // both compared against the JWT-resolved caller, never client identity.
-    if (req.params.user_id !== userId && req.params.user_id !== user.id) {
-      return res.status(403).json({ error: 'Forbidden: Cannot modify other users\' games' });
+    // Resolve the CALLER row: reuse matchesSelf's UUID-arm memoized row when present,
+    // fall back to the lookup on the sub arm (DB-free short-circuit leaves it unset).
+    const user = req.selfUser ?? await User.findOne({ where: { user_id: userId } });
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
     }
 
     const game = await Game.findByPk(req.params.game_id);
@@ -107,17 +106,20 @@ router.delete('/user/:user_id/game/:game_id', async (req, res) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
     
-    const user = await User.findOne({ where: { user_id: userId } });
+    // Self-gate (87.5-05): folded onto the shared matchesSelf dual-accept — resolves
+    // the caller's OWN row from the token (BOLA-safe), subsuming the former bespoke
+    // `param !== user.id` compare.
+    if (!(await matchesSelf(req, req.params.user_id))) {
+      return res.status(403).json({ error: 'Forbidden: Cannot modify other users\' games' });
+    }
+
+    // Resolve the CALLER row: reuse matchesSelf's UUID-arm memoized row when present,
+    // fall back to the lookup on the sub arm.
+    const user = req.selfUser ?? await User.findOne({ where: { user_id: userId } });
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    // Self-gate, dual-armed like the GET above: accept the caller's sub OR
-    // their Users.id UUID (the self row's user_id value post-PR-C).
-    if (req.params.user_id !== userId && req.params.user_id !== user.id) {
-      return res.status(403).json({ error: 'Forbidden: Cannot modify other users\' games' });
-    }
-    
     const userGame = await UserGame.findOne({
       where: { user_id: user.id, game_id: req.params.game_id }
     });
@@ -144,15 +146,18 @@ router.post('/user/:user_id/import-bgg-collection', validateAuth0UserId('user_id
     
     const { bgg_username } = req.body;
 
-    const user = await User.findOne({ where: { user_id: userId } });
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
+    // Self-gate (87.5-05): folded onto the shared matchesSelf dual-accept — resolves
+    // the caller's OWN row from the token (BOLA-safe), subsuming the former bespoke
+    // `param !== user.id` compare.
+    if (!(await matchesSelf(req, req.params.user_id))) {
+      return res.status(403).json({ error: 'Forbidden: Cannot import games for other users' });
     }
 
-    // Self-gate, dual-armed like the GET above: accept the caller's sub OR
-    // their Users.id UUID (validateAuth0UserId's charset admits both shapes).
-    if (req.params.user_id !== userId && req.params.user_id !== user.id) {
-      return res.status(403).json({ error: 'Forbidden: Cannot import games for other users' });
+    // Resolve the CALLER row: reuse matchesSelf's UUID-arm memoized row when present,
+    // fall back to the lookup on the sub arm.
+    const user = req.selfUser ?? await User.findOne({ where: { user_id: userId } });
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
     }
 
     // Log import start (sanitized - no user ID)
