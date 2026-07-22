@@ -22,10 +22,13 @@
 //   MIXED KEYSPACE (the scrub matches on BOTH keys — neither arm is dead code):
 //   - Feedback.user_id -> historical rows are Auth0-sub-keyed (pre-87.5); NEW rows
 //                         submitted while logged in are Users.id-UUID-keyed once Plan 11
-//                         flips FeedbackForm.js to send self.id. The anonymize scrub's
-//                         Op.or therefore matches sub OR uuid OR email so BOTH row shapes
-//                         are anonymized on deletion (a sub-only match would leak every
-//                         post-Plan-11 UUID-keyed feedback row of a deleted user).
+//                         flips FeedbackForm.js to send self.id. The /feedback/github
+//                         DB-fallback also stamps a resolved Users.id UUID (87.5 review
+//                         ML-10 — its old req.auth?.sub read was dead code storing null).
+//                         The anonymize scrub's Op.or therefore matches sub OR uuid OR
+//                         email so BOTH row shapes are anonymized on deletion (a sub-only
+//                         match would leak every post-Plan-11 UUID-keyed feedback row of
+//                         a deleted user).
 //
 // SURVIVING EXCEPTIONS (completeness-by-enumeration — these are INTENTIONALLY NOT
 // touched, per SPEC out-of-scope):
