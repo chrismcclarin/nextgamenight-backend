@@ -300,8 +300,10 @@ router.get('/google/status/:user_id', async (req, res) => {
       return res.status(403).json({ error: 'Forbidden: Cannot access other users\' calendar status' });
     }
 
-    // Find user (don't auto-create, just return status)
-    const user = await User.findOne({
+    // Find user (don't auto-create, just return status). Reuse matchesSelf's
+    // UUID-arm memoized row when present (default scope carries both calendar
+    // fields — only email/phone are excluded); fall back on the sub arm. (ML-19)
+    const user = req.selfUser ?? await User.findOne({
       where: { user_id: userId },
       attributes: ['google_calendar_enabled', 'google_calendar_token']
     });

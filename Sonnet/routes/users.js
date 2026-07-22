@@ -489,7 +489,9 @@ router.put('/:user_id/tutorial', async (req, res) => {
       return res.status(403).json({ error: 'Forbidden: Cannot update other users\' tutorial status' });
     }
 
-    const user = await User.findOne({ where: { user_id: userId } });
+    // Reuse matchesSelf's UUID-arm memoized row when present; fall back to the
+    // lookup on the sub arm (DB-free short-circuit leaves it unset). (ML-19)
+    const user = req.selfUser ?? await User.findOne({ where: { user_id: userId } });
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
@@ -515,7 +517,9 @@ router.delete('/:user_id/tutorial', async (req, res) => {
       return res.status(403).json({ error: 'Forbidden: Cannot reset other users\' tutorial status' });
     }
 
-    const user = await User.findOne({ where: { user_id: userId } });
+    // Reuse matchesSelf's UUID-arm memoized row when present; fall back to the
+    // lookup on the sub arm (DB-free short-circuit leaves it unset). (ML-19)
+    const user = req.selfUser ?? await User.findOne({ where: { user_id: userId } });
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
@@ -589,7 +593,9 @@ router.put('/:user_id/username', async (req, res) => {
       return res.status(400).json({ error: 'Username must be 50 characters or less' });
     }
     
-    const user = await User.findOne({ where: { user_id: userId } });
+    // Reuse matchesSelf's UUID-arm memoized row when present; fall back to the
+    // lookup on the sub arm (DB-free short-circuit leaves it unset). (ML-19)
+    const user = req.selfUser ?? await User.findOne({ where: { user_id: userId } });
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
@@ -779,7 +785,9 @@ router.patch('/:user_id/timezone', writeOperationLimiter, async (req, res) => {
       return res.status(400).json({ error: 'Invalid IANA timezone string' });
     }
 
-    const user = await User.findOne({ where: { user_id: userId } });
+    // Reuse matchesSelf's UUID-arm memoized row when present; fall back to the
+    // lookup on the sub arm (DB-free short-circuit leaves it unset). (ML-19)
+    const user = req.selfUser ?? await User.findOne({ where: { user_id: userId } });
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
@@ -815,7 +823,9 @@ router.post('/:user_id/phone', async (req, res) => {
       return res.status(400).json({ error: result.error });
     }
 
-    const user = await User.findOne({ where: { user_id: userId } });
+    // Reuse matchesSelf's UUID-arm memoized row when present; fall back to the
+    // lookup on the sub arm (DB-free short-circuit leaves it unset). (ML-19)
+    const user = req.selfUser ?? await User.findOne({ where: { user_id: userId } });
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
@@ -915,7 +925,9 @@ router.delete('/:user_id/phone', async (req, res) => {
       return res.status(403).json({ error: 'Forbidden: Cannot update other users\' phone numbers' });
     }
 
-    const user = await User.findOne({ where: { user_id: userId } });
+    // Reuse matchesSelf's UUID-arm memoized row when present; fall back to the
+    // lookup on the sub arm (DB-free short-circuit leaves it unset). (ML-19)
+    const user = req.selfUser ?? await User.findOne({ where: { user_id: userId } });
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }

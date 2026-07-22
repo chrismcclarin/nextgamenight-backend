@@ -130,7 +130,9 @@ router.get('/user/:user_id', async (req, res) => {
       return res.status(403).json({ error: 'Forbidden: Cannot access other users\' groups' });
     }
 
-    let user = await User.findOne({
+    // Reuse matchesSelf's UUID-arm memoized row when present; fall back to the
+    // lookup on the sub arm (DB-free short-circuit leaves it unset). (ML-19)
+    let user = req.selfUser ?? await User.findOne({
       where: { user_id: userId }
     });
 
