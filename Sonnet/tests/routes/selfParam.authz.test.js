@@ -30,6 +30,9 @@ process.env.NODE_ENV = 'test';
 // req.user below (mirrors wire-sweep.test.js).
 jest.mock('../../middleware/auth0', () => ({
   verifyAuth0Token: (req, _res, next) => next(),
+  // games.js search-all mounts optionalAuth (ML-06 gate); pass through so the
+  // harness-injected req.user (below) is what matchesSelf sees.
+  optionalAuth: (req, _res, next) => next(),
 }));
 
 // users.js reaches for the Auth0 Management API on profile-fixup branches —
@@ -339,12 +342,13 @@ describe('Self-param dual-accept family (87.4-02): sub OR caller-own-UUID author
   // Assert a representative route across both keyspaces + the member gate + BOLA.
   // --------------------------------------------------------------------------
   describe('lists H-1 family — self-param dual-accept + active-member gate', () => {
-    // Positive (authorizes + query executes) assertions use routes with healthy
-    // queries (by-theme, player-wins-by-id). The aggregation routes (most-played,
-    // least-played, alphabetical, player-games) carried PRE-EXISTING query defects
-    // that 500'd for any authorized caller and were DELETED in 87.5-06 (SPEC Req
-    // 9/10); the auth-gate assertions they used to host are now re-pointed onto the
-    // surviving /by-theme route, which shares the identical self-param gate.
+    // Positive (authorizes + query executes) assertions use the surviving
+    // /by-theme route (healthy query, identical self-param gate). The aggregation
+    // routes (most-played, least-played, alphabetical, player-games) carried
+    // PRE-EXISTING query defects that 500'd for any authorized caller and were
+    // DELETED in 87.5-06 (SPEC Req 9/10); WR-02 (87.5 review) then deleted the
+    // per-player wins/picks routes (player-wins-by-id + name-keyed siblings) for
+    // the same always-empty-predicate defect class. Deleted routes are pinned 404.
     it('by-theme authorizes for the caller OWN UUID shape (member)', async () => {
       const res = await request(app).get(`/api/lists/by-theme/${group.id}/strategy/${caller.id}`);
       expect(res.status).toBe(200);
@@ -359,12 +363,11 @@ describe('Self-param dual-accept family (87.4-02): sub OR caller-own-UUID author
       expect(Array.isArray(res.body)).toBe(true);
     });
 
-    it('player-wins-by-id authorizes for the caller OWN UUID shape (member)', async () => {
+    it('player-wins-by-id 404s — route deleted in WR-02 (87.5 review, dead always-empty query)', async () => {
       const res = await request(app).get(
         `/api/lists/player-wins-by-id/${group.id}/${caller.id}/${caller.id}`
       );
-      expect(res.status).toBe(200);
-      expect(Array.isArray(res.body)).toBe(true);
+      expect(res.status).toBe(404);
     });
 
     it('by-theme 403s a caller who is NOT an active member (self-param passes, member gate fails)', async () => {
