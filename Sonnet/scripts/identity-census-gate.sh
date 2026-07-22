@@ -82,22 +82,34 @@ C2=$(grep -rnE \
   `# §2/§4 Users identity-anchor writes: user_id IS the Auth0 sub == Users.user_id, the` \
   `#        auth boundary (accepted-forever). Users.findOrCreate / provisioning upserts.` \
   | grep -vE 'routes/users\.js:.*user_id: (userDetails|user)\.user_id' \
-  | grep -vE 'routes/groups\.js:.*user_id: userId' \
+  `# groups.js provisioning writes ONLY (ML-08 tighten): the findOrCreate defaults` \
+  `#   one-liners (join flows) + the bare defaults-block line in /user/:user_id` \
+  `#   auto-create. A future user_id: userId write with trailing content on the` \
+  `#   same line (e.g. into a rekeyed table) is NOT pre-forgiven.` \
+  | grep -vE 'routes/groups\.js:[0-9]+:.*defaults: \{ user_id: userId, email:' \
+  | grep -vE 'routes/groups\.js:[0-9]+:[[:space:]]*user_id: userId,[[:space:]]*$' \
   | grep -vE 'services/auth0Service\.js:.*user_id: auth0User\.user_id' \
-  `# §2 Feedback sub store: Feedback.user_id holds the sub (or client value), inert, never` \
-  `#     emitted, DB-internal by owner disposition (census §4).` \
-  | grep -vE 'routes/feedback\.js:.*user_id: (req\.auth\?\.sub|user_id) \|\| null' \
+  `# §2/§4 Feedback client-value store: POST / stores the client-asserted user_id (a` \
+  `#     Users.id UUID from FeedbackForm post-Plan-11), inert, never emitted, DB-internal` \
+  `#     by owner disposition (census §4). The /github fallback's req.auth?.sub arm was` \
+  `#     dead code, replaced in 87.5 review ML-10 by a resolved Users.id UUID stamp.` \
+  | grep -vE 'routes/feedback\.js:.*user_id: user_id \|\| null' \
   `# §4 auth-flow token internals (accepted-forever auth boundary): the verifyAuth0Token` \
   `#     middleware builds req.user.user_id from the JWT sub claim — THE identity boundary;` \
   `#     MagicToken + SingleUseToken key on the sub by design.` \
   | grep -vE 'middleware/auth0\.js:.*user_id: decoded\.sub' \
   | grep -vE 'services/magicTokenService\.js:.*user_id: user\.user_id' \
-  | grep -vE 'routes/rsvp\.js:.*user_id: userId' \
+  `# rsvp.js: bare defaults/create-block lines only (ML-08 tighten, same rationale` \
+  `#   as groups.js above).` \
+  | grep -vE 'routes/rsvp\.js:[0-9]+:[[:space:]]*user_id: userId,[[:space:]]*$' \
   `# §2 UUID wire-aliases (field NAME user_id, VALUE is a Users.id UUID): EventParticipation` \
   `#     is UUID-keyed; groups owner + availability heatmap serializers emit the UUID.` \
   | grep -vE 'routes/events\.js:.*user_id: p\.user_id' \
   | grep -vE 'routes/groups\.js:.*user_id: ug\.user_id' \
-  | grep -vE 'services/availabilityService\.js:.*user_id: (m\.user_id|userId)' \
+  `# availabilityService serializer emissions ONLY (ML-08 tighten): the two Map` \
+  `#   .set(...) wire-alias shapes + the bare payload line in the poll fold.` \
+  | grep -vE 'services/availabilityService\.js:[0-9]+:.*\.set\((m\.user_id|userId), \{ user_id: (m\.user_id|userId), username:' \
+  | grep -vE 'services/availabilityService\.js:[0-9]+:[[:space:]]*user_id: userId,[[:space:]]*$' \
   `# §2 notification/email TEMPLATE payloads (not a DB table write): the sub travels in` \
   `#     notification data, consumed by the email renderer, never persisted to a rekeyed table.` \
   | grep -vE 'services/promptInvitationService\.js:.*user_id: user\.user_id' \
