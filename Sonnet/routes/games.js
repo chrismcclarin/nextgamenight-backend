@@ -2,7 +2,8 @@
 const express = require('express');
 const { Game, Event, EventParticipation, GameReview, User, UserGame, UserGroup } = require('../models');
 const { Op } = require('sequelize');
-const { requireParamMatchesToken } = require('../middleware/objectAuth');
+const { requireParamMatchesToken, matchesSelf } = require('../middleware/objectAuth');
+const { optionalAuth } = require('../middleware/auth0');
 // Phase 87.4 Plan 02 (KEYMISS mitigation): resolve a UUID self-param to the
 // sub-keyed Users row.
 const { isUuid } = require('../utils/resolveTargetUser');
@@ -58,7 +59,17 @@ router.get('/', async (req, res) => {
 
 
 // Unified search: local custom games + BGG results
-router.get('/search-all', async (req, res) => {
+//
+// 87.5 adversarial review ML-06: the route stays on the public allow-list (the
+// catalog/BGG arm is genuinely public), but the ?user_id PERSONALIZATION arm is
+// now token-gated. Post-87.x, Users.id UUIDs circulate to every co-member on the
+// wire (heatmap availableMembers, respondents, rosters), so an unauthenticated
+// `?user_id=<uuid>` probe could enumerate a user's owned games + cross-group play
+// history. optionalAuth verifies a bearer token when present (req.user null
+// otherwise); the local arm runs ONLY for the caller's own verified identity
+// (matchesSelf, either keyspace). Anonymous callers get BGG-only results — the FE
+// always calls this authenticated with the caller's own id, so no surface changes.
+router.get('/search-all', optionalAuth, async (req, res) => {
   try {
     const { query, group_id, user_id } = req.query;
 
@@ -69,20 +80,22 @@ router.get('/search-all', async (req, res) => {
 
     let local = [];
 
-    // Local search: find games the user/group has used
-    if (user_id) {
+    // Local search: find games the user/group has used — verified self only (ML-06).
+    if (user_id && req.user && (await matchesSelf(req, user_id))) {
       try {
-        // 87.5-06 (T-875-06-SEARCHALL / KEYMISS): this is a PUBLIC route with no
-        // auth gate, so the ?user_id query-param is the only place the caller's
-        // identifier is interpreted. Plan 11 flips the FE searchAll senders from
-        // the caller's Auth0 sub to their Users.id UUID — so resolve BOTH shapes
+        // 87.5-06 (T-875-06-SEARCHALL / KEYMISS): the ?user_id param carries the
+        // caller's identifier. Plan 11 flips the FE searchAll senders from the
+        // caller's Auth0 sub to their Users.id UUID — so resolve BOTH shapes
         // (findByPk on the UUID, findOne on the sub), matching the dual-resolution
         // precedent already on the sibling /games/for-event route. A sub-only
         // lookup would silently miss a UUID-identified caller and return zero
-        // local results while BGG results keep rendering.
-        const user = isUuid(user_id)
-          ? await User.findByPk(user_id)
-          : await User.findOne({ where: { user_id } });
+        // local results while BGG results keep rendering. matchesSelf has already
+        // proven the param IS the caller (either keyspace), and memoized
+        // req.selfUser for the UUID arm — reuse it before hitting Users again.
+        const user = req.selfUser
+          ?? (isUuid(user_id)
+            ? await User.findByPk(user_id)
+            : await User.findOne({ where: { user_id } }));
         if (user) {
           // Get all active group_ids for the user. Phase 87.1 (BINT-02): the
           // subject user was resolved from the ?user_id query-param above (this
