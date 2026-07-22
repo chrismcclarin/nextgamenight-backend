@@ -963,8 +963,12 @@ router.put('/:id', validateUUID('id'), validateEventUpdate, async (req, res) => 
         // Resolve-miss: no Users row matched the caller's own sub. Should not
         // happen for an authenticated caller; log explicitly (rather than
         // silently skipping inside the non-fatal catch below) so the lost audit
-        // rows are observable in logs.
-        console.error(`[events:put-participants] audit actor resolve-miss for caller sub=${userId} — skipping ${removedUserIds.length} audit write(s)`);
+        // rows are observable in logs. No raw sub in the log line (T14).
+        // NOTE: skipping these writes also disables EVT-08 silent-welcome-back
+        // suppression for the removed users — /join-game-by-token consults these
+        // audit rows, so a user removed during a resolve-miss who re-joins via QR
+        // gets the welcome email the suppression exists to prevent.
+        console.error(`[events:put-participants] audit actor resolve-miss (caller sub unresolvable, event=${event.id}) — skipping ${removedUserIds.length} audit write(s); EVT-08 suppression disabled for these removals`);
       }
       for (const removedUuid of actorUuid ? removedUserIds : []) {
         try {
@@ -1494,7 +1498,9 @@ router.delete('/:event_id/participations/:user_id', validateUUID('event_id'), va
     if (!actorUuid) {
       // Resolve-miss: an organizer with no Users row of their own reached here
       // (isOrganizer true, callerDbUser null). Log rather than silently skip.
-      console.error(`[events:remove-participant] audit actor resolve-miss for caller sub=${userId} — skipping audit write`);
+      // No raw sub in the log line (T14). NOTE: skipping the write also disables
+      // EVT-08 welcome-back suppression for this removal (see put-participants).
+      console.error(`[events:remove-participant] audit actor resolve-miss (caller sub unresolvable, event=${event.id}) — skipping audit write; EVT-08 suppression disabled for this removal`);
     }
     if (actorUuid) try {
       const removeNowMs = Date.now();
@@ -1681,7 +1687,8 @@ router.delete('/:id', async (req, res) => {
     if (!actorUuid) {
       // Resolve-miss: no Users row matched the caller's own sub. Log explicitly
       // rather than silently skipping inside the non-fatal catch below.
-      console.error(`[events:delete] audit actor resolve-miss for caller sub=${userId} — skipping audit write`);
+      // No raw sub in the log line (T14).
+      console.error(`[events:delete] audit actor resolve-miss (caller sub unresolvable, event=${event.id}) — skipping audit write`);
     }
     if (actorUuid) try {
       await EventAuditLog.create({
