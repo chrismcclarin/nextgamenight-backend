@@ -56,6 +56,28 @@ module.exports = {
           `[AR-DROP] deploy-window duplicate NULL-uuid rows deleted: ${dedupeMeta ? dedupeMeta.rowCount : 0}`
         );
 
+        // (0b) CROSS-KEYSPACE DEDUPE (87.5 adversarial review ML-01). The deploy
+        // window also produces the MIXED shape: an old-bundle write lands a
+        // sub-keyed row (user_uuid NULL) while the new bundle — whose findOne keys
+        // on user_uuid and cannot see that NULL row — creates a SECOND, UUID-keyed
+        // row for the same (prompt_id, user). The NULL-NULL dedupe above cannot see
+        // this pair, and the re-backfill below would set the NULL row's user_uuid
+        // to the same UUID → unique violation → whole PR-2 transaction rolls back.
+        // Delete the NULL-uuid row and keep the UUID-keyed one (the newer-bundle
+        // write, which the app has been reading/updating since the PR-1 cutover).
+        const [, mixedMeta] = await sequelize.query(
+          `DELETE FROM "AvailabilityResponses" a
+            USING "Users" u, "AvailabilityResponses" k
+            WHERE a.user_uuid IS NULL
+              AND u.user_id = a.user_id
+              AND k.prompt_id = a.prompt_id
+              AND k.user_uuid = u.id`,
+          { transaction: t }
+        );
+        console.log(
+          `[AR-DROP] deploy-window NULL-uuid rows superseded by UUID-keyed rows deleted: ${mixedMeta ? mixedMeta.rowCount : 0}`
+        );
+
         const [, backfillMeta] = await sequelize.query(
           `UPDATE "AvailabilityResponses" t SET user_uuid = u.id
              FROM "Users" u
