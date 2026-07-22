@@ -224,8 +224,10 @@ async function applyDispositions(user, t) {
 
   // 1. SOLE-MEMBER OWNED GROUP AUTO-DELETE (Pitfall 8).
   //    For each owned group whose ONLY UserGroup row (any status) is the owner's,
-  //    replicate routes/groups.js:721-742 group-delete IN-TXN. Never call the route
-  //    (it is non-transactional). Groups with other members were already rejected by
+  //    replicate the routes/groups.js group-delete IN-TXN. Never call the route —
+  //    it now runs its own transaction (87.5 IN-03), but this replica must ride
+  //    INSIDE the deletion txn `t`, not a separate one, so the whole account
+  //    deletion stays atomic. Groups with other members were already rejected by
   //    the owner gate (Step 1 + the in-txn re-check in Step 3), so they never reach here.
   const ownedRows = await UserGroup.findAll({
     where: { user_uuid: uuid, role: 'owner' },

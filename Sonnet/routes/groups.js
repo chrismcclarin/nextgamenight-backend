@@ -786,28 +786,34 @@ router.delete('/:group_id', async (req, res) => {
       return res.status(404).json({ error: 'Group not found' });
     }
     
-    // Delete all event participations for events in this group
-    const events = await Event.findAll({ where: { group_id } });
-    const eventIds = events.map(e => e.id);
-    if (eventIds.length > 0) {
-      await EventParticipation.destroy({ where: { event_id: { [Op.in]: eventIds } } });
-    }
-    
-    // Delete all events for this group
-    await Event.destroy({ where: { group_id } });
-    
-    // Delete all game reviews for this group
-    await GameReview.destroy({ where: { group_id } });
+    // One transaction (87.5 review IN-03, owner-approved fix): these were six
+    // independent writes, so a mid-sequence failure left a half-deleted group
+    // (events gone, roster intact). Same delete order as before; mirrors the
+    // in-transaction replica in accountDeletionService Step 1.
+    await sequelize.transaction(async (t) => {
+      // Delete all event participations for events in this group
+      const events = await Event.findAll({ where: { group_id }, transaction: t });
+      const eventIds = events.map(e => e.id);
+      if (eventIds.length > 0) {
+        await EventParticipation.destroy({ where: { event_id: { [Op.in]: eventIds } }, transaction: t });
+      }
 
-    // Delete all pending invites for this group — GroupInvite.group_id has NO FK,
-    // so skipping this orphans rows carrying invitee email PII.
-    await GroupInvite.destroy({ where: { group_id } });
+      // Delete all events for this group
+      await Event.destroy({ where: { group_id }, transaction: t });
 
-    // Delete all user-group associations
-    await UserGroup.destroy({ where: { group_id } });
-    
-    // Finally, delete the group
-    await group.destroy();
+      // Delete all game reviews for this group
+      await GameReview.destroy({ where: { group_id }, transaction: t });
+
+      // Delete all pending invites for this group — GroupInvite.group_id has NO FK,
+      // so skipping this orphans rows carrying invitee email PII.
+      await GroupInvite.destroy({ where: { group_id }, transaction: t });
+
+      // Delete all user-group associations
+      await UserGroup.destroy({ where: { group_id }, transaction: t });
+
+      // Finally, delete the group
+      await group.destroy({ transaction: t });
+    });
     
     res.json({ message: 'Group deleted successfully' });
   } catch (error) {
