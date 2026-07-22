@@ -20,48 +20,17 @@ describe('Game Routes', () => {
   // NOTE: no afterAll(sequelize.close()) — connection lifecycle is owned by
   // tests/globalTeardown.js (BTEST-02).
 
-  describe('GET /api/games', () => {
-    it('should get all games', async () => {
-      // Create test games
-      await Game.create({
-        name: 'Test Game 1',
-        is_custom: true
-      });
-      await Game.create({
-        name: 'Test Game 2',
-        is_custom: false
-      });
-
-      const response = await request(app)
-        .get('/api/games')
-        .expect(200);
-
-      expect(Array.isArray(response.body)).toBe(true);
-      expect(response.body.length).toBeGreaterThanOrEqual(2);
+  // GET /api/games (catalog listing) DELETED in 87.5 review SW-02 — zero product
+  // callers, and its ?group_id arm attached group reviews + usernames to an
+  // unauthenticated response. Pin the 404 (same precedent as the deleted lists
+  // routes) so a re-added route is a deliberate act, not a silent regression.
+  describe('GET /api/games — deleted route (SW-02)', () => {
+    it('404s — no route responds on the deleted catalog path', async () => {
+      await request(app).get('/api/games').expect(404);
     });
 
-    it('should filter games by search query', async () => {
-      await Game.create({ name: 'Catan', is_custom: true });
-      await Game.create({ name: 'Ticket to Ride', is_custom: true });
-      await Game.create({ name: 'Monopoly', is_custom: true });
-
-      const response = await request(app)
-        .get('/api/games?search=Catan')
-        .expect(200);
-
-      expect(response.body.length).toBe(1);
-      expect(response.body[0].name).toContain('Catan');
-    });
-
-    it('should filter games by is_custom', async () => {
-      await Game.create({ name: 'Custom Game', is_custom: true });
-      await Game.create({ name: 'BGG Game', is_custom: false, bgg_id: 123 });
-
-      const response = await request(app)
-        .get('/api/games?is_custom=true')
-        .expect(200);
-
-      expect(response.body.every(game => game.is_custom === true)).toBe(true);
+    it('404s with the group_id review-leak query too', async () => {
+      await request(app).get('/api/games?group_id=g1').expect(404);
     });
   });
 
