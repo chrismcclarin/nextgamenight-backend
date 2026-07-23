@@ -958,7 +958,14 @@ router.put('/:id', validateUUID('id'), validateEventUpdate, async (req, res) => 
       // above the per-removed-user loop: the caller's own UUID is the same on
       // every iteration (only removedUuid, the per-row payload, varies), so
       // resolving inside the loop would fire N redundant User.findOne queries.
-      const actorUuid = req.selfUuid || (await User.findOne({ where: { user_id: userId }, attributes: ['id'] }))?.id;
+      // Resolution is INSIDE the non-fatal contract (PR-2 CI catch): a failed
+      // lookup degrades to skip-audit-write, never 500s the participant update.
+      let actorUuid = null;
+      try {
+        actorUuid = req.selfUuid || (await User.findOne({ where: { user_id: userId }, attributes: ['id'] }))?.id || null;
+      } catch (resolveErr) {
+        console.error(`[events:put-participants] audit actor resolve FAILED (${resolveErr.message}) — skipping ${removedUserIds.length} audit write(s)`);
+      }
       if (!actorUuid) {
         // Resolve-miss: no Users row matched the caller's own sub. Should not
         // happen for an authenticated caller; log explicitly (rather than
@@ -1682,8 +1689,15 @@ router.delete('/:id', async (req, res) => {
     //
     // 87.5 Req 9: record the caller's Users.id UUID (no FK — audit rows survive
     // account deletion). No callerDbUser in scope on this handler, so resolve the
-    // caller's own UUID from their sub.
-    const actorUuid = req.selfUuid || (await User.findOne({ where: { user_id: userId }, attributes: ['id'] }))?.id;
+    // caller's own UUID from their sub. Resolution is INSIDE the non-fatal
+    // contract (PR-2 CI catch): a failed audit-actor lookup must degrade to
+    // skip-audit-write, never 500 the delete itself.
+    let actorUuid = null;
+    try {
+      actorUuid = req.selfUuid || (await User.findOne({ where: { user_id: userId }, attributes: ['id'] }))?.id || null;
+    } catch (resolveErr) {
+      console.error(`[events:delete] audit actor resolve FAILED (${resolveErr.message}) — skipping audit write`);
+    }
     if (!actorUuid) {
       // Resolve-miss: no Users row matched the caller's own sub. Log explicitly
       // rather than silently skipping inside the non-fatal catch below.
