@@ -104,8 +104,10 @@ Game.hasMany(UserGame, { foreignKey: 'game_id' });
 UserGame.belongsTo(Game, { foreignKey: 'game_id' });
 
 // User Availability
-User.hasMany(UserAvailability, { foreignKey: 'user_id', sourceKey: 'user_id' });
-UserAvailability.belongsTo(User, { foreignKey: 'user_id', targetKey: 'user_id' });
+// Phase 87.5 (BINT-02, D-01): re-keyed onto Users.id via user_uuid (UUID PK), the
+// protective FK ON DELETE CASCADE. Default UUID key — no STRING sourceKey/targetKey.
+User.hasMany(UserAvailability, { foreignKey: 'user_uuid', sourceKey: 'id' });
+UserAvailability.belongsTo(User, { foreignKey: 'user_uuid', targetKey: 'id' });
 
 // Group Prompt Settings (One-to-One)
 Group.hasOne(GroupPromptSettings, { foreignKey: 'group_id' });
@@ -137,9 +139,10 @@ AvailabilityPrompt.hasMany(AvailabilityResponse, { foreignKey: 'prompt_id' });
 AvailabilityResponse.belongsTo(AvailabilityPrompt, { foreignKey: 'prompt_id' });
 
 // Availability Responses (Many-to-One from User)
-// Note: Uses sourceKey/targetKey because user_id is STRING (Auth0 ID), not UUID
-User.hasMany(AvailabilityResponse, { foreignKey: 'user_id', sourceKey: 'user_id' });
-AvailabilityResponse.belongsTo(User, { foreignKey: 'user_id', targetKey: 'user_id' });
+// Phase 87.5 (BINT-02, D-01): re-keyed onto Users.id via user_uuid (UUID PK), the
+// protective FK ON DELETE CASCADE. Default UUID key — no STRING sourceKey/targetKey.
+User.hasMany(AvailabilityResponse, { foreignKey: 'user_uuid', sourceKey: 'id' });
+AvailabilityResponse.belongsTo(User, { foreignKey: 'user_uuid', targetKey: 'id' });
 
 // Availability Suggestions (One-to-Many from Prompt)
 AvailabilityPrompt.hasMany(AvailabilitySuggestion, { foreignKey: 'prompt_id' });

@@ -73,9 +73,13 @@ async function seedConsensusPrompt() {
     week_identifier: '2026-W27',
   });
   // A submitted response → respondedCount 1 (consensus reached).
+  // Phase 87.5 rekey: AvailabilityResponse is keyed on user_uuid (NOT NULL as of
+  // Plan 01; the legacy user_id attribute is dropped in Plan 07). Caught by PR-1
+  // CI — this suite was outside the availability "run alone" list, so the seed
+  // was never re-pointed with the others.
   await AvailabilityResponse.create({
     prompt_id: prompt.id,
-    user_id: CREATOR_SUB,
+    user_uuid: creator.id,
     time_slots: [{ start: '2026-07-10T18:00:00Z', end: '2026-07-10T21:00:00Z', preference: 'preferred' }],
     user_timezone: 'UTC',
     submitted_at: new Date(),

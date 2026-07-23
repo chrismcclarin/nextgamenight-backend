@@ -527,19 +527,20 @@ describe('Wire sweep (87.4-11 PR-2): availability + prompt-settings — allowlis
       created_by_user_id: owner.id,
     });
 
-    // A member response (sub-keyed row — the emission must still not leak the sub).
+    // A member response (user_uuid-keyed row — Phase 87.5 D-04 re-keyed the table;
+    // the emission must still not leak the sub).
     await AvailabilityResponse.create({
       prompt_id: prompt.id,
-      user_id: member.user_id, // AvailabilityResponse is still sub-keyed (Phase 87.5 rekeys)
+      user_uuid: member.id, // AvailabilityResponse re-keyed onto user_uuid (Phase 87.5 D-04)
       time_slots: [{ start: new Date().toISOString(), end: new Date(Date.now() + 36e5).toISOString(), preference: 'preferred' }],
       user_timezone: 'UTC',
       submitted_at: new Date(),
     });
 
-    // A recurring availability pattern for the owner (sub-keyed row) so patterns /
+    // A recurring availability pattern for the owner (user_uuid-keyed row) so patterns /
     // heatmap / overlaps render non-empty and prove the emission carries the UUID.
     await UserAvailability.create({
-      user_id: owner.user_id, // sub-keyed row (Phase 87.5 rekeys the column)
+      user_uuid: owner.id, // UserAvailability re-keyed onto user_uuid (Phase 87.5)
       type: 'recurring_pattern',
       pattern_data: { dayOfWeek: 3, startTime: '18:00', endTime: '22:00' },
       start_date: '2026-01-01',

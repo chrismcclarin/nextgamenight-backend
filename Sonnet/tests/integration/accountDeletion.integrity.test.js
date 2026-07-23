@@ -101,7 +101,7 @@ async function makeEventParticipation(event, user, overrides = {}) {
 }
 async function makeUserAvailability(user, overrides = {}) {
   return UserAvailability.create({
-    user_id: user.user_id, // Auth0 sub keyspace (FK -> Users.user_id, CASCADE)
+    user_uuid: user.id, // Phase 87.5 (D-04): re-keyed FK -> Users.id, CASCADE
     type: 'recurring_pattern',
     pattern_data: { dayOfWeek: 3, startTime: '18:00', endTime: '22:00', timezone: 'UTC' },
     start_date: '2026-01-01',
@@ -122,7 +122,7 @@ async function makePrompt(group, overrides = {}) {
 async function makeAvailabilityResponse(prompt, user, overrides = {}) {
   return AvailabilityResponse.create({
     prompt_id: prompt.id,
-    user_id: user.user_id, // Auth0 sub keyspace (FK -> Users.user_id, CASCADE)
+    user_uuid: user.id, // Phase 87.5 (D-04): re-keyed FK -> Users.id, CASCADE
     time_slots: [{ start: '2026-01-01T18:00:00Z', end: '2026-01-01T22:00:00Z', preference: 'preferred' }],
     user_timezone: 'UTC',
     submitted_at: new Date(),
@@ -193,7 +193,7 @@ describe('accountDeletion integrity — full disposition table on real Postgres 
     const tParticipation = await makeEventParticipation(customEvent, target, { google_calendar_event_id: 'gcal-evt-target' });
     const tRsvp = await makeEventRsvp(customEvent, target);
     const tBring = await makeEventBring(customEvent, target, game);
-    const tBallotOption = await makeEventBallotOption(customEvent, target); // created_by -> SET NULL (survives)
+    const tBallotOption = await makeEventBallotOption(customEvent, target); // created_by_uuid -> SET NULL (survives)
     const tBallotVote = await makeEventBallotVote(tBallotOption, target); // CASCADE (gone)
     const tSentNotif = await makeSentNotification(customEvent, target);
     const tAvailability = await makeUserAvailability(target); // Auth0-sub CASCADE
@@ -212,7 +212,7 @@ describe('accountDeletion integrity — full disposition table on real Postgres 
     // --- ANONYMIZE surfaces for the target ---
     const tFeedback = await makeFeedback(target); // user_id=sub + user_email=email
     const tFeedbackEmailOnly = await makeFeedback(target, { user_id: null }); // email-ONLY row
-    // tBallotOption above is the created_by ANONYMIZE (SET NULL) surface.
+    // tBallotOption above is the created_by_uuid creator scrub (SET NULL) surface (Phase 87.5 PR-1).
 
     // --- JSONB-scrub surface for the target ---
     const tSuggestion = await makeAvailabilitySuggestion(prompt, target); // [target.sub] + { target.sub: gcalId }
@@ -309,7 +309,7 @@ describe('accountDeletion integrity — full disposition table on real Postgres 
 
     const ballotAfter = await EventBallotOption.findByPk(tBallotOption.id);
     expect(ballotAfter).not.toBeNull();
-    expect(ballotAfter.created_by).toBeNull(); // ANONYMIZE (Auth0-sub) -> NULL
+    expect(ballotAfter.created_by_uuid).toBeNull(); // creator scrub (UUID) + SET NULL FK -> NULL
 
     // Member-winner event: pointers nulled, NO display text (hard-delete semantics).
     const memberWinnerAfter = await Event.findByPk(memberWinnerEvent.id);
@@ -385,8 +385,11 @@ describe('accountDeletion integrity — full disposition table on real Postgres 
     expect(await GameReview.findByPk(cGameReview.id)).not.toBeNull();
     expect(await MagicToken.findByPk(cMagicToken.id)).not.toBeNull();
     expect(await SingleUseToken.findByPk(cSingleUse.id)).not.toBeNull();
-    // control's created_by / inviter pointers keep control's identifiers.
+    // control's creator / inviter pointers keep control's identifiers. The operative
+    // creator key is created_by_uuid (Phase 87.5 PR-1) — it must survive the target's
+    // deletion for the control; the retained sub column keeps control's sub too.
     const cBallotAfter = await EventBallotOption.findByPk(cBallotOption.id);
+    expect(cBallotAfter.created_by_uuid).toBe(control.id);
     expect(cBallotAfter.created_by).toBe(control.user_id);
     const cInviteAfter = await GroupInvite.findByPk(cGroupInvite.id);
     expect(cInviteAfter.invited_by_uuid).toBe(control.id);

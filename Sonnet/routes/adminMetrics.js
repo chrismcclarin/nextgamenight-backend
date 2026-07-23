@@ -42,7 +42,12 @@ router.get('/admin/metrics', verifyAuth0Token, requirePlatformAdmin, async (req,
       EmailMetrics.count({ where: { event_type: 'bounce', source_type: { [Op.in]: liveSourceTypes }, occurred_at: { [Op.gte]: since } } })
     ]);
 
-    // Availability response rate: magic tokens sent vs responses submitted
+    // Availability response rate: magic tokens sent vs responses submitted.
+    // Phase 87.5 (BINT-02, D-04) rekey audit: this is a fleet-wide response COUNT
+    // keyed on submitted_at only — it has NO per-user identity predicate, so there
+    // is no sub->user_uuid key to flip here (unlike the per-user readers in
+    // reminderWorker / availabilityPrompt). Recorded so the rekey sweep is provably
+    // exhaustive.
     const [tokensSent, responsesSubmitted] = await Promise.all([
       MagicToken.count({ where: { createdAt: { [Op.gte]: since } } }),
       AvailabilityResponse.count({ where: { submitted_at: { [Op.ne]: null, [Op.gte]: since } } })

@@ -133,12 +133,18 @@ router.post('/validate', magicTokenLimiter, async (req, res) => {
     // the boolean. (Information-disclosure mitigation, research V4.)
     let profileTimezone = null;
     let gcalConnected = false;
+    // Phase 87.5 (BINT-02, D-04): resolve the caller's Users.id here (from the
+    // SAME profile lookup — no extra query) so the re-keyed UserAvailability count
+    // below can key on user_uuid. Stays null if the lookup fails → the saved-avail
+    // count fails gracefully (button just won't render).
+    let meId = null;
     try {
       const dbUser = await User.findOne({
         where: { user_id: result.decoded.sub },
-        attributes: ['timezone', 'google_calendar_enabled', 'google_calendar_token'],
+        attributes: ['id', 'timezone', 'google_calendar_enabled', 'google_calendar_token'],
       });
       profileTimezone = dbUser?.timezone || null;
+      meId = dbUser?.id || null;
       // Canonical "connected" check — both the flag AND a usable token must be
       // present. Mirrors googleAuth.js /google/status semantics so the button
       // doesn't appear for users with a stale token after a disconnect.
@@ -168,23 +174,31 @@ router.post('/validate', magicTokenLimiter, async (req, res) => {
     // end_date NULL for open-ended, and specific_overrides set start_date =
     // end_date = the override's date (see routes/availability.js).
     let hasSavedAvailability = false;
-    try {
-      const weekStart = windowStart;
-      const weekEnd = addDaysUTC(weekStart, 6); // 7-day window, inclusive
-      const savedCount = await UserAvailability.count({
-        where: {
-          user_id: result.decoded.sub,
-          start_date: { [Op.lte]: weekEnd },
-          [Op.or]: [
-            { end_date: null },
-            { end_date: { [Op.gte]: weekStart } },
-          ],
-        },
-      });
-      hasSavedAvailability = savedCount > 0;
-    } catch (countErr) {
-      // Non-fatal — defaults to false (button just won't render).
-      console.error('[magic-auth] failed to count saved availability:', countErr.message);
+    // Phase 87.5 (D-04): UserAvailability is re-keyed onto user_uuid. Key the count
+    // on the resolved Users.id (meId), NOT the raw sub — a literal
+    // `where: { user_uuid: result.decoded.sub }` would silently return 0 for every
+    // magic-link recipient (a sub never matches a UUID column), permanently
+    // disabling the "you have saved availability" button. Skip gracefully if the
+    // caller's UUID could not be resolved (meId null).
+    if (meId) {
+      try {
+        const weekStart = windowStart;
+        const weekEnd = addDaysUTC(weekStart, 6); // 7-day window, inclusive
+        const savedCount = await UserAvailability.count({
+          where: {
+            user_uuid: meId,
+            start_date: { [Op.lte]: weekEnd },
+            [Op.or]: [
+              { end_date: null },
+              { end_date: { [Op.gte]: weekStart } },
+            ],
+          },
+        });
+        hasSavedAvailability = savedCount > 0;
+      } catch (countErr) {
+        // Non-fatal — defaults to false (button just won't render).
+        console.error('[magic-auth] failed to count saved availability:', countErr.message);
+      }
     }
 
     // Success response with info needed by frontend

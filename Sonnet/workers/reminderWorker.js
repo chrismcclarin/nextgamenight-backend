@@ -145,24 +145,24 @@ async function processReminderJob(job) {
       submitted_at: { [Op.ne]: null }
     }
   });
-  const respondedUserIds = new Set(responses.map(r => r.user_id));
+  const respondedUserIds = new Set(responses.map(r => r.user_uuid));
 
   let remindersSent = 0;
   let skipped = 0;
 
   for (const membership of eligibleMemberships) {
     const user = membership.User;
-    // Pitfall 4 (keyspace bridge): AvailabilityResponse is NOT re-keyed — its
-    // user_id column still holds Auth0 STRINGS. UserGroup is now re-keyed onto
-    // user_uuid, so `membership.user_id` (the legacy string column) is an
-    // undefined-SILENT read once Plan 09 drops it. Pull the Auth0 id from the
-    // included User row instead (the join resolves on user_uuid, required:true
-    // guarantees membership.User exists) — this is the value that keys every
-    // AvailabilityResponse read/claim/create below.
-    const userId = membership.User.user_id;
+    // Phase 87.5 (BINT-02, D-04): AvailabilityResponse is now re-keyed onto
+    // Users.id (user_uuid). Source the identity from the included User row's UUID
+    // (membership.User.id) — NOT membership.User.user_id (the Auth0 sub) — because
+    // every AvailabilityResponse read/claim/create below keys on user_uuid. The
+    // join resolves on user_uuid and required:true guarantees membership.User
+    // exists. (The magic-token generate below still uses user.user_id — the token
+    // subject IS the Auth0 sub, correctly.)
+    const userUuid = membership.User.id;
 
     // Skip if already responded
-    if (respondedUserIds.has(userId)) {
+    if (respondedUserIds.has(userUuid)) {
       continue;
     }
 
@@ -173,12 +173,12 @@ async function processReminderJob(job) {
 
     // Check reminder count (max 2 per prompt per user) — cumulative ceiling.
     let existingResponse = await AvailabilityResponse.findOne({
-      where: { prompt_id: promptId, user_id: userId }
+      where: { prompt_id: promptId, user_uuid: userUuid }
     });
 
     const reminderCount = existingResponse?.reminder_count || 0;
     if (reminderCount >= MAX_REMINDERS_PER_USER) {
-      console.log(`[ReminderWorker] User ${userId} already received ${reminderCount} reminders, skipping`);
+      console.log(`[ReminderWorker] User ${userUuid} already received ${reminderCount} reminders, skipping`);
       skipped++;
       continue;
     }
@@ -200,7 +200,7 @@ async function processReminderJob(job) {
     if (existingResponse) {
       const [claimCount] = await AvailabilityResponse.update(
         { reminder_count: expectedCount, last_reminded_at: new Date() },
-        { where: { prompt_id: promptId, user_id: userId, reminder_count: { [Op.lt]: expectedCount } } }
+        { where: { prompt_id: promptId, user_uuid: userUuid, reminder_count: { [Op.lt]: expectedCount } } }
       );
       claimed = claimCount === 1;
     } else {
@@ -215,7 +215,7 @@ async function processReminderJob(job) {
       try {
         await AvailabilityResponse.create({
           prompt_id: promptId,
-          user_id: userId,
+          user_uuid: userUuid,
           time_slots: [],
           user_timezone: 'UTC',
           submitted_at: null, // Not submitted yet - this is a placeholder
@@ -229,7 +229,7 @@ async function processReminderJob(job) {
           // expected-prior-value claim so we don't double-send.
           const [claimCount] = await AvailabilityResponse.update(
             { reminder_count: expectedCount, last_reminded_at: new Date() },
-            { where: { prompt_id: promptId, user_id: userId, reminder_count: { [Op.lt]: expectedCount } } }
+            { where: { prompt_id: promptId, user_uuid: userUuid, reminder_count: { [Op.lt]: expectedCount } } }
           );
           claimed = claimCount === 1;
         } else {
@@ -241,7 +241,7 @@ async function processReminderJob(job) {
     if (!claimed) {
       // Retry / concurrent double-fire: this reminder was already claimed by a
       // prior (possibly crashed-then-retried) invocation. Skip the send.
-      console.log(`[ReminderWorker] Reminder ${reminderType} for user ${userId} already claimed (row not below ${expectedCount}); skipping send`);
+      console.log(`[ReminderWorker] Reminder ${reminderType} for user ${userUuid} already claimed (row not below ${expectedCount}); skipping send`);
       skipped++;
       continue;
     }

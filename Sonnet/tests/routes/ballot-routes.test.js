@@ -185,9 +185,13 @@ describe('POLL-06 vote gate coverage (structural)', () => {
 //                     creator-after-removal 403 (membership required), and an
 //                     owner/admin replace PRESERVES the original creator. [T-87-01]
 //   (d) PRODUCTION  — a ballot born via the real FE path (POST /events with
-//                     embedded ballot_options) is stamped created_by=event
-//                     creator, so the creator-authz branch is live in prod.
+//                     embedded ballot_options) is stamped created_by_uuid=event
+//                     creator's UUID, so the creator-authz branch is live in prod.
 //                     [T-87-04]
+//
+// Phase 87.5 (BINT-02, PR-1): creator authz/write flipped from the Auth0-sub
+// `created_by` column to the UUID `created_by_uuid` FK — seeds + assertions here
+// key on the creator's Users.id (`user.id`), not the sub (`user.user_id`).
 //
 // Real-DB (sequelize.sync via tests/globalSetup.js; per-test TRUNCATE via
 // tests/setup.js). Run ALONE per the never-green-locally caveat:
@@ -250,7 +254,9 @@ describe('Phase 87 ballot integrity (DB-backed)', () => {
   });
 
   // Seed a ballot with N options attributed to `attribUser` (or NULL for a
-  // legacy ballot). Bypasses the route so tests control the created_by value.
+  // legacy ballot). Bypasses the route so tests control the creator value.
+  // Phase 87.5 (BINT-02, PR-1): creator is now keyed on created_by_uuid
+  // (the creator's Users.id UUID), not the Auth0 sub — seed the UUID column.
   async function seedOptions(count, attribUser) {
     const rows = [];
     for (let i = 0; i < count; i++) {
@@ -259,7 +265,7 @@ describe('Phase 87 ballot integrity (DB-backed)', () => {
         game_id: null,
         game_name: `Seed Option ${i + 1}`,
         display_order: i,
-        created_by: attribUser ? attribUser.user_id : null,
+        created_by_uuid: attribUser ? attribUser.id : null,
       });
     }
     return EventBallotOption.bulkCreate(rows);
@@ -385,13 +391,33 @@ describe('Phase 87 ballot integrity (DB-backed)', () => {
 
     expect(res.status).toBe(200);
     const rows = await EventBallotOption.findAll({ where: { event_id: event.id } });
-    // created_by is still the ORIGINAL member-creator, NOT the owner editor.
-    expect(rows.every(o => o.created_by === creator.user_id)).toBe(true);
-    expect(rows.every(o => o.created_by === owner.user_id)).toBe(false);
+    // created_by_uuid is still the ORIGINAL member-creator's UUID, NOT the owner editor's.
+    expect(rows.every(o => o.created_by_uuid === creator.id)).toBe(true);
+    expect(rows.every(o => o.created_by_uuid === owner.id)).toBe(false);
   });
 
-  // ---- (d) CREATED_BY ON THE PRODUCTION CREATION PATH ----
-  it('stamps created_by=event-creator on a ballot born via POST /events', async () => {
+  it('KEEPS created_by_uuid NULL when an owner/admin replaces a NULL-creator ballot', async () => {
+    // A creatorless (legacy NULL) ballot must STAY creatorless on replace — the
+    // owner/admin editor's identity must never be stamped as the creator, so the
+    // row remains permanently owner/admin-only (D-05). Guards the write-site
+    // distinction between "no ballot exists" (stamp actor) and "ballot exists with
+    // no creator" (preserve NULL) — a plain `?? callerUuid` conflates the two.
+    await seedOptions(2, null); // NULL-creator ballot
+
+    const res = await request(makeApp(owner))
+      .put(`/api/ballot/${event.id}/options`)
+      .send({ options: [{ game_name: 'Admin Rebuild 1' }, { game_name: 'Admin Rebuild 2' }] });
+
+    expect(res.status).toBe(200);
+    const rows = await EventBallotOption.findAll({ where: { event_id: event.id } });
+    expect(rows).toHaveLength(2);
+    // The replaced rows carry NO creator — NOT the owner editor's UUID.
+    expect(rows.every(o => o.created_by_uuid === null)).toBe(true);
+    expect(rows.some(o => o.created_by_uuid === owner.id)).toBe(false);
+  });
+
+  // ---- (d) CREATED_BY_UUID ON THE PRODUCTION CREATION PATH ----
+  it('stamps created_by_uuid=event-creator on a ballot born via POST /events', async () => {
     const res = await request(makeApp(owner))
       .post('/api/events')
       .send({
@@ -412,9 +438,9 @@ describe('Phase 87 ballot integrity (DB-backed)', () => {
 
     const rows = await EventBallotOption.findAll({ where: { event_id: createdEventId } });
     expect(rows.length).toBeGreaterThanOrEqual(2);
-    // Every option row is born with a NON-NULL creator = the event creator, so
-    // the "creator can replace/wipe" branch is live against the real FE path.
-    expect(rows.every(o => o.created_by === owner.user_id)).toBe(true);
+    // Every option row is born with a NON-NULL creator = the event creator's UUID,
+    // so the "creator can replace/wipe" branch is live against the real FE path.
+    expect(rows.every(o => o.created_by_uuid === owner.id)).toBe(true);
   });
 
   // ---- (e) Phase 87.1: cast-vote RSVP-eligibility gate + user_voted on the UUID keyspace ----

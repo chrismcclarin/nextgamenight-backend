@@ -12,10 +12,20 @@
 //
 // KEYSPACE DISCIPLINE (RESEARCH Pitfall 1 — the top defect risk): user surfaces split
 // across TWO keyspaces. Use the correct key per surface EXACTLY:
-//   - user.id       (UUID surrogate PK)  -> UserGame, GameReview
+//   - user.id       (UUID surrogate PK)  -> UserGame, GameReview,
+//                                            EventBallotOption.created_by_uuid
+//                                            (Phase 87.5 PR-1 rekey — the creator scrub
+//                                            + SET NULL FK both key on the UUID now)
 //   - user.user_id  (Auth0 sub string)   -> MagicToken, SingleUseToken,
-//                                            EventBallotOption.created_by, Feedback,
 //                                            both JSONB scrubs
+//
+//   MIXED KEYSPACE (the scrub matches on BOTH keys — neither arm is dead code):
+//   - Feedback.user_id -> historical rows are Auth0-sub-keyed (pre-87.5); NEW rows
+//                         submitted while logged in are Users.id-UUID-keyed once Plan 11
+//                         flips FeedbackForm.js to send self.id. The anonymize scrub's
+//                         Op.or therefore matches sub OR uuid OR email so BOTH row shapes
+//                         are anonymized on deletion (a sub-only match would leak every
+//                         post-Plan-11 UUID-keyed feedback row of a deleted user).
 //
 // SURVIVING EXCEPTIONS (completeness-by-enumeration — these are INTENTIONALLY NOT
 // touched, per SPEC out-of-scope):
@@ -256,15 +266,22 @@ async function applyDispositions(user, t) {
 
   // 3. ANONYMIZE Feedback — null both keys, KEEP the feedback text (Open Question 1:
   //    match user_id OR user_email so rows submitted logged-out-with-email are covered).
+  //    Phase 87.5 (MIXED keyspace): Feedback.user_id holds the Auth0 sub on historical
+  //    rows but the Users.id UUID on rows submitted logged-in after Plan 11 flips
+  //    FeedbackForm.js to send self.id. Match sub OR uuid OR email so a deleted user's
+  //    post-Plan-11 feedback is anonymized too — a sub-only predicate would leave those
+  //    UUID-keyed rows un-scrubbed. Both id arms are intentional (see keyspace block).
   await Feedback.update(
     { user_id: null, user_email: null },
-    { where: { [Op.or]: [{ user_id: sub }, { user_email: email }] }, transaction: t }
+    { where: { [Op.or]: [{ user_id: sub }, { user_id: uuid }, { user_email: email }] }, transaction: t }
   );
 
-  // 4. EventBallotOption.created_by -> NULL (Auth0 sub).
+  // 4. EventBallotOption.created_by_uuid -> NULL (Users.id UUID; Phase 87.5 PR-1 rekey).
+  //    Keep the explicit update for clarity — the new SET NULL FK is the safety net; both
+  //    fire on User.destroy. NULL-creator rows (incl. legacy) stay NULL (owner/admin-only).
   await EventBallotOption.update(
-    { created_by: null },
-    { where: { created_by: sub }, transaction: t }
+    { created_by_uuid: null },
+    { where: { created_by_uuid: uuid }, transaction: t }
   );
 
   // 5. JSONB SCRUBS.

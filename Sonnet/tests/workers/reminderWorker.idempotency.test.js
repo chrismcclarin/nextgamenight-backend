@@ -86,7 +86,10 @@ function jobFor(promptId, reminderType, groupId) {
 }
 
 async function reminderRow(promptId) {
-  return AvailabilityResponse.findOne({ where: { prompt_id: promptId, user_id: USER_SUB } });
+  // Phase 87.5 PR-2 cutover: AvailabilityResponse is keyed on user_uuid (the legacy
+  // user_id attribute + column are dropped). Resolve the seeded user's UUID and query on it.
+  const u = await User.findOne({ where: { user_id: USER_SUB }, attributes: ['id'] });
+  return AvailabilityResponse.findOne({ where: { prompt_id: promptId, user_uuid: u.id } });
 }
 
 describe('reminderWorker.processReminderJob same-reminder idempotency (BINT-01 / T-87-12, real DB)', () => {
@@ -96,11 +99,11 @@ describe('reminderWorker.processReminderJob same-reminder idempotency (BINT-01 /
   });
 
   it('50-percent, row at 0: two invocations → exactly ONE send, reminder_count → 1', async () => {
-    const { group, prompt } = await seedActivePromptAndMember();
+    const { user, group, prompt } = await seedActivePromptAndMember();
     // Seed a not-yet-submitted placeholder at reminder_count 0.
     await AvailabilityResponse.create({
       prompt_id: prompt.id,
-      user_id: USER_SUB,
+      user_uuid: user.id,
       time_slots: [],
       user_timezone: 'UTC',
       submitted_at: null,
@@ -117,11 +120,11 @@ describe('reminderWorker.processReminderJob same-reminder idempotency (BINT-01 /
   });
 
   it('90-percent, row at 1: two invocations → exactly ONE send, reminder_count → 2 (<= MAX)', async () => {
-    const { group, prompt } = await seedActivePromptAndMember();
+    const { user, group, prompt } = await seedActivePromptAndMember();
     // Row already advanced past the 50% reminder.
     await AvailabilityResponse.create({
       prompt_id: prompt.id,
-      user_id: USER_SUB,
+      user_uuid: user.id,
       time_slots: [],
       user_timezone: 'UTC',
       submitted_at: null,
@@ -162,12 +165,12 @@ describe('reminderWorker.processReminderJob same-reminder idempotency (BINT-01 /
   // rows on a count-0 row → silently skipped the final reminder. The monotonic
   // `< expected` claim advances it 0→2 and sends exactly once, still MAX-safe.
   it('90-percent, row STUCK at 0: two invocations → exactly ONE send, reminder_count → 2', async () => {
-    const { group, prompt } = await seedActivePromptAndMember();
+    const { user, group, prompt } = await seedActivePromptAndMember();
     // Placeholder seeded at 0 (as the admin manual-remind route does) and never
     // advanced by the 50-percent job.
     await AvailabilityResponse.create({
       prompt_id: prompt.id,
-      user_id: USER_SUB,
+      user_uuid: user.id,
       time_slots: [],
       user_timezone: 'UTC',
       submitted_at: null,

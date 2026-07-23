@@ -308,11 +308,14 @@ async function makeFeedback(user, overrides = {}) {
 }
 
 /**
- * Seed an EventBallotOption (ANONYMIZE surface — deletion nulls `created_by`).
- * Auth0-sub keyspace: `created_by` = user.user_id. `event_id` is a REQUIRED CASCADE
- * FK to Events, so the builder takes an event.
+ * Seed an EventBallotOption. Phase 87.5 (BINT-02, PR-1): the OPERATIVE creator key is
+ * now `created_by_uuid` = user.id (the UUID FK; deletion nulls it via the explicit scrub
+ * + the SET NULL FK). The legacy Auth0-sub `created_by` column is RETAINED until Plan 07
+ * as the rollback net, so we ALSO seed it (= user.user_id) — this keeps the wire-sweep
+ * guard (`created_by sub column never serializes`) exercising a populated sub column.
+ * `event_id` is a REQUIRED CASCADE FK to Events, so the builder takes an event.
  * @param {Event} event
- * @param {User} user - the option's creator (created_by).
+ * @param {User} user - the option's creator (created_by_uuid = user.id; created_by = user.user_id).
  * @param {object} overrides - spread last (e.g. { game_id, game_name }).
  * @returns {Promise<EventBallotOption>}
  */
@@ -322,7 +325,8 @@ async function makeEventBallotOption(event, user, overrides = {}) {
     event_id: event.id,
     game_name: `Ballot Game ${n}`,
     display_order: 0,
-    created_by: user.user_id, // Auth0 sub STRING (RESEARCH: created_by is an Auth0-sub surface)
+    created_by_uuid: user.id,     // UUID FK — the operative creator key post-Plan-04
+    created_by: user.user_id,     // retained Auth0-sub rollback net (dropped in Plan 07)
     ...overrides,
   });
 }

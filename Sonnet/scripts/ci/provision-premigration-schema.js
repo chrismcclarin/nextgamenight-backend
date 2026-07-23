@@ -57,6 +57,11 @@ const REKEY = [
   { file: '20260703000005-rekey-eventbring-user-uuid.js', table: 'EventBrings', legacy: ['user_id'] },
   { file: '20260703000006-rekey-eventballotvote-user-uuid.js', table: 'EventBallotVotes', legacy: ['user_id'] },
   { file: '20260703000007-rekey-sentnotification-user-uuid.js', table: 'SentNotifications', legacy: ['user_id'] },
+  // Phase 87.5 (BE PR-1) — the 3 fresh sibling-column rekeys (availability CASCADE, ballot SET NULL).
+  // Each retains its old sub column, so provision() must down()+re-add the legacy column for replay.
+  { file: '20260720000001-rekey-useravailability-user-uuid.js', table: 'UserAvailabilities', legacy: ['user_id'] },
+  { file: '20260720000002-rekey-availabilityresponse-user-uuid.js', table: 'AvailabilityResponses', legacy: ['user_id'] },
+  { file: '20260720000003-rekey-eventballotoption-created-by-uuid.js', table: 'EventBallotOptions', legacy: ['created_by'] },
 ];
 const REKEY_FILES = new Set(REKEY.map((r) => r.file));
 
@@ -72,8 +77,16 @@ const DATA_MIGRATIONS_874 = new Set([
   '20260716000003-resweep-selected-member-ids-uuid.js',  // Plan 11 — selected_member_ids PR-2 re-sweep (residue window close)
 ]);
 
+// Phase 87.5 pure non-rekey DDL/data migrations replayed by the CLI (no legacy column to
+// down()/re-add — they operate on the sync-built schema as-is, so they are EXCLUDED from
+// the REKEY loop but STILL withheld from the SequelizeMeta seed). Plan 07 appends the 3
+// PR-2 contract-drop filenames to this same set.
+const DATA_MIGRATIONS_875 = new Set([
+  '20260720000004-finalize-d08-notnull-drop-legacy.js', // Plan 01 — D-08 finalize (SET NOT NULL 7 + DROP 8 legacy)
+]);
+
 // Every migration the CLI path is expected to apply + book in SequelizeMeta.
-const CLI_APPLIED_FILES = new Set([...REKEY_FILES, ...DATA_MIGRATIONS_874]);
+const CLI_APPLIED_FILES = new Set([...REKEY_FILES, ...DATA_MIGRATIONS_874, ...DATA_MIGRATIONS_875]);
 
 async function provision() {
   // Safety: sync({force:true}) DROPS every table. This script is CI/local-only and
@@ -120,7 +133,7 @@ async function provision() {
   console.log(
     `[premigration] SequelizeMeta seeded with ${toSeed.length} pre-existing migration(s); ` +
       `${CLI_APPLIED_FILES.size} migration(s) left UNAPPLIED for the CLI to run ` +
-      `(${REKEY_FILES.size} re-key + ${DATA_MIGRATIONS_874.size} Phase-87.4 data migrations).`
+      `(${REKEY_FILES.size} re-key + ${DATA_MIGRATIONS_874.size} Phase-87.4 data + ${DATA_MIGRATIONS_875.size} Phase-87.5 data migrations).`
   );
 }
 
@@ -141,7 +154,7 @@ async function verify() {
   }
   console.log(
     `[premigration:verify] OK — all ${CLI_APPLIED_FILES.size} CLI migrations recorded in SequelizeMeta ` +
-      `(${REKEY_FILES.size} re-key + ${DATA_MIGRATIONS_874.size} Phase-87.4 data; the sequelize-cli path applied and booked them).`
+      `(${REKEY_FILES.size} re-key + ${DATA_MIGRATIONS_874.size} Phase-87.4 data + ${DATA_MIGRATIONS_875.size} Phase-87.5 data; the sequelize-cli path applied and booked them).`
   );
 }
 

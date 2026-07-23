@@ -6,7 +6,7 @@ const express = require('express');
 const router = express.Router();
 const { UniqueConstraintError } = require('sequelize');
 const { validateToken } = require('../services/magicTokenService');
-const { AvailabilityPrompt, AvailabilityResponse } = require('../models');
+const { AvailabilityPrompt, AvailabilityResponse, User } = require('../models');
 const { magicTokenLimiter } = require('../middleware/rateLimiter');
 const { sendError } = require('../utils/errors');
 
@@ -81,7 +81,10 @@ router.post('/', magicTokenLimiter, async (req, res) => {
     }
 
     const { decoded } = tokenResult;
-    const userId = decoded.sub;
+    // `callerSub` is the caller's Auth0 sub (the token subject). It is used ONLY
+    // to resolve the caller's Users.id below — it is NEVER persisted as an
+    // AvailabilityResponse key (that table is keyed on user_uuid, Phase 87.5).
+    const callerSub = decoded.sub;
     const promptId = decoded.prompt_id;
     const tokenJti = decoded.jti;
 
@@ -105,12 +108,25 @@ router.post('/', magicTokenLimiter, async (req, res) => {
       return sendError(res, 'prompt_deadline_expired');
     }
 
+    // Phase 87.5 (BINT-02, BE PR-1 — D-04): AvailabilityResponse is re-keyed onto
+    // Users.id (user_uuid). Resolve the magic-token caller's UUID from decoded.sub
+    // BEFORE any response read/write. The sub MUST map to a real Users row — we
+    // never mint a synthetic identity for an unknown sub (threat T-875-03-MINT).
+    const me = await User.findOne({ where: { user_id: callerSub }, attributes: ['id'] });
+    if (!me) {
+      // Unknown sub — treat as an invalid link; no row is created.
+      return res.status(400).json({
+        error: 'This link is no longer valid.',
+        action: 'request_new'
+      });
+    }
+
     // 5. Upsert availability response
-    // Look for existing response by this user for this prompt
+    // Look for existing response by this user (user_uuid) for this prompt
     const existingResponse = await AvailabilityResponse.findOne({
       where: {
         prompt_id: promptId,
-        user_id: userId
+        user_uuid: me.id
       }
     });
 
@@ -135,14 +151,14 @@ router.post('/', magicTokenLimiter, async (req, res) => {
       try {
         response = await AvailabilityResponse.create({
           prompt_id: promptId,
-          user_id: userId,
+          user_uuid: me.id,
           ...responseData
         });
       } catch (createErr) {
         if (createErr instanceof UniqueConstraintError) {
           // Concurrent request already created the record — find and update it
           const raceRecord = await AvailabilityResponse.findOne({
-            where: { prompt_id: promptId, user_id: userId }
+            where: { prompt_id: promptId, user_uuid: me.id }
           });
           if (raceRecord) {
             await raceRecord.update(responseData);
@@ -217,7 +233,7 @@ router.get('/:promptId', magicTokenLimiter, async (req, res) => {
     }
 
     const { decoded } = tokenResult;
-    const userId = decoded.sub;
+    const callerSub = decoded.sub;
 
     // Verify token's prompt_id matches requested promptId
     if (decoded.prompt_id !== promptId) {
@@ -227,11 +243,19 @@ router.get('/:promptId', magicTokenLimiter, async (req, res) => {
       });
     }
 
+    // Phase 87.5 (BINT-02, D-04): resolve the caller's UUID before the response
+    // read (the table is keyed on user_uuid now). An unknown sub simply has no
+    // response — return the same 200/null "no pre-fill" shape.
+    const me = await User.findOne({ where: { user_id: callerSub }, attributes: ['id'] });
+    if (!me) {
+      return res.status(200).json(null);
+    }
+
     // Find existing response
     const response = await AvailabilityResponse.findOne({
       where: {
         prompt_id: promptId,
-        user_id: userId
+        user_uuid: me.id
       },
       attributes: ['id', 'time_slots', 'user_timezone', 'submitted_at']
     });

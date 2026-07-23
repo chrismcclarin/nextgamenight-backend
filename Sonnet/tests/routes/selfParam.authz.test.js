@@ -192,10 +192,10 @@ describe('Self-param dual-accept family (87.4-02): sub OR caller-own-UUID author
   // without per-handler param re-keying.
   // --------------------------------------------------------------------------
   describe('inline matchesSelf sites — own-UUID authorizes + correct data', () => {
-    it('availability GET /user/:user_id/patterns returns the caller sub-keyed rows for the UUID shape', async () => {
-      // Seed a pattern in the still-sub-keyed store (user_id = caller sub).
+    it('availability GET /user/:user_id/patterns returns the caller UUID-keyed rows for the UUID shape', async () => {
+      // Phase 87.5: the store is rekeyed to user_uuid (Users.id UUID).
       await UserAvailability.create({
-        user_id: caller.user_id,
+        user_uuid: caller.id,
         type: 'recurring_pattern',
         pattern_data: { dayOfWeek: 2, startTime: '18:00', endTime: '21:00', timezone: 'UTC' },
         start_date: '2026-06-01',
@@ -231,14 +231,14 @@ describe('Self-param dual-accept family (87.4-02): sub OR caller-own-UUID author
 
     it('availability DELETE /:id — caller deletes own row (200), rejects another user row (403)', async () => {
       const mine = await UserAvailability.create({
-        user_id: caller.user_id,
+        user_uuid: caller.id, // Phase 87.5: rekeyed to user_uuid (Users.id UUID)
         type: 'recurring_pattern',
         pattern_data: { dayOfWeek: 1, startTime: '10:00', endTime: '12:00', timezone: 'UTC' },
         start_date: '2026-06-04',
         timezone: 'UTC',
       });
       const theirs = await UserAvailability.create({
-        user_id: other.user_id,
+        user_uuid: other.id, // Phase 87.5: rekeyed to user_uuid (Users.id UUID)
         type: 'recurring_pattern',
         pattern_data: { dayOfWeek: 1, startTime: '10:00', endTime: '12:00', timezone: 'UTC' },
         start_date: '2026-06-04',

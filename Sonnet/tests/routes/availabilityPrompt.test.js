@@ -76,7 +76,7 @@ describe('POST /api/prompts/:promptId/remind/:userId — <24h cooldown envelope'
     // A response reminded just now => hoursSince < 24 => cooldown branch.
     await AvailabilityResponse.create({
       prompt_id: prompt.id,
-      user_id: target.user_id,
+      user_uuid: target.id, // Phase 87.5 (D-04): table re-keyed onto user_uuid
       user_timezone: 'America/New_York', // NOT-NULL on the model
       submitted_at: new Date(),          // NOT-NULL on the model
       last_reminded_at: new Date(),
@@ -84,9 +84,9 @@ describe('POST /api/prompts/:promptId/remind/:userId — <24h cooldown envelope'
   });
 
   it('returns the reminder_cooldown envelope at 429 with the 24-hour prose', async () => {
-    // Phase 87.4 Plan 09: the remind endpoint is UUID-only — send the target's
-    // Users.id UUID. The cooldown find re-keys on the RESOLVED sub, so it still
-    // hits the sub-keyed AvailabilityResponse row seeded with target.user_id.
+    // The remind endpoint is UUID-only — send the target's Users.id UUID. Phase
+    // 87.5 (D-04): the cooldown find keys on the resolved target UUID, hitting the
+    // AvailabilityResponse row seeded above with user_uuid: target.id.
     const res = await request(makeApp(owner))
       .post(`/api/prompts/${prompt.id}/remind/${encodeURIComponent(target.id)}`)
       .send({});
@@ -170,15 +170,14 @@ describe('POST /api/prompts/:promptId/remind/:userId — concurrent-duplicate ab
   });
 });
 
-// Phase 87.4 / Plan 09 (BINT-02, D-03): the respondents endpoint now emits the
+// Phase 87.5 / Plan 03 (BINT-02, D-04): the respondents endpoint emits the
 // member's Users.id UUID (member.User.id) as the serialized wire `user_id`,
 // translated from the endpoint's EXISTING groupMembers include (no duplicate
-// roster query). The AvailabilityResponse map + has_responded bridge stay
-// Auth0-sub-keyed internally (read from member.User.user_id) because the
-// response table is still sub-keyed (Phase 87.5 rekeys it). This real-DB test
-// pins BOTH facts: the wire carries the UUID, and the sub-keyed bridge still
-// resolves has_responded correctly for each member.
-describe('GET /api/prompts/:promptId/respondents — UUID wire field + sub-keyed response bridge (87.4 D-03)', () => {
+// roster query). The AvailabilityResponse map + has_responded bridge now key on
+// member.User.id (the UUID) because the response table is re-keyed onto user_uuid.
+// This real-DB test pins BOTH facts: the wire carries the UUID, and the
+// UUID-keyed bridge resolves has_responded correctly for each member.
+describe('GET /api/prompts/:promptId/respondents — UUID wire field + UUID response bridge (87.5 D-04)', () => {
   let owner;
   let responder;
   let nonResponder;
@@ -202,17 +201,17 @@ describe('GET /api/prompts/:promptId/respondents — UUID wire field + sub-keyed
       week_identifier: '2026-W28',
     });
 
-    // Only `responder` submits — AvailabilityResponse stays Auth0-keyed.
+    // Only `responder` submits — AvailabilityResponse keyed on user_uuid (D-04).
     await AvailabilityResponse.create({
       prompt_id: prompt.id,
-      user_id: responder.user_id,
+      user_uuid: responder.id,
       user_timezone: 'UTC',
       time_slots: [{ start: '2026-07-10T18:00:00Z', end: '2026-07-10T21:00:00Z', preference: 'preferred' }],
       submitted_at: new Date(),
     });
   });
 
-  it('serializes each respondent with the Users.id UUID and still bridges has_responded via the sub-keyed map', async () => {
+  it('serializes each respondent with the Users.id UUID and bridges has_responded via the UUID-keyed map', async () => {
     const res = await request(makeApp(owner))
       .get(`/api/prompts/${prompt.id}/respondents`)
       .send();
@@ -228,8 +227,8 @@ describe('GET /api/prompts/:promptId/respondents — UUID wire field + sub-keyed
     expect(responderEntry).toBeDefined();
     expect(responderEntry.user_id).toBe(responder.id);
     expect(res.body.some((r) => r.user_id === responder.user_id)).toBe(false);
-    // Bridge into the still-sub-keyed AvailabilityResponse map resolved correctly
-    // (proves the internal responseMap stayed sub-keyed while the wire flipped).
+    // Bridge into the UUID-keyed AvailabilityResponse map resolved correctly
+    // (proves the internal responseMap keys on member.User.id, the UUID).
     expect(responderEntry.has_responded).toBe(true);
 
     // The non-responder bridges to has_responded=false; its wire id is also the UUID.
@@ -297,25 +296,25 @@ describe('POST /api/prompts/:promptId/remind/:userId — non-member target rejec
     // The check sits BEFORE the email + placeholder-create steps.
     expect(sendSpy).not.toHaveBeenCalled();
     const rowCount = await AvailabilityResponse.count({
-      where: { prompt_id: prompt.id, user_id: outsider.user_id },
+      where: { prompt_id: prompt.id, user_uuid: outsider.id },
     });
     expect(rowCount).toBe(0);
   });
 });
 
-// Phase 87.4 / Plan 09 (BINT-02, D-03): the remind endpoint is now UUID-only and
-// resolves the target BEFORE any AvailabilityResponse query, re-keying the
+// Phase 87.5 / Plan 03 (BINT-02, D-04): the remind endpoint is UUID-only and
+// resolves the target BEFORE any AvailabilityResponse query, keying the
 // cooldown / already-responded / placeholder-create / race lookups on the
-// RESOLVED target's Auth0 sub (targetUser.user_id) so they still hit the
-// sub-keyed AvailabilityResponse table. These tests pin the three coupled facts:
+// RESOLVED target's Users.id UUID (targetUser.id) against the re-keyed
+// AvailabilityResponse table (user_uuid). These tests pin the three coupled facts:
 //   (1) a sub-form :userId is rejected as not-found (T-874-09-VALID);
 //   (2) a UUID :userId reminds successfully AND the email is sent to the target's
 //       REAL, DEFINED address — proving the contact-info-lifted re-fetch by the
 //       resolved PK ran (targetUser.email not undefined);
 //   (3) the 24h cooldown HOLDS for a UUID target — a first remind succeeds, a
 //       second within the window is rejected with the cooldown envelope (proving
-//       the cooldown query keyed the RESOLVED sub, not the raw UUID which would
-//       silently miss the sub-keyed table and let an admin spam reminders —
+//       the cooldown query keyed the RESOLVED UUID against the user_uuid column,
+//       so the row is found and an admin cannot spam reminders —
 //       T-874-09-COOLDOWN).
 describe('POST /api/prompts/:promptId/remind/:userId — UUID-only contract (87.4 D-03)', () => {
   let owner;
@@ -356,7 +355,7 @@ describe('POST /api/prompts/:promptId/remind/:userId — UUID-only contract (87.
     expect(sendSpy).not.toHaveBeenCalled();
     // No placeholder row created for a rejected target.
     const rowCount = await AvailabilityResponse.count({
-      where: { prompt_id: prompt.id, user_id: target.user_id },
+      where: { prompt_id: prompt.id, user_uuid: target.id },
     });
     expect(rowCount).toBe(0);
   });
@@ -379,9 +378,9 @@ describe('POST /api/prompts/:promptId/remind/:userId — UUID-only contract (87.
     expect(sendArgs.to).toBeDefined();
     expect(sendArgs.to).toBe(target.email);
 
-    // The placeholder response row was created keyed on the RESOLVED sub.
+    // The placeholder response row was created keyed on the RESOLVED UUID.
     const row = await AvailabilityResponse.findOne({
-      where: { prompt_id: prompt.id, user_id: target.user_id },
+      where: { prompt_id: prompt.id, user_uuid: target.id },
     });
     expect(row).not.toBeNull();
     expect(row.last_reminded_at).not.toBeNull();
@@ -390,16 +389,16 @@ describe('POST /api/prompts/:promptId/remind/:userId — UUID-only contract (87.
   it('holds the 24h cooldown for a UUID target (second remind within window rejected)', async () => {
     jest.spyOn(emailService, 'send').mockResolvedValue({ success: true });
 
-    // First remind — succeeds and stamps last_reminded_at on the sub-keyed row.
+    // First remind — succeeds and stamps last_reminded_at on the user_uuid-keyed row.
     const first = await request(makeApp(owner))
       .post(`/api/prompts/${prompt.id}/remind/${encodeURIComponent(target.id)}`)
       .send({});
     expect(first.status).toBe(200);
     expect(first.body.success).toBe(true);
 
-    // Second remind within 24h — the cooldown query keys the RESOLVED sub, finds
-    // the just-stamped row, and rejects. (If it keyed the raw UUID it would miss
-    // the sub-keyed row and wrongly succeed — the regression this test guards.)
+    // Second remind within 24h — the cooldown query keys the RESOLVED UUID against
+    // the user_uuid column, finds the just-stamped row, and rejects. (A sub-keyed
+    // query would miss it and wrongly succeed — the regression this test guards.)
     const second = await request(makeApp(owner))
       .post(`/api/prompts/${prompt.id}/remind/${encodeURIComponent(target.id)}`)
       .send({});

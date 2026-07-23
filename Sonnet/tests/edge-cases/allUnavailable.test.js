@@ -87,10 +87,11 @@ describe('All-unavailable deadline processing', () => {
       auto_schedule_enabled: true
     });
 
-    // Create 3 availability responses all marking users as unavailable
+    // Create 3 availability responses all marking users as unavailable.
+    // Phase 87.5 (D-04): AvailabilityResponse re-keyed onto user_uuid (Users.id).
     await AvailabilityResponse.create({
       prompt_id: testPrompt.id,
-      user_id: testUsers[0].user_id,
+      user_uuid: testUsers[0].id,
       time_slots: [],
       user_timezone: 'America/New_York',
       submitted_at: new Date(),
@@ -98,7 +99,7 @@ describe('All-unavailable deadline processing', () => {
     });
     await AvailabilityResponse.create({
       prompt_id: testPrompt.id,
-      user_id: testUsers[1].user_id,
+      user_uuid: testUsers[1].id,
       time_slots: [],
       user_timezone: 'America/New_York',
       submitted_at: new Date(),
@@ -106,7 +107,7 @@ describe('All-unavailable deadline processing', () => {
     });
     await AvailabilityResponse.create({
       prompt_id: testPrompt.id,
-      user_id: testUsers[2].user_id,
+      user_uuid: testUsers[2].id,
       time_slots: [],
       user_timezone: 'America/New_York',
       submitted_at: new Date(),
