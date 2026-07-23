@@ -13,7 +13,7 @@ async function getOctokit() {
 const { validateFeedback } = require('../middleware/validators');
 const { verifyAuth0Token } = require('../middleware/auth0');
 const { requirePlatformAdmin } = require('../middleware/adminAuth');
-const { Feedback } = require('../models');
+const { Feedback, User } = require('../models');
 const emailService = require('../services/emailService');
 
 // Submit feedback as a GitHub Issue (with DB fallback)
@@ -66,12 +66,20 @@ router.post('/github', verifyAuth0Token, async (req, res) => {
       });
     } catch (err) {
       console.error('GitHub Issue creation failed, falling back to DB:', err.message);
+      // 87.5 adversarial review ML-10: stamp the caller's Users.id UUID, matching
+      // the FeedbackForm path's keyspace (Plan 11) — one keyspace per column.
+      // (The previous `req.auth?.sub` was dead — nothing sets req.auth — so this
+      // path silently stored null; verifyAuth0Token guarantees req.user here.)
+      const submitter = await User.findOne({
+        where: { user_id: req.user.user_id },
+        attributes: ['id'],
+      });
       await Feedback.create({
         type: 'feedback',
         subject: title,
         description: text,
         user_email: userEmail || null,
-        user_id: req.auth?.sub || null,
+        user_id: submitter?.id || null,
         page_context: pageUrl,
       });
     }

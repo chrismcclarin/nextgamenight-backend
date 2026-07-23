@@ -28,7 +28,12 @@ const EventAuditLog = sequelize.define('EventAuditLog', {
   actor_user_id: {
     type: DataTypes.STRING,
     allowNull: false,
-    // Auth0 string ID. NOT UUID -- matches UserGroup, EventRsvp pattern.
+    // 87.5 write-forward (Req 9): records the caller's Users.id UUID, not the
+    // Auth0 sub. Column type stays STRING (UUID values fit; no migration/backfill
+    // needed — the table is empty in prod, so it's 100%-UUID from the first row).
+    // Deliberately carries NO FK so audit rows survive account deletion (the
+    // retention design also enumerated in accountDeletionService's SURVIVING
+    // EXCEPTIONS block).
   },
   action: {
     type: DataTypes.STRING,

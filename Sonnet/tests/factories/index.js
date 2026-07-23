@@ -325,8 +325,7 @@ async function makeEventBallotOption(event, user, overrides = {}) {
     event_id: event.id,
     game_name: `Ballot Game ${n}`,
     display_order: 0,
-    created_by_uuid: user.id,     // UUID FK — the operative creator key post-Plan-04
-    created_by: user.user_id,     // retained Auth0-sub rollback net (dropped in Plan 07)
+    created_by_uuid: user.id,     // UUID FK — the operative creator key (legacy created_by sub column + attribute dropped in Plan 07)
     ...overrides,
   });
 }

@@ -93,93 +93,70 @@ describe('List Routes', () => {
     currentActor = null;
   });
 
-  describe('GET /api/lists/player-wins/:group_id/:player_name/:user_id', () => {
-    it('should get games won by a specific player', async () => {
-      currentActor = testUser1.user_id; // token-authorized member (self-param dual-accept)
-      const response = await request(app)
+  // 87.5 code-review WR-02: the player-wins routes (by name + by-id) were deleted
+  // under the Plan-06 dead-route policy — player-wins-by-id filtered on a user_id
+  // never selected in its includes (always returned []); player-wins (by name)
+  // was functional but had zero FE callers. These now assert the routes are gone
+  // (404), mirroring the 87.5-06 deletion precedent below.
+  describe('GET /api/lists/player-wins/:group_id/:player_name/:user_id (deleted 87.5 WR-02)', () => {
+    it('404s — route deleted', async () => {
+      currentActor = testUser1.user_id;
+      await request(app)
         .get(`/api/lists/player-wins/${testGroup.id}/testuser1/${testUser1.user_id}`)
-        .expect(200);
-
-      expect(Array.isArray(response.body)).toBe(true);
-    });
-
-    it('should return 403 if user not in group', async () => {
-      currentActor = testUser2.user_id; // authenticated (self-param) but NOT a member
-      const response = await request(app)
-        .get(`/api/lists/player-wins/${testGroup.id}/testuser1/${testUser2.user_id}`)
-        .expect(403);
-
-      expect(response.body.error).toBe('Access denied to this group');
+        .expect(404);
     });
   });
 
-  describe('GET /api/lists/player-wins-by-id/:group_id/:player_user_id/:user_id', () => {
-    it('should get games won by a specific player by user_id', async () => {
-      currentActor = testUser1.user_id; // token-authorized member (self-param dual-accept)
-      const response = await request(app)
+  describe('GET /api/lists/player-wins-by-id/:group_id/:player_user_id/:user_id (deleted 87.5 WR-02)', () => {
+    it('404s — route deleted', async () => {
+      currentActor = testUser1.user_id;
+      await request(app)
         .get(`/api/lists/player-wins-by-id/${testGroup.id}/${testUser1.user_id}/${testUser1.user_id}`)
-        .expect(200);
-
-      expect(Array.isArray(response.body)).toBe(true);
+        .expect(404);
     });
   });
 
-  describe('GET /api/lists/most-played/:group_id/:user_id', () => {
-    // SKIP(87): pre-existing route bug surfaced by correct fixtures — the
-    // aggregate query GROUP BYs Game.name/theme/url but omits Game.id, which
-    // Sequelize auto-selects, so Postgres rejects it: 'column "Game.id" must
-    // appear in the GROUP BY clause'. Route-query correctness is owned by
-    // Phase 87 (BE Wave B — Data Integrity, BINT-01/02). Fix: add 'Game.id' to
-    // the group array in routes/lists.js. See deferred-items.md.
-    it.skip('should get games organized by most played', async () => {
-      const response = await request(app)
+  // 87.5-06 (SPEC Req 9/10): the /most-played and /least-played sort routes were
+  // deleted (they 500'd on main, zero FE callers; capability preserved by the
+  // unified /lists/games sort/order params). These now assert the routes are gone
+  // (404), giving Req 10's "routes return 404" acceptance an executable assertion.
+  describe('GET /api/lists/most-played/:group_id/:user_id (deleted 87.5-06)', () => {
+    it('404s — route deleted', async () => {
+      currentActor = testUser1.user_id;
+      await request(app)
         .get(`/api/lists/most-played/${testGroup.id}/${testUser1.user_id}`)
-        .expect(200);
-
-      expect(Array.isArray(response.body)).toBe(true);
-    });
-
-    it('should return 403 if user not in group', async () => {
-      currentActor = testUser2.user_id; // authenticated (self-param) but NOT a member
-      const response = await request(app)
-        .get(`/api/lists/most-played/${testGroup.id}/${testUser2.user_id}`)
-        .expect(403);
-
-      expect(response.body.error).toBe('Access denied to this group');
+        .expect(404);
     });
   });
 
-  describe('GET /api/lists/least-played/:group_id/:user_id', () => {
-    // SKIP(87): same pre-existing GROUP BY bug as most-played (Game.id omitted
-    // from the group array). Owned by Phase 87 (Data Integrity). See deferred-items.md.
-    it.skip('should get games organized by least played', async () => {
-      const response = await request(app)
+  describe('GET /api/lists/least-played/:group_id/:user_id (deleted 87.5-06)', () => {
+    it('404s — route deleted', async () => {
+      currentActor = testUser1.user_id;
+      await request(app)
         .get(`/api/lists/least-played/${testGroup.id}/${testUser1.user_id}`)
-        .expect(200);
-
-      expect(Array.isArray(response.body)).toBe(true);
+        .expect(404);
     });
   });
 
-  describe('GET /api/lists/player-picks/:group_id/:player_name/:user_id', () => {
-    it('should get games picked by a specific player', async () => {
-      currentActor = testUser1.user_id; // token-authorized member (self-param dual-accept)
-      const response = await request(app)
+  // 87.5 code-review WR-02: the player-picks routes (by name + by-id) were deleted
+  // under the Plan-06 dead-route policy — player-picks-by-id filtered on a user_id
+  // never selected in its include (always returned []); player-picks (by name) was
+  // functional but had zero FE callers. Assert the routes are gone (404).
+  describe('GET /api/lists/player-picks/:group_id/:player_name/:user_id (deleted 87.5 WR-02)', () => {
+    it('404s — route deleted', async () => {
+      currentActor = testUser1.user_id;
+      await request(app)
         .get(`/api/lists/player-picks/${testGroup.id}/testuser1/${testUser1.user_id}`)
-        .expect(200);
-
-      expect(Array.isArray(response.body)).toBe(true);
+        .expect(404);
     });
   });
 
-  describe('GET /api/lists/player-picks-by-id/:group_id/:player_user_id/:user_id', () => {
-    it('should get games picked by a specific player by user_id', async () => {
-      currentActor = testUser1.user_id; // token-authorized member (self-param dual-accept)
-      const response = await request(app)
+  describe('GET /api/lists/player-picks-by-id/:group_id/:player_user_id/:user_id (deleted 87.5 WR-02)', () => {
+    it('404s — route deleted', async () => {
+      currentActor = testUser1.user_id;
+      await request(app)
         .get(`/api/lists/player-picks-by-id/${testGroup.id}/${testUser1.user_id}/${testUser1.user_id}`)
-        .expect(200);
-
-      expect(Array.isArray(response.body)).toBe(true);
+        .expect(404);
     });
   });
 
@@ -194,34 +171,24 @@ describe('List Routes', () => {
     });
   });
 
-  describe('GET /api/lists/alphabetical/:group_id/:user_id', () => {
-    // SKIP(87): pre-existing route bug surfaced by correct fixtures — the
-    // aggregate findAll throws "Cannot read properties of undefined (reading
-    // 'type')" from the `order: [['Game.name','ASC']]` against the grouped
-    // include. Route-query correctness owned by Phase 87 (Data Integrity).
-    // See deferred-items.md.
-    it.skip('should get all games sorted alphabetically', async () => {
-      const response = await request(app)
+  // 87.5-06 (SPEC Req 9/10): /alphabetical and /player-games were deleted (they
+  // 500'd on main, zero FE callers; alphabetical listing preserved by the unified
+  // /lists/games sort/order params). Assert the routes are gone (404).
+  describe('GET /api/lists/alphabetical/:group_id/:user_id (deleted 87.5-06)', () => {
+    it('404s — route deleted', async () => {
+      currentActor = testUser1.user_id;
+      await request(app)
         .get(`/api/lists/alphabetical/${testGroup.id}/${testUser1.user_id}`)
-        .expect(200);
-
-      expect(Array.isArray(response.body)).toBe(true);
+        .expect(404);
     });
   });
 
-  describe('GET /api/lists/player-games/:group_id/:player_name/:user_id', () => {
-    // SKIP(87): pre-existing route bug surfaced by correct fixtures — the
-    // handler includes `{ model: User, as: 'Players' }`, but no 'Players'
-    // alias exists (User<->Event is an unaliased M2M plus Winner/PickedBy), so
-    // Sequelize throws "User is associated to Event multiple times". This
-    // endpoint has never worked. Owned by Phase 87 (Data Integrity). Fix:
-    // include via EventParticipation->User. See deferred-items.md.
-    it.skip('should get all games played by a specific player', async () => {
-      const response = await request(app)
+  describe('GET /api/lists/player-games/:group_id/:player_name/:user_id (deleted 87.5-06)', () => {
+    it('404s — route deleted', async () => {
+      currentActor = testUser1.user_id;
+      await request(app)
         .get(`/api/lists/player-games/${testGroup.id}/testuser1/${testUser1.user_id}`)
-        .expect(200);
-
-      expect(Array.isArray(response.body)).toBe(true);
+        .expect(404);
     });
   });
 

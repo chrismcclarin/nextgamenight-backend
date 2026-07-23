@@ -2,21 +2,22 @@
 const express = require('express');
 const { Game, Event, EventParticipation, GameReview, User, UserGame, UserGroup } = require('../models');
 const { Op } = require('sequelize');
-const { requireParamMatchesToken } = require('../middleware/objectAuth');
+const { requireParamMatchesToken, matchesSelf } = require('../middleware/objectAuth');
+const { optionalAuth } = require('../middleware/auth0');
 // Phase 87.4 Plan 02 (KEYMISS mitigation): resolve a UUID self-param to the
 // sub-keyed Users row.
 const { isUuid } = require('../utils/resolveTargetUser');
 const router = express.Router();
 
 // BSEC-02 / BE-098: this router is mounted under the global `/api` default-deny
-// authn layer (server.js). The public game-search GETs (`/`, `/search-all`,
-// `/:id`, `/bgg/search`) are EXACT-match allow-listed there, so they reach the
-// handlers below with no token. The write handlers (`POST /`, `POST /resolve`,
-// `POST /import-bgg/:bgg_id`, `PUT /:id`, `DELETE /:id`) are NOT allow-listed,
-// so the default-deny layer already requires a valid JWT before they run.
-// `GET /for-event/:group_id/:user_id` is also NOT allow-listed (it is not one
-// of the four public search paths) — it requires a token AND, because it returns
-// the named user's OWNED games, an object-level self-check (see its handler).
+// authn layer (server.js). Post 87.5 SW-01/SW-02, ONLY the two search GETs
+// (`/search-all`, `/bgg/search`) are allow-listed public there. Everything else
+// — `GET /:id` (SW-01: its includes expose events/participants/winner UUIDs, so
+// it is authed; sole consumer is the authenticated gameDetail page), the write
+// handlers (`POST /`, `POST /resolve`, `POST /import-bgg/:bgg_id`, `PUT /:id`,
+// `DELETE /:id`), and `GET /for-event/:group_id/:user_id` — requires a valid
+// JWT before the handler runs. for-event ADDITIONALLY carries an object-level
+// self-check (see its handler) because it returns the named user's OWNED games.
 
 
 // BGG API integration helper
@@ -25,40 +26,26 @@ const bggService = require('../services/bggService');
 const bggCsvService = require('../services/bggCsvService');
 
 
-// Get all games (with optional search)
-router.get('/', async (req, res) => {
-  try {
-    const { search, is_custom, group_id } = req.query;
-    const where = {};
-    
-    if (search) {
-      where.name = { [Op.iLike]: `%${search}%` };
-    }
-    
-    if (is_custom !== undefined) {
-      where.is_custom = is_custom === 'true';
-    }
-    
-    const games = await Game.findAll({
-      where,
-      order: [['name', 'ASC']],
-      include: group_id ? [{
-        model: GameReview,
-        where: { group_id },
-        required: false,
-        include: [{ model: User, attributes: ['username'] }]
-      }] : []
-    });
-    
-    res.json(games);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
+// GET / (catalog listing) DELETED — 87.5 adversarial-review sweep SW-02.
+// Zero product callers (the gamesAPI.getGames wrapper was dead; every real flow
+// uses /search-all, /for-event, or lists/games), and its ?group_id arm attached
+// a group's GameReviews + reviewer usernames to an UNAUTHENTICATED response.
+// Same dead-route policy as the 87.5-06/WR-02 lists deletions: caller-less
+// routes are removed, not left as an unwatched public surface.
 
 
 // Unified search: local custom games + BGG results
-router.get('/search-all', async (req, res) => {
+//
+// 87.5 adversarial review ML-06: the route stays on the public allow-list (the
+// catalog/BGG arm is genuinely public), but the ?user_id PERSONALIZATION arm is
+// now token-gated. Post-87.x, Users.id UUIDs circulate to every co-member on the
+// wire (heatmap availableMembers, respondents, rosters), so an unauthenticated
+// `?user_id=<uuid>` probe could enumerate a user's owned games + cross-group play
+// history. optionalAuth verifies a bearer token when present (req.user null
+// otherwise); the local arm runs ONLY for the caller's own verified identity
+// (matchesSelf, either keyspace). Anonymous callers get BGG-only results — the FE
+// always calls this authenticated with the caller's own id, so no surface changes.
+router.get('/search-all', optionalAuth, async (req, res) => {
   try {
     const { query, group_id, user_id } = req.query;
 
@@ -69,10 +56,22 @@ router.get('/search-all', async (req, res) => {
 
     let local = [];
 
-    // Local search: find games the user/group has used
-    if (user_id) {
+    // Local search: find games the user/group has used — verified self only (ML-06).
+    if (user_id && req.user && (await matchesSelf(req, user_id))) {
       try {
-        const user = await User.findOne({ where: { user_id } });
+        // 87.5-06 (T-875-06-SEARCHALL / KEYMISS): the ?user_id param carries the
+        // caller's identifier. Plan 11 flips the FE searchAll senders from the
+        // caller's Auth0 sub to their Users.id UUID — so resolve BOTH shapes
+        // (findByPk on the UUID, findOne on the sub), matching the dual-resolution
+        // precedent already on the sibling /games/for-event route. A sub-only
+        // lookup would silently miss a UUID-identified caller and return zero
+        // local results while BGG results keep rendering. matchesSelf has already
+        // proven the param IS the caller (either keyspace), and memoized
+        // req.selfUser for the UUID arm — reuse it before hitting Users again.
+        const user = req.selfUser
+          ?? (isUuid(user_id)
+            ? await User.findByPk(user_id)
+            : await User.findOne({ where: { user_id } }));
         if (user) {
           // Get all active group_ids for the user. Phase 87.1 (BINT-02): the
           // subject user was resolved from the ?user_id query-param above (this

@@ -1,294 +1,45 @@
 // routes/lists.js
 const express = require('express');
 const { Event, Game, Group, User, EventParticipation, GameReview } = require('../models');
-const { Op, fn, col, literal } = require('sequelize');
+const { Op, fn, col } = require('sequelize');
 const { isActiveMember } = require('../services/authorizationService');
 // Phase 87.4 Plan 02 (SPEC Req 5, D-04): shared self-param dual-accept (own sub
 // OR own resolved Users.id UUID). Every route in this file now keys isActiveMember
 // on the token sub (req.user.user_id), NOT the URL :user_id param, and clamps the
 // :user_id self-param to the caller via matchesSelf. Phase 87.4 code-review H-1
-// folded the remaining URL-param-gated routes (player-wins, most-played, etc.) into
+// folded the remaining URL-param-gated routes (player-wins, player-picks, etc.) into
 // this same pattern — the /games and /players siblings are the precedent.
 const { matchesSelf } = require('../middleware/objectAuth');
 const router = express.Router();
 
-// 1. Games won by a specific player in a group (by name)
-router.get('/player-wins/:group_id/:player_name/:user_id', async (req, res) => {
-  try {
-    // Use verified user_id from token (self-param dual-accept — same pattern as
-    // the /games and /players siblings; the path :user_id alone is spoofable).
-    const userId = req.user?.user_id;
-    if (!userId) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
+// 1 + 1b. [REMOVED — Phase 87.5 code-review WR-02, dead-route policy per Plan 06]
+// The per-player "games won" routes — player-wins (by name, path
+// :group_id/:player_name/:user_id) and player-wins-by-id (by user_id, path
+// :group_id/:player_user_id/:user_id) — were deleted. player-wins-by-id filtered
+// on `p.User.user_id` / `event.Winner.user_id` from includes that only select
+// ['id','username'] (never user_id), so its predicate was ALWAYS false and it
+// always returned [] — the identical defect class as the deleted
+// games-played-by-id (see route 7b below). player-wins (by name) was functional
+// but had ZERO FE callers (confirmed via grep of periodictabletop/src for
+// 'player-wins'). Both removed under the Plan-06 dead-route policy. Recoverable
+// from git history if ever needed.
 
-    const { group_id, player_name, user_id } = req.params;
+// [REMOVED — Phase 87.5 Plan 06, SPEC Req 9/10] Two dead play-count sort routes
+// (games ordered by descending and by ascending play count; path
+// :group_id/:user_id) were deleted: they 500'd on main and had zero FE callers.
+// Their capability is preserved by the unified /lists/games endpoint's sort/order
+// params + client-side sort. Recoverable from git history if ever needed.
 
-    // Verify the requested user_id is the caller's own identity (dual-accept: own
-    // sub OR own resolved UUID). The group-scoped data query below keys on
-    // group_id + isActiveMember(token sub), not this param.
-    if (!(await matchesSelf(req, user_id))) {
-      return res.status(403).json({ error: 'Forbidden: Cannot access other users\' data' });
-    }
-
-    const hasAccess = await isActiveMember(userId, group_id);
-    if (!hasAccess) {
-      return res.status(403).json({ error: 'Access denied to this group' });
-    }
-
-    const events = await Event.findAll({
-      where: { group_id },
-      include: [
-        { model: Game, attributes: ['name', 'theme', 'url'] },
-        { model: User, as: 'Winner', attributes: ['id', 'username'] },
-        {
-          model: EventParticipation,
-          include: [{ model: User, attributes: ['id', 'username'] }]
-        }
-      ],
-      order: [['start_date', 'DESC']]
-    });
-
-    // Filter to only include events where this player actually won
-    const winningEvents = events.filter(event => {
-      if (event.Winner && event.EventParticipations) {
-        const playerParticipation = event.EventParticipations.find(p =>
-          p.User.username === player_name
-        );
-        return playerParticipation && event.Winner.username === player_name;
-      }
-      return false;
-    });
-    
-    res.json(winningEvents);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 1b. Games won by a specific player in a group (by user_id)
-router.get('/player-wins-by-id/:group_id/:player_user_id/:user_id', async (req, res) => {
-  try {
-    // Use verified user_id from token (self-param dual-accept — same pattern as
-    // the /games and /players siblings; the path :user_id alone is spoofable).
-    const userId = req.user?.user_id;
-    if (!userId) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    const { group_id, player_user_id, user_id } = req.params;
-
-    // Verify the requested user_id is the caller's own identity (dual-accept: own
-    // sub OR own resolved UUID). The group-scoped data query below keys on
-    // group_id + isActiveMember(token sub), not this param.
-    if (!(await matchesSelf(req, user_id))) {
-      return res.status(403).json({ error: 'Forbidden: Cannot access other users\' data' });
-    }
-
-    const hasAccess = await isActiveMember(userId, group_id);
-    if (!hasAccess) {
-      return res.status(403).json({ error: 'Access denied to this group' });
-    }
-
-    const events = await Event.findAll({
-      where: { group_id },
-      include: [
-        { model: Game, attributes: ['name', 'theme', 'url'] },
-        { model: User, as: 'Winner', attributes: ['id', 'username'] },
-        {
-          model: EventParticipation,
-          include: [{ model: User, attributes: ['id', 'username'] }]
-        }
-      ],
-      order: [['start_date', 'DESC']]
-    });
-    
-    // Filter to only include events where this player actually won
-    const winningEvents = events.filter(event => {
-      if (event.Winner && event.EventParticipations) {
-        const playerParticipation = event.EventParticipations.find(p => 
-          p.User.user_id === player_user_id
-        );
-        return playerParticipation && event.Winner.user_id === player_user_id;
-      }
-      return false;
-    });
-    
-    res.json(winningEvents);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 2. Games organized by most played to least played
-router.get('/most-played/:group_id/:user_id', async (req, res) => {
-  try {
-    // Use verified user_id from token (self-param dual-accept — same pattern as
-    // the /games and /players siblings; the path :user_id alone is spoofable).
-    const userId = req.user?.user_id;
-    if (!userId) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    const { group_id, user_id } = req.params;
-
-    // Verify the requested user_id is the caller's own identity (dual-accept: own
-    // sub OR own resolved UUID). The group-scoped data query below keys on
-    // group_id + isActiveMember(token sub), not this param.
-    if (!(await matchesSelf(req, user_id))) {
-      return res.status(403).json({ error: 'Forbidden: Cannot access other users\' data' });
-    }
-
-    const hasAccess = await isActiveMember(userId, group_id);
-    if (!hasAccess) {
-      return res.status(403).json({ error: 'Access denied to this group' });
-    }
-
-    const games = await Event.findAll({
-      where: { group_id },
-      include: [{ model: Game, attributes: ['name', 'theme', 'url'] }],
-      attributes: [
-        'game_id',
-        [fn('COUNT', col('Event.id')), 'play_count']
-      ],
-      group: ['Event.game_id', 'Game.name', 'Game.theme', 'Game.url'],
-      order: [[literal('play_count'), 'DESC']]
-    });
-    
-    res.json(games);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 3. Games organized by least played to most played
-router.get('/least-played/:group_id/:user_id', async (req, res) => {
-  try {
-    // Use verified user_id from token (self-param dual-accept — same pattern as
-    // the /games and /players siblings; the path :user_id alone is spoofable).
-    const userId = req.user?.user_id;
-    if (!userId) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    const { group_id, user_id } = req.params;
-
-    // Verify the requested user_id is the caller's own identity (dual-accept: own
-    // sub OR own resolved UUID). The group-scoped data query below keys on
-    // group_id + isActiveMember(token sub), not this param.
-    if (!(await matchesSelf(req, user_id))) {
-      return res.status(403).json({ error: 'Forbidden: Cannot access other users\' data' });
-    }
-
-    const hasAccess = await isActiveMember(userId, group_id);
-    if (!hasAccess) {
-      return res.status(403).json({ error: 'Access denied to this group' });
-    }
-
-    const games = await Event.findAll({
-      where: { group_id },
-      include: [{ model: Game, attributes: ['name', 'theme', 'url'] }],
-      attributes: [
-        'game_id',
-        [fn('COUNT', col('Event.id')), 'play_count']
-      ],
-      group: ['Event.game_id', 'Game.name', 'Game.theme', 'Game.url'],
-      order: [[literal('play_count'), 'ASC']]
-    });
-    
-    res.json(games);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 4. Games picked by a specific player (by name)
-router.get('/player-picks/:group_id/:player_name/:user_id', async (req, res) => {
-  try {
-    // Use verified user_id from token (self-param dual-accept — same pattern as
-    // the /games and /players siblings; the path :user_id alone is spoofable).
-    const userId = req.user?.user_id;
-    if (!userId) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    const { group_id, player_name, user_id } = req.params;
-
-    // Verify the requested user_id is the caller's own identity (dual-accept: own
-    // sub OR own resolved UUID). The group-scoped data query below keys on
-    // group_id + isActiveMember(token sub), not this param.
-    if (!(await matchesSelf(req, user_id))) {
-      return res.status(403).json({ error: 'Forbidden: Cannot access other users\' data' });
-    }
-
-    const hasAccess = await isActiveMember(userId, group_id);
-    if (!hasAccess) {
-      return res.status(403).json({ error: 'Access denied to this group' });
-    }
-
-    const events = await Event.findAll({
-      where: { group_id },
-      include: [
-        { model: Game, attributes: ['name', 'theme', 'url'] },
-        { model: User, as: 'PickedBy', attributes: ['id', 'username'] }
-      ],
-      order: [['start_date', 'DESC']]
-    });
-
-    // Filter to only include events where this player picked the game
-    const pickedEvents = events.filter(event => {
-      return event.PickedBy && event.PickedBy.username === player_name;
-    });
-    
-    res.json(pickedEvents);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 4b. Games picked by a specific player (by user_id)
-router.get('/player-picks-by-id/:group_id/:player_user_id/:user_id', async (req, res) => {
-  try {
-    // Use verified user_id from token (self-param dual-accept — same pattern as
-    // the /games and /players siblings; the path :user_id alone is spoofable).
-    const userId = req.user?.user_id;
-    if (!userId) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    const { group_id, player_user_id, user_id } = req.params;
-
-    // Verify the requested user_id is the caller's own identity (dual-accept: own
-    // sub OR own resolved UUID). The group-scoped data query below keys on
-    // group_id + isActiveMember(token sub), not this param.
-    if (!(await matchesSelf(req, user_id))) {
-      return res.status(403).json({ error: 'Forbidden: Cannot access other users\' data' });
-    }
-
-    const hasAccess = await isActiveMember(userId, group_id);
-    if (!hasAccess) {
-      return res.status(403).json({ error: 'Access denied to this group' });
-    }
-
-    const events = await Event.findAll({
-      where: { group_id },
-      include: [
-        { model: Game, attributes: ['name', 'theme', 'url'] },
-        { model: User, as: 'PickedBy', attributes: ['id', 'username'] }
-      ],
-      order: [['start_date', 'DESC']]
-    });
-
-    // Filter to only include events where this player picked the game
-    const pickedEvents = events.filter(event => {
-      return event.PickedBy && event.PickedBy.user_id === player_user_id;
-    });
-    
-    res.json(pickedEvents);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
+// 4 + 4b. [REMOVED — Phase 87.5 code-review WR-02, dead-route policy per Plan 06]
+// The per-player "games picked" routes — player-picks (by name, path
+// :group_id/:player_name/:user_id) and player-picks-by-id (by user_id, path
+// :group_id/:player_user_id/:user_id) — were deleted. player-picks-by-id
+// filtered on `event.PickedBy.user_id` from an include that only selects
+// ['id','username'] (never user_id), so its predicate was ALWAYS false and it
+// always returned []. player-picks (by name) was functional but had ZERO FE
+// callers (confirmed via grep of periodictabletop/src for 'player-picks'). Both
+// removed under the Plan-06 dead-route policy. Recoverable from git history if
+// ever needed.
 
 // 5. Games by theme
 router.get('/by-theme/:group_id/:theme/:user_id', async (req, res) => {
@@ -536,91 +287,12 @@ router.get('/games/:group_id/:user_id', async (req, res) => {
   }
 });
 
-// 6. All games sorted alphabetically (kept for backward compatibility)
-router.get('/alphabetical/:group_id/:user_id', async (req, res) => {
-  try {
-    // Use verified user_id from token (self-param dual-accept — same pattern as
-    // the /games and /players siblings; the path :user_id alone is spoofable).
-    const userId = req.user?.user_id;
-    if (!userId) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    const { group_id, user_id } = req.params;
-
-    // Verify the requested user_id is the caller's own identity (dual-accept: own
-    // sub OR own resolved UUID). The group-scoped data query below keys on
-    // group_id + isActiveMember(token sub), not this param.
-    if (!(await matchesSelf(req, user_id))) {
-      return res.status(403).json({ error: 'Forbidden: Cannot access other users\' data' });
-    }
-
-    const hasAccess = await isActiveMember(userId, group_id);
-    if (!hasAccess) {
-      return res.status(403).json({ error: 'Access denied to this group' });
-    }
-
-    // Use the unified endpoint with alphabetical sort
-    const games = await Event.findAll({
-      where: { group_id },
-      include: [{ model: Game, attributes: ['id', 'name', 'theme', 'url'] }],
-      attributes: [
-        'game_id',
-        [fn('MAX', col('Event.start_date')), 'last_played']
-      ],
-      group: ['Event.game_id', 'Game.id', 'Game.name', 'Game.theme', 'Game.url'],
-      order: [['Game.name', 'ASC']]
-    });
-    
-    res.json(games);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 7. All games played by a specific player (by name)
-router.get('/player-games/:group_id/:player_name/:user_id', async (req, res) => {
-  try {
-    // Use verified user_id from token (self-param dual-accept — same pattern as
-    // the /games and /players siblings; the path :user_id alone is spoofable).
-    const userId = req.user?.user_id;
-    if (!userId) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    const { group_id, player_name, user_id } = req.params;
-
-    // Verify the requested user_id is the caller's own identity (dual-accept: own
-    // sub OR own resolved UUID). The group-scoped data query below keys on
-    // group_id + isActiveMember(token sub), not this param.
-    if (!(await matchesSelf(req, user_id))) {
-      return res.status(403).json({ error: 'Forbidden: Cannot access other users\' data' });
-    }
-
-    const hasAccess = await isActiveMember(userId, group_id);
-    if (!hasAccess) {
-      return res.status(403).json({ error: 'Access denied to this group' });
-    }
-
-    const events = await Event.findAll({
-      where: { group_id },
-      include: [
-        { model: Game, attributes: ['name', 'theme', 'url'] },
-        { model: User, as: 'Players', attributes: ['id', 'username'] }
-      ],
-      order: [['start_date', 'DESC']]
-    });
-    
-    // Filter to only include events where this player participated
-    const playerEvents = events.filter(event => {
-      return event.Players && event.Players.some(p => p.username === player_name);
-    });
-    
-    res.json(playerEvents);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
+// 6. [REMOVED — Phase 87.5 Plan 06, SPEC Req 9/10] Two more dead routes were
+// deleted: the games-sorted-by-name listing (path :group_id/:user_id) and the
+// per-player games-by-name listing (path :group_id/:player_name/:user_id). Both
+// 500'd on main and had zero FE callers. Name-sorted listing is preserved by the
+// unified /lists/games endpoint's sort/order params + client-side sort.
+// Recoverable from git history if ever needed.
 
 // 7b. [REMOVED — Phase 87.4 Plan 02, SPEC Req 6] The dead "games-played-by-id"
 // endpoint (path :group_id/:player_user_id/:user_id) was deleted. It filtered on

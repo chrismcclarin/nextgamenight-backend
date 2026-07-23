@@ -4,7 +4,7 @@ const { User, Group, UserGroup, PendingAuth0Deletion, sequelize } = require('../
 const router = express.Router();
 const { validateUserSearch } = require('../middleware/validators');
 const { writeOperationLimiter } = require('../middleware/rateLimiter');
-const { requireParamMatchesToken } = require('../middleware/objectAuth');
+const { requireParamMatchesToken, matchesSelf } = require('../middleware/objectAuth');
 // Phase 87.4 Plan 02 (KEYMISS mitigation): resolve a UUID self-param to the
 // sub-keyed Users row.
 const { isUuid } = require('../utils/resolveTargetUser');
@@ -485,11 +485,13 @@ router.put('/:user_id/tutorial', async (req, res) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
-    if (req.params.user_id !== userId) {
+    if (!(await matchesSelf(req, req.params.user_id))) {
       return res.status(403).json({ error: 'Forbidden: Cannot update other users\' tutorial status' });
     }
 
-    const user = await User.findOne({ where: { user_id: userId } });
+    // Reuse matchesSelf's UUID-arm memoized row when present; fall back to the
+    // lookup on the sub arm (DB-free short-circuit leaves it unset). (ML-19)
+    const user = req.selfUser ?? await User.findOne({ where: { user_id: userId } });
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
@@ -511,11 +513,13 @@ router.delete('/:user_id/tutorial', async (req, res) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
-    if (req.params.user_id !== userId) {
+    if (!(await matchesSelf(req, req.params.user_id))) {
       return res.status(403).json({ error: 'Forbidden: Cannot reset other users\' tutorial status' });
     }
 
-    const user = await User.findOne({ where: { user_id: userId } });
+    // Reuse matchesSelf's UUID-arm memoized row when present; fall back to the
+    // lookup on the sub arm (DB-free short-circuit leaves it unset). (ML-19)
+    const user = req.selfUser ?? await User.findOne({ where: { user_id: userId } });
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
@@ -575,7 +579,7 @@ router.put('/:user_id/username', async (req, res) => {
     }
     
     // Verify that the requested user_id matches the authenticated user
-    if (req.params.user_id !== userId) {
+    if (!(await matchesSelf(req, req.params.user_id))) {
       return res.status(403).json({ error: 'Forbidden: Cannot update other users\' usernames' });
     }
     
@@ -589,7 +593,9 @@ router.put('/:user_id/username', async (req, res) => {
       return res.status(400).json({ error: 'Username must be 50 characters or less' });
     }
     
-    const user = await User.findOne({ where: { user_id: userId } });
+    // Reuse matchesSelf's UUID-arm memoized row when present; fall back to the
+    // lookup on the sub arm (DB-free short-circuit leaves it unset). (ML-19)
+    const user = req.selfUser ?? await User.findOne({ where: { user_id: userId } });
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
@@ -612,7 +618,7 @@ router.post('/:user_id/refresh', async (req, res) => {
     }
     
     // Verify that the requested user_id matches the authenticated user
-    if (req.params.user_id !== userId) {
+    if (!(await matchesSelf(req, req.params.user_id))) {
       return res.status(403).json({ error: 'Forbidden: Cannot refresh other users\' info' });
     }
 
@@ -673,7 +679,7 @@ router.patch('/:user_id/notification-preferences', async (req, res) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
-    if (req.params.user_id !== userId) {
+    if (!(await matchesSelf(req, req.params.user_id))) {
       return res.status(403).json({ error: 'Forbidden: Cannot update other users\' notification preferences' });
     }
 
@@ -762,7 +768,7 @@ router.patch('/:user_id/timezone', writeOperationLimiter, async (req, res) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
-    if (req.params.user_id !== userId) {
+    if (!(await matchesSelf(req, req.params.user_id))) {
       return res.status(403).json({ error: 'Forbidden: Cannot update other users\' timezone' });
     }
 
@@ -779,7 +785,9 @@ router.patch('/:user_id/timezone', writeOperationLimiter, async (req, res) => {
       return res.status(400).json({ error: 'Invalid IANA timezone string' });
     }
 
-    const user = await User.findOne({ where: { user_id: userId } });
+    // Reuse matchesSelf's UUID-arm memoized row when present; fall back to the
+    // lookup on the sub arm (DB-free short-circuit leaves it unset). (ML-19)
+    const user = req.selfUser ?? await User.findOne({ where: { user_id: userId } });
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
@@ -799,7 +807,7 @@ router.post('/:user_id/phone', async (req, res) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
-    if (req.params.user_id !== userId) {
+    if (!(await matchesSelf(req, req.params.user_id))) {
       return res.status(403).json({ error: 'Forbidden: Cannot update other users\' phone numbers' });
     }
 
@@ -815,7 +823,9 @@ router.post('/:user_id/phone', async (req, res) => {
       return res.status(400).json({ error: result.error });
     }
 
-    const user = await User.findOne({ where: { user_id: userId } });
+    // Reuse matchesSelf's UUID-arm memoized row when present; fall back to the
+    // lookup on the sub arm (DB-free short-circuit leaves it unset). (ML-19)
+    const user = req.selfUser ?? await User.findOne({ where: { user_id: userId } });
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
@@ -851,7 +861,7 @@ router.post('/:user_id/phone/verify', async (req, res) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
-    if (req.params.user_id !== userId) {
+    if (!(await matchesSelf(req, req.params.user_id))) {
       return res.status(403).json({ error: 'Forbidden: Cannot verify other users\' phone numbers' });
     }
 
@@ -911,11 +921,13 @@ router.delete('/:user_id/phone', async (req, res) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
-    if (req.params.user_id !== userId) {
+    if (!(await matchesSelf(req, req.params.user_id))) {
       return res.status(403).json({ error: 'Forbidden: Cannot update other users\' phone numbers' });
     }
 
-    const user = await User.findOne({ where: { user_id: userId } });
+    // Reuse matchesSelf's UUID-arm memoized row when present; fall back to the
+    // lookup on the sub arm (DB-free short-circuit leaves it unset). (ML-19)
+    const user = req.selfUser ?? await User.findOne({ where: { user_id: userId } });
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }

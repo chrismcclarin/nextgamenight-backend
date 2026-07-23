@@ -200,7 +200,11 @@ app.use((req, res, next) => {
   // Exclude public routes that don't require auth
   const publicRoutes = [
     '/api/auth/google/callback', // Google OAuth callback (public - Google redirects to it)
-    '/api/games', // Game search is public
+    // 87.5 SW-01/SW-02: only the two search endpoints are public now — the old
+    // '/api/games' PREFIX also exempted the now-authed /games/:id (and the
+    // deleted GET /games) from the no-origin block.
+    '/api/games/search-all',
+    '/api/games/bgg/search',
     '/api/feedback', // Feedback is public (or optional auth)
     '/health', // Health check is public
     '/api/groups/invite-preview', // QR code group invite preview (public)
@@ -271,12 +275,16 @@ app.use('/api/', apiLimiter);
 
 // Exact (method, path-regex) public routes — path is mount-relative to `/api`.
 const PUBLIC_EXACT = [
-  // Game search (public) — `/games/:id` and `/games/search-all` are single
-  // dynamic segments; `/games/for-event/:group_id/:user_id` (3 segments) is
-  // deliberately NOT matched and stays gated.
-  { method: 'GET', re: /^\/games$/ },
+  // Game search (public) — 87.5 adversarial-review sweep narrowed this family:
+  // SW-02 deleted `GET /games` (dead route, leaked group reviews anonymously);
+  // SW-01 pulled `GET /games/:id` off the allow-list (its includes exposed every
+  // group's events/participants/winner UUIDs to anonymous callers; sole consumer
+  // is the authenticated gameDetail page). Only the two SEARCH endpoints remain
+  // public — search-all is matched LITERALLY (never a `[^/]+` wildcard, so no
+  // future single-segment route is silently public), and its ?user_id
+  // personalization arm is separately token-gated in-route (ML-06).
   { method: 'GET', re: /^\/games\/bgg\/search$/ },
-  { method: 'GET', re: /^\/games\/[^/]+$/ },
+  { method: 'GET', re: /^\/games\/search-all$/ },
   // Google OAuth callback — Google redirects here with no Auth0 token.
   { method: 'GET', re: /^\/auth\/google\/callback$/ },
   // RSVP magic-link response (HMAC-token authed inside the handler).

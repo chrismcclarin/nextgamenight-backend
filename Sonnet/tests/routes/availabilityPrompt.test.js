@@ -407,3 +407,56 @@ describe('POST /api/prompts/:promptId/remind/:userId — UUID-only contract (87.
     expect(second.body.message).toContain('24 hours');
   });
 });
+
+// Phase 87.5 code-review WR-04: GET /prompts/:promptId was the only route in this
+// file with NO membership gate and it serialized the raw prompt row including
+// created_by_user_id (which /prompts/open deliberately strips, T-71.2-02). These
+// tests pin (a) a non-member is rejected 403, and (b) a member's response omits
+// created_by_user_id.
+describe('GET /api/prompts/:promptId — membership gate + created_by_user_id strip (WR-04)', () => {
+  let member;
+  let outsider;
+  let creator;
+  let group;
+  let prompt;
+
+  beforeEach(async () => {
+    creator = await makeUser({ username: 'wr04-creator' });
+    member = await makeUser({ username: 'wr04-member' });
+    outsider = await makeUser({ username: 'wr04-outsider' });
+    group = await makeGroup({ name: 'WR04 Prompt Group' });
+    await addToGroup(creator, group, 'owner');
+    await addToGroup(member, group, 'member');
+    // outsider is intentionally NOT added to the group.
+
+    prompt = await AvailabilityPrompt.create({
+      group_id: group.id,
+      prompt_date: new Date(),
+      deadline: new Date(Date.now() + 72 * 60 * 60 * 1000),
+      status: 'active',
+      week_identifier: '2026-W30-wr04',
+      created_by_user_id: creator.id, // raw creator UUID must NOT reach the wire
+    });
+  });
+
+  it('rejects a non-member with 403', async () => {
+    const res = await request(makeApp(outsider))
+      .get(`/api/prompts/${prompt.id}`)
+      .send();
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toBe('You must be a member of this group');
+  });
+
+  it('returns 200 for a member and omits created_by_user_id from the response', async () => {
+    const res = await request(makeApp(member))
+      .get(`/api/prompts/${prompt.id}`)
+      .send();
+
+    expect(res.status).toBe(200);
+    expect(res.body.prompt).toBeDefined();
+    expect(res.body.prompt.id).toBe(prompt.id);
+    // T-71.2-02: raw creator UUID stripped from the wire.
+    expect(res.body.prompt.created_by_user_id).toBeUndefined();
+  });
+});

@@ -40,8 +40,11 @@ const EventBallotOption = sequelize.define('EventBallotOption', {
   // BOTH this model (sync() builds the FK on the CI/test DB) AND migration 20260720000003
   // (prod). SET NULL because the creator is a soft attribution, not an ownership key: a
   // deleted creator's ballot options survive with a NULL creator (fall through to
-  // owner/admin-only authz). The old `created_by` Auth0-string column is RETAINED as the
-  // D-07 rollback net (dropped in the BE PR-2 contract migration, Plan 07).
+  // owner/admin-only authz). The old `created_by` Auth0-string attribute has been REMOVED
+  // from this model (BE PR-2 cutover, Plan 07): its physical DB column is dropped by
+  // migration 20260721000003, so leaving the attribute declared would make Sequelize's
+  // default attribute enumeration SELECT the dropped column and 500 every read. Mirrors
+  // the 87.1 UserGroup cutover.
   created_by_uuid: {
     type: DataTypes.UUID,
     allowNull: true,
@@ -50,14 +53,6 @@ const EventBallotOption = sequelize.define('EventBallotOption', {
       key: 'id',
     },
     onDelete: 'SET NULL',
-  },
-  // Phase 87 (BINT-01, D-05): RETAINED legacy Auth0 sub of the ballot's creator. Kept as
-  // the D-07 rollback net during the expand-contract window; readers/writers key
-  // created_by_uuid after the Plan 04 flip. NULLABLE with NO backfill — legacy rows stay
-  // NULL and fall through to owner/admin-only replace/wipe authz.
-  created_by: {
-    type: DataTypes.STRING,
-    allowNull: true,
   },
 }, {
   timestamps: true,

@@ -11,9 +11,11 @@
 //      gate calls next() instead of 401). We mount trivial 200-returning stub
 //      handlers behind the REAL gate so "reachable" is observable without a DB —
 //      proving the allow-list, not the downstream handler.
-//   3. The allow-list matches on EXACT method+path: `GET /api/games/:id` is
-//      public but `GET /api/games/for-event/:group_id/:user_id` is NOT — it
-//      falls through to the gate and 401s with no token (the BOLA-audit gate).
+//   3. The allow-list matches on EXACT method+path — 87.5 SW-01/SW-02 narrowed
+//      the games family to the two literal search endpoints: `GET /games` is
+//      DELETED, `GET /games/:id` is now AUTHED (its includes exposed
+//      events/participants/winner UUIDs anonymously), and
+//      `GET /games/for-event/...` stays gated (the BOLA-audit gate).
 //
 // This test deliberately reconstructs the gate from the SAME public allow-list
 // shape used in server.js and the SAME `verifyAuth0Token`. If server.js changes
@@ -26,9 +28,8 @@ const { verifyAuth0Token } = require('../../middleware/auth0');
 
 // --- Mirror of the server.js allow-list (the security contract) ---------------
 const PUBLIC_EXACT = [
-  { method: 'GET', re: /^\/games$/ },
   { method: 'GET', re: /^\/games\/bgg\/search$/ },
-  { method: 'GET', re: /^\/games\/[^/]+$/ },
+  { method: 'GET', re: /^\/games\/search-all$/ },
   { method: 'GET', re: /^\/auth\/google\/callback$/ },
   { method: 'GET', re: /^\/rsvp\/respond$/ },
   { method: 'GET', re: /^\/groups\/invite-preview(\/|$)/ },
@@ -59,10 +60,9 @@ function buildApp() {
   // Stub handlers — 200 means "the gate let it through". A real handler would
   // touch the DB; we don't care here, only whether the gate denied or allowed.
   const ok = (_req, res) => res.json({ ok: true });
-  app.get('/api/games', ok);
   app.get('/api/games/search-all', ok);
   app.get('/api/games/bgg/search', ok);
-  app.get('/api/games/:id', ok);
+  app.get('/api/games/:id', ok); // AUTHED as of 87.5 SW-01 — must 401 tokenless
   app.get('/api/games/for-event/:group_id/:user_id', ok); // NOT allow-listed
   app.get('/api/auth/google/callback', ok);
   app.get('/api/rsvp/respond', ok);
@@ -93,6 +93,12 @@ describe('Default-deny `/api` authn layer (DB-independent)', () => {
       ['POST', '/api/games'],
       ['PUT', '/api/games/abc'],
       ['DELETE', '/api/games/abc'],
+      // 87.5 SW-01: game detail came OFF the public allow-list (anonymous
+      // callers could read every group's events/participants/winner UUIDs).
+      ['GET', '/api/games/some-game-id'],
+      // 87.5 SW-02: the deleted catalog route's path must not be silently
+      // public if a route is ever re-added at GET /games.
+      ['GET', '/api/games'],
     ];
     it.each(denied)('%s %s → 401', async (method, path) => {
       const res = await request(app)[method.toLowerCase()](path);
@@ -102,10 +108,8 @@ describe('Default-deny `/api` authn layer (DB-independent)', () => {
 
   describe('Test 2 — allow-list reachable with NO token', () => {
     const allowed = [
-      ['GET', '/api/games'],
       ['GET', '/api/games/search-all'],
       ['GET', '/api/games/bgg/search'],
-      ['GET', '/api/games/some-game-id'],
       ['GET', '/api/auth/google/callback'],
       ['GET', '/api/rsvp/respond'],
       ['GET', '/api/groups/invite-preview/tok123'],

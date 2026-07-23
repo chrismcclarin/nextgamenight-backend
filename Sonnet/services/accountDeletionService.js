@@ -22,15 +22,21 @@
 //   MIXED KEYSPACE (the scrub matches on BOTH keys — neither arm is dead code):
 //   - Feedback.user_id -> historical rows are Auth0-sub-keyed (pre-87.5); NEW rows
 //                         submitted while logged in are Users.id-UUID-keyed once Plan 11
-//                         flips FeedbackForm.js to send self.id. The anonymize scrub's
-//                         Op.or therefore matches sub OR uuid OR email so BOTH row shapes
-//                         are anonymized on deletion (a sub-only match would leak every
-//                         post-Plan-11 UUID-keyed feedback row of a deleted user).
+//                         flips FeedbackForm.js to send self.id. The /feedback/github
+//                         DB-fallback also stamps a resolved Users.id UUID (87.5 review
+//                         ML-10 — its old req.auth?.sub read was dead code storing null).
+//                         The anonymize scrub's Op.or therefore matches sub OR uuid OR
+//                         email so BOTH row shapes are anonymized on deletion (a sub-only
+//                         match would leak every post-Plan-11 UUID-keyed feedback row of
+//                         a deleted user).
 //
 // SURVIVING EXCEPTIONS (completeness-by-enumeration — these are INTENTIONALLY NOT
 // touched, per SPEC out-of-scope):
-//   - EventAuditLog.actor_user_id (Auth0 string, no FK) — legitimate-interest audit
-//     trail; SPEC-accepted exception.
+//   - EventAuditLog.actor_user_id (Users.id UUID going forward — 87.5 write-forward,
+//     Req 9; column type stays STRING but records the caller's UUID, no backfill as
+//     the table was empty in prod) — deliberately NO FK so audit rows survive account
+//     deletion; legitimate-interest audit trail, SPEC-accepted exception. This column
+//     is untouched by the deletion flow — only its keyspace description changed.
 //   - EmailMetrics.email_hash — SHA-256-hashed, no direct user link; SPEC-accepted.
 //   - TokenAnalytics (token_id/jti + ip + user_agent, NO user key) — once this user's
 //     MagicToken rows are hard-deleted (below), the jti->user join path is severed, so
@@ -218,8 +224,10 @@ async function applyDispositions(user, t) {
 
   // 1. SOLE-MEMBER OWNED GROUP AUTO-DELETE (Pitfall 8).
   //    For each owned group whose ONLY UserGroup row (any status) is the owner's,
-  //    replicate routes/groups.js:721-742 group-delete IN-TXN. Never call the route
-  //    (it is non-transactional). Groups with other members were already rejected by
+  //    replicate the routes/groups.js group-delete IN-TXN. Never call the route —
+  //    it now runs its own transaction (87.5 IN-03), but this replica must ride
+  //    INSIDE the deletion txn `t`, not a separate one, so the whole account
+  //    deletion stays atomic. Groups with other members were already rejected by
   //    the owner gate (Step 1 + the in-txn re-check in Step 3), so they never reach here.
   const ownedRows = await UserGroup.findAll({
     where: { user_uuid: uuid, role: 'owner' },

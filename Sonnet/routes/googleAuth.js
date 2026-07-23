@@ -6,6 +6,7 @@ const { google } = require('googleapis');
 const { User, SingleUseToken, PendingAuth0Deletion } = require('../models');
 const { sendError, AppError } = require('../utils/errors');
 const { resolveAllowedFrontendUrl } = require('../config/allowedOrigins');
+const { matchesSelf } = require('../middleware/objectAuth');
 const router = express.Router();
 
 // OAuth state nonce lifetime: the consent round-trip is short; 30 min is generous.
@@ -295,12 +296,14 @@ router.get('/google/status/:user_id', async (req, res) => {
     }
 
     // Verify that the requested user_id matches the authenticated user
-    if (req.params.user_id !== userId) {
+    if (!(await matchesSelf(req, req.params.user_id))) {
       return res.status(403).json({ error: 'Forbidden: Cannot access other users\' calendar status' });
     }
 
-    // Find user (don't auto-create, just return status)
-    const user = await User.findOne({
+    // Find user (don't auto-create, just return status). Reuse matchesSelf's
+    // UUID-arm memoized row when present (default scope carries both calendar
+    // fields — only email/phone are excluded); fall back on the sub arm. (ML-19)
+    const user = req.selfUser ?? await User.findOne({
       where: { user_id: userId },
       attributes: ['google_calendar_enabled', 'google_calendar_token']
     });

@@ -386,11 +386,11 @@ describe('accountDeletion integrity — full disposition table on real Postgres 
     expect(await MagicToken.findByPk(cMagicToken.id)).not.toBeNull();
     expect(await SingleUseToken.findByPk(cSingleUse.id)).not.toBeNull();
     // control's creator / inviter pointers keep control's identifiers. The operative
-    // creator key is created_by_uuid (Phase 87.5 PR-1) — it must survive the target's
-    // deletion for the control; the retained sub column keeps control's sub too.
+    // creator key is created_by_uuid (Phase 87.5) — it must survive the target's
+    // deletion for the control. (The legacy created_by sub column + attribute were dropped
+    // in the Phase 87.5 PR-2 contract cutover, so there is no sub column to assert.)
     const cBallotAfter = await EventBallotOption.findByPk(cBallotOption.id);
     expect(cBallotAfter.created_by_uuid).toBe(control.id);
-    expect(cBallotAfter.created_by).toBe(control.user_id);
     const cInviteAfter = await GroupInvite.findByPk(cGroupInvite.id);
     expect(cInviteAfter.invited_by_uuid).toBe(control.id);
     // control's Feedback untouched (keys intact).
