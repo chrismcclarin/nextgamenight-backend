@@ -2,7 +2,8 @@
 const express = require('express');
 const { User, Group, UserGroup, PendingAuth0Deletion, sequelize } = require('../models');
 const router = express.Router();
-const { validateUserSearch } = require('../middleware/validators');
+// (validateUserSearch import removed — its only consumer, GET /search/email/:email,
+// was deleted in Phase 87.6 users-search-email.)
 const { writeOperationLimiter } = require('../middleware/rateLimiter');
 const { requireParamMatchesToken, matchesSelf } = require('../middleware/objectAuth');
 // Phase 87.4 Plan 02 (KEYMISS mitigation): resolve a UUID self-param to the
@@ -42,96 +43,15 @@ const toSelfWire = (user) => {
   return json;
 };
 
-// Search user by email
-// Searches both our database and Auth0
-router.get('/search/email/:email', validateUserSearch, async (req, res) => {
-  try {
-    const email = decodeURIComponent(req.params.email);
-
-    // First, search in our database.
-    // BSEC-01 (D-03 / WR-01): this is a CROSS-USER email search (friend lookup),
-    // NOT a self read. We use withContactInfo so the self-case below can return the
-    // caller's own full profile, but the cross-user response is projected down to
-    // identity fields only (see the projection before res.json) — never leak phone.
-    let user = await User.scope('withContactInfo').findOne({
-      where: { email: email }
-    });
-    
-    // If not found in database, try to find in Auth0 Management API
-    // SECURITY: We ONLY create users if they exist in Auth0 (verified by Management API search)
-    // We never create users "from thin air" - they must exist in Auth0 first
-    if (!user) {
-      try {
-        const auth0Users = await auth0Service.searchUsersByEmail(email);
-        
-        // Only create user if found in Auth0
-        if (auth0Users && auth0Users.length > 0) {
-          // Found in Auth0, safe to create user in our database
-          const auth0User = auth0Users[0]; // Use first match
-          const userDetails = auth0Service.extractUserDetails(auth0User);
-
-          // SPEC Req 6 (tombstone guard): this is a THIRD-PARTY-triggered create keyed on
-          // the SEARCHED user's sub. If that sub was deleted (tombstone present, pending or
-          // completed, within the ~24h token-TTL retention window), a still-valid deletion
-          // must not let a third party re-materialize the deleted user's PII. Skip creation
-          // entirely and fall through to the normal DB-miss 404 below — leaking nothing.
-          if (await PendingAuth0Deletion.isTombstoned(userDetails.user_id)) {
-            // user stays null → returns the ordinary "User not found" 404.
-          } else {
-          // Create user in our database (they exist in Auth0, so this is safe)
-          const [newUser, created] = await User.findOrCreate({
-            where: { user_id: userDetails.user_id },
-            defaults: {
-              user_id: userDetails.user_id,
-              email: userDetails.email,
-              username: userDetails.username, // This includes the username they entered during signup
-            }
-          });
-          
-          // If user already existed but had wrong email, update it
-          if (!created && newUser.email !== userDetails.email) {
-            await newUser.update({
-              email: userDetails.email,
-              username: userDetails.username
-            });
-          }
-          
-          user = newUser;
-          } // end tombstone-guard else
-        }
-        // If not found in Auth0, user doesn't exist - return 404 (don't create from thin air)
-      } catch (auth0Error) {
-        // If Auth0 Management API is not configured, log and continue
-        // This allows the endpoint to work even without Management API (but won't find users who haven't logged in yet)
-        console.warn('Auth0 Management API lookup failed (this is optional):', auth0Error.message);
-        // Continue to return 404 below (user not found)
-      }
-    }
-    
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-
-    // WR-01 (BSEC-01/D-03): only the caller's OWN row gets the full contact-info
-    // profile. For any other user, return identity fields plus the searched email
-    // (which the caller already supplied) — never phone or integration PII.
-    // Phase 87.3 PR-C (BE-11): the non-self object DROPS the sub user_id — this
-    // endpoint has ZERO FE consumers (the FE email-search flow calls
-    // GET /friendships/search, BE-12); cleaned on its own merit. The self branch
-    // rides the toSelfWire alias (user_id = UUID) like every self read.
-    const isSelf = req.user?.user_id === user.user_id;
-    const payload = isSelf
-      ? toSelfWire(user)
-      : {
-          id: user.id,
-          username: user.username,
-          email: user.email,
-        };
-    res.json(payload);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
+// GET /search/email/:email — DELETED (Phase 87.6 users-search-email, Tier 1).
+// Superseded by friendshipsAPI.searchUserByEmail → GET /friendships/search
+// (BE-12), the sole live email-search path (callers: friends/page.js,
+// FriendInvitePanel.js — both use friendshipsAPI, not the deleted usersAPI twin).
+// The WR-01 cross-user PII regression this route carried is now enforced on the
+// surviving /friendships/search test (friendships.test.js BE-12, strengthened to
+// an exact-projection + PII-victim assertion in the same commit that retired the
+// WR-01 block here). Zero FE callers of usersAPI.searchUserByEmail (re-confirmed
+// 2026-07-24, object-qualified grep).
 
 // ---------------------------------------------------------------------------
 // Phase 87.2 (D-01) — self-serve account deletion HTTP surface.
@@ -531,43 +451,12 @@ router.delete('/:user_id/tutorial', async (req, res) => {
   }
 });
 
-// Create or update the AUTHENTICATED user's own row (BE-049).
-// FOLLOW-UP: this duplicates POST /:user_id/refresh (which reconciles
-// username/email authoritatively from Auth0); consider removing this route
-// and the unused FE `createOrUpdateUser` client method in a later cleanup.
-router.post('/', async (req, res) => {
-  try {
-    const { username, email } = req.body;
-
-    // BE-049 (BSEC-01): derive the subject from the verified JWT, NEVER from the
-    // request body. Previously `user_id` came from req.body, letting any
-    // authenticated caller create/overwrite ANY user's username+email.
-    const user_id = req.user?.user_id;
-    if (!user_id) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    // SPEC Req 6 (tombstone guard, self-keyed): a still-valid token surviving the
-    // Auth0 deletion must not re-create the Users row from token claims. Pinned
-    // refusal shape: 410 account_deleted on the Phase 85 envelope.
-    if (await PendingAuth0Deletion.isTombstoned(user_id)) {
-      return sendError(res, 'account_deleted');
-    }
-
-    const [user, created] = await User.findOrCreate({
-      where: { user_id },
-      defaults: { username, email, user_id }
-    });
-
-    if (!created) {
-      await user.update({ username, email });
-    }
-
-    res.json(toSelfWire(user)); // PR-C: user_id aliased to the UUID
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
+// POST / — DELETED (Phase 87.6 users-create, Tier 1). Superseded by the JIT
+// auto-create branch in GET /:user_id (~L200, Phase 78 TZ-01 auto-create), which
+// provisions the caller's row on first authenticated read. NOT superseded by the
+// old FOLLOW-UP's POST /:user_id/refresh (itself deleted this phase, Tier 3 —
+// evidence-rot correction from RESEARCH item 6). Zero FE callers of
+// createOrUpdateUser (re-confirmed 2026-07-24).
 
 // Update user's username
 router.put('/:user_id/username', async (req, res) => {
@@ -608,68 +497,11 @@ router.put('/:user_id/username', async (req, res) => {
   }
 });
 
-// Refresh user info from Auth0 (updates email and username from Auth0)
-router.post('/:user_id/refresh', async (req, res) => {
-  try {
-    // Use verified user_id from token
-    const userId = req.user?.user_id;
-    if (!userId) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-    
-    // Verify that the requested user_id matches the authenticated user
-    if (!(await matchesSelf(req, req.params.user_id))) {
-      return res.status(403).json({ error: 'Forbidden: Cannot refresh other users\' info' });
-    }
-
-    // SPEC Req 6 (tombstone guard, self-keyed): during the pending window the Auth0
-    // identity may not be deleted yet, so the Auth0-404 check below is not enough —
-    // this route's User.create could re-materialize the deleted row. Pinned refusal
-    // shape: 410 account_deleted envelope.
-    if (await PendingAuth0Deletion.isTombstoned(userId)) {
-      return sendError(res, 'account_deleted');
-    }
-
-    // BSEC-01 (D-03): withContactInfo — self-gated refresh that returns the
-    // user's own profile (incl. email) reconciled with Auth0.
-    let user = await User.scope('withContactInfo').findOne({ where: { user_id: userId } });
-    
-    try {
-      // Fetch latest info from Auth0 Management API
-      const auth0User = await auth0Service.getUserById(userId);
-      if (!auth0User) {
-        return res.status(404).json({ error: 'User not found in Auth0' });
-      }
-      
-      const userDetails = auth0Service.extractUserDetails(auth0User);
-      
-      if (!user) {
-        // Create user if doesn't exist
-        user = await User.create({
-          user_id: userDetails.user_id,
-          email: userDetails.email,
-          username: userDetails.username,
-        });
-      } else {
-        // Update existing user with correct info
-        await user.update({
-          email: userDetails.email,
-          username: userDetails.username,
-        });
-      }
-      
-      res.json(toSelfWire(user)); // PR-C: user_id aliased to the UUID
-    } catch (auth0Error) {
-      if (!user) {
-        return res.status(404).json({ error: 'User not found and could not fetch from Auth0' });
-      }
-      // If Auth0 fails but user exists, return current user
-      res.json(toSelfWire(user)); // PR-C: user_id aliased to the UUID
-    }
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
+// POST /:user_id/refresh — DELETED (Phase 87.6 users-refresh, Tier 3, owner batch
+// decision 2026-07-22). Redundant with the JIT auto-create branch in
+// GET /:user_id (~L200), which reconciles email/username from Auth0 on read.
+// Zero FE callers; no /users/:id/refresh path literal in periodictabletop/src
+// (re-confirmed 2026-07-24).
 
 // Update notification preferences
 router.patch('/:user_id/notification-preferences', async (req, res) => {

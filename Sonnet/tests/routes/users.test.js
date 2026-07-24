@@ -44,73 +44,18 @@ describe('User Routes', () => {
   // NOTE: no afterAll(sequelize.close()) — connection lifecycle is owned by
   // tests/globalTeardown.js (BTEST-02).
 
-  describe('POST /api/users (self-upsert — BE-049)', () => {
-    it('should create the authenticated user from the verified JWT (PR-C: user_id aliased to the UUID)', async () => {
-      const response = await request(makeApp('test-user-1'))
+  // Phase 87.6 (users-create, Tier 1): POST /api/users DELETED. The self-upsert
+  // capability is superseded by the JIT auto-create branch in GET /:user_id
+  // (Phase 78 TZ-01) — exercised by the "auto-provision on first read" test in the
+  // GET block below. Zero FE callers of createOrUpdateUser. The prior BE-049
+  // forged-body-user_id assertions retire WITH the route: the write surface they
+  // guarded no longer exists, so the tampering vector is structurally gone.
+  describe('POST /api/users (deleted 87.6 users-create)', () => {
+    it('404s — route deleted', async () => {
+      await request(makeApp('test-user-1'))
         .post('/api/users')
         .send({ username: 'testuser', email: 'test@example.com' })
-        .expect(200);
-
-      expect(response.body).toHaveProperty('id');
-      expect(response.body.username).toBe('testuser');
-      expect(response.body.email).toBe('test@example.com');
-      // Phase 87.3 PR-C: every User-row serialization aliases user_id to the
-      // Users.id UUID — the sub never crosses the wire.
-      expect(response.body.user_id).toBe(response.body.id);
-      const created = await User.findOne({ where: { user_id: 'test-user-1' } });
-      expect(response.body.id).toBe(created.id);
-    });
-
-    it('should update the authenticated user if their row already exists', async () => {
-      const existing = await User.create({
-        user_id: 'test-user-2',
-        username: 'oldusername',
-        email: 'old@example.com'
-      });
-
-      const response = await request(makeApp('test-user-2'))
-        .post('/api/users')
-        .send({ username: 'newusername', email: 'new@example.com' })
-        .expect(200);
-
-      expect(response.body.user_id).toBe(existing.id); // PR-C alias
-      expect(response.body.username).toBe('newusername');
-      expect(response.body.email).toBe('new@example.com');
-    });
-
-    it('should IGNORE a forged body user_id and only touch the caller\'s own row (BE-049)', async () => {
-      // Victim row the attacker tries to overwrite.
-      const victimRow = await User.create({
-        user_id: 'auth0|victim-B',
-        username: 'victim',
-        email: 'victim@example.com'
-      });
-
-      // Caller A posts a body claiming to be victim B.
-      const response = await request(makeApp('auth0|caller-A'))
-        .post('/api/users')
-        .send({ user_id: 'auth0|victim-B', username: 'hacked', email: 'hacked@evil.com' })
-        .expect(200);
-
-      // The write landed on caller A's OWN row, not the victim's (PR-C: the
-      // echoed user_id is the caller's UUID, not the victim's row).
-      expect(response.body.user_id).not.toBe(victimRow.id);
-      expect(response.body.user_id).toBe(response.body.id);
-      const callerRow = await User.findOne({ where: { user_id: 'auth0|caller-A' } });
-      expect(response.body.id).toBe(callerRow.id);
-
-      const victim = await User.scope('withContactInfo').findOne({ where: { user_id: 'auth0|victim-B' } });
-      expect(victim.username).toBe('victim');
-      expect(victim.email).toBe('victim@example.com');
-    });
-
-    it('should return 401 when there is no authenticated user', async () => {
-      const response = await request(app) // module app: no req.user injected
-        .post('/api/users')
-        .send({ username: 'nobody', email: 'nobody@example.com' })
-        .expect(401);
-
-      expect(response.body).toHaveProperty('error');
+        .expect(404);
     });
   });
 
@@ -180,45 +125,34 @@ describe('User Routes', () => {
     });
   });
 
-  describe('GET /api/users/search/email/:email (WR-01 — cross-user PII)', () => {
+  // Phase 87.6 (users-search-email, Tier 1): GET /search/email/:email DELETED.
+  // Superseded by friendshipsAPI.searchUserByEmail → GET /friendships/search
+  // (BE-12). The WR-01 cross-user PII assertions retire WITH the route — the
+  // vulnerability class (this route leaking a victim's phone) disappears with the
+  // handler. The surviving /friendships/search route carries its own hardened
+  // PII-projection regression net (friendships.test.js BE-12, strengthened in the
+  // SAME commit that retired this block — exact-projection + PII-victim assertion,
+  // replacing the mocked-only arrayContaining check). See T-87.6-03.
+  describe('GET /api/users/search/email/:email (deleted 87.6 users-search-email)', () => {
     const enc = (e) => encodeURIComponent(e);
-
-    it('cross-user search returns identity + searched email but NEVER phone, and DROPS the sub user_id (PR-C BE-11)', async () => {
-      const victim = await User.create({
-        user_id: 'auth0|wr01-victim',
-        username: 'victim',
-        email: 'wr01-victim@example.com',
-        phone: '+15555550123',
-      });
-
-      const response = await request(makeApp('auth0|wr01-caller'))
+    it('404s — route deleted', async () => {
+      await request(makeApp('auth0|wr01-caller'))
         .get(`/api/users/search/email/${enc('wr01-victim@example.com')}`)
-        .expect(200);
-
-      // Phase 87.3 PR-C (BE-11, zero FE consumers): the non-self object no
-      // longer includes the sub user_id at all.
-      expect(response.body).not.toHaveProperty('user_id');
-      expect(response.body.id).toBe(victim.id);
-      expect(response.body.username).toBe('victim');
-      expect(response.body.email).toBe('wr01-victim@example.com'); // echoed (caller supplied it)
-      expect(response.body).not.toHaveProperty('phone'); // the real leak — must be gone
-      expect(JSON.stringify(response.body)).not.toMatch(/(auth0|google-oauth2|apple)\|/);
+        .expect(404);
     });
+  });
 
-    it('self search returns the full profile incl. phone (PR-C: user_id aliased to the UUID)', async () => {
-      const selfRow = await User.create({
-        user_id: 'auth0|wr01-self',
-        username: 'selfie',
-        email: 'wr01-self@example.com',
-        phone: '+15555559999',
-      });
-
-      const response = await request(makeApp('auth0|wr01-self'))
-        .get(`/api/users/search/email/${enc('wr01-self@example.com')}`)
-        .expect(200);
-
-      expect(response.body.user_id).toBe(selfRow.id); // PR-C alias — never the sub
-      expect(response.body.phone).toBe('+15555559999'); // own row → full contact info
+  // Phase 87.6 (users-refresh, Tier 3, owner batch decision 2026-07-22):
+  // POST /:user_id/refresh DELETED. Redundant with the JIT auto-create branch in
+  // GET /:user_id, which reconciles email/username from Auth0 on read. Zero FE
+  // callers; no /users/:id/refresh path literal in periodictabletop/src. Net-new
+  // pin — no prior behavioral block existed for this route.
+  describe('POST /api/users/:user_id/refresh (deleted 87.6 users-refresh)', () => {
+    it('404s — route deleted', async () => {
+      await request(makeApp('auth0|refresh-caller'))
+        .post('/api/users/auth0|refresh-caller/refresh')
+        .send({})
+        .expect(404);
     });
   });
 });
