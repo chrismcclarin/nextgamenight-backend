@@ -72,3 +72,45 @@ describe('availability orphan pins (deleted 87.6 availability-reads)', () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// availabilitySuggestion router (mounted at /api for /convert; no owning suite
+// for the deleted prompt-suggestion reads — orphan pins)
+// ---------------------------------------------------------------------------
+describe('availability-suggestion orphan pins (deleted 87.6 availability-suggestions)', () => {
+  const suggestionRouter = require('../../routes/availabilitySuggestion');
+  // Prod mount is `app.use('/api', ...)`, so the routes are /api/prompts/... .
+  const app = mountApp('/api', suggestionRouter);
+
+  // Tier 2 COVERAGE PROOF: the same aggregated rows are served live by
+  // GET /prompts/:promptId/heatmap (availabilityPrompt.js:761 → heatmapService),
+  // and re-aggregation happens automatically on prompt close
+  // (promptLifecycleService.js:202). Deleting these reads loses no capability.
+  describe('GET /api/prompts/:promptId/suggestions (deleted 87.6 availability-suggestions)', () => {
+    it('404s — route deleted (rows served live by GET /prompts/:promptId/heatmap)', async () => {
+      await request(app)
+        .get(`/api/prompts/${UUID}/suggestions`)
+        .expect(404);
+    });
+  });
+
+  describe('POST /api/prompts/:promptId/suggestions/refresh (deleted 87.6 availability-suggestions)', () => {
+    it('404s — route deleted (auto re-aggregation on prompt close)', async () => {
+      await request(app)
+        .post(`/api/prompts/${UUID}/suggestions/refresh`)
+        .expect(404);
+    });
+  });
+
+  // Name-collision guard + live-route sanity: the router STAYS MOUNTED — the
+  // sibling POST /suggestions/:suggestionId/convert must NOT 404 (it 401s with no
+  // token). Proves we deleted the reads, not the whole router.
+  describe('POST /api/suggestions/:suggestionId/convert (LIVE — must NOT 404)', () => {
+    it('does not 404 (route still mounted)', async () => {
+      const res = await request(app)
+        .post(`/api/suggestions/${UUID}/convert`)
+        .send({});
+      expect(res.status).not.toBe(404);
+    });
+  });
+});
