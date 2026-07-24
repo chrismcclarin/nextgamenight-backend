@@ -96,13 +96,32 @@ router.post('/', validateFeedback, async (req, res) => {
   try {
     const { type, subject, description, user_email, user_id, screenshot_base64, screenshot_filename } = req.body;
 
+    // [87.6-07, adversarial-review #20, owner decision 2026-07-24] Prefer the
+    // VERIFIED-SESSION identity over the client-asserted body user_id. This route
+    // runs under mount-level optionalAuth (server.js), so a verified session
+    // populates req.user. When present, resolve the caller's OWN Users.id UUID and
+    // stamp THAT — never trusting the body for attribution (anti-spoof). The
+    // sanctioned anonymous path (no session) falls back to the body value, which
+    // validateFeedback has already constrained to a UUID or null; if a session
+    // exists but has no Users row, we fail safe to null rather than the body value.
+    let resolvedUserId;
+    if (req.user?.user_id) {
+      const submitter = await User.findOne({
+        where: { user_id: req.user.user_id },
+        attributes: ['id'],
+      });
+      resolvedUserId = submitter?.id || null;
+    } else {
+      resolvedUserId = user_id || null;
+    }
+
     // Save to database
     const entry = await Feedback.create({
       type,
       subject,
       description,
       user_email: user_email || null,
-      user_id: user_id || null,
+      user_id: resolvedUserId,
     });
 
     console.log(`Feedback saved: ${type} - ${subject.substring(0, 50)}${subject.length > 50 ? '...' : ''}`);
