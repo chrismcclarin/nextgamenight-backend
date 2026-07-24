@@ -366,7 +366,7 @@ describe('Wire sweep (87.3-09 Req 1): no Auth0 sub crosses the wire outside the 
     expect(userEvents.body.length).toBeGreaterThan(0);
   });
 
-  it('game reviews: the review list endpoints (nested reviewer User sub-free)', async () => {
+  it('game reviews: the review list endpoint (nested reviewer User sub-free)', async () => {
     const byGame = await request(app).get(
       `/api/game-reviews/game/${game.id}/group/${group.id}`
     );
@@ -375,11 +375,11 @@ describe('Wire sweep (87.3-09 Req 1): no Auth0 sub crosses the wire outside the 
     expect(byGame.body[0].User.id).toBe(member.id);
     expect(byGame.body[0].User.user_id).toBeUndefined();
 
-    const byUser = await request(app).get(
-      `/api/game-reviews/user/${member.id}/group/${group.id}`
-    );
-    expectSubFree(byUser, 'GET /game-reviews/user/:user_id/group/:group_id');
-    expect(byUser.body.length).toBeGreaterThan(0);
+    // GET /game-reviews/user/:user_id/group/:group_id DELETED — Phase 87.6
+    // (gameReviews, Tier-3). expectSubFree requires a 2xx; a deleted route 404s,
+    // so it cannot be sub-free-probed and is dropped from this sweep. Resurrection
+    // guard: the gameReviews deletion tombstone (routes/gameReviews.js). The live
+    // /game/:game_id/group/:group_id twin above still proves the nested-reviewer strip.
   });
 
   it('ballot: GET /ballot/:eventId (created_by sub column never serializes)', async () => {
@@ -388,7 +388,7 @@ describe('Wire sweep (87.3-09 Req 1): no Auth0 sub crosses the wire outside the 
     expect(res.body.options.length).toBeGreaterThan(0); // non-vacuous
   });
 
-  it('lists: games-with-winners (winners/pickers NON-EMPTY, aliased) AND player-stats (D3 — UUID values)', async () => {
+  it('lists: games-with-winners (winners/pickers NON-EMPTY, aliased — UUID values)', async () => {
     const games = await request(app).get(
       `/api/lists/games/${group.id}/${encodeURIComponent(owner.user_id)}`
     );
@@ -400,28 +400,27 @@ describe('Wire sweep (87.3-09 Req 1): no Auth0 sub crosses the wire outside the 
     expect(g.winners[0].user_id).toBe(member.id); // ALIAS: UUID, name stable
     expect(g.pickers[0].user_id).toBe(owner.id);
 
-    const players = await request(app).get(
-      `/api/lists/players/${group.id}/${encodeURIComponent(owner.user_id)}`
-    );
-    expectSubFree(players, 'GET /lists/players/:group_id/:user_id');
-    expect(players.body.length).toBeGreaterThanOrEqual(2); // non-vacuous (D3)
+    // GET /lists/players/:group_id/:user_id DELETED — Phase 87.6 (lists, Tier-3).
+    // A deleted route 404s and cannot be sub-free-probed (expectSubFree requires a
+    // 2xx), so it is dropped from this sweep. Resurrection guard: lists.test.js
+    // `GET /api/lists/players/... (deleted 87.6 lists)` 404 pin.
   });
 
-  it('users: /users/:user_id (aliased self read) AND /users/search/email/:email (BE-11 dropped)', async () => {
+  it('users: /users/:user_id (aliased self read)', async () => {
     const self = await request(app).get(
       `/api/users/${encodeURIComponent(owner.user_id)}`
     );
     expectSubFree(self, 'GET /users/:user_id (self)');
     expect(self.body.user_id).toBe(owner.id); // alias — name stable, UUID value
 
-    const crossSearch = await request(app).get(
-      `/api/users/search/email/${encodeURIComponent(member.email)}`
-    );
-    expectSubFree(crossSearch, 'GET /users/search/email/:email (non-self)');
-    expect(crossSearch.body).not.toHaveProperty('user_id'); // BE-11 drop
+    // GET /users/search/email/:email DELETED — Phase 87.6 (users-search-email,
+    // Tier 1). A deleted route 404s and cannot be sub-free-probed (expectSubFree
+    // requires a 2xx), so it is dropped from this sweep. Resurrection guards:
+    // accountDeletion.test.js search-by-email 404 pin + the deletion tombstone in
+    // routes/users.js.
   });
 
-  it('users write echoes: PUT username, PATCH notification-preferences, DELETE phone, POST refresh (toSelfWire aliased on every echo)', async () => {
+  it('users write echoes: PUT username, PATCH notification-preferences, DELETE phone (toSelfWire aliased on every echo)', async () => {
     // PRC-H2: every self-write echoes the row via toSelfWire — pin each echo
     // sub-free AND aliased so a single-call-site revert (res.json(user)) reds.
     const rename = await request(app)
@@ -442,13 +441,10 @@ describe('Wire sweep (87.3-09 Req 1): no Auth0 sub crosses the wire outside the 
     expectSubFree(phoneGone, 'DELETE /users/:user_id/phone');
     expect(phoneGone.body.user_id).toBe(owner.id);
 
-    // auth0Service.getUserById is mocked to reject, so this exercises the
-    // Auth0-failure branch — which still echoes the local row via toSelfWire.
-    const refreshed = await request(app).post(
-      `/api/users/${encodeURIComponent(owner.user_id)}/refresh`
-    );
-    expectSubFree(refreshed, 'POST /users/:user_id/refresh (Auth0-failure branch)');
-    expect(refreshed.body.user_id).toBe(owner.id);
+    // POST /users/:user_id/refresh echo REMOVED — route DELETED (Phase 87.6
+    // users-refresh, Tier 3). A deleted route 404s and cannot be sub-free-probed.
+    // Resurrection guards: selfParam.authz.test.js POST /refresh 404 pin + the
+    // deletion tombstone in routes/users.js.
   });
 
   it('events write echo: PUT /events/:id response (formatEventWithCustomParticipants on the cleaned includes)', async () => {
@@ -616,10 +612,11 @@ describe('Wire sweep (87.4-11 PR-2): availability + prompt-settings — allowlis
     expectSubFree(del, 'DELETE .../schedules/:id');
   });
 
-  it('availability self-CRUD: GET /user/:id, POST recurring, POST override, GET patterns (caller UUID emitted)', async () => {
-    const get = await request(availApp).get(`/api/availability/user/${encodeURIComponent(owner.user_id)}`);
-    expectSubFree(get, 'GET /availability/user/:user_id');
-
+  it('availability self-CRUD: POST recurring, POST override, GET patterns (caller UUID emitted)', async () => {
+    // GET /availability/user/:user_id (bare) DELETED — Phase 87.6 (87.6-07,
+    // Tier 1); a deleted route 404s and cannot be sub-free-probed. Resurrection
+    // guard: deadRoutes.pin.test.js availability orphan pin. The live
+    // /recurring|override|patterns reads below still carry the UUID-emission sweep.
     const recurring = await request(availApp)
       .post(`/api/availability/user/${encodeURIComponent(owner.user_id)}/recurring`)
       .send({ dayOfWeek: 5, startTime: '18:00', endTime: '21:00', start_date: '2026-01-01', timezone: 'UTC' });
@@ -635,10 +632,11 @@ describe('Wire sweep (87.4-11 PR-2): availability + prompt-settings — allowlis
     expectSubFree(patterns, 'GET /availability/user/:user_id/patterns');
   });
 
-  it('availability group: GET overlaps + GET heatmap (member payload UUIDs)', async () => {
-    const overlaps = await request(availApp).get(`/api/availability/group/${group.id}/overlaps`);
-    expectSubFree(overlaps, 'GET /availability/group/:group_id/overlaps');
-
+  it('availability group: GET heatmap (member payload UUIDs)', async () => {
+    // GET /availability/group/:group_id/overlaps DELETED — Phase 87.6 (87.6-07,
+    // Tier 2); a deleted route 404s and cannot be sub-free-probed. Resurrection
+    // guards: deadRoutes.pin.test.js + availability.membershipGate.test.js 404 pins.
+    // The live /heatmap successor below carries the member-payload UUID sweep.
     const heatmap = await request(availApp).get(`/api/availability/group/${group.id}/heatmap`);
     expectSubFree(heatmap, 'GET /availability/group/:group_id/heatmap');
   });
@@ -659,23 +657,17 @@ describe('Wire sweep (87.4-11 PR-2): availability + prompt-settings — allowlis
     expectSubFree(open, 'GET /groups/:groupId/prompts/open');
   });
 
-  it('availability suggestions: GET /prompts/:id/suggestions (participant_user_ids UUID array)', async () => {
-    const suggestions = await request(availApp).get(`/api/prompts/${prompt.id}/suggestions`);
-    expectSubFree(suggestions, 'GET /prompts/:promptId/suggestions');
-  });
+  // GET /prompts/:promptId/suggestions DELETED — Phase 87.6 (availability-
+  // suggestions, Tier 2); a deleted route 404s and cannot be sub-free-probed, so
+  // its sweep block is removed. Resurrection guard: deadRoutes.pin.test.js
+  // `GET /api/prompts/:promptId/suggestions (deleted 87.6 availability-suggestions)`.
 
-  // PR2-H1 (87.4-review): the three formerly-excluded endpoints the coverage claim
-  // named but this suite never requested — POST suggestions/refresh, POST
-  // suggestions/:id/convert, GET prompts/active. Each is now exercised for real.
-  it('availability suggestions: POST /prompts/:id/suggestions/refresh (admin actor) — response sub-free at any status (PR2-H1)', async () => {
-    // Body is asserted sub-free WHATEVER the status (counts/message shape), then
-    // non-vacuously: the seeded member response aggregates into >=1 suggestion.
-    const refresh = await request(availApp).post(`/api/prompts/${prompt.id}/suggestions/refresh`);
-    expectBodySubFree(refresh, 'POST /prompts/:promptId/suggestions/refresh');
-    expect(refresh.status).toBe(200);
-    expect(refresh.body.success).toBe(true);
-    expect(refresh.body.suggestion_count).toBeGreaterThan(0);
-  });
+  // PR2-H1 (87.4-review): the formerly-excluded endpoints the coverage claim named
+  // — POST suggestions/:id/convert + GET prompts/active — are exercised for real
+  // below. (POST /prompts/:id/suggestions/refresh, also named there, was DELETED in
+  // Phase 87.6 availability-suggestions Tier 2; a deleted route 404s and cannot be
+  // sub-free-probed, so its sweep block is removed. Resurrection guard:
+  // deadRoutes.pin.test.js POST .../suggestions/refresh 404 pin.)
 
   it('availability suggestions: POST /suggestions/:id/convert creates the event — 201 body sub-free (PR2-H1)', async () => {
     // Fresh suggestion with NO tentative gcal holds (post-commit hold cleanup then
