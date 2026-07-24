@@ -240,16 +240,4 @@ router.post('/validate', magicTokenLimiter, async (req, res) => {
   }
 });
 
-/**
- * POST /api/magic-auth/request-new
- * Stub endpoint for requesting a new magic link (Phase 4 will implement)
- */
-router.post('/request-new', async (req, res) => {
-  // Placeholder - will be implemented in Phase 4 when prompt/email integration is complete
-  res.status(501).json({
-    error: 'This feature will be available soon.',
-    message: 'Please ask the group organizer to resend the availability prompt.'
-  });
-});
-
 module.exports = router;

@@ -227,14 +227,15 @@ describe('Magic Auth API', () => {
     });
   });
 
-  describe('POST /api/magic-auth/request-new', () => {
-    it('returns 501 not implemented (placeholder)', async () => {
-      const res = await request(app)
+  // Dead-route deletion pin (Phase 87.6 D-02). The request-new stub was removed on
+  // re-confirmed caller-less evidence (R8); the resend capability is owned by the
+  // organizer resend flow (successor) and the pending magic-link resend todo.
+  describe('POST /api/magic-auth/request-new (deleted 87.6 magic-auth-request-new)', () => {
+    it('404s — route deleted; successor is the organizer resend flow', async () => {
+      await request(app)
         .post('/api/magic-auth/request-new')
-        .send({ email: 'test@example.com' });
-
-      expect(res.status).toBe(501);
-      expect(res.body.error).toBe('This feature will be available soon.');
+        .send({ email: 'test@example.com' })
+        .expect(404);
     });
   });
 });
