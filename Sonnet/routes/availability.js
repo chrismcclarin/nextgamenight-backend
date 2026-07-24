@@ -54,10 +54,11 @@ const validate = (req, res, next) => {
   if (!errors.isEmpty()) {
     return res.status(400).json({ 
       error: 'Validation failed',
+      // Emit { field, message } ONLY — do NOT reflect err.value back to the
+      // client (matches the shared validators.js no-reflection rule).
       errors: errors.array().map(err => ({
         field: err.path || err.param,
-        message: err.msg,
-        value: err.value
+        message: err.msg
       }))
     });
   }

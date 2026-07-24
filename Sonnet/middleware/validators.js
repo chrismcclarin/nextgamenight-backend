@@ -305,15 +305,6 @@ const validateFeedback = [
     .isEmail()
     .withMessage('User email must be a valid email address'),
   // [87.6-07, adversarial-review #20, owner decision 2026-07-24] The public
-  // POST /api/feedback persists this client-asserted value. Validate it as a
-  // UUID so a non-UUID user_id 400s here instead of reaching Sequelize (500 /
-  // spoofed-attribution gap). The route additionally prefers the verified-session
-  // identity over this body value; this rule only bounds the anonymous-path
-  // fallback (null stays null via optional/nullable).
-  body('user_id')
-    .optional({ nullable: true })
-    .isUUID()
-    .withMessage('user_id must be a valid UUID'),
   body('screenshot_base64')
     .optional({ nullable: true })
     .isString()
