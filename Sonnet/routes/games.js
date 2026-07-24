@@ -239,49 +239,13 @@ router.get('/:id', async (req, res) => {
 });
 
 
-// BSEC-01 / D-05C: mass-assignment allow-list for the Game write sinks.
-// games.js has NO express-validator validators, so the Sequelize `fields:`
-// option is the ONLY guard against a client setting columns the handler never
-// intended (e.g. forging is_custom/bgg_id/id). Excludes server-controlled
-// columns: id (PK), bgg_id + is_custom (forced by the handlers below).
-const GAME_USER_FIELDS = [
-  'name',
-  'year_published',
-  'min_players',
-  'max_players',
-  'playing_time',
-  'weight',
-  'description',
-  'image_url',
-  'thumbnail_url',
-  'theme',
-  'url'
-];
-
-// Create custom game
-router.post('/', async (req, res) => {
-  try {
-    // BSEC-01 / D-05C: build gameData by EXPLICIT allow-list pick rather than a
-    // body spread. This is defense-in-depth (the `fields:` option below is a
-    // second guard) AND keeps the file clear of the mass-assignment spread
-    // idiom the CI grep gate forbids.
-    const gameData = { is_custom: true, bgg_id: null };
-    for (const key of GAME_USER_FIELDS) {
-      if (Object.prototype.hasOwnProperty.call(req.body, key)) {
-        gameData[key] = req.body[key];
-      }
-    }
-
-    // fields: includes the user-supplyable columns PLUS the two the handler
-    // force-sets (is_custom/bgg_id) so the explicit values above persist.
-    const game = await Game.create(gameData, {
-      fields: [...GAME_USER_FIELDS, 'is_custom', 'bgg_id']
-    });
-    res.json(game);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
+// POST / (create custom game) DELETED — 87.6 dead-api-surface cleanup (Tier 1,
+// item 1). Zero product callers (the gamesAPI.createGame wrapper was dead), and
+// its custom-create capability is superseded by the live POST /games/resolve
+// (above), which does `Game.create({ ..., is_custom: true })`. The
+// GAME_USER_FIELDS mass-assignment allow-list that guarded this sink + the now-
+// deleted PUT /:id was removed with them (no remaining consumer). Pinned 404 in
+// tests/routes/games.test.js.
 
 
 // Import game from BGG
@@ -334,39 +298,13 @@ router.post('/import-bgg/:bgg_id', async (req, res) => {
 });
 
 
-// Update game
-router.put('/:id', async (req, res) => {
-  try {
-    const game = await Game.findByPk(req.params.id);
-    if (!game) {
-      return res.status(404).json({ error: 'Game not found' });
-    }
-    
-    // BSEC-01 / D-05C: only user-editable columns may be updated. is_custom,
-    // bgg_id, and id are NOT in the allow-list so a client cannot flip a BGG
-    // game to custom or forge its bgg_id via PUT.
-    await game.update(req.body, { fields: GAME_USER_FIELDS });
-    res.json(game);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
+// PUT /:id (update game) + DELETE /:id (delete game) DELETED — 87.6 dead-api-
+// surface cleanup (Tier 3, items 18/19; owner batch decision 2026-07-22). No FE
+// wrapper and zero callers. The custom-game edit/remove capability is owned by a
+// pending future feature (todo 2026-07-22-edit-and-remove-custom-games-feature.md)
+// which will reintroduce authored, authorized handlers. Pinned 404 in
+// tests/routes/games.test.js.
 
-
-// Delete game
-router.delete('/:id', async (req, res) => {
-  try {
-    const game = await Game.findByPk(req.params.id);
-    if (!game) {
-      return res.status(404).json({ error: 'Game not found' });
-    }
-    
-    await game.destroy();
-    res.json({ message: 'Game deleted successfully' });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
 
 // Search BGG for games
 // Uses local database (from CSV dump) for fast, unlimited searches
