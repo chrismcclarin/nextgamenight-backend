@@ -14,8 +14,10 @@
 //   3. The allow-list matches on EXACT method+path — 87.5 SW-01/SW-02 narrowed
 //      the games family to the two literal search endpoints: `GET /games` is
 //      DELETED, `GET /games/:id` is now AUTHED (its includes exposed
-//      events/participants/winner UUIDs anonymously), and
-//      `GET /games/for-event/...` stays gated (the BOLA-audit gate).
+//      events/participants/winner UUIDs anonymously). `GET /games/for-event/...`
+//      was DELETED in 87.6 (dead-api-surface cleanup); its path is kept here as a
+//      resurrection guard — a deep `/games/*` GET must stay gated, never silently
+//      public via the `/games` prefix, if ever re-added.
 //
 // This test deliberately reconstructs the gate from the SAME public allow-list
 // shape used in server.js and the SAME `verifyAuth0Token`. If server.js changes
@@ -63,7 +65,7 @@ function buildApp() {
   app.get('/api/games/search-all', ok);
   app.get('/api/games/bgg/search', ok);
   app.get('/api/games/:id', ok); // AUTHED as of 87.5 SW-01 — must 401 tokenless
-  app.get('/api/games/for-event/:group_id/:user_id', ok); // NOT allow-listed
+  app.get('/api/games/for-event/:group_id/:user_id', ok); // DELETED 87.6 — kept as a NOT-allow-listed resurrection guard
   app.get('/api/auth/google/callback', ok);
   app.get('/api/rsvp/respond', ok);
   app.get('/api/groups/invite-preview/:token', ok);
@@ -128,7 +130,9 @@ describe('Default-deny `/api` authn layer (DB-independent)', () => {
     });
   });
 
-  describe('Test 3 — exact-match: for-event is NOT auto-public from `/games` prefix', () => {
+  describe('Test 3 — exact-match: a deep `/games/*` GET is NOT auto-public from the prefix', () => {
+    // for-event was DELETED in 87.6; its path stays here as a resurrection guard —
+    // if any deep `/games/*` GET is ever re-added it must NOT be silently public.
     it('GET /api/games/for-event/:group_id/:user_id with no token → 401', async () => {
       const res = await request(app).get('/api/games/for-event/g1/u1');
       expect(res.status).toBe(401);

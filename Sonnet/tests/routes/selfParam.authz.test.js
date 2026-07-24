@@ -203,13 +203,14 @@ describe('Self-param dual-accept family (87.4-02): sub OR caller-own-UUID author
       expect(res.body.some((e) => e.id === event.id)).toBe(true);
     });
 
-    it('games GET /for-event/:group_id/:user_id returns the caller OWNED games for the UUID shape', async () => {
-      await makeUserGame(caller, game); // UserGame.user_id = caller.id (UUID surface)
+    // games GET /for-event/:group_id/:user_id DELETED — 87.6 dead-api-surface
+    // cleanup (Tier 1, item 2; caller-less, superseded by GET /games/search-all).
+    // This consumer previously proved the route's KEYMISS dual-accept; the route
+    // is gone, so it now 404s. The requireParamMatchesToken factory is still
+    // covered by the synthetic authz-probe above and the events/users consumers.
+    it('games GET /for-event/:group_id/:user_id is DELETED (87.6) — 404', async () => {
       const res = await request(app).get(`/api/games/for-event/${group.id}/${caller.id}`);
-      expect(res.status).toBe(200);
-      const owned = res.body.find((g) => g.id === game.id);
-      expect(owned).toBeTruthy();
-      expect(owned.is_owned).toBe(true);
+      expect(res.status).toBe(404);
     });
 
     it('users GET /:user_id returns the caller OWN profile for the UUID shape', async () => {

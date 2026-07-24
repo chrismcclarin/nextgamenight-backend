@@ -2,7 +2,7 @@
 const express = require('express');
 const { Game, Event, EventParticipation, GameReview, User, UserGame, UserGroup } = require('../models');
 const { Op } = require('sequelize');
-const { requireParamMatchesToken, matchesSelf } = require('../middleware/objectAuth');
+const { matchesSelf } = require('../middleware/objectAuth');
 const { optionalAuth } = require('../middleware/auth0');
 // Phase 87.4 Plan 02 (KEYMISS mitigation): resolve a UUID self-param to the
 // sub-keyed Users row.
@@ -13,11 +13,13 @@ const router = express.Router();
 // authn layer (server.js). Post 87.5 SW-01/SW-02, ONLY the two search GETs
 // (`/search-all`, `/bgg/search`) are allow-listed public there. Everything else
 // — `GET /:id` (SW-01: its includes expose events/participants/winner UUIDs, so
-// it is authed; sole consumer is the authenticated gameDetail page), the write
-// handlers (`POST /`, `POST /resolve`, `POST /import-bgg/:bgg_id`, `PUT /:id`,
-// `DELETE /:id`), and `GET /for-event/:group_id/:user_id` — requires a valid
-// JWT before the handler runs. for-event ADDITIONALLY carries an object-level
-// self-check (see its handler) because it returns the named user's OWNED games.
+// it is authed; sole consumer is the authenticated gameDetail page) and the
+// write handlers (`POST /resolve`, `POST /import-bgg/:bgg_id`) — requires a
+// valid JWT before the handler runs.
+// 87.6 dead-api-surface cleanup deleted the custom-CRUD sinks (`POST /`,
+// `PUT /:id`, `DELETE /:id`) and the self-scoped event-form game picker
+// (superseded by the search-all picker) — all caller-less; they are 404-pinned
+// in games.test.js.
 
 
 // BGG API integration helper
@@ -28,8 +30,8 @@ const bggCsvService = require('../services/bggCsvService');
 
 // GET / (catalog listing) DELETED — 87.5 adversarial-review sweep SW-02.
 // Zero product callers (the gamesAPI.getGames wrapper was dead; every real flow
-// uses /search-all, /for-event, or lists/games), and its ?group_id arm attached
-// a group's GameReviews + reviewer usernames to an UNAUTHENTICATED response.
+// uses /search-all or lists/games), and its ?group_id arm attached a group's
+// GameReviews + reviewer usernames to an UNAUTHENTICATED response.
 // Same dead-route policy as the 87.5-06/WR-02 lists deletions: caller-less
 // routes are removed, not left as an unwatched public surface.
 
@@ -62,9 +64,9 @@ router.get('/search-all', optionalAuth, async (req, res) => {
         // 87.5-06 (T-875-06-SEARCHALL / KEYMISS): the ?user_id param carries the
         // caller's identifier. Plan 11 flips the FE searchAll senders from the
         // caller's Auth0 sub to their Users.id UUID — so resolve BOTH shapes
-        // (findByPk on the UUID, findOne on the sub), matching the dual-resolution
-        // precedent already on the sibling /games/for-event route. A sub-only
-        // lookup would silently miss a UUID-identified caller and return zero
+        // (findByPk on the UUID, findOne on the sub) — the same dual-resolution
+        // shape the now-deleted event-form picker route also carried (87.6). A
+        // sub-only lookup would silently miss a UUID-identified caller and return zero
         // local results while BGG results keep rendering. matchesSelf has already
         // proven the param IS the caller (either keyspace), and memoized
         // req.selfUser for the UUID arm — reuse it before hitting Users again.
@@ -336,65 +338,10 @@ router.get('/bgg/search', async (req, res) => {
   }
 });
 
-// Get games for event form (group played + user owned)
-// BSEC-02 audit (Task 1): this returns the named user's OWNED games merged with
-// the group's played games, so it is a self-scoped read — a BOLA candidate, NOT
-// public event-form data. Gate it: the actor (verified JWT) must equal the
-// :user_id param. The frontend only ever calls this for the logged-in user.
-router.get('/for-event/:group_id/:user_id', requireParamMatchesToken('user_id'), async (req, res) => {
-  try {
-    const { group_id, user_id } = req.params;
-
-    // Get user. Phase 87.4 Plan 02 (T-874-02-KEYMISS): the self-gated param may
-    // be the caller's own Users.id UUID (post-PR-2) — resolve it to the PK rather
-    // than querying the still-sub-keyed Users.user_id column (which would miss and
-    // 404 the caller's own owned-games list).
-    // M-4 (87.4-review): reuse the caller's own row memoized by matchesSelf (via
-    // requireParamMatchesToken) for the UUID shape — no duplicate Users lookup. The
-    // sub shape sets no memo and resolves by the sub column here.
-    const user = req.selfUser
-      ? req.selfUser
-      : (isUuid(user_id)
-          ? await User.findByPk(user_id)
-          : await User.findOne({ where: { user_id } }));
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-    
-    // Get games played by this group
-    const groupEvents = await Event.findAll({
-      where: { group_id },
-      include: [{ model: Game }],
-      attributes: ['game_id']
-    });
-    const groupGameIds = [...new Set(groupEvents.map(e => e.game_id).filter(Boolean))];
-    
-    // Get games owned by user
-    const userOwnedGames = await UserGame.findAll({
-      where: { user_id: user.id },
-      include: [{ model: Game }]
-    });
-    const ownedGameIds = userOwnedGames.map(ug => ug.game_id);
-    
-    // Combine and get unique games
-    const allGameIds = [...new Set([...groupGameIds, ...ownedGameIds])];
-    
-    const games = await Game.findAll({
-      where: { id: allGameIds },
-      order: [['name', 'ASC']]
-    });
-    
-    // Mark which games are owned
-    const gamesWithOwnership = games.map(game => ({
-      ...game.toJSON(),
-      is_owned: ownedGameIds.includes(game.id),
-      is_group_game: groupGameIds.includes(game.id)
-    }));
-    
-    res.json(gamesWithOwnership);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
+// Event-form game picker route DELETED — 87.6 dead-api-surface cleanup (Tier 1,
+// item 2). Zero product callers (the gamesAPI.getGamesForEvent wrapper was dead),
+// superseded by the live GET /games/search-all picker (GameComboInput on the
+// event form). 404-pinned in tests/routes/games.test.js (that pin carries the
+// exact deleted path for resurrection protection).
 
 module.exports = router;

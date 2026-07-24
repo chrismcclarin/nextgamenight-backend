@@ -102,5 +102,21 @@ describe('Game Routes', () => {
         .expect(404);
     });
   });
+
+  // GET /api/games/for-event/:group_id/:user_id (event-form game picker) DELETED
+  // — 87.6 dead-api-surface cleanup (Tier 1, item 2). Zero product callers (the
+  // gamesAPI.getGamesForEvent wrapper was dead); superseded by the live
+  // GET /games/search-all picker (GameComboInput on the event form). Net-new 404
+  // pin (this route had no behavioral block to convert); plain request against
+  // this suite's mounted app (no actor seam) with a valid :group_id/:user_id path.
+  describe('GET /api/games/for-event/:group_id/:user_id (deleted 87.6 for-event)', () => {
+    it('404s — route deleted', async () => {
+      const fakeGroupId = '00000000-0000-0000-0000-000000000000';
+      const fakeUserId = '11111111-1111-1111-1111-111111111111';
+      await request(app)
+        .get(`/api/games/for-event/${fakeGroupId}/${fakeUserId}`)
+        .expect(404);
+    });
+  });
 });
 
