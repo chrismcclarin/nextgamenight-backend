@@ -260,9 +260,13 @@ describe('Self-param dual-accept family (87.4-02): sub OR caller-own-UUID author
       expect(res.body.type).toBe('specific_override');
     });
 
-    it('availability GET /user/:user_id authorizes for the UUID shape (data keyed on token sub)', async () => {
+    // availability GET /user/:user_id (bare) DELETED — Phase 87.6 (87.6-07,
+    // Tier 1; superseded by the /patterns|recurring|override reads above, which
+    // stay live). Owning-suite 404 pin: deadRoutes.pin.test.js (availability
+    // orphan pins). A gone route needs no self-param guard — routing 404 is it.
+    it('availability GET /user/:user_id (bare) is DELETED (87.6) — 404', async () => {
       const res = await request(app).get(`/api/availability/user/${caller.id}`);
-      expect(res.status).toBe(200);
+      expect(res.status).toBe(404);
     });
 
     it('availability DELETE /:id — caller deletes own row (200), rejects another user row (403)', async () => {
@@ -286,12 +290,13 @@ describe('Self-param dual-accept family (87.4-02): sub OR caller-own-UUID author
       expect(forbidden.status).toBe(403);
     });
 
-    it('rsvp GET /user/:user_id returns the caller RSVPs for the UUID shape', async () => {
-      await makeEventRsvp(event, caller, { status: 'yes' }); // user_uuid = caller.id
+    // rsvp GET /user/:user_id DELETED — Phase 87.6 (rsvp, Tier-3). A deleted route
+    // 404s at the routing layer; a gone route needs no self-param/BOLA guard (the
+    // routing 404 leaks nothing — the pin IS the guard). Owning-suite 404 pin:
+    // rsvp.test.js `GET /api/rsvp/user/:user_id (deleted 87.6 rsvp)`.
+    it('rsvp GET /user/:user_id is DELETED (87.6) — 404', async () => {
       const res = await request(app).get(`/api/rsvp/user/${caller.id}`);
-      expect(res.status).toBe(200);
-      expect(Array.isArray(res.body)).toBe(true);
-      expect(res.body.length).toBeGreaterThanOrEqual(1);
+      expect(res.status).toBe(404);
     });
 
     it('lists GET /games/:group_id/:user_id authorizes + returns for the UUID shape', async () => {
@@ -300,10 +305,11 @@ describe('Self-param dual-accept family (87.4-02): sub OR caller-own-UUID author
       expect(Array.isArray(res.body)).toBe(true);
     });
 
-    it('lists GET /players/:group_id/:user_id authorizes for the UUID shape', async () => {
+    // lists GET /players/:group_id/:user_id DELETED — Phase 87.6 (lists, Tier-3).
+    // Owning-suite 404 pin: lists.test.js `GET /api/lists/players/... (deleted 87.6 lists)`.
+    it('lists GET /players/:group_id/:user_id is DELETED (87.6) — 404', async () => {
       const res = await request(app).get(`/api/lists/players/${group.id}/${caller.id}`);
-      expect(res.status).toBe(200);
-      expect(Array.isArray(res.body)).toBe(true);
+      expect(res.status).toBe(404);
     });
   });
 
@@ -317,11 +323,8 @@ describe('Self-param dual-accept family (87.4-02): sub OR caller-own-UUID author
       expect(res.status).toBe(403);
     });
 
-    it('rsvp GET /user/:user_id 403s on ANOTHER user UUID (BOLA guard)', async () => {
-      const res = await request(app).get(`/api/rsvp/user/${other.id}`);
-      expect(res.status).toBe(403);
-    });
-
+    // rsvp GET /user/:user_id BOLA block REMOVED — route deleted (87.6). A deleted
+    // route needs no BOLA guard; the 404 pin above is the whole contract.
     it('lists GET /games/:group_id/:user_id 403s on a garbage self-param', async () => {
       const res = await request(app).get(`/api/lists/games/${group.id}/garbage-not-me`);
       expect(res.status).toBe(403);
@@ -338,30 +341,21 @@ describe('Self-param dual-accept family (87.4-02): sub OR caller-own-UUID author
   // --------------------------------------------------------------------------
   // 87.4 code-review H-1: the previously URL-param-gated lists routes
   // (player-wins, most-played, least-played, player-picks, by-theme,
-  // alphabetical, player-games, *-by-id) now follow the SAME self-param
-  // dual-accept + token-sub isActiveMember pattern as /games and /players.
-  // Assert a representative route across both keyspaces + the member gate + BOLA.
+  // alphabetical, player-games, *-by-id) were the self-param + isActiveMember
+  // family. Every one of them is now DELETED (87.5-06 SPEC Req 9/10 + WR-02
+  // 87.5 review + 87.6 by-theme, Tier-3). The LIVE self-param dual-accept +
+  // member-gate proof for lists now rides on GET /games/:group_id/:user_id
+  // (authorize+return above, garbage-403 in the reject/BOLA block above); these
+  // blocks just pin the deleted routes 404. Owning-suite 404 pins: lists.test.js.
   // --------------------------------------------------------------------------
-  describe('lists H-1 family — self-param dual-accept + active-member gate', () => {
-    // Positive (authorizes + query executes) assertions use the surviving
-    // /by-theme route (healthy query, identical self-param gate). The aggregation
-    // routes (most-played, least-played, alphabetical, player-games) carried
-    // PRE-EXISTING query defects that 500'd for any authorized caller and were
-    // DELETED in 87.5-06 (SPEC Req 9/10); WR-02 (87.5 review) then deleted the
-    // per-player wins/picks routes (player-wins-by-id + name-keyed siblings) for
-    // the same always-empty-predicate defect class. Deleted routes are pinned 404.
-    it('by-theme authorizes for the caller OWN UUID shape (member)', async () => {
+  describe('lists H-1 family — deleted routes pinned 404', () => {
+    // by-theme DELETED — Phase 87.6 (lists, Tier-3). A gone route needs no
+    // self-param dual-accept or active-member gate: the routing 404 leaks nothing
+    // (the pin IS the guard). Owning-suite 404 pin: lists.test.js
+    // `GET /api/lists/by-theme/... (deleted 87.6 lists)`.
+    it('by-theme is DELETED (87.6) — 404 for the OWN-UUID shape', async () => {
       const res = await request(app).get(`/api/lists/by-theme/${group.id}/strategy/${caller.id}`);
-      expect(res.status).toBe(200);
-      expect(Array.isArray(res.body)).toBe(true);
-    });
-
-    it('by-theme authorizes for the caller OWN sub shape (member)', async () => {
-      const res = await request(app).get(
-        `/api/lists/by-theme/${group.id}/strategy/${encodeURIComponent(caller.user_id)}`
-      );
-      expect(res.status).toBe(200);
-      expect(Array.isArray(res.body)).toBe(true);
+      expect(res.status).toBe(404);
     });
 
     it('player-wins-by-id 404s — route deleted in WR-02 (87.5 review, dead always-empty query)', async () => {
@@ -369,24 +363,6 @@ describe('Self-param dual-accept family (87.4-02): sub OR caller-own-UUID author
         `/api/lists/player-wins-by-id/${group.id}/${caller.id}/${caller.id}`
       );
       expect(res.status).toBe(404);
-    });
-
-    it('by-theme 403s a caller who is NOT an active member (self-param passes, member gate fails)', async () => {
-      // `other` is a real user but was never added to `group`. Acting AS other with
-      // other OWN identity: matchesSelf passes, isActiveMember(other, group) 403s.
-      currentActor = other.user_id;
-      const res = await request(app).get(`/api/lists/by-theme/${group.id}/strategy/${other.id}`);
-      expect(res.status).toBe(403);
-    });
-
-    // 87.5-06 (SPEC Req 9/10): most-played was deleted along with least-played,
-    // alphabetical, and player-games. Its former BOLA-guard coverage (a member
-    // requesting ANOTHER user's UUID as the self-param must 403 before the query)
-    // is re-pointed to the surviving /by-theme route, which carries the SAME
-    // matchesSelf gate — so the security assertion is preserved, not dropped.
-    it('by-theme 403s a member requesting ANOTHER user UUID as the self-param (BOLA guard, pre-query)', async () => {
-      const res = await request(app).get(`/api/lists/by-theme/${group.id}/strategy/${other.id}`);
-      expect(res.status).toBe(403);
     });
 
     it('most-played 404s — route deleted in 87.5-06 (no stale 403 against a gone route)', async () => {
@@ -460,16 +436,13 @@ describe('Self-param dual-accept family (87.4-02): sub OR caller-own-UUID author
       expect(bySub.status).toBe(200);
     });
 
-    it('POST /:user_id/refresh dual-accepts and returns the caller OWN row', async () => {
-      // auth0Service.getUserById is mocked to reject → handler falls back to the
-      // existing caller row (still 200), proving the gate + self-read on the UUID arm.
-      const byUuid = await request(app).post(`/api/users/${caller.id}/refresh`);
-      expect(byUuid.status).toBe(200);
-      expect(byUuid.body.id).toBe(caller.id);
-      const bySub = await request(app).post(
-        `/api/users/${encodeURIComponent(caller.user_id)}/refresh`
-      );
-      expect(bySub.status).toBe(200);
+    // POST /:user_id/refresh DELETED — Phase 87.6 (users-refresh, Tier 3; zero FE
+    // callers). A gone route needs no self-param dual-accept; the routing 404 is
+    // the whole contract. No dedicated owning suite — the deletion tombstone in
+    // routes/users.js + wire-sweep no longer probing it are the resurrection guards.
+    it('POST /:user_id/refresh is DELETED (87.6) — 404', async () => {
+      const res = await request(app).post(`/api/users/${caller.id}/refresh`);
+      expect(res.status).toBe(404);
     });
 
     it('PATCH /:user_id/notification-preferences dual-accepts and mutates the caller prefs', async () => {
@@ -627,7 +600,8 @@ describe('Self-param dual-accept family (87.4-02): sub OR caller-own-UUID author
       { name: 'users PUT /tutorial', method: 'put', path: (id) => `/api/users/${id}/tutorial`, body: { version: 1 } },
       { name: 'users DELETE /tutorial', method: 'delete', path: (id) => `/api/users/${id}/tutorial` },
       { name: 'users PUT /username', method: 'put', path: (id) => `/api/users/${id}/username`, body: { username: 'x' } },
-      { name: 'users POST /refresh', method: 'post', path: (id) => `/api/users/${id}/refresh` },
+      // users POST /refresh REMOVED from reject/BOLA table — route deleted (87.6
+      // users-refresh, Tier 3); a gone route has no self-param reject semantics.
       { name: 'users PATCH /notification-preferences', method: 'patch', path: (id) => `/api/users/${id}/notification-preferences`, body: { preferences: { event_created: { email: true } } } },
       { name: 'users PATCH /timezone', method: 'patch', path: (id) => `/api/users/${id}/timezone`, body: { timezone: 'UTC' } },
       { name: 'users POST /phone', method: 'post', path: (id) => `/api/users/${id}/phone`, body: { phone: '+14155552671' } },
