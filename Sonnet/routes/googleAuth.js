@@ -145,31 +145,6 @@ router.get('/google/url', async (req, res) => {
   }
 });
 
-// Step 1: Redirect user to Google OAuth consent screen (deprecated - use /url endpoint instead)
-router.get('/google', async (req, res) => {
-  try {
-    // Use verified user_id from token
-    const userId = req.user?.user_id;
-    if (!userId) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    const { email, username } = req.query; // Optional, for user creation
-
-    const authUrl = await generateGoogleAuthUrl(userId, email, username);
-
-    // Redirect to Google
-    res.redirect(authUrl);
-  } catch (error) {
-    if (error instanceof AppError && error.code === 'account_deleted') {
-      // Phase 87.2 tombstone refusal — pinned 410 envelope, never a raw 500.
-      return sendError(res, 'account_deleted');
-    }
-    console.error('Error initiating Google OAuth:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
 // Step 2: Handle OAuth callback from Google (PUBLIC - no auth required)
 router.get('/google/callback', async (req, res) => {
   // D-04: the resolved nonce row is hoisted so BOTH the success path AND the
@@ -321,42 +296,6 @@ router.get('/google/status/:user_id', async (req, res) => {
     });
   } catch (error) {
     console.error('Error getting Google Calendar status:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Refresh Google Calendar token
-router.post('/google/refresh', async (req, res) => {
-  try {
-    // Use verified user_id from token
-    const userId = req.user?.user_id;
-    if (!userId) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    const user = await User.findOne({ where: { user_id: userId } });
-    if (!user || !user.google_calendar_refresh_token) {
-      return res.status(404).json({ error: 'User not found or no refresh token available' });
-    }
-
-    const oauth2Client = getOAuth2Client();
-    oauth2Client.setCredentials({
-      refresh_token: user.google_calendar_refresh_token,
-    });
-
-    // Refresh the token
-    const { credentials } = await oauth2Client.refreshAccessToken();
-    
-    // Update stored token
-    await user.update({
-      google_calendar_token: credentials.access_token,
-      // Refresh token might be updated too
-      google_calendar_refresh_token: credentials.refresh_token || user.google_calendar_refresh_token,
-    });
-
-    res.json({ message: 'Token refreshed successfully' });
-  } catch (error) {
-    console.error('Error refreshing Google Calendar token:', error.message);
     res.status(500).json({ error: error.message });
   }
 });

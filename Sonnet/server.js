@@ -185,7 +185,6 @@ app.use((req, res, next) => {
   const protectedRoutes = [
     '/api/auth/google/url', // Google auth URL generation (requires auth)
     '/api/auth/google/disconnect', // Google disconnect (requires auth)
-    '/api/auth/google/refresh', // Token refresh (requires auth)
     '/api/users',
     '/api/groups',
     '/api/events',
