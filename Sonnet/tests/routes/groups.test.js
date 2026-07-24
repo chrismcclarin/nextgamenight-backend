@@ -157,90 +157,26 @@ describe('Group Routes', () => {
     });
   });
 
-  describe('POST /api/groups/:group_id/users', () => {
-    it('should add user to group when actor is owner/admin', async () => {
+  // Phase 87.6 (groups-add-user, Tier 1): POST /:group_id/users DELETED. Superseded
+  // by the invite / QR join flows (join-by-token + group invites). Zero FE callers
+  // of addUserToGroup (multi-line-aware `rg -U` re-confirmation, 2026-07-24 — a
+  // single-line grep MISSES the `router.post(\n '/:group_id/users',` def). The prior
+  // BE-044 owner/admin-gate + resolve-target behavioral assertions retire WITH the
+  // route. Seed an owner + real group so the 404 unambiguously means "route removed",
+  // not a live handler's authz/not-found branch. GET /:group_id/users (roster) is a
+  // DIFFERENT live route, pinned separately below.
+  describe('POST /api/groups/:group_id/users (deleted 87.6 groups-add-user)', () => {
+    it('404s — route deleted', async () => {
       const testGroup = await Group.create({
-        group_id: 'test-group-3',
-        name: 'Test Group 3'
+        group_id: 'test-group-3-deleted',
+        name: 'Test Group 3 (deleted-route pin)'
       });
-      // Actor must be owner/admin to add members (BE-044 authz gate).
       await addToGroup(testUser1, testGroup, 'owner');
 
-      const response = await request(makeApp(testUser1))
+      await request(makeApp(testUser1))
         .post(`/api/groups/${testGroup.id}/users`)
         .send({ user_id: testUser2.user_id })
-        .expect(200);
-
-      expect(response.body.message).toBe('User added to group successfully');
-
-      // Verify the added user (keyed on user_uuid = Users.id UUID; the old
-      // Auth0-string user_id column was removed in Plan 09).
-      const userGroup = await UserGroup.findOne({
-        where: {
-          user_uuid: testUser2.id,
-          group_id: testGroup.id
-        }
-      });
-      expect(userGroup).not.toBeNull();
-    });
-
-    it('should return 403 when actor is not owner/admin', async () => {
-      const testGroup = await Group.create({
-        group_id: 'test-group-3b',
-        name: 'Test Group 3b'
-      });
-      // testUser1 is only a plain member here — not allowed to add members.
-      await addToGroup(testUser1, testGroup, 'member');
-
-      const response = await request(makeApp(testUser1))
-        .post(`/api/groups/${testGroup.id}/users`)
-        .send({ user_id: testUser2.user_id })
-        .expect(403);
-
-      expect(response.body.error).toContain('owners and admins');
-    });
-
-    it('should not create duplicate if user already in group', async () => {
-      const testGroup = await Group.create({
-        group_id: `test-group-4-${Date.now()}`,
-        name: 'Test Group 4'
-      });
-
-      await addToGroup(testUser1, testGroup, 'owner');
-
-      const response = await request(makeApp(testUser1))
-        .post(`/api/groups/${testGroup.id}/users`)
-        .send({ user_id: testUser1.user_id })
-        .expect(200);
-
-      expect(response.body.message).toBe('User added to group successfully');
-    });
-
-    it('should return 404 if target user not found', async () => {
-      const testGroup = await Group.create({
-        group_id: 'test-group-5',
-        name: 'Test Group 5'
-      });
-      await addToGroup(testUser1, testGroup, 'owner');
-
-      const response = await request(makeApp(testUser1))
-        .post(`/api/groups/${testGroup.id}/users`)
-        .send({ user_id: 'non-existent-user' })
         .expect(404);
-
-      expect(response.body.error).toBe('User or Group not found');
-    });
-
-    it('should return 403 if group not found (authz gate runs first)', async () => {
-      // The owner/admin authz check runs before the existence lookup, so a
-      // non-existent group yields 403 (actor is not owner/admin of it).
-      const fakeId = '00000000-0000-0000-0000-000000000000';
-      const response = await request(makeApp(testUser1))
-        .post(`/api/groups/${fakeId}/users`)
-        .send({ user_id: testUser1.user_id })
-        .expect(403);
-
-      expect(response.body.error).toContain('owners and admins');
     });
   });
 
@@ -368,35 +304,20 @@ describe('Group admin mutations — UUID-only target resolution (87.3 PR-C contr
     await addToGroup(member, group, 'member');
   });
 
-  // ---- POST /:group_id/users add-member/friend-invite path ----
-  // The SOLE retained dual-key after the amended-D1 contraction (outside D1's
-  // endpoint list): both identifier shapes keep working here.
-  it('add-member: accepts a UUID-shaped target user_id (post-PR-C roster shape) -> 200', async () => {
+  // ---- POST /:group_id/users add-member path — DELETED (Phase 87.6 groups-add-user) ----
+  // This was the SOLE retained dual-key add-member/friend-invite route after the
+  // 87.3 amended-D1 contraction. It is removed this phase (Tier 1 — superseded by
+  // the invite / QR join flows). Its prior behavioral cases (UUID target,
+  // sub-shaped dual-key, and the review #6 non-string input-hygiene 400) retire
+  // WITH the route — the dual-key resolution + validator surface no longer exists.
+  // Pin here too so the deletion is proven from THIS block's actor seam (the
+  // canonical pin also lives in the 'GET/POST roster' block above).
+  it('add-member POST /:group_id/users 404s — route deleted (87.6 groups-add-user)', async () => {
     const newcomer = await makeUser({ user_id: 'auth0|dk-newcomer', username: 'dk-newcomer' });
-    const res = await request(makeApp(owner))
-      .post(`/api/groups/${group.id}/users`)
-      .send({ user_id: newcomer.id }) // UUID, not the sub
-      .expect(200);
-    expect(res.body.message).toBe('User added to group successfully');
-    const ug = await UserGroup.findOne({ where: { user_uuid: newcomer.id, group_id: group.id } });
-    expect(ug).not.toBeNull();
-  });
-
-  it('add-member: still accepts a sub-shaped target user_id (the retained dual-key) -> 200', async () => {
-    const newcomer = await makeUser({ user_id: 'auth0|dk-newcomer2', username: 'dk-newcomer2' });
     await request(makeApp(owner))
       .post(`/api/groups/${group.id}/users`)
-      .send({ user_id: newcomer.user_id }) // Auth0 sub
-      .expect(200);
-    const ug = await UserGroup.findOne({ where: { user_uuid: newcomer.id, group_id: group.id } });
-    expect(ug).not.toBeNull();
-  });
-
-  it('add-member: rejects a non-string user_id body (87.3 review #6 input hygiene) -> 400', async () => {
-    await request(makeApp(owner))
-      .post(`/api/groups/${group.id}/users`)
-      .send({ user_id: ['auth0|dk-array', 'auth0|dk-array2'] }) // array — must not coerce
-      .expect(400);
+      .send({ user_id: newcomer.id })
+      .expect(404);
   });
 
   // ---- PUT /:group_id/users/:target_user_id/role ----
