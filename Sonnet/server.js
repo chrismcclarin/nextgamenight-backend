@@ -60,7 +60,8 @@ const availabilityPrefillRoutes = require('./routes/availabilityPrefill');
 const availabilitySuggestionRoutes = require('./routes/availabilitySuggestion');
 const availabilityPromptRoutes = require('./routes/availabilityPrompt');
 const adminMetricsRoutes = require('./routes/adminMetrics');
-const tokenRoutes = require('./routes/tokens');
+// [87.6-07] tokenRoutes require removed — GET /api/tokens/metrics deleted (dead,
+// redundant with admin/metrics; zero FE callers). Router unmounted below.
 const inviteRoutes = require('./routes/invites');
 const friendshipRoutes = require('./routes/friendships');
 const rsvpRoutes = require('./routes/rsvp');
@@ -356,8 +357,7 @@ app.use('/api', writeOperationLimiter, availabilitySuggestionRoutes);
 app.use('/api', writeOperationLimiter, availabilityPromptRoutes);
 // Admin metrics dashboard — authn by the layer, then requirePlatformAdmin (83-03) in-handler
 app.use('/api', adminMetricsRoutes);
-// Token analytics
-app.use('/api/tokens', tokenRoutes);
+// [87.6-07] Token analytics mount removed — GET /api/tokens/metrics deleted.
 app.use('/api/invites', writeOperationLimiter, inviteRoutes); // GET /info allow-listed at the layer
 // Friendships (social graph: friend requests, accept, decline, remove)
 app.use('/api/friendships', writeOperationLimiter, friendshipRoutes);

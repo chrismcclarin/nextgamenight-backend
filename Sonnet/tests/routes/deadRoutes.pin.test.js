@@ -26,6 +26,8 @@ process.env.NODE_ENV = 'test';
 
 const request = require('supertest');
 const express = require('express');
+const fs = require('fs');
+const path = require('path');
 
 // A valid-shaped UUID for :group_id (validateUUID would 400 a malformed one, but
 // a DELETED route 404s at the routing layer before any validator runs — the UUID
@@ -111,6 +113,39 @@ describe('availability-suggestion orphan pins (deleted 87.6 availability-suggest
         .post(`/api/suggestions/${UUID}/convert`)
         .send({});
       expect(res.status).not.toBe(404);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// tokens router — WEAKER pin (D-05). tokens.js was emptied and DELETED, and the
+// server.js require + mount removed. There is no live router to mount, so a bare
+// 404 is VACUOUS (any unmounted path 404s). The real resurrection teeth are the
+// SOURCE-LEVEL assertions against server.js below — they fail if the tokens
+// router is ever re-required or re-mounted.
+// ---------------------------------------------------------------------------
+describe('tokens orphan pin (deleted 87.6 tokens-metrics)', () => {
+  // D-05: weaker guarantee — unmounted path, not a removed handler.
+  describe('GET /api/tokens/metrics (deleted 87.6 tokens-metrics)', () => {
+    it('404s — path unmounted (D-05: weaker guarantee — unmounted path, not a removed handler)', async () => {
+      // No router mounts /api/tokens anymore; an empty app 404s the path.
+      const app = express();
+      app.use(express.json());
+      await request(app).get('/api/tokens/metrics').expect(404);
+    });
+
+    // RESURRECTION TEETH: the 404 above is vacuous on its own. These assert the
+    // wiring in server.js stays gone — they FAIL if tokens routing is
+    // re-introduced (comment lines mentioning /api/tokens do NOT match these
+    // active-code patterns).
+    it('server.js no longer requires the tokens router', () => {
+      const serverSrc = fs.readFileSync(path.join(__dirname, '../../server.js'), 'utf8');
+      expect(serverSrc).not.toMatch(/require\(\s*['"]\.\/routes\/tokens['"]\s*\)/);
+    });
+
+    it('server.js no longer mounts /api/tokens', () => {
+      const serverSrc = fs.readFileSync(path.join(__dirname, '../../server.js'), 'utf8');
+      expect(serverSrc).not.toMatch(/app\.use\(\s*['"]\/api\/tokens['"]/);
     });
   });
 });
