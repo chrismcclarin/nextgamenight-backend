@@ -1,6 +1,10 @@
 // routes/lists.js
 const express = require('express');
-const { Event, Game, Group, User, EventParticipation, GameReview } = require('../models');
+// EventParticipation was imported solely for the deleted /players route (87.6-06);
+// dropped here. `Group` is a PRE-EXISTING unused import (not used by any surviving
+// or deleted-this-plan route) — left untouched per scope boundary, logged to
+// deferred-items.md for a future dead-import sweep.
+const { Event, Game, Group, User, GameReview } = require('../models');
 const { Op, fn, col } = require('sequelize');
 const { isActiveMember } = require('../services/authorizationService');
 // Phase 87.4 Plan 02 (SPEC Req 5, D-04): shared self-param dual-accept (own sub
