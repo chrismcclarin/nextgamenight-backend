@@ -86,5 +86,16 @@ A migration was committed to the repo but never ran against production for ~2.5 
 - `scripts/audit-migrations.js` — the audit script (read-only)
 - `scripts/run-migration-prod.js` — single-migration runner via Railway public URL (emergency-only; does NOT update SequelizeMeta)
 - `.sequelizerc` + `config/sequelize-cli.config.js` — sequelize-cli wiring (added in Phase 74)
-- `.github/workflows/migrations-check.yml` — PR-time CI check that migrations apply cleanly
-- `.planning/phases/74-production-audits/RAILWAY-PREDEPLOY-CONFIG.md` — current Railway config snapshot
+- `.github/workflows/ci.yml` (repo ROOT, not `Sonnet/`) — the `migrate-cli-replay` job is the
+  PR-time check that migrations apply cleanly and are idempotent on a second run
+- `railway.json` — the Railway deploy contract, including the pre-deploy command (config-as-code)
+
+> **Parked CI idea — not yet wired up:** [`docs/migrations-check.ci.yml.disabled`](migrations-check.ci.yml.disabled)
+> is a GitHub Actions workflow that smoke-tests migrations on PRs (fresh Postgres → apply all
+> migrations from scratch → re-run for idempotency). It was written in phase 74-03 but never ran
+> (it lived in the remote-less umbrella repo). If you're doing migration work and want an extra
+> automated safety net beyond `ci.yml`'s `migrate-cli-replay` job, see that file's header for the
+> ~6-step "to activate" checklist. Otherwise leave it parked.
+>
+> Salvaged 2026-07-25 from `RAILWAY_MIGRATION_INSTRUCTIONS.md` before that file was deleted — its
+> body documented migrating `UserGroups.user_id` UUID → VARCHAR, which Phase 87.1 reversed.
