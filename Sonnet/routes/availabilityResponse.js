@@ -93,9 +93,10 @@ router.post('/', magicTokenLimiter, async (req, res) => {
 
     if (!prompt) {
       // Anchored at 400 (A2): prompt-not-exists is a token/lifecycle reject, NOT a 404.
-      // Reuse the prompt_closed code (same 400 status) with the original prose preserved
-      // and `action` carried under details for the FE's request-new flow.
-      return sendError(res, 'prompt_closed', { action: 'request_new' }, 'This availability prompt no longer exists.');
+      // Reuse the prompt_closed code (same 400 status) with the original prose preserved.
+      // (87.6: the request-new serving endpoint was deleted, so we no longer advertise an
+      // `action` with no backing route — a future resend feature can re-add the hint.)
+      return sendError(res, 'prompt_closed', undefined, 'This availability prompt no longer exists.');
     }
 
     if (prompt.status !== 'active') {

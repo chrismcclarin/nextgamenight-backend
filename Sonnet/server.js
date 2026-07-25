@@ -60,7 +60,8 @@ const availabilityPrefillRoutes = require('./routes/availabilityPrefill');
 const availabilitySuggestionRoutes = require('./routes/availabilitySuggestion');
 const availabilityPromptRoutes = require('./routes/availabilityPrompt');
 const adminMetricsRoutes = require('./routes/adminMetrics');
-const tokenRoutes = require('./routes/tokens');
+// [87.6-07] tokenRoutes require removed — GET /api/tokens/metrics deleted (dead,
+// redundant with admin/metrics; zero FE callers). Router unmounted below.
 const inviteRoutes = require('./routes/invites');
 const friendshipRoutes = require('./routes/friendships');
 const rsvpRoutes = require('./routes/rsvp');
@@ -185,7 +186,6 @@ app.use((req, res, next) => {
   const protectedRoutes = [
     '/api/auth/google/url', // Google auth URL generation (requires auth)
     '/api/auth/google/disconnect', // Google disconnect (requires auth)
-    '/api/auth/google/refresh', // Token refresh (requires auth)
     '/api/users',
     '/api/groups',
     '/api/events',
@@ -264,10 +264,10 @@ app.use('/api/', apiLimiter);
 //
 // The allow-list matches on EXACT method + path (mount-relative, i.e. with the
 // `/api` prefix already stripped). It is NOT a `startsWith` prefix for the
-// game-search routes — `GET /games/:id` is public but `GET /games/for-event/...`
-// is NOT, so it stays gated (Task 1 BOLA audit). The prefix entries below are
-// reserved for routers that are wholly public (webhooks, magic-auth) or
-// self-authenticate via a magic token inside the handler.
+// game-search routes — `GET /games/search-all` is public but `GET /games/:id`
+// is NOT, so it stays gated (SW-01). The prefix entries below are reserved for
+// routers that are wholly public (webhooks, magic-auth) or self-authenticate
+// via a magic token inside the handler.
 //
 // MUST include `GET /api/auth/google/callback` — Google redirects the OAuth
 // flow back here carrying NO Auth0 bearer token; omitting it would 401 the
@@ -335,7 +335,7 @@ app.use('/api/webhooks', webhooksRoutes); // External service webhooks
 app.use('/api/magic-auth', magicAuthRoutes); // Magic link validation (no Auth0 required)
 app.use('/api/availability-responses', availabilityResponseRoutes); // Magic-token authed
 app.use('/api/availability-prefill', availabilityPrefillRoutes); // Magic-token authed
-app.use('/api/games', gameRoutes); // Search GETs public (allow-list); writes + for-event gated by the layer / per-route
+app.use('/api/games', gameRoutes); // Search GETs public (allow-list); writes + GET /:id gated by the layer
 app.use('/api/rsvp', writeOperationLimiter, rsvpRoutes); // GET /respond public (allow-list); POST/GET/DELETE authed by the layer
 app.use('/api/event-brings', writeOperationLimiter, eventBringRoutes);
 
@@ -357,8 +357,7 @@ app.use('/api', writeOperationLimiter, availabilitySuggestionRoutes);
 app.use('/api', writeOperationLimiter, availabilityPromptRoutes);
 // Admin metrics dashboard — authn by the layer, then requirePlatformAdmin (83-03) in-handler
 app.use('/api', adminMetricsRoutes);
-// Token analytics
-app.use('/api/tokens', tokenRoutes);
+// [87.6-07] Token analytics mount removed — GET /api/tokens/metrics deleted.
 app.use('/api/invites', writeOperationLimiter, inviteRoutes); // GET /info allow-listed at the layer
 // Friendships (social graph: friend requests, accept, decline, remove)
 app.use('/api/friendships', writeOperationLimiter, friendshipRoutes);

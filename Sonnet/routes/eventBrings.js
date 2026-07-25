@@ -158,34 +158,11 @@ router.put('/event/:event_id/my-brings', verifyAuth0Token, async (req, res) => {
   }
 });
 
-// DELETE /:bring_id -- Remove a single bring
-router.delete('/:bring_id', verifyAuth0Token, async (req, res) => {
-  try {
-    const { bring_id } = req.params;
-    const userId = req.user.user_id;
-
-    const bring = await EventBring.findByPk(bring_id);
-    if (!bring) {
-      return res.status(404).json({ error: 'Bring record not found' });
-    }
-
-    // Only the owner can remove their own bring. Phase 87.1 (D-11): resolve the
-    // verified caller to Users.id and compare user_uuid. Fail-closed: a null
-    // resolve (no Users row) is treated as non-owner → 403, never a raw 500.
-    const caller = await User.findOne({
-      where: { user_id: userId },
-      attributes: ['id'],
-    });
-    if (!caller || bring.user_uuid !== caller.id) {
-      return res.status(403).json({ error: 'You can only remove your own brings' });
-    }
-
-    await bring.destroy();
-    return res.status(200).json({ message: 'Bring removed' });
-  } catch (error) {
-    console.error('Error removing bring:', error.message);
-    return res.status(500).json({ error: error.message });
-  }
-});
+// DELETE /:bring_id deleted 87.6 (Tier-3, owner batch decision 2026-07-22 —
+// REDELETE-EVIDENCE item 17). Never wired: zero FE callers (removeBring) and
+// zero /event-brings/ path literals across periodictabletop/src. Removing a
+// single bring rides the live PUT /event/:event_id/my-brings list-replace
+// (destroy + bulkCreate in a transaction), so no capability exits into thin
+// air. Pinned 404 in the suite. The live GET /event and PUT /my-brings stay.
 
 module.exports = router;

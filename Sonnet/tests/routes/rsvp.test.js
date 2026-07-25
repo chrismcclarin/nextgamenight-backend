@@ -343,28 +343,20 @@ describe('RSVP UUID keyspace authz + wire (Phase 87.1)', () => {
     jest.restoreAllMocks();
   });
 
-  it('DELETE: the RSVP owner can remove their own RSVP (UUID gate positive)', async () => {
-    const rsvp = await makeEventRsvp(event, owner, { status: 'yes' });
-    currentActor = owner.user_id;
-    const res = await request(app).delete(`/api/rsvp/${rsvp.id}`);
-    expect(res.status).toBe(200);
-    expect(await EventRsvp.findByPk(rsvp.id)).toBeNull();
-  });
-
-  it("DELETE: a non-owner cannot remove someone else's RSVP (UUID gate negative)", async () => {
-    const rsvp = await makeEventRsvp(event, owner, { status: 'yes' });
-    currentActor = other.user_id;
-    const res = await request(app).delete(`/api/rsvp/${rsvp.id}`);
-    expect(res.status).toBe(403);
-    expect(await EventRsvp.findByPk(rsvp.id)).not.toBeNull();
-  });
-
-  it('DELETE: an unresolvable caller fails closed with 403, not a 500', async () => {
-    const rsvp = await makeEventRsvp(event, owner, { status: 'yes' });
-    currentActor = 'auth0|ghost-no-users-row';
-    const res = await request(app).delete(`/api/rsvp/${rsvp.id}`);
-    expect(res.status).toBe(403);
-    expect(await EventRsvp.findByPk(rsvp.id)).not.toBeNull();
+  // DELETE /api/rsvp/:rsvp_id deleted 87.6 rsvp (Tier-3, owner batch decision
+  // 2026-07-22 — REDELETE-EVIDENCE item 16). Zero FE callers (removeRsvp);
+  // status changes are covered by the live POST /rsvp upsert, so nothing exits
+  // into thin air. Formerly asserted the UUID owner gate (owner-can-remove /
+  // non-owner-403 / unresolvable-fail-closed); those behaviors are gone with
+  // the route. Now pinned 404.
+  describe('DELETE /api/rsvp/:rsvp_id (deleted 87.6 rsvp)', () => {
+    it('404s — route deleted', async () => {
+      const rsvp = await makeEventRsvp(event, owner, { status: 'yes' });
+      currentActor = owner.user_id;
+      await request(app).delete(`/api/rsvp/${rsvp.id}`).expect(404);
+      // Route gone, so the RSVP is untouched (no owner-gate destroy path).
+      expect(await EventRsvp.findByPk(rsvp.id)).not.toBeNull();
+    });
   });
 
   it('POST downgrade to no destroys the caller bring on the UUID keyspace (D-11)', async () => {
@@ -414,31 +406,17 @@ describe('RSVP UUID keyspace authz + wire (Phase 87.1)', () => {
     expect(row.User.username).toBeDefined();
   });
 
-  it('GET /user/:id returns a freshly UUID-keyed RSVP with flat user_id = caller UUID (PR-C self-only site)', async () => {
-    // Seed UUID-keyed only: user_id is a non-matching sentinel so a query keyed
-    // on the Auth0 param would MISS — only a user_uuid-keyed query finds it.
-    const rsvp = await EventRsvp.create({
-      event_id: event.id,
-      user_id: `auth0|uuid-only-sentinel-${Date.now()}`,
-      user_uuid: owner.id,
-      status: 'yes',
+  // GET /api/rsvp/user/:user_id deleted 87.6 rsvp (Tier-3, owner batch decision
+  // 2026-07-22 — REDELETE-EVIDENCE item 15). Zero FE callers (getUserRsvps) and
+  // zero /rsvp/user/ path literals across src; RSVP status is authored via the
+  // live POST /rsvp upsert, not listed cross-event, so status stays covered by
+  // the POST upsert. Formerly asserted the PR-C self-only UUID-keyed read and
+  // the fail-closed empty-list path; both are gone with the route. Now 404.
+  describe('GET /api/rsvp/user/:user_id (deleted 87.6 rsvp)', () => {
+    it('404s — route deleted', async () => {
+      currentActor = owner.user_id;
+      await request(app).get(`/api/rsvp/user/${owner.user_id}`).expect(404);
     });
-    currentActor = owner.user_id;
-    const res = await request(app).get(`/api/rsvp/user/${owner.user_id}`);
-    expect(res.status).toBe(200);
-    expect(Array.isArray(res.body)).toBe(true);
-    const row = res.body.find((r) => r.id === rsvp.id);
-    expect(row).toBeDefined(); // proves the query keyed user_uuid, not the Auth0 param
-    expect(row.user_id).toBe(owner.id); // PR-C: caller's resolved UUID, never the sub
-    expect(row.user_id).not.toMatch(SUB_RE);
-  });
-
-  it('GET /user/:id with an unresolvable caller returns an empty list (fail-closed, no 500)', async () => {
-    const ghost = 'auth0|ghost-no-users-row';
-    currentActor = ghost;
-    const res = await request(app).get(`/api/rsvp/user/${encodeURIComponent(ghost)}`);
-    expect(res.status).toBe(200);
-    expect(res.body).toEqual([]);
   });
 
   it('GET /respond writes an EventRsvp keyed by user_uuid for a seeded user', async () => {

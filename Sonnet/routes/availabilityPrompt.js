@@ -294,13 +294,13 @@ router.post('/prompts/:promptId/remind/:userId', verifyAuth0Token, async (req, r
           <p>Hi ${targetUser.username || 'there'},</p>
           <p>This is a friendly reminder to submit your availability for the upcoming <strong>${gameName}</strong> session with <strong>${groupName}</strong>.</p>
           <p>The deadline to respond is <strong>${deadline}</strong>.</p>
-          <p>Please check your email for the original availability link, or contact your group admin if you need a new one.</p>
+          <p>Please check your email for the original availability link.</p>
           <p style="color: #6B7280; font-size: 12px; margin-top: 30px;">
             This is an automated reminder from NextGameNight.
           </p>
         </div>
       `,
-      text: `Hi ${targetUser.username || 'there'},\n\nThis is a friendly reminder to submit your availability for the upcoming ${gameName} session with ${groupName}.\n\nThe deadline to respond is ${deadline}.\n\nPlease check your email for the original availability link, or contact your group admin if you need a new one.`,
+      text: `Hi ${targetUser.username || 'there'},\n\nThis is a friendly reminder to submit your availability for the upcoming ${gameName} session with ${groupName}.\n\nThe deadline to respond is ${deadline}.\n\nPlease check your email for the original availability link.`,
       groupName: groupName
     });
 

@@ -114,87 +114,19 @@ describe('GameReview Routes', () => {
     });
   });
 
-  describe('GET /api/game-reviews/user/:user_id/group/:group_id', () => {
-    it('should get all reviews by a user in a group', async () => {
-      await GameReview.create({
-        user_id: testUser1.id,
-        group_id: testGroup.id,
-        game_id: testGame.id,
-        rating: 4.5,
-        review_text: 'Amazing game!'
-      });
-
-      // Phase 87.3 PR-C (deferred review #1/#12): the target is UUID-ONLY —
-      // callers address the user by their Users.id UUID, not the sub.
-      const response = await request(makeApp(testUser1))
+  // GET /api/game-reviews/user/:user_id/group/:group_id deleted 87.6 game-reviews
+  // (Tier-3, owner batch decision 2026-07-22 — REDELETE-EVIDENCE item 14). Zero FE
+  // callers (getUserReviews) and zero game-reviews/user path literals across src.
+  // The list-your-reviews capability is owned by the future feature todo
+  // 2026-07-22-review-delete-and-list-your-reviews-feature.md. Formerly asserted
+  // the PR-C UUID-only member-gated list (happy path, empty list, non-member 403,
+  // user-not-found 404, sub-shaped-target rejection, member access, DB error);
+  // all gone with the route. Now pinned 404.
+  describe('GET /api/game-reviews/user/:user_id/group/:group_id (deleted 87.6 game-reviews)', () => {
+    it('404s — route deleted', async () => {
+      await request(makeApp(testUser1))
         .get(`/api/game-reviews/user/${testUser1.id}/group/${testGroup.id}`)
-        .expect(200);
-
-      expect(Array.isArray(response.body)).toBe(true);
-      expect(response.body.length).toBeGreaterThan(0);
-      expect(response.body[0]).toHaveProperty('rating');
-      expect(response.body[0]).toHaveProperty('User');
-      expect(response.body[0]).toHaveProperty('Game');
-      // PR-C (Req 1): the reviewer's nested User is sub-free — id/username only.
-      expect(response.body[0].User.id).toBe(testUser1.id);
-      expect(response.body[0].User.user_id).toBeUndefined();
-    });
-
-    it('should return empty array if user has no reviews', async () => {
-      const newUser = await makeUser({ username: 'newuser' });
-      await addToGroup(newUser, testGroup);
-
-      const response = await request(makeApp(newUser))
-        .get(`/api/game-reviews/user/${newUser.id}/group/${testGroup.id}`)
-        .expect(200);
-
-      expect(Array.isArray(response.body)).toBe(true);
-      expect(response.body.length).toBe(0);
-    });
-
-    it('should return 403 if the CALLER is not a member of the group', async () => {
-      // Phase 86 code-review fix: authorization is on the VERIFIED caller
-      // (req.user.user_id), NOT a client-supplied ?user_id. testUser2 is a
-      // non-member, so even requesting a member's reviews is denied — and no
-      // ?user_id is passed, proving the gate no longer depends on it.
-      const response = await request(makeApp(testUser2))
-        .get(`/api/game-reviews/user/${testUser1.id}/group/${testGroup.id}`)
-        .expect(403);
-
-      expect(response.body.error).toBe('Access denied to this group');
-    });
-
-    it('should return 404 if user not found', async () => {
-      const response = await request(makeApp(testUser1))
-        .get(`/api/game-reviews/user/non-existent-user/group/${testGroup.id}`)
         .expect(404);
-
-      expect(response.body.error).toBe('User not found');
-    });
-
-    it('REJECTS a sub-shaped target user_id (87.3 PR-C, deferred #1/#12 — UUID-only lookup) -> 404', async () => {
-      const response = await request(makeApp(testUser1))
-        .get(`/api/game-reviews/user/${encodeURIComponent(testUser1.user_id)}/group/${testGroup.id}`)
-        .expect(404);
-
-      expect(response.body.error).toBe('User not found');
-    });
-
-    it('should allow access when the caller is a member of the group', async () => {
-      // Member caller, no ?user_id needed — authz is on req.user.
-      const response = await request(makeApp(testUser1))
-        .get(`/api/game-reviews/user/${testUser1.id}/group/${testGroup.id}`)
-        .expect(200);
-
-      expect(Array.isArray(response.body)).toBe(true);
-    });
-
-    it('should handle database errors when fetching reviews', async () => {
-      const response = await request(makeApp(testUser1))
-        .get(`/api/game-reviews/user/${testUser1.id}/group/invalid-uuid`)
-        .expect(500);
-
-      expect(response.body).toHaveProperty('error');
     });
   });
 
@@ -384,8 +316,15 @@ describe('GameReview Routes', () => {
     });
   });
 
-  describe('DELETE /api/game-reviews/:id', () => {
-    it('should delete a review', async () => {
+  // DELETE /api/game-reviews/:id deleted 87.6 game-reviews (Tier-3, owner batch
+  // decision 2026-07-22 — REDELETE-EVIDENCE item 13). Zero FE callers
+  // (deleteReview). The review-delete capability is owned by the future feature
+  // todo 2026-07-22-review-delete-and-list-your-reviews-feature.md; review
+  // editing rides the live POST /game-reviews upsert. Formerly asserted the
+  // BSEC-01 owner gate (owner-200, non-owner-403, not-found-404, unauth-401,
+  // invalid-uuid-500); all gone with the route. Now pinned 404.
+  describe('DELETE /api/game-reviews/:id (deleted 87.6 game-reviews)', () => {
+    it('404s — route deleted', async () => {
       const review = await GameReview.create({
         user_id: testUser1.id,
         group_id: testGroup.id,
@@ -393,61 +332,12 @@ describe('GameReview Routes', () => {
         rating: 4
       });
 
-      const response = await request(makeApp(testUser1))
+      await request(makeApp(testUser1))
         .delete(`/api/game-reviews/${review.id}`)
-        .expect(200);
-
-      expect(response.body.message).toBe('Review deleted successfully');
-
-      const deletedReview = await GameReview.findByPk(review.id);
-      expect(deletedReview).toBeNull();
-    });
-
-    it('should return 403 if user does not own the review', async () => {
-      const review = await GameReview.create({
-        user_id: testUser1.id,
-        group_id: testGroup.id,
-        game_id: testGame.id,
-        rating: 4
-      });
-
-      const response = await request(makeApp(testUser2))
-        .delete(`/api/game-reviews/${review.id}`)
-        .expect(403);
-
-      expect(response.body.error).toBe('Access denied');
-    });
-
-    it('should return 404 if review not found', async () => {
-      const fakeId = '00000000-0000-0000-0000-000000000000';
-      const response = await request(makeApp(testUser1))
-        .delete(`/api/game-reviews/${fakeId}`)
         .expect(404);
 
-      expect(response.body.error).toBe('Review not found');
-    });
-
-    it('should return 401 if unauthenticated', async () => {
-      const review = await GameReview.create({
-        user_id: testUser1.id,
-        group_id: testGroup.id,
-        game_id: testGame.id,
-        rating: 4
-      });
-
-      const response = await request(makeApp(null))
-        .delete(`/api/game-reviews/${review.id}`)
-        .expect(401);
-
-      expect(response.body.error).toBe('Unauthorized');
-    });
-
-    it('should handle invalid UUID format gracefully', async () => {
-      const response = await request(makeApp(testUser1))
-        .delete('/api/game-reviews/invalid-uuid')
-        .expect(500);
-
-      expect(response.body).toHaveProperty('error');
+      // Route gone, so the review is untouched (no owner-gate destroy path).
+      expect(await GameReview.findByPk(review.id)).not.toBeNull();
     });
   });
 });

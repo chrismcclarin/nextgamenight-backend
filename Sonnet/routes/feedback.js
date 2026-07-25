@@ -13,7 +13,7 @@ async function getOctokit() {
 const { validateFeedback } = require('../middleware/validators');
 const { verifyAuth0Token } = require('../middleware/auth0');
 const { requirePlatformAdmin } = require('../middleware/adminAuth');
-const { Feedback, User } = require('../models');
+const { Feedback } = require('../models');
 const emailService = require('../services/emailService');
 
 // Submit feedback as a GitHub Issue (with DB fallback)
@@ -66,20 +66,14 @@ router.post('/github', verifyAuth0Token, async (req, res) => {
       });
     } catch (err) {
       console.error('GitHub Issue creation failed, falling back to DB:', err.message);
-      // 87.5 adversarial review ML-10: stamp the caller's Users.id UUID, matching
-      // the FeedbackForm path's keyspace (Plan 11) — one keyspace per column.
-      // (The previous `req.auth?.sub` was dead — nothing sets req.auth — so this
-      // path silently stored null; verifyAuth0Token guarantees req.user here.)
-      const submitter = await User.findOne({
-        where: { user_id: req.user.user_id },
-        attributes: ['id'],
-      });
+      // [87.6, owner decision 2026-07-24] Feedback rows carry no user attribution
+      // (see POST / below) — user_email is the contact handle on this path too.
       await Feedback.create({
         type: 'feedback',
         subject: title,
         description: text,
         user_email: userEmail || null,
-        user_id: submitter?.id || null,
+        user_id: null,
         page_context: pageUrl,
       });
     }
@@ -94,15 +88,19 @@ router.post('/github', verifyAuth0Token, async (req, res) => {
 // Submit bug report or suggestion
 router.post('/', validateFeedback, async (req, res) => {
   try {
-    const { type, subject, description, user_email, user_id, screenshot_base64, screenshot_filename } = req.body;
+    const { type, subject, description, user_email, screenshot_base64, screenshot_filename } = req.body;
 
-    // Save to database
+    // [87.6, owner decision 2026-07-24, review WR-01] Feedback is NOT attributed
+    // to a user account: this route rides the public transport (no bearer), so
+    // any user_id would be client-asserted and unverifiable. user_email is the
+    // contact handle. The user_id column is retained for historical rows only
+    // (account deletion anonymizes them); new rows always store null.
     const entry = await Feedback.create({
       type,
       subject,
       description,
       user_email: user_email || null,
-      user_id: user_id || null,
+      user_id: null,
     });
 
     console.log(`Feedback saved: ${type} - ${subject.substring(0, 50)}${subject.length > 50 ? '...' : ''}`);

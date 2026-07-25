@@ -549,28 +549,69 @@ describe('GET /friendships — PR-C UUID wire + UUID where-branches', () => {
 });
 
 // Phase 87.3 PR-C (BE-12, user D1 resolution): GET /search drops its flat sub
-// user_id — the SOLE sanctioned drop of this phase. The friends page (its only
+// user_id — the SOLE sanctioned drop of that phase. The friends page (its only
 // FE consumer) reads foundUser.id (plan 06).
-describe('GET /friendships/search — BE-12 flat user_id DROPPED (PR-C)', () => {
-  it('the search result carries id/username only — no user_id, no sub anywhere', async () => {
+//
+// Phase 87.6 (T-87.6-03): STRENGTHENED. GET /users/search/email/:email was
+// deleted this phase and the WR-01 cross-user PII regression it carried retired
+// with it (users.test.js). This /friendships/search route is now the SOLE live
+// email-search path, so it inherits that regression net. The prior version
+// mocked User.findOne to return a hand-built {id, username} and asserted the
+// projection with `arrayContaining(['id','username'])` — which could NEVER catch
+// a widened projection (arrayContaining passes when EXTRA fields are present, and
+// the hand-built mock never carried PII to leak). Fix, mirroring what WR-01
+// verified for the deleted route: (a) mock findOne to APPLY the route's real
+// `attributes` projection to a full victim row WITH PII (phone/email/sub), so a
+// widened projection actually leaks into the mocked response and fails the body
+// assertions; and (b) pin the projection with an EXACT toEqual(['id','username']),
+// which fails the instant any sensitive column is added to the select list.
+describe('GET /friendships/search — BE-12 exact PII projection (PR-C + T-87.6-03)', () => {
+  // A full victim row WITH sensitive PII. A real DB with `attributes:['id','username']`
+  // would only ever hydrate those two columns; the projectRow mock below mirrors
+  // that exactly, so widening the projection is observable in BOTH the response
+  // body AND the attributes pin.
+  const VICTIM_FULL = {
+    id: ADDRESSEE_UUID,
+    username: 'addressee',
+    user_id: ADDRESSEE,            // Auth0 sub — must never project
+    email: 'addressee@example.com', // must never project (searcher already has it)
+    phone: '+15555550123',          // the real leak WR-01 guarded — must never project
+  };
+
+  // Mimic Sequelize attribute projection: return only the requested columns.
+  function projectRow(row, attributes) {
+    if (!Array.isArray(attributes)) return { ...row };
+    const projected = {};
+    for (const attr of attributes) {
+      if (attr in row) projected[attr] = row[attr];
+    }
+    return projected;
+  }
+
+  it('projects id/username ONLY — no sub, email, or phone in the response; projection is exactly [id, username]', async () => {
     currentActor = REQUESTER;
-    // The route queries by email with a projected attribute list; return the
-    // projected shape the contracted route selects.
-    const findOneSpy = jest.spyOn(User, 'findOne').mockResolvedValue({
-      id: ADDRESSEE_UUID,
-      username: 'addressee',
-    });
+    const findOneSpy = jest
+      .spyOn(User, 'findOne')
+      .mockImplementation(async ({ attributes }) => projectRow(VICTIM_FULL, attributes));
 
     const res = await request(app).get('/api/friendships/search?email=addressee@example.com');
 
     expect(res.status).toBe(200);
     expect(res.body.id).toBe(ADDRESSEE_UUID);
     expect(res.body.username).toBe('addressee');
+
+    // Negative PII assertions against a REAL victim row (not a hand-built stub):
+    // because the mock applies the route's projection, these fail if the select
+    // list is ever widened to a sensitive column.
     expect(res.body).not.toHaveProperty('user_id');
+    expect(res.body).not.toHaveProperty('email');
+    expect(res.body).not.toHaveProperty('phone');
+    expect(JSON.stringify(res.body)).not.toContain('+15555550123');
     expect(JSON.stringify(res.body)).not.toMatch(/(auth0|google-oauth2|apple)\|/);
-    // Query-shape pin: the projection no longer selects the sub column.
+
+    // EXACT projection pin (was arrayContaining — which passed even with extra
+    // fields). toEqual fails the moment ANY column beyond id/username is selected.
     const attrs = findOneSpy.mock.calls[0][0].attributes;
-    expect(attrs).toEqual(expect.arrayContaining(['id', 'username']));
-    expect(attrs).not.toContain('user_id');
+    expect(attrs).toEqual(['id', 'username']);
   });
 });

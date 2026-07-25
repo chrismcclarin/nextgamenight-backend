@@ -46,18 +46,18 @@ describe('availability membership gates — post-rekey (87.1 BINT-02)', () => {
     await addToGroup(member, group, 'member');
   });
 
-  describe('GET /api/availability/group/:group_id/overlaps', () => {
-    it('admits an active member (200)', async () => {
+  // GET /api/availability/group/:group_id/overlaps DELETED — Phase 87.6
+  // (87.6-07, Tier 2): redundant thin wrapper. calculateGroupOverlaps stays LIVE
+  // via getGroupHeatmap, so the /heatmap route below is the live successor and
+  // keeps the post-rekey membership-gate coverage. A deleted route 404s at the
+  // routing layer BEFORE the membership gate runs, so admit/403 semantics are
+  // moot here — the routing 404 is the whole contract. Resurrection guard also
+  // pinned in deadRoutes.pin.test.js (availability orphan pins).
+  describe('GET /api/availability/group/:group_id/overlaps (deleted 87.6 availability-reads)', () => {
+    it('404s — route deleted (overlaps served live via /heatmap; gate moot on a gone route)', async () => {
       const res = await request(makeApp(member))
         .get(`/api/availability/group/${group.id}/overlaps`);
-      expect(res.status).toBe(200);
-      expect(Array.isArray(res.body)).toBe(true);
-    });
-
-    it('403s a non-member', async () => {
-      const res = await request(makeApp(nonMember))
-        .get(`/api/availability/group/${group.id}/overlaps`);
-      expect(res.status).toBe(403);
+      expect(res.status).toBe(404);
     });
   });
 

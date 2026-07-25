@@ -4,136 +4,23 @@
 const express = require('express');
 const router = express.Router();
 const { verifyAuth0Token } = require('../middleware/auth0');
-const heatmapService = require('../services/heatmapService');
 const eventCreationService = require('../services/eventCreationService');
-const { AvailabilityPrompt, AvailabilitySuggestion, User, UserGroup } = require('../models');
-const { isOwnerOrAdmin, isActiveMember } = require('../services/authorizationService');
-// Phase 87.4 code-review M-3: same canonical UUID shape the three sibling readers
-// (availabilityPrompt.js, tentativeHoldService.js, eventCreationService.js) use to
-// drop deploy-window Auth0-sub residue before it reaches the wire.
-const { isUuid } = require('../utils/resolveTargetUser');
+const { AvailabilityPrompt, AvailabilitySuggestion } = require('../models');
+const { isOwnerOrAdmin } = require('../services/authorizationService');
+// [87.6-07] heatmapService / isActiveMember / isUuid / User / UserGroup imports
+// dropped with the deleted GET suggestions + POST refresh routes; the remaining
+// POST /suggestions/:suggestionId/convert route uses only the imports above.
 
-/**
- * GET /api/prompts/:promptId/suggestions
- * Fetch suggestions for a prompt with optional filtering
- *
- * Query params:
- * - min_participants (optional): Filter by participant_count >= value
- * - meets_minimum (optional): Filter by meets_minimum = true/false
- *
- * Protected: User must be a member of the prompt's group
- */
-router.get('/prompts/:promptId/suggestions', verifyAuth0Token, async (req, res) => {
-  try {
-    const { promptId } = req.params;
-    const userId = req.user?.user_id;
-
-    if (!userId) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    // Fetch the prompt to get group_id
-    const prompt = await AvailabilityPrompt.findByPk(promptId);
-    if (!prompt) {
-      return res.status(404).json({ error: 'Prompt not found' });
-    }
-
-    // Verify user is a member of the prompt's group
-    const isMember = await isActiveMember(userId, prompt.group_id);
-    if (!isMember) {
-      return res.status(403).json({ error: 'You must be a group member to view suggestions' });
-    }
-
-    // Parse query parameters
-    const options = {};
-
-    // Parse min_participants filter
-    if (req.query.min_participants !== undefined) {
-      const minParticipants = parseInt(req.query.min_participants, 10);
-      if (!isNaN(minParticipants) && minParticipants >= 0) {
-        options.minParticipants = minParticipants;
-      }
-    }
-
-    // Parse meets_minimum filter
-    if (req.query.meets_minimum !== undefined) {
-      options.meetsMinimum = req.query.meets_minimum === 'true';
-    }
-
-    // Fetch suggestions
-    const suggestions = await heatmapService.getSuggestions(promptId, options);
-
-    res.json({
-      prompt_id: promptId,
-      suggestion_count: suggestions.length,
-      suggestions: suggestions.map(s => ({
-        id: s.id,
-        suggested_start: s.suggested_start,
-        suggested_end: s.suggested_end,
-        participant_count: s.participant_count,
-        // M-3 (87.4-review): filter to UUID-shaped ids only — a deploy-window residue
-        // row would otherwise emit another member's Auth0 sub. Mirrors the three
-        // sibling readers' isUuid guard.
-        participant_user_ids: (Array.isArray(s.participant_user_ids) ? s.participant_user_ids : []).filter(isUuid),
-        preferred_count: s.preferred_count,
-        meets_minimum: s.meets_minimum,
-        score: s.score,
-        converted_to_event_id: s.converted_to_event_id
-      }))
-    });
-  } catch (error) {
-    console.error('Error fetching suggestions:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-/**
- * POST /api/prompts/:promptId/suggestions/refresh
- * Trigger re-aggregation of responses into suggestions
- *
- * Protected: User must be admin or owner of the prompt's group
- */
-router.post('/prompts/:promptId/suggestions/refresh', verifyAuth0Token, async (req, res) => {
-  try {
-    const { promptId } = req.params;
-    const userId = req.user?.user_id;
-
-    if (!userId) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    // Fetch the prompt to get group_id
-    const prompt = await AvailabilityPrompt.findByPk(promptId);
-    if (!prompt) {
-      return res.status(404).json({ error: 'Prompt not found' });
-    }
-
-    // Verify user is admin or owner of the prompt's group
-    const hasPermission = await isOwnerOrAdmin(userId, prompt.group_id);
-    if (!hasPermission) {
-      return res.status(403).json({ error: 'Only admins and owners can refresh suggestions' });
-    }
-
-    // Trigger aggregation
-    const result = await heatmapService.aggregateResponses(promptId);
-
-    if (!result.success) {
-      return res.status(400).json({
-        success: false,
-        message: result.message
-      });
-    }
-
-    res.json({
-      success: true,
-      suggestion_count: result.suggestionCount,
-      message: result.message
-    });
-  } catch (error) {
-    console.error('Error refreshing suggestions:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
+// [87.6-07, Tier 2] GET /prompts/:promptId/suggestions + POST
+// /prompts/:promptId/suggestions/refresh DELETED — orphan reads with zero FE
+// callers (promptAPI.getSuggestions; NOT the LIVE suggestionsAPI.getEventSuggestions,
+// a different game-suggestions feature used by BrowseMoreModal — untouched).
+// COVERAGE PROOF: the same aggregated rows are served live by
+// GET /prompts/:promptId/heatmap (availabilityPrompt.js:761 → heatmapService), and
+// re-aggregation happens automatically on prompt close
+// (promptLifecycleService.js:202 calls heatmapService.aggregateResponses). The
+// router STAYS MOUNTED for POST /suggestions/:suggestionId/convert below.
+// 404-pinned in tests/routes/deadRoutes.pin.test.js.
 
 /**
  * POST /api/suggestions/:suggestionId/convert

@@ -23,7 +23,13 @@ describe('Ballot route module', () => {
     expect(getRoute).toBeDefined();
   });
 
-  it('should have POST /:eventId/options route', () => {
+  // 87.6-06 (SPEC Req 2, Tier-2 coverage-proven): POST /:eventId/options was
+  // DELETED. Successor is the event-creation embed in events.js (~:575-611) which
+  // bulkCreates ballot_options + flips ballot_status='open' atomically at event
+  // birth — NOT the PUT route, which requires ballot_status==='open' and 400s
+  // otherwise (cannot create an initial set). Assert the POST is now ABSENT so a
+  // future re-add is a deliberate, reviewed act.
+  it('should NOT have POST /:eventId/options route (deleted 87.6 ballot-options)', () => {
     const ballot = require('../../routes/ballot');
     const routes = ballot.stack
       .filter(layer => layer.route)
@@ -32,7 +38,7 @@ describe('Ballot route module', () => {
         methods: Object.keys(layer.route.methods),
       }));
     const postRoute = routes.find(r => r.path === '/:eventId/options' && r.methods.includes('post'));
-    expect(postRoute).toBeDefined();
+    expect(postRoute).toBeUndefined();
   });
 
   it('should have PUT /:eventId/options route', () => {
@@ -272,6 +278,11 @@ describe('Phase 87 ballot integrity (DB-backed)', () => {
   }
 
   // ---- (a) ATOMICITY ----
+  // 87.6-06: this rollback invariant (T-87-02) formerly exercised the deleted
+  // POST /:eventId/options route. The PUT route carries the IDENTICAL atomic
+  // destroy+bulkCreate transaction (ballot.js:~398-407), so the invariant is
+  // re-pointed to PUT rather than dropped (event is seeded ballot_status='open',
+  // so PUT's open-gate passes). The deleted POST's own 404 is pinned below.
   it('rolls back a mid-replace failure, leaving prior options intact', async () => {
     await seedOptions(3, owner);
 
@@ -281,7 +292,7 @@ describe('Phase 87 ballot integrity (DB-backed)', () => {
       .mockRejectedValueOnce(new Error('forced mid-replace failure'));
 
     const res = await request(makeApp(owner))
-      .post(`/api/ballot/${event.id}/options`)
+      .put(`/api/ballot/${event.id}/options`)
       .send({ options: [{ game_name: 'New A' }, { game_name: 'New B' }] });
 
     expect(res.status).toBe(500);
@@ -293,6 +304,22 @@ describe('Phase 87 ballot integrity (DB-backed)', () => {
     expect(remaining.map(o => o.game_name).sort()).toEqual(
       ['Seed Option 1', 'Seed Option 2', 'Seed Option 3']
     );
+  });
+
+  // ---- (a2) 404 PIN — POST /:eventId/options deleted (87.6-06, Tier-2) ----
+  // Coverage proof (see commit body + 87.6-REDELETE-EVIDENCE item 11): the live
+  // successor for CREATING a ballot is the event-creation embed in
+  // events.js:~575-611 (bulkCreate ballot_options + ballot_status='open' atomically
+  // at event birth), NOT this POST and NOT the PUT (PUT requires
+  // ballot_status==='open' → 400, cannot create an initial set). Known capability
+  // loss recorded in the proof: the edit-event add-ballot seam (createEvent.js:552
+  // → PUT soft-fail) has NO successor after this deletion; owned by todo
+  // 2026-07-24-add-ballot-to-existing-event.md.
+  it('404s — route deleted (deleted 87.6 ballot-options)', async () => {
+    const res = await request(makeApp(owner))
+      .post(`/api/ballot/${event.id}/options`)
+      .send({ options: [{ game_name: 'New A' }, { game_name: 'New B' }] });
+    expect(res.status).toBe(404);
   });
 
   // ---- (b) VOTE IDEMPOTENCY ----

@@ -160,14 +160,16 @@ describe('List Routes', () => {
     });
   });
 
-  describe('GET /api/lists/by-theme/:group_id/:theme/:user_id', () => {
-    it('should get games by theme', async () => {
-      currentActor = testUser1.user_id; // token-authorized member (self-param dual-accept)
-      const response = await request(app)
+  // 87.6-06 (SPEC Req 2/3): the games-by-theme route was deleted. ⚠ The
+  // 87.5-interview KEEP is REVERSED here — the owner overturned it and re-decided
+  // delete on 2026-07-22. Zero FE callers; future themed-browsing owned by
+  // `2026-07-22-themed-and-player-count-list-browsing-feature.md`. Assert 404.
+  describe('GET /api/lists/by-theme/:group_id/:theme/:user_id (deleted 87.6 lists)', () => {
+    it('404s — route deleted', async () => {
+      currentActor = testUser1.user_id;
+      await request(app)
         .get(`/api/lists/by-theme/${testGroup.id}/Strategy/${testUser1.user_id}`)
-        .expect(200);
-
-      expect(Array.isArray(response.body)).toBe(true);
+        .expect(404);
     });
   });
 
@@ -205,53 +207,17 @@ describe('List Routes', () => {
     });
   });
 
-  describe('GET /api/lists/players/:group_id/:user_id', () => {
-    afterEach(() => {
-      currentActor = null;
-    });
-
-    it('should get all players in a group with statistics', async () => {
-      currentActor = testUser1.user_id; // token-authorized (PR-C review #7)
-      const response = await request(app)
+  // 87.6-06 (SPEC Req 2/3): the all-players-in-a-group aggregation route was
+  // deleted (zero FE callers; future player-count browsing owned by
+  // `2026-07-22-themed-and-player-count-list-browsing-feature.md`). The route's
+  // own 403-spoof + UUID-shape coverage drops with it — route gone = no surface.
+  // Assert 404.
+  describe('GET /api/lists/players/:group_id/:user_id (deleted 87.6 lists)', () => {
+    it('404s — route deleted', async () => {
+      currentActor = testUser1.user_id;
+      await request(app)
         .get(`/api/lists/players/${testGroup.id}/${testUser1.user_id}`)
-        .expect(200);
-
-      expect(Array.isArray(response.body)).toBe(true);
-      expect(response.body.length).toBeGreaterThan(0);
-      expect(response.body[0]).toHaveProperty('user_id');
-      expect(response.body[0]).toHaveProperty('name');
-      expect(response.body[0]).toHaveProperty('games_played');
-      expect(response.body[0]).toHaveProperty('games_won');
-      // Phase 87.3 PR-C (user D3, mechanical conversion): the emitted user_id
-      // VALUE is the player's Users.id UUID (name stable) — the internal
-      // aggregation keying stays sub-keyed, but no sub crosses the wire.
-      for (const player of response.body) {
-        expect(player.user_id).not.toMatch(/^(auth0|google-oauth2|apple)\|/);
-        expect(player.user_id).toMatch(
-          /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
-        );
-      }
-      const p1 = response.body.find((p) => p.name === 'testuser1');
-      expect(p1).toBeDefined();
-      expect(p1.user_id).toBe(testUser1.id);
-    });
-
-    it('should return 403 if user not in group', async () => {
-      currentActor = testUser2.user_id; // authenticated but NOT a member
-      const response = await request(app)
-        .get(`/api/lists/players/${testGroup.id}/${testUser2.user_id}`)
-        .expect(403);
-
-      expect(response.body.error).toBe('Access denied to this group');
-    });
-
-    it("should return 403 when the param names ANOTHER user (spoof attempt)", async () => {
-      currentActor = testUser2.user_id;
-      const response = await request(app)
-        .get(`/api/lists/players/${testGroup.id}/${encodeURIComponent(testUser1.user_id)}`)
-        .expect(403);
-
-      expect(response.body.error).toBe("Forbidden: Cannot access other users' data");
+        .expect(404);
     });
   });
 });

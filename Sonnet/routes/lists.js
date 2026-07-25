@@ -1,6 +1,10 @@
 // routes/lists.js
 const express = require('express');
-const { Event, Game, Group, User, EventParticipation, GameReview } = require('../models');
+// EventParticipation was imported solely for the deleted /players route (87.6-06);
+// dropped here. `Group` is a PRE-EXISTING unused import (not used by any surviving
+// or deleted-this-plan route) — left untouched per scope boundary, logged to
+// deferred-items.md for a future dead-import sweep.
+const { Event, Game, Group, User, GameReview } = require('../models');
 const { Op, fn, col } = require('sequelize');
 const { isActiveMember } = require('../services/authorizationService');
 // Phase 87.4 Plan 02 (SPEC Req 5, D-04): shared self-param dual-accept (own sub
@@ -41,47 +45,14 @@ const router = express.Router();
 // removed under the Plan-06 dead-route policy. Recoverable from git history if
 // ever needed.
 
-// 5. Games by theme
-router.get('/by-theme/:group_id/:theme/:user_id', async (req, res) => {
-  try {
-    // Use verified user_id from token (self-param dual-accept — same pattern as
-    // the /games and /players siblings; the path :user_id alone is spoofable).
-    const userId = req.user?.user_id;
-    if (!userId) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    const { group_id, theme, user_id } = req.params;
-
-    // Verify the requested user_id is the caller's own identity (dual-accept: own
-    // sub OR own resolved UUID). The group-scoped data query below keys on
-    // group_id + isActiveMember(token sub), not this param.
-    if (!(await matchesSelf(req, user_id))) {
-      return res.status(403).json({ error: 'Forbidden: Cannot access other users\' data' });
-    }
-
-    const hasAccess = await isActiveMember(userId, group_id);
-    if (!hasAccess) {
-      return res.status(403).json({ error: 'Access denied to this group' });
-    }
-    
-    const events = await Event.findAll({
-      where: { group_id },
-      include: [
-        { 
-          model: Game, 
-          attributes: ['name', 'theme', 'url'],
-          where: { theme: { [Op.iLike]: `%${theme}%` } }
-        }
-      ],
-      order: [['start_date', 'DESC']]
-    });
-    
-    res.json(events);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
+// 5. [REMOVED — Phase 87.6 Plan 06, SPEC Req 2/3] The games-by-theme route
+// (path :group_id/:theme/:user_id) was deleted. It had ZERO FE callers (grep of
+// periodictabletop/src for `getByTheme` + `/lists/by-theme`: only the wrapper
+// def at api.ts:753, deleted by Plan 08). ⚠ The 87.5-interview KEEP is REVERSED
+// here — the owner overturned it and re-decided delete on 2026-07-22. The future
+// themed / player-count list-browsing feature is owned by the pending todo
+// `2026-07-22-themed-and-player-count-list-browsing-feature.md`. Recoverable from
+// git history if ever needed.
 
 // Unified games list endpoint with sorting
 // GET /api/lists/games/:group_id/:user_id?sort=name|play_count|last_played|rating&order=asc|desc
@@ -301,94 +272,13 @@ router.get('/games/:group_id/:user_id', async (req, res) => {
 // route always returned []. Zero consumers (no FE reference; confirmed via grep
 // of periodictabletop/src). Recoverable from git history if ever needed.
 
-// 8. All players in a group (aggregated from all games)
-router.get('/players/:group_id/:user_id', async (req, res) => {
-  try {
-    // Use verified user_id from token (same self-check as the /games sibling —
-    // the path param alone is spoofable: any known member sub read group stats;
-    // PR-C review #7).
-    const userId = req.user?.user_id;
-    if (!userId) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    const { group_id, user_id } = req.params;
-
-    // Verify the requested user_id is the caller's own identity (dual-accept:
-    // own sub OR own resolved UUID). The group-scoped data query below keys on
-    // group_id + isActiveMember(token sub), not this param, so no keyspace
-    // resolution of the param is needed.
-    if (!(await matchesSelf(req, user_id))) {
-      return res.status(403).json({ error: 'Forbidden: Cannot access other users\' data' });
-    }
-
-    const hasAccess = await isActiveMember(userId, group_id);
-    if (!hasAccess) {
-      return res.status(403).json({ error: 'Access denied to this group' });
-    }
-    
-    // Get all events for the group with participations
-    const events = await Event.findAll({
-      where: { group_id },
-      include: [
-        {
-          model: EventParticipation,
-          include: [{ model: User, attributes: ['id', 'username', 'user_id'] }]
-        },
-        { model: User, as: 'Winner', attributes: ['id', 'username', 'user_id'] }
-      ]
-    });
-    
-    // Aggregate player statistics
-    const playerStats = {};
-    
-    events.forEach(event => {
-      if (event.EventParticipations && Array.isArray(event.EventParticipations)) {
-        event.EventParticipations.forEach(participation => {
-          const player = participation.User;
-          // Phase 87.3 PR-C (user D3, mechanical read-only emitter): the
-          // aggregation's INTERNAL keying stays sub-keyed (playerKey below) —
-          // only the SERIALIZED user_id value flips to the Users.id UUID.
-          const playerKey = player.user_id;
-
-          if (!playerStats[playerKey]) {
-            playerStats[playerKey] = {
-              user_id: player.id, // D3: emitted value is the UUID (name stable)
-              name: player.username,
-              games_played: 0,
-              games_won: 0,
-              total_score: 0
-            };
-          }
-          playerStats[playerKey].games_played++;
-          
-          // Check if this player won
-          if (event.Winner && event.Winner.user_id === player.user_id) {
-            playerStats[playerKey].games_won++;
-          }
-          
-          // Get score from participation
-          if (participation.score !== undefined) {
-            playerStats[playerKey].total_score += participation.score;
-          }
-        });
-      }
-    });
-    
-    // Convert to array and calculate averages
-    const players = Object.values(playerStats).map(player => ({
-      ...player,
-      average_score: player.games_played > 0 ? (player.total_score / player.games_played).toFixed(2) : 0,
-      win_rate: player.games_played > 0 ? ((player.games_won / player.games_played) * 100).toFixed(1) : 0
-    }));
-    
-    // Sort by player name
-    players.sort((a, b) => a.name.localeCompare(b.name));
-    
-    res.json(players);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
+// 8. [REMOVED — Phase 87.6 Plan 06, SPEC Req 2/3] The all-players-in-a-group
+// aggregation route (path :group_id/:user_id) was deleted. It had ZERO FE callers
+// (grep of periodictabletop/src for `getPlayers` + `/lists/players`: zero hits,
+// not even a wrapper-def path literal). The route's own 403-spoof + UUID-shape
+// coverage drops with it (route gone = no surface). The future player-count
+// list-browsing feature is owned by the pending todo
+// `2026-07-22-themed-and-player-count-list-browsing-feature.md`. Recoverable from
+// git history if ever needed.
 
 module.exports = router;

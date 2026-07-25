@@ -207,115 +207,24 @@ router.get('/:eventId', async (req, res) => {
   }
 });
 
-// ============================================
-// POST /:eventId/options -- Create/set ballot options (organizer only)
-// ============================================
-router.post('/:eventId/options', validateBallotOptions, async (req, res) => {
-  try {
-    const { eventId } = req.params;
-    const userId = req.user.user_id;
-    const { options } = req.body;
-
-    // Phase 87.5 (BINT-02, PR-1): resolve the verified caller to Users.id ONCE.
-    // The creator FK is now created_by_uuid (UUID), so the authz compare + the
-    // first-creation stamp both key on this UUID, never the Auth0 sub. A null
-    // resolve → callerUuid null → isCreator false → the ballot falls to
-    // owner/admin-only (never a client-asserted creator identity).
-    const caller = await User.findOne({
-      where: { user_id: userId },
-      attributes: ['id'],
-    });
-    const callerUuid = caller ? caller.id : null;
-
-    // Find event
-    const event = await Event.findByPk(eventId);
-    if (!event) {
-      return res.status(404).json({ error: 'Event not found' });
-    }
-
-    // Require rsvp_deadline
-    if (!event.rsvp_deadline) {
-      return res.status(400).json({ error: 'Event must have an RSVP deadline to create a ballot' });
-    }
-
-    // Phase 87 (T-87-01): read the ballot's current creator BEFORE any destroy
-    // so we can enforce creator-based replace/wipe authz AND preserve the
-    // original creator on replace. Phase 87.5: project created_by_uuid — the UUID
-    // creator FK the authz compares against. Projecting the old created_by would
-    // read undefined for created_by_uuid and silently kill creator authz.
-    const existing = await EventBallotOption.findOne({
-      where: { event_id: eventId },
-      attributes: ['created_by_uuid'],
-    });
-
-    // Authz on the caller's server-resolved Users.id (Phase 83 default-deny —
-    // never a client-supplied id). isCreator REQUIRES current membership too, so a
-    // creator later removed from the group cannot replace/wipe (EoP fix).
-    const isAdmin = await isOwnerOrAdmin(userId, event.group_id);
-    const isMember = await isMemberOrHigher(userId, event.group_id);
-    const isCreator = !!existing && existing.created_by_uuid !== null && existing.created_by_uuid === callerUuid;
-
-    if (existing) {
-      // Replacing/wiping an existing ballot: creator (still a member) OR
-      // owner/admin. Legacy created_by IS NULL → isCreator false → owner/admin
-      // only (D-05).
-      if (!(isAdmin || (isCreator && isMember))) {
-        return res.status(403).json({ error: 'Only the ballot creator or a group owner/admin can replace or wipe ballot options' });
-      }
-    } else if (!isMember) {
-      // First-ever creation: keep the existing member-or-higher gate.
-      return res.status(403).json({ error: 'Pending members cannot create ballot options', required_role: 'member' });
-    }
-
-    // Preserve the ballot's original creator UUID on replace; stamp the actor's
-    // UUID ONLY on first-ever creation (no existing ballot). An owner/admin edit must
-    // NOT overwrite created_by_uuid with the editor's id (#8). Use an explicit
-    // existing-row check, NOT `?? callerUuid`: a NULL-creator ballot (legacy D-05 row)
-    // exists but has a null creator, and it must STAY creatorless on replace (remain
-    // permanently owner/admin-only) — `?? callerUuid` would wrongly stamp the editor.
-    const preservedCreator = existing ? existing.created_by_uuid : callerUuid;
-
-    // BulkCreate new options
-    const optionRows = options.map((opt, index) => ({
-      event_id: eventId,
-      game_id: opt.game_id || null,
-      game_name: opt.game_name,
-      display_order: index,
-      created_by_uuid: preservedCreator,
-    }));
-
-    // Atomic replace (T-87-02): destroy + bulkCreate (+ status flip) in ONE
-    // managed transaction so a mid-op failure rolls back → no zero-option
-    // ballot. destroy CASCADE-deletes votes on removed options.
-    const t = await sequelize.transaction();
-    let created;
-    try {
-      await EventBallotOption.destroy({ where: { event_id: eventId }, transaction: t });
-      created = await EventBallotOption.bulkCreate(optionRows, { transaction: t });
-      if (event.ballot_status !== 'open') {
-        event.ballot_status = 'open';
-        await event.save({ transaction: t });
-      }
-      await t.commit();
-    } catch (txErr) {
-      await t.rollback();
-      throw txErr;
-    }
-
-    return res.status(201).json({
-      ballot_status: 'open',
-      options: created.map(opt => ({
-        id: opt.id,
-        game_id: opt.game_id,
-        game_name: opt.game_name,
-        display_order: opt.display_order,
-      })),
-    });
-  } catch (error) {
-    console.error('Error creating ballot options:', error.message);
-    return res.status(500).json({ error: error.message });
-  }
-});
+// [REMOVED — Phase 87.6 Plan 06, SPEC Req 2 (Tier-2, coverage-proven)]
+// POST /:eventId/options (Create/set ballot options) was deleted. Coverage proof
+// (87.6-REDELETE-EVIDENCE item 11 + the deletion commit body): the live successor
+// for CREATING a ballot is the event-creation embed in events.js:~575-611, which
+// bulkCreates ballot_options + flips ballot_status='open' atomically at event
+// birth. The PUT route below is NOT the successor — it requires
+// ballot_status==='open' and 400s otherwise, so it cannot create an initial set.
+// The dead FE wrapper ballotAPI.setBallotOptions had ZERO object-qualified callers
+// (the live React setBallotOptions useState setters + ballotAPI.updateBallotOptions
+// PUT wrapper are a name collision, NOT this route — untouched).
+// KNOWN CAPABILITY LOSS (owner-visible, non-blocking): the edit-event add-ballot
+// seam (createEvent.js:552 unconditionally calls the PUT wrapper when saving an
+// event with >=2 options, including events with no existing ballot) has NO
+// successor after this deletion — PUT 400s and the FE soft-fails ('Event updated
+// but ballot options could not be saved.'). This POST was that seam's only
+// create-capable route; fixing it later requires re-adding a create-capable route
+// or relaxing the PUT handler. Owned by todo
+// 2026-07-24-add-ballot-to-existing-event.md. Recoverable from git history.
 
 // ============================================
 // PUT /:eventId/options -- Update ballot options (organizer only, before close)

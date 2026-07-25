@@ -190,4 +190,22 @@ describe('Google OAuth single-use nonce state (D-04 / BSEC-03)', () => {
       expect(res.headers.location.startsWith('http://localhost:3000/')).toBe(true);
     });
   });
+
+  // Dead-route deletion pins (Phase 87.6 D-02). These two auth routes were removed
+  // on re-confirmed caller-less evidence (R8); the live successors stay untouched.
+  describe('GET /api/auth/google (deleted 87.6 google-auth)', () => {
+    it('404s — route deleted; successor is GET /api/auth/google/url', async () => {
+      await request(app)
+        .get('/api/auth/google')
+        .expect(404);
+    });
+  });
+
+  describe('POST /api/auth/google/refresh (deleted 87.6 google-auth)', () => {
+    it('404s — route deleted; successor is the service-layer auto-refresh (googleCalendarService.refreshAccessToken)', async () => {
+      await request(app)
+        .post('/api/auth/google/refresh')
+        .expect(404);
+    });
+  });
 });

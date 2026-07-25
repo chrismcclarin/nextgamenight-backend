@@ -6,9 +6,8 @@ const { Op, UniqueConstraintError } = require('sequelize');
 const { EventRsvp, EventBring, Event, User, Game, Group, EventParticipation, SingleUseToken } = require('../models');
 const { validateRsvpCreate } = require('../middleware/validators');
 const { verifyAuth0Token } = require('../middleware/auth0');
-// Phase 87.4 Plan 02 (SPEC Req 5, D-04): shared self-param dual-accept (own sub
-// OR own resolved Users.id UUID).
-const { matchesSelf } = require('../middleware/objectAuth');
+// (87.6) matchesSelf import removed with the deleted GET /user/:user_id route —
+// it was the only consumer in this file.
 const { enqueueCleanupJobForAttendee } = require('../services/gcalCleanupService');
 const router = express.Router();
 
@@ -541,116 +540,12 @@ router.get('/event/:event_id', verifyAuth0Token, async (req, res) => {
   }
 });
 
-// GET /user/:user_id -- Get all RSVPs for a user (across events)
-router.get('/user/:user_id', verifyAuth0Token, async (req, res) => {
-  try {
-    const { user_id } = req.params;
-    const userId = req.user.user_id;
-
-    // Only allow users to fetch their own RSVPs. Dual-accept (SPEC Req 5): the
-    // self-param may be the caller's own sub (today) OR their own Users.id UUID
-    // (post-PR-2). The data query below keys on the caller's token-resolved
-    // user_uuid regardless, so no keyspace resolution of the param is needed here.
-    if (!(await matchesSelf(req, user_id))) {
-      return res.status(403).json({ error: 'You can only view your own RSVPs' });
-    }
-
-    // Phase 87.1 (BINT-02, D-11/D-12): resolve the verified caller to Users.id and
-    // query by user_uuid — post-cutover RSVPs carry only user_uuid, so the old
-    // Auth0-keyed query would silently return only pre-migration rows. Fail-closed:
-    // a caller with no Users row gets an empty list (never a raw 500).
-    const caller = await User.findOne({
-      where: { user_id: userId },
-      attributes: ['id'],
-    });
-    if (!caller) {
-      return res.json([]);
-    }
-
-    const rsvps = await EventRsvp.findAll({
-      where: { user_uuid: caller.id },
-      include: [
-        {
-          model: Event,
-          attributes: ['id', 'start_date', 'group_id', 'game_id', 'status'],
-          include: [
-            { model: Game, attributes: ['id', 'name'] },
-          ],
-        },
-      ],
-      order: [[Event, 'start_date', 'DESC']],
-    });
-
-    // PR-C: this endpoint is self-only (param === token above), so every
-    // returned row belongs to the caller. Serialize the flat user_id as the
-    // caller's resolved Users.id UUID (no User include here to source from).
-    const shaped = rsvps.map((r) => {
-      const json = r.toJSON();
-      json.user_id = caller.id;
-      delete json.user_uuid; // one identifier pair on the wire
-      return json;
-    });
-
-    return res.json(shaped);
-  } catch (error) {
-    console.error('Error fetching user RSVPs:', error.message);
-    return res.status(500).json({ error: error.message });
-  }
-});
-
-// DELETE /:rsvp_id -- Remove an RSVP
-router.delete('/:rsvp_id', verifyAuth0Token, async (req, res) => {
-  try {
-    const { rsvp_id } = req.params;
-    const userId = req.user.user_id;
-
-    const rsvp = await EventRsvp.findByPk(rsvp_id);
-    if (!rsvp) {
-      return res.status(404).json({ error: 'RSVP not found' });
-    }
-
-    // Only the RSVP owner can delete it. Phase 87.1 (D-11): resolve the verified
-    // caller to Users.id and compare user_uuid. Fail-closed: a null resolve (no
-    // Users row) is treated as non-owner → 403, never a raw 500.
-    const caller = await User.findOne({
-      where: { user_id: userId },
-      attributes: ['id'],
-    });
-    if (!caller || rsvp.user_uuid !== caller.id) {
-      return res.status(403).json({ error: 'You can only remove your own RSVP' });
-    }
-
-    // Phase 75 / GCAL-01: capture status + event_id BEFORE destroy.
-    // rsvp.status is gone after destroy; we need it to detect the
-    // "was-yes" condition that triggers a cleanup dispatch.
-    const priorStatus = rsvp.status;
-    const eventId = rsvp.event_id;
-
-    // Hard-delete bring commitments when RSVP is removed. Phase 87.1 (D-11):
-    // key on user_uuid (both columns are UUID now).
-    await EventBring.destroy({ where: { event_id: rsvp.event_id, user_uuid: rsvp.user_uuid } });
-
-    await rsvp.destroy();
-
-    // Phase 75 / GCAL-01: if the user was previously RSVPed 'yes', dispatch
-    // a GCal cleanup job — same code path as the yes->no transition.
-    // Synthesize newStatus='no' since the row is gone (effective non-attendance).
-    // Fire-and-forget; never blocks the DELETE response.
-    maybeDispatchGcalCleanup({
-      eventId,
-      authUserId: userId,
-      oldStatus: priorStatus,
-      newStatus: 'no',
-    }).catch((err) =>
-      console.error('[rsvp:DELETE] GCal cleanup dispatch error (non-fatal):', err.message)
-    );
-
-    return res.status(200).json({ message: 'RSVP removed' });
-  } catch (error) {
-    console.error('Error removing RSVP:', error.message);
-    return res.status(500).json({ error: error.message });
-  }
-});
+// GET /user/:user_id and DELETE /:rsvp_id deleted 87.6 (Tier-3, owner batch
+// decision 2026-07-22 — see 87.6-REDELETE-EVIDENCE items 15/16). Both never
+// wired: zero FE callers (getUserRsvps, removeRsvp) and zero /rsvp/user/ path
+// literals across periodictabletop/src. RSVP status changes ride the live
+// POST /rsvp upsert, so no capability exits into thin air. Pinned 404 in the
+// suite. The live POST /rsvp upsert + GET /event/:id list stay untouched.
 
 // Export router as default + named exports for email template use
 module.exports = router;

@@ -240,22 +240,18 @@ describe('REQ-6 orphaned-token re-provision guard (JIT + search)', () => {
     expect(mockUserCreate).not.toHaveBeenCalled();
   });
 
-  it('search-by-email whose Auth0 sub is tombstoned → NO Users row created, normal not-found shape', async () => {
-    mockUserScopeFindOne.mockResolvedValueOnce(null); // not in our DB
-    mockSearchUsersByEmail.mockResolvedValueOnce([{ user_id: 'auth0|deleted-friend' }]);
-    mockExtractUserDetails.mockReturnValueOnce({
-      user_id: 'auth0|deleted-friend',
-      email: 'deleted-friend@example.com',
-      username: 'gone',
-    });
-    mockIsTombstoned.mockResolvedValueOnce(true); // searched user is tombstoned
-
+  // GET /api/users/search/email/:email DELETED — Phase 87.6 (users-search-email,
+  // Tier 1). The route is gone, so a request 404s at the Express routing layer
+  // (default 404 — NO JSON body contract, so the prior `{error:'User not found'}`
+  // body-shape assertion no longer applies and would fail on the empty default
+  // 404 body). A deleted route trivially creates no Users row and leaks nothing
+  // about a tombstoned account — the "no JIT provisioning via search" invariant
+  // is preserved below. Resurrection guards: wire-sweep.test.js no longer probes
+  // it + the deletion tombstone in routes/users.js.
+  it('search-by-email route is DELETED (87.6) → routing 404, no Users row, no deletion leak', async () => {
     const res = await request(makeApp('auth0|searcher'))
-      .get('/api/users/search/email/deleted-friend%40example.com')
-      .expect(404);
-
-    // Normal DB-miss not-found shape — leaks nothing about the deletion.
-    expect(res.body.error).toBe('User not found');
+      .get('/api/users/search/email/deleted-friend%40example.com');
+    expect(res.status).toBe(404); // routing-layer 404 (Express default, no body contract)
     expect(mockUserFindOrCreate).not.toHaveBeenCalled();
     expect(mockUserCreate).not.toHaveBeenCalled();
   });

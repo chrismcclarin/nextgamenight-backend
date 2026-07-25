@@ -63,31 +63,17 @@ describe('BOLA cross-actor 403 regression (Plan 83-05)', () => {
   });
 
   // ---- Test 1: gameReviews DELETE — cross-actor spoof → 403 (BE-100) ----------
-  describe('DELETE /api/game-reviews/:id (BE-100)', () => {
-    it('rejects an attacker deleting the owner\'s review even with spoofed body.user_id → 403', async () => {
-      const review = await GameReview.create({
-        user_id: owner.id, group_id: group.id, game_id: game.id, rating: 4,
-      });
+  // ---- Test 1: gameReviews DELETE — (deleted 87.6 reviews-delete) ------------
+  // The route was removed in Phase 87.6 (Plan 05, Tier 3; rebuild owned by the
+  // review-delete todo). A deleted route needs no BOLA guard — the routing 404
+  // leaks nothing and rejects every actor; this pin is the resurrection guard.
+  describe('DELETE /api/game-reviews/:id (deleted 87.6 reviews-delete)', () => {
+    it('404s for ANY actor — route deleted', async () => {
       const app = appWith({ user_id: attacker.user_id }, '/api/game-reviews', gameReviewRoutes);
       const res = await request(app)
-        .delete(`/api/game-reviews/${review.id}`)
-        .send({ user_id: owner.user_id }); // spoof — must be ignored
-      expect(res.status).toBe(403);
-      // review still exists
-      expect(await GameReview.findByPk(review.id)).not.toBeNull();
-    });
-
-    it('lets the owner delete their own review → 200', async () => {
-      // The prior test leaves a review for the same (user_id, group_id, game_id);
-      // GameReview has a unique index on that triple, so clear it before re-creating.
-      await GameReview.destroy({ where: { user_id: owner.id, group_id: group.id, game_id: game.id } });
-      const review = await GameReview.create({
-        user_id: owner.id, group_id: group.id, game_id: game.id, rating: 5,
-      });
-      const app = appWith({ user_id: owner.user_id }, '/api/game-reviews', gameReviewRoutes);
-      const res = await request(app).delete(`/api/game-reviews/${review.id}`).send({});
-      expect(res.status).toBe(200);
-      expect(await GameReview.findByPk(review.id)).toBeNull();
+        .delete('/api/game-reviews/00000000-0000-4000-8000-000000000000')
+        .send({ user_id: owner.user_id });
+      expect(res.status).toBe(404);
     });
   });
 
@@ -146,32 +132,23 @@ describe('BOLA cross-actor 403 regression (Plan 83-05)', () => {
   });
 
   // ---- Test 5: groups POST /:group_id/users — owner/admin only (BE-044) --------
-  describe('POST /api/groups/:group_id/users (BE-044)', () => {
-    it('non-member/non-admin attacker → 403 and no membership created', async () => {
+  // ---- Test 5: groups add-user — (deleted 87.6 groups-add-user) --------------
+  // POST /:group_id/users was removed in Phase 87.6 (Plan 03, Tier 3): joins ride
+  // the live invite/QR flows. A deleted route needs no BOLA guard — the routing
+  // 404 rejects owner and attacker alike; this pin is the resurrection guard
+  // (groups.test.js carries the per-actor pins).
+  describe('POST /api/groups/:group_id/users (deleted 87.6 groups-add-user)', () => {
+    it('404s for ANY actor — route deleted (no membership created)', async () => {
       const target = await User.create({
         user_id: `bola-target-${ts}`, username: `target-${ts}`, email: `target-${ts}@example.com`,
-      });
-      const app = appWith({ user_id: attacker.user_id }, '/api/groups', groupRoutes);
-      const res = await request(app)
-        .post(`/api/groups/${group.id}/users`)
-        .send({ user_id: target.user_id });
-      expect(res.status).toBe(403);
-      const membership = await UserGroup.findOne({ where: { user_uuid: target.id, group_id: group.id } });
-      expect(membership).toBeNull();
-    });
-
-    it('owner → 200 and the target user is added as a member', async () => {
-      const target = await User.create({
-        user_id: `bola-target2-${ts}`, username: `target2-${ts}`, email: `target2-${ts}@example.com`,
       });
       const app = appWith({ user_id: owner.user_id }, '/api/groups', groupRoutes);
       const res = await request(app)
         .post(`/api/groups/${group.id}/users`)
         .send({ user_id: target.user_id });
-      expect(res.status).toBe(200);
+      expect(res.status).toBe(404);
       const membership = await UserGroup.findOne({ where: { user_uuid: target.id, group_id: group.id } });
-      expect(membership).not.toBeNull();
-      expect(membership.role).toBe('member');
+      expect(membership).toBeNull();
     });
   });
 });

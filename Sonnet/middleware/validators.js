@@ -304,10 +304,18 @@ const validateFeedback = [
     .optional({ nullable: true })
     .isEmail()
     .withMessage('User email must be a valid email address'),
+  // [87.6, review WR-01, owner decision 2026-07-24] user_id is intentionally
+  // NOT validated here: the public feedback route ignores any body user_id and
+  // always stores null (attribution removed — see routes/feedback.js). Do not
+  // re-add a user_id rule.
+  // Cap mirrors the FE's 2MB file limit after base64 inflation (~4/3): an
+  // anonymous caller must not be able to push an arbitrarily large attachment
+  // through the admin-notification email relay.
   body('screenshot_base64')
     .optional({ nullable: true })
     .isString()
-    .withMessage('Screenshot must be a base64 string'),
+    .isLength({ max: Math.ceil((2 * 1024 * 1024 * 4) / 3) })
+    .withMessage('Screenshot must be a base64 string of at most 2MB'),
   body('screenshot_filename')
     .optional({ nullable: true })
     .isString()

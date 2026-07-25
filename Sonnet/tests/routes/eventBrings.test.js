@@ -85,29 +85,21 @@ describe('EventBring UUID keyspace ownership + wire (Phase 87.1)', () => {
     jest.restoreAllMocks();
   });
 
-  // ---- (a) DELETE ownership gate ----
-  it('DELETE: the bring owner can remove their own bring (UUID gate positive)', async () => {
-    const bring = await makeEventBring(event, owner, game);
-    currentActor = owner.user_id;
-    const res = await request(app).delete(`/api/brings/${bring.id}`);
-    expect(res.status).toBe(200);
-    expect(await EventBring.findByPk(bring.id)).toBeNull();
-  });
-
-  it('DELETE: a non-owner cannot remove someone else\'s bring (UUID gate negative)', async () => {
-    const bring = await makeEventBring(event, owner, game);
-    currentActor = other.user_id;
-    const res = await request(app).delete(`/api/brings/${bring.id}`);
-    expect(res.status).toBe(403);
-    expect(await EventBring.findByPk(bring.id)).not.toBeNull();
-  });
-
-  it('DELETE: an unresolvable caller fails closed with 403, not a 500', async () => {
-    const bring = await makeEventBring(event, owner, game);
-    currentActor = 'auth0|brings-ghost-no-users-row';
-    const res = await request(app).delete(`/api/brings/${bring.id}`);
-    expect(res.status).toBe(403);
-    expect(await EventBring.findByPk(bring.id)).not.toBeNull();
+  // ---- (a) DELETE /:bring_id deleted 87.6 event-brings ----
+  // Tier-3, owner batch decision 2026-07-22 (REDELETE-EVIDENCE item 17). Zero FE
+  // callers (removeBring); single-bring removal rides the live PUT /my-brings
+  // list-replace, so removal capability stays covered. Formerly asserted the
+  // UUID owner gate (owner-200 / non-owner-403 / unresolvable-fail-closed); those
+  // are gone with the route. Pin hits the SUITE-LOCAL mount /api/brings/:id
+  // (prod mount is /api/event-brings/:id — RESEARCH Pitfall 6). Now 404.
+  describe('DELETE /api/brings/:bring_id (deleted 87.6 event-brings)', () => {
+    it('404s — route deleted', async () => {
+      const bring = await makeEventBring(event, owner, game);
+      currentActor = owner.user_id;
+      await request(app).delete(`/api/brings/${bring.id}`).expect(404);
+      // Route gone, so the bring is untouched (no owner-gate destroy path).
+      expect(await EventBring.findByPk(bring.id)).not.toBeNull();
+    });
   });
 
   // ---- (b) PUT /my-brings RSVP-yes gate + re-fetch body + D-12 shim ----

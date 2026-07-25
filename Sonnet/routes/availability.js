@@ -54,63 +54,21 @@ const validate = (req, res, next) => {
   if (!errors.isEmpty()) {
     return res.status(400).json({ 
       error: 'Validation failed',
+      // Emit { field, message } ONLY — do NOT reflect err.value back to the
+      // client (matches the shared validators.js no-reflection rule).
       errors: errors.array().map(err => ({
         field: err.path || err.param,
-        message: err.msg,
-        value: err.value
+        message: err.msg
       }))
     });
   }
   next();
 };
 
-// Get user's availability for a date range
-router.get('/user/:user_id', 
-  validateAuth0UserId('user_id'),
-  async (req, res) => {
-    try {
-      const userId = req.user?.user_id;
-      if (!userId) {
-        return res.status(401).json({ error: 'Unauthorized' });
-      }
-
-      // Users can only view their own availability (dual-accept: own sub OR own UUID)
-      if (!(await matchesSelf(req, req.params.user_id))) {
-        return res.status(403).json({ error: 'Forbidden: Cannot access other users\' availability' });
-      }
-
-      const user = await User.findOne({ where: { user_id: userId } });
-      if (!user) {
-        return res.status(404).json({ error: 'User not found' });
-      }
-
-      // Parse query parameters
-      const startDate = req.query.start_date ? new Date(req.query.start_date) : new Date();
-      const endDate = req.query.end_date ? new Date(req.query.end_date) : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // Default: 30 days
-      const timezone = req.query.timezone || 'UTC';
-
-      // Validate dates
-      if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
-        return res.status(400).json({ error: 'Invalid date format. Use ISO 8601 format (YYYY-MM-DD)' });
-      }
-
-      if (startDate >= endDate) {
-        return res.status(400).json({ error: 'Start date must be before end date' });
-      }
-
-      const availability = await availabilityService.calculateUserAvailability(
-        user,
-        startDate,
-        endDate,
-        timezone
-      );
-
-      res.json(availability);
-    } catch (error) {
-      sendSafeError(res, 500, error, 'Error fetching user availability');
-    }
-  }
-);
+// [87.6-07, Tier 1] GET /user/:user_id (dead read) DELETED — superseded by the
+// live patterns/recurring/override reads below (calculateUserAvailability stays
+// live via those). Zero FE callers (getUserAvailability). 404-pinned in
+// tests/routes/deadRoutes.pin.test.js.
 
 // Create recurring availability pattern
 router.post('/user/:user_id/recurring',
@@ -326,94 +284,11 @@ router.delete('/:id',
   }
 );
 
-// Get overlapping free time for all group members
-router.get('/group/:group_id/overlaps',
-  validateUUID('group_id'),
-  async (req, res) => {
-    try {
-      const userId = req.user?.user_id;
-      if (!userId) {
-        return res.status(401).json({ error: 'Unauthorized' });
-      }
-
-      // Verify user is a member of the group
-      const { Group, UserGroup, User } = require('../models');
-      let userGroup;
-      try {
-        // Phase 87.1 (BINT-02): UserGroup is re-keyed onto the user_uuid UUID FK.
-        // Resolve the authenticated caller's Users.id first, then gate on
-        // user_uuid — keying the legacy Auth0-string user_id column is an
-        // undefined-SILENT read once Plan 09 drops it. Fail-closed (userGroup
-        // stays null -> 403) if the caller has no Users row.
-        const caller = await User.findOne({ where: { user_id: userId }, attributes: ['id'] });
-        userGroup = caller ? await UserGroup.findOne({
-          where: {
-            group_id: req.params.group_id,
-            user_uuid: caller.id,
-            status: 'active',
-          },
-        }) : null;
-      } catch (dbError) {
-        console.error('Database error checking group membership:', dbError);
-        return sendSafeError(res, 500, dbError, 'Error checking group membership');
-      }
-
-      if (!userGroup) {
-        return res.status(403).json({ error: 'Forbidden: You must be a member of this group' });
-      }
-
-      // Parse query parameters
-      const startDate = req.query.start_date ? new Date(req.query.start_date) : new Date();
-      const endDate = req.query.end_date ? new Date(req.query.end_date) : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // Default: 30 days
-      const timezone = req.query.timezone || 'UTC';
-
-      // Validate dates
-      if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
-        return res.status(400).json({ error: 'Invalid date format. Use ISO 8601 format (YYYY-MM-DD)' });
-      }
-
-      if (startDate >= endDate) {
-        return res.status(400).json({ error: 'Start date must be before end date' });
-      }
-
-      // Limit date range to prevent performance issues and infinite loops
-      const MAX_DATE_RANGE_DAYS = 90; // Maximum 90 days
-      const dateRangeMs = endDate.getTime() - startDate.getTime();
-      const dateRangeDays = dateRangeMs / (1000 * 60 * 60 * 24);
-      
-      if (dateRangeDays > MAX_DATE_RANGE_DAYS) {
-        return res.status(400).json({ 
-          error: `Date range too large. Maximum allowed range is ${MAX_DATE_RANGE_DAYS} days. Requested range: ${Math.ceil(dateRangeDays)} days` 
-        });
-      }
-
-      // Prevent dates too far in the past or future
-      const MAX_PAST_DAYS = 365;
-      const MAX_FUTURE_DAYS = 365;
-      const now = new Date();
-      const daysFromNow = (startDate.getTime() - now.getTime()) / (1000 * 60 * 60 * 24);
-      
-      if (daysFromNow < -MAX_PAST_DAYS) {
-        return res.status(400).json({ error: `Start date cannot be more than ${MAX_PAST_DAYS} days in the past` });
-      }
-      
-      if (daysFromNow > MAX_FUTURE_DAYS) {
-        return res.status(400).json({ error: `Start date cannot be more than ${MAX_FUTURE_DAYS} days in the future` });
-      }
-
-      const overlaps = await availabilityService.calculateGroupOverlaps(
-        req.params.group_id,
-        startDate,
-        endDate,
-        timezone
-      );
-
-      res.json(overlaps);
-    } catch (error) {
-      sendSafeError(res, 500, error, 'Error calculating group overlaps');
-    }
-  }
-);
+// [87.6-07, Tier 2] GET /group/:group_id/overlaps DELETED — redundant thin
+// wrapper. COVERAGE PROOF: the underlying availabilityService.calculateGroupOverlaps
+// stays LIVE, consumed by getGroupHeatmap (availabilityService.js:670) which the
+// live GET /group/:group_id/heatmap route below drives. Zero FE callers
+// (getGroupOverlaps). 404-pinned in tests/routes/deadRoutes.pin.test.js.
 
 // Get heatmap data for group availability (normalized 1-hour slots, 10am-11pm)
 router.get('/group/:group_id/heatmap',

@@ -19,7 +19,9 @@ const {
   sequelize,
 } = require('../models');
 const { sendError } = require('../utils/errors');
-const { resolveTargetUser, resolveTargetUserUuidOnly } = require('../utils/resolveTargetUser');
+// resolveTargetUser (dual-key) removed with POST /:group_id/users (Phase 87.6
+// groups-add-user); the UUID-only resolver remains for the role/transfer routes.
+const { resolveTargetUserUuidOnly } = require('../utils/resolveTargetUser');
 const { matchesSelf } = require('../middleware/objectAuth');
 const { Op } = require('sequelize');
 const { body, validationResult } = require('express-validator');
@@ -428,62 +430,12 @@ router.get('/:group_id/users', async (req, res) => {
   }
 });
 
-// Add user to group (owner/admin only — BE-044)
-// 87.3 code-review #6: express-validator input hygiene on the mutation body —
-// a non-string (e.g. array) user_id is rejected 400 before any lookup.
-router.post(
-  '/:group_id/users',
-  [body('user_id').isString().trim().notEmpty().isLength({ max: 255 }).withMessage('user_id must be a non-empty string')],
-  async (req, res) => {
-  try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      // Same { error: string } envelope as the rest of the groups surface —
-      // the FE reads data.error (raw express-validator arrays render blank).
-      return res.status(400).json({ error: errors.array()[0].msg });
-    }
-    const { user_id } = req.body;
-
-    // BE-044 (BSEC-01): gate behind owner/admin. Without this any authenticated
-    // caller could add arbitrary users to any group (object-level authz hole).
-    const callerAuth0Id = req.user?.user_id;
-    const hasPermission = await isOwnerOrAdmin(callerAuth0Id, req.params.group_id);
-    if (!hasPermission) {
-      return res.status(403).json({ error: 'Only owners and admins can add members to a group' });
-    }
-
-    // V5: the client-supplied `user_id` is resolved to a Users row server-side
-    // here — never trusted directly as the UserGroup FK.
-    // Phase 87.3 PR-C NOTE: this friend-invite/add-member path is the SOLE
-    // RETAINED dual-key after the amended-D1 contraction (it is outside D1's
-    // endpoint list) — Users.id UUID first, Auth0 sub fallback.
-    const user = await resolveTargetUser(user_id);
-    const group = await Group.findByPk(req.params.group_id);
-
-    if (!user || !group) {
-      return res.status(404).json({ error: 'User or Group not found' });
-    }
-
-    // D-11: key on user_uuid (Users.id). Phase 87.1 (Plan 09 cutover): the old
-    // Auth0-string user_id column was removed from the model.
-    await UserGroup.findOrCreate({
-      where: {
-        user_uuid: user.id,
-        group_id: group.id
-      },
-      defaults: {
-        user_uuid: user.id, // Users.id UUID (the join key)
-        group_id: group.id,
-        role: 'member'
-      }
-    });
-
-    res.json({ message: 'User added to group successfully' });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-  }
-);
+// POST /:group_id/users — DELETED (Phase 87.6 groups-add-user, Tier 1). Superseded
+// by the invite / QR join flows (join-by-token + group invites). The direct
+// add-member route had zero FE callers (addUserToGroup, re-confirmed 2026-07-24
+// with a multi-line-aware `rg -U`). NOT the same route as GET /:group_id/users
+// (the live roster read above, ~L330) — only the POST mutation is removed.
+// (resolveTargetUser dual-key import dropped with it; the UUID-only sibling stays.)
 
 // Update user role in group (only owner can do this)
 router.put('/:group_id/users/:target_user_id/role', async (req, res) => {

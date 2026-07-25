@@ -4,7 +4,8 @@ const { GameReview, User, Game } = require('../models');
 const router = express.Router();
 const { validateReviewCreate, validateUUID } = require('../middleware/validators');
 const { isActiveMember, isMemberOrHigher } = require('../services/authorizationService');
-const { resolveTargetUserUuidOnly } = require('../utils/resolveTargetUser');
+// (87.6) resolveTargetUserUuidOnly import removed with the deleted
+// GET /user/:user_id/group/:group_id route — it was the only consumer here.
 
 
 // Get reviews for a game in a specific group
@@ -44,50 +45,12 @@ router.get('/game/:game_id/group/:group_id', async (req, res) => {
 });
 
 
-// Get all reviews by a user in a group
-router.get('/user/:user_id/group/:group_id', async (req, res) => {
-  try {
-    const { user_id: target_user_id, group_id } = req.params;
-
-    // Authorize on the VERIFIED caller (req.user), not a client-supplied ?user_id.
-    // The FE dropped the spoofable ?user_id query param (FSEC-02), so the old
-    // `if (user_id)` gate no longer fired — leaving this endpoint with zero
-    // authorization. Enforce group membership unconditionally on the token identity.
-    const callerId = req.user?.user_id;
-    if (!callerId) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-    const hasAccess = await isActiveMember(callerId, group_id);
-    if (!hasAccess) {
-      return res.status(403).json({ error: 'Access denied to this group' });
-    }
-
-    // Phase 87.3 PR-C (deferred review #1/#12, amended D1): the target lookup
-    // was SUB-ONLY — contracted UUID-only to match this plan's end-state (the
-    // FE client fn is dead code today; any future caller sources member ids
-    // from the aliased rosters, which now carry UUIDs). A sub-shaped target
-    // rejects as not-found.
-    const targetUser = await resolveTargetUserUuidOnly(target_user_id);
-    if (!targetUser) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-
-    // PR-C (Req 1): nested User include sub-free — id/username only.
-    const reviews = await GameReview.findAll({
-      where: { user_id: targetUser.id, group_id },
-      include: [
-        { model: User, attributes: ['id', 'username'] },
-        { model: Game, attributes: ['name', 'image_url'] }
-      ],
-      order: [['createdAt', 'DESC']]
-    });
-    
-    res.json(reviews);
-  } catch (error) {
-    console.error('[gameReviews] request failed:', error.message);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
+// GET /user/:user_id/group/:group_id deleted 87.6 (Tier-3, owner batch decision
+// 2026-07-22 — REDELETE-EVIDENCE item 14). Never wired: zero FE callers
+// (getUserReviews) and zero game-reviews/user path literals across
+// periodictabletop/src. The list-your-reviews capability is owned by the future
+// feature todo 2026-07-22-review-delete-and-list-your-reviews-feature.md.
+// Pinned 404 in the suite.
 
 
 // Create or update a review
@@ -170,37 +133,11 @@ router.post('/', validateReviewCreate, async (req, res) => {
 });
 
 
-// Delete a review
-router.delete('/:id', async (req, res) => {
-  try {
-    // BSEC-01 / BE-100: derive the actor from the verified JWT — NEVER from
-    // req.body.user_id (which any client can spoof to delete another user's
-    // review). Matches the POST handler's own pattern at :76.
-    const userId = req.user?.user_id;
-    if (!userId) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    const review = await GameReview.findByPk(req.params.id, {
-      include: [{ model: User }]
-    });
-
-    if (!review) {
-      return res.status(404).json({ error: 'Review not found' });
-    }
-
-    // Verify the verified actor owns the review.
-    if (review.User.user_id !== userId) {
-      return res.status(403).json({ error: 'Access denied' });
-    }
-
-    await review.destroy();
-    res.json({ message: 'Review deleted successfully' });
-  } catch (error) {
-    console.error('[gameReviews] request failed:', error.message);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
+// DELETE /:id deleted 87.6 (Tier-3, owner batch decision 2026-07-22 —
+// REDELETE-EVIDENCE item 13). Never wired: zero FE callers (deleteReview). The
+// review-delete capability is owned by the future feature todo
+// 2026-07-22-review-delete-and-list-your-reviews-feature.md. Review editing
+// rides the live POST /game-reviews upsert, which stays untouched. Pinned 404.
 
 
 module.exports = router;
