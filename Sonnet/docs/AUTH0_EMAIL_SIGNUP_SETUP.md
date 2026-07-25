@@ -119,4 +119,8 @@ After enabling email signup:
 1. Test the signup flow
 2. Test email verification (if enabled)
 3. Test password reset functionality
-4. Consider implementing the notification preferences toggle (see FUTURE_FEATURES.md) before sending emails
+4. Notification preferences are already shipped — the per-channel notification matrix on the user
+   profile, backed by `migrations/20260109-add-email-notifications-enabled.js` and
+   `migrations/20260328000001-add-notification-fields-to-users.js`. (This line previously said
+   "consider implementing ... see FUTURE_FEATURES.md"; that file was a pre-GSD wishlist, deleted
+   2026-07-25 as superseded by `.planning/ROADMAP.md` + `REQUIREMENTS.md`.)
