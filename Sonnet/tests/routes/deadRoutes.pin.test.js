@@ -140,12 +140,22 @@ describe('tokens orphan pin (deleted 87.6 tokens-metrics)', () => {
     // active-code patterns).
     it('server.js no longer requires the tokens router', () => {
       const serverSrc = fs.readFileSync(path.join(__dirname, '../../server.js'), 'utf8');
-      expect(serverSrc).not.toMatch(/require\(\s*['"]\.\/routes\/tokens['"]\s*\)/);
+      // Module-stem match: also catches './routes/tokens.js' and other
+      // respellings of the same module, not just the exact deleted literal.
+      expect(serverSrc).not.toMatch(/require\(\s*['"][^'"]*routes\/tokens(\.js)?['"]\s*\)/);
     });
 
     it('server.js no longer mounts /api/tokens', () => {
       const serverSrc = fs.readFileSync(path.join(__dirname, '../../server.js'), 'utf8');
-      expect(serverSrc).not.toMatch(/app\.use\(\s*['"]\/api\/tokens['"]/);
+      // Any active mount whose path segment is /api/tokens (with or without a
+      // trailing subpath), regardless of the router identifier used.
+      expect(serverSrc).not.toMatch(/app\.use\(\s*['"]\/api\/tokens(\/[^'"]*)?['"]/);
+    });
+
+    it('routes/tokens.js stays deleted (file-level tripwire)', () => {
+      // Belt-and-suspenders alongside the source regexes: re-creating the
+      // module file at its old path trips this even before any mount lands.
+      expect(fs.existsSync(path.join(__dirname, '../../routes/tokens.js'))).toBe(false);
     });
   });
 });
