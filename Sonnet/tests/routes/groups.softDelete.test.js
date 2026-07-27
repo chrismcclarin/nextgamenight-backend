@@ -25,10 +25,30 @@
 // the real single-timestamp stamping path; this suite must not encode a discipline
 // that contradicts it. `silent: true` additionally suppresses the `updatedAt` bump.
 
+// The ownership-offer fanout is mocked file-wide so no test attempts a real send.
+// It is mocked as a PROMISE-RETURNING jest.fn because the DELETE handler attaches a
+// trailing .catch to it (AF-11) — a bare jest.fn returning undefined would throw
+// inside the handler instead of exercising the real shape.
+jest.mock('../../services/groupOwnershipOfferService', () => ({
+  sendGroupOwnershipOffers: jest.fn(),
+}));
+
 const request = require('supertest');
 const express = require('express');
 const groupRoutes = require('../../routes/groups');
-const { Group, User, UserGroup, Event, SingleUseToken } = require('../../models');
+const {
+  Group,
+  User,
+  UserGroup,
+  Event,
+  EventParticipation,
+  GameReview,
+  GroupInvite,
+  Game,
+  SingleUseToken,
+  sequelize,
+} = require('../../models');
+const { sendGroupOwnershipOffers } = require('../../services/groupOwnershipOfferService');
 const { getUserRoleInGroup } = require('../../services/authorizationService');
 const {
   softDeleteGroup,
@@ -36,9 +56,16 @@ const {
   TOKEN_EXPIRY_MARGIN_MS,
   GroupAlreadyDeletedError,
 } = require('../../services/groupRecoveryService');
-const { makeUser, makeGroup, addToGroup } = require('../factories');
+const {
+  makeUser,
+  makeGroup,
+  addToGroup,
+  makeGameReview,
+  makeGroupInvite,
+} = require('../factories');
 
-const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const THIRTY_DAYS_MS = 30 * DAY_MS;
 
 // Harness mirrors tests/routes/groups.invite.test.js: inject req.user ahead of the
 // router (the router is mounted with NO real Auth0 middleware, so without this every
@@ -373,5 +400,311 @@ describe('Phase 88.2 — paranoid soft-delete is the central hide filter', () =>
       expect(token.expires_at.getTime()).toBeGreaterThan(purgeAfter.getTime());
       expect(token.expires_at.getTime() - purgeAfter.getTime()).toBe(TOKEN_EXPIRY_MARGIN_MS);
     });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Plan 88.2-06 Task 2 — DELETE /api/groups/:group_id
+  // ---------------------------------------------------------------------------
+  describe('DELETE /api/groups/:group_id — the soft-delete handler', () => {
+    beforeEach(() => {
+      sendGroupOwnershipOffers.mockReset();
+      sendGroupOwnershipOffers.mockResolvedValue({ sent: 0, failed: 0, unreachable: 0 });
+    });
+
+    /** Row counts across every table SPEC-REQ-1 says must be untouched. */
+    async function sixTableCounts(groupId) {
+      const events = await Event.findAll({
+        where: { group_id: groupId },
+        paranoid: false,
+        attributes: ['id'],
+      });
+      return {
+        Groups: await Group.count({ paranoid: false }),
+        Events: await Event.count({ paranoid: false }),
+        EventParticipations: await EventParticipation.count({
+          where: { event_id: events.map((e) => e.id) },
+        }),
+        GameReviews: await GameReview.count(),
+        GroupInvites: await GroupInvite.count(),
+        UserGroups: await UserGroup.count({ paranoid: false }),
+      };
+    }
+
+    /** Seed a group with a row in every one of the six tables. */
+    async function seedFullGroup() {
+      const member = await makeUser({ username: 'delete-member' });
+      const game = await Game.create({ name: `Game ${Date.now()}`, is_custom: true });
+      await addToGroup(member, group, 'member');
+      const event = await Event.create({
+        group_id: group.id,
+        start_date: new Date('2026-09-01T18:00:00.000Z'),
+        status: 'scheduled',
+      });
+      await EventParticipation.create({ event_id: event.id, user_id: member.id });
+      await makeGameReview(member, group, game);
+      await makeGroupInvite(group, owner);
+      return { member, game, event };
+    }
+
+    it('SPEC-REQ-1: destroys ZERO rows — all six table counts are identical after the call', async () => {
+      await seedFullGroup();
+      const before = await sixTableCounts(group.id);
+      // The fixture must actually populate all six, or the comparison is vacuous.
+      for (const [table, n] of Object.entries(before)) {
+        expect([table, n]).toEqual([table, expect.any(Number)]);
+        expect(n).toBeGreaterThan(0);
+      }
+
+      await request(app).delete(`/api/groups/${group.id}`).expect(200);
+
+      expect(await sixTableCounts(group.id)).toEqual(before);
+    });
+
+    it('SPEC-REQ-1: the Groups row carries a stamp and a purge_after exactly 30 days later', async () => {
+      const res = await request(app).delete(`/api/groups/${group.id}`).expect(200);
+      expect(res.body.message).toBe('Group deleted successfully');
+
+      const row = await Group.findByPk(group.id, { paranoid: false });
+      expect(row.deletedAt).toBeInstanceOf(Date);
+      expect(row.purge_after.getTime() - row.deletedAt.getTime()).toBe(THIRTY_DAYS_MS);
+      expect(new Date(res.body.recoverable_until).getTime()).toBe(row.purge_after.getTime());
+    });
+
+    it('SPEC-REQ-9 precondition: Groups, UserGroups and Events all carry the IDENTICAL deletedAt', async () => {
+      await Event.create({
+        group_id: group.id,
+        start_date: new Date('2026-09-02T18:00:00.000Z'),
+        status: 'scheduled',
+      });
+      const member = await makeUser({ username: 'stamp-member' });
+      await addToGroup(member, group, 'member');
+
+      await request(app).delete(`/api/groups/${group.id}`).expect(200);
+
+      const groupRow = await Group.findByPk(group.id, { paranoid: false });
+      const memberships = await UserGroup.findAll({ where: { group_id: group.id }, paranoid: false });
+      const events = await Event.findAll({ where: { group_id: group.id }, paranoid: false });
+
+      expect(memberships).toHaveLength(2);
+      expect(events).toHaveLength(1);
+
+      const stamp = groupRow.deletedAt.getTime();
+      // Byte-identical, not merely close. Three .destroy() calls would produce three
+      // timestamps milliseconds apart and plan 07's stamp-matched restore would then
+      // match nothing (88.2-RESEARCH.md F-05).
+      for (const row of [...memberships, ...events]) {
+        expect(row.deletedAt.getTime()).toBe(stamp);
+      }
+    });
+
+    it('SPEC-REQ-2: purge_after is STAMPED and read back from the column, never recomputed', async () => {
+      // A deliberately INCONSISTENT fixture: a group held for five days, not 30. A
+      // test that only checks the 30-day arithmetic cannot distinguish "stamped from
+      // the column" from "recomputed from the constant" — they agree by construction.
+      const oddDeletedAt = new Date('2026-07-01T00:00:00.000Z');
+      const oddPurgeAfter = new Date(oddDeletedAt.getTime() + 5 * DAY_MS);
+      const odd = await makeGroup({ name: 'Five Day Window' });
+      await addToGroup(owner, odd, 'owner');
+      await Group.update(
+        { deletedAt: oddDeletedAt, purge_after: oddPurgeAfter },
+        { where: { id: odd.id }, silent: true }
+      );
+
+      const oddRow = await Group.findByPk(odd.id, { paranoid: false });
+      expect(oddRow.purge_after.getTime()).toBe(oddPurgeAfter.getTime());
+      expect(oddRow.purge_after.getTime() - oddRow.deletedAt.getTime()).toBe(5 * DAY_MS);
+      expect(oddRow.purge_after.getTime() - oddRow.deletedAt.getTime()).not.toBe(
+        RECOVERY_WINDOW_DAYS * DAY_MS
+      );
+
+      // ...and on a real delete, the deadline the response reports AND the deadline
+      // the email is built from are both the value that landed on the row — not a
+      // second, independently derived one.
+      const member = await makeUser({ username: 'purge-after-member' });
+      await addToGroup(member, group, 'member');
+      const res = await request(app).delete(`/api/groups/${group.id}`).expect(200);
+
+      const stampedRow = await Group.findByPk(group.id, { paranoid: false });
+      const dispatched = sendGroupOwnershipOffers.mock.calls[0][0];
+      expect(new Date(dispatched.purgeAfter).getTime()).toBe(stampedRow.purge_after.getTime());
+      expect(new Date(res.body.recoverable_until).getTime()).toBe(stampedRow.purge_after.getTime());
+    });
+
+    it('SPEC-REQ-6: a non-owner active member gets 403 and nothing is stamped', async () => {
+      const member = await makeUser({ username: 'not-the-owner' });
+      await addToGroup(member, group, 'member');
+      currentActor = member.user_id;
+
+      await request(app).delete(`/api/groups/${group.id}`).expect(403);
+
+      expect(await Group.findByPk(group.id)).not.toBeNull();
+      expect(await Group.count({ paranoid: false, where: { id: group.id } })).toBe(1);
+      const rows = await UserGroup.findAll({ where: { group_id: group.id }, paranoid: false });
+      expect(rows.every((r) => r.deletedAt === null)).toBe(true);
+      expect(sendGroupOwnershipOffers).not.toHaveBeenCalled();
+    });
+
+    it('SPEC-REQ-6: a many-member group deletes in ONE call — no acknowledgement step, no member-count block', async () => {
+      for (let i = 0; i < 6; i += 1) {
+        const m = await makeUser({ username: `bulk-member-${i}` });
+        await addToGroup(m, group, 'member');
+      }
+
+      // No confirmation token, no typed name, no second request.
+      await request(app).delete(`/api/groups/${group.id}`).expect(200);
+      expect(await Group.findByPk(group.id)).toBeNull();
+    });
+
+    it('SPEC-REQ-8: the fanout is invoked once, excludes the deleting owner, and carries the minted nonce', async () => {
+      const memberA = await makeUser({ username: 'offer-a' });
+      const memberB = await makeUser({ username: 'offer-b' });
+      await addToGroup(memberA, group, 'member');
+      await addToGroup(memberB, group, 'admin');
+
+      await request(app).delete(`/api/groups/${group.id}`).expect(200);
+
+      // Asserted on the mock's ARGUMENTS, never on ordering relative to res.json —
+      // the dispatch is deliberately not awaited (AF-11), so an ordering assertion
+      // would pin the bug rather than the behavior.
+      expect(sendGroupOwnershipOffers).toHaveBeenCalledTimes(1);
+      const args = sendGroupOwnershipOffers.mock.calls[0][0];
+      expect(args.groupName).toBe('Soft Delete Test Group');
+      expect(args.recipients.map((r) => r.user_uuid).sort()).toEqual(
+        [memberA.id, memberB.id].sort()
+      );
+      expect(args.recipients.some((r) => r.user_uuid === owner.id)).toBe(false);
+      expect(args.recipients.every((r) => typeof r.user_id === 'string')).toBe(true);
+
+      const token = await SingleUseToken.findOne({
+        where: { group_id: group.id, purpose: 'group_restore' },
+      });
+      expect(args.restoreUrl.endsWith(`/restore/group/${token.nonce}`)).toBe(true);
+    });
+
+    it('AF-11 non-regression: the 200 does NOT wait on the fanout', async () => {
+      const member = await makeUser({ username: 'never-settles' });
+      await addToGroup(member, group, 'member');
+
+      // A promise that never settles. If a future edit re-adds an await, this
+      // request hangs and the test times out instead of passing.
+      sendGroupOwnershipOffers.mockReturnValue(new Promise(() => {}));
+
+      await request(app).delete(`/api/groups/${group.id}`).expect(200);
+      expect(sendGroupOwnershipOffers).toHaveBeenCalledTimes(1);
+    });
+
+    it('mints a group_restore token whose expiry strictly OUTLIVES purge_after by the margin', async () => {
+      await request(app).delete(`/api/groups/${group.id}`).expect(200);
+
+      const row = await Group.findByPk(group.id, { paranoid: false });
+      const token = await SingleUseToken.findOne({
+        where: { group_id: group.id, purpose: 'group_restore' },
+      });
+
+      expect(token.user_id).toBeNull();
+      expect(token.status).toBe('active');
+      // Strictly greater, by exactly the margin — so `purge_after` is provably the
+      // binding deadline and a late acceptance is refused as window_expired rather
+      // than as an invalid token.
+      expect(token.expires_at.getTime()).toBeGreaterThan(row.purge_after.getTime());
+      expect(token.expires_at.getTime() - row.purge_after.getTime()).toBe(TOKEN_EXPIRY_MARGIN_MS);
+
+      // There is an instant STRICTLY BETWEEN the two — the window in which the group
+      // deadline, not the token, is what refuses. (The behavioural half belongs to
+      // plan 07 Task 3, which owns the accept endpoint; wave 3 pins the relationship.)
+      const between = new Date(row.purge_after.getTime() + 1);
+      expect(between.getTime()).toBeGreaterThan(row.purge_after.getTime());
+      expect(between.getTime()).toBeLessThan(token.expires_at.getTime());
+    });
+
+    it('a repeat DELETE is refused 403 by the paranoid membership check and does not re-stamp', async () => {
+      await request(app).delete(`/api/groups/${group.id}`).expect(200);
+      const first = await Group.findByPk(group.id, { paranoid: false });
+
+      // 403, NOT 404: isOwner runs before Group.findByPk, and the owner's own
+      // UserGroup row is now stamped, so the authorization check fails first and
+      // findByPk is never reached (AF-15).
+      await request(app).delete(`/api/groups/${group.id}`).expect(403);
+
+      const after = await Group.findByPk(group.id, { paranoid: false });
+      expect(after.deletedAt.getTime()).toBe(first.deletedAt.getTime());
+      expect(after.purge_after.getTime()).toBe(first.purge_after.getTime());
+      expect(sendGroupOwnershipOffers).toHaveBeenCalledTimes(1);
+      expect(
+        await SingleUseToken.count({ where: { group_id: group.id, purpose: 'group_restore' } })
+      ).toBe(1);
+    });
+
+    // Poll for a handler transaction actually BLOCKING on our row lock. An
+    // observable database condition, not a sleep.
+    async function waitForLockWaiters(n, { timeoutMs = 10000 } = {}) {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        const [row] = await sequelize.query(
+          `SELECT count(*)::int AS n FROM pg_stat_activity
+             WHERE wait_event_type = 'Lock'
+               AND query ILIKE '%FOR UPDATE%'
+               AND pid <> pg_backend_pid()`,
+          { type: sequelize.QueryTypes.SELECT }
+        );
+        if (row && row.n >= n) return true;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      return false;
+    }
+
+    it('DETERMINISTIC RACE: two overlapping DELETEs produce one stamp, one token and one fanout; the loser gets 403', async () => {
+      const member = await makeUser({ username: 'race-member' });
+      await addToGroup(member, group, 'member');
+
+      // 1) Hold the same row lock both handlers take, from a test-owned txn. This is
+      //    what makes the race deterministic: BOTH requests are provably past their
+      //    isOwner gate (the group is still live, no membership is stamped) and
+      //    blocked inside their own transactions before either can commit.
+      const t0 = await sequelize.transaction();
+      await sequelize.query('SELECT id FROM "Groups" WHERE id = :id FOR UPDATE', {
+        replacements: { id: group.id },
+        type: sequelize.QueryTypes.SELECT,
+        transaction: t0,
+      });
+
+      let released = false;
+      let pendingA;
+      let pendingB;
+      try {
+        // .then() is REQUIRED — a supertest Test is lazy and does not dispatch until
+        // end()/then() is called.
+        pendingA = request(app).delete(`/api/groups/${group.id}`).then((r) => r, (e) => e);
+        pendingB = request(app).delete(`/api/groups/${group.id}`).then((r) => r, (e) => e);
+
+        expect(await waitForLockWaiters(2)).toBe(true);
+
+        await t0.commit();
+        released = true;
+      } finally {
+        // Never leave the lock held — it would hang the global truncateAll and red
+        // every later test in the file with a misleading hook timeout.
+        if (!released) await t0.rollback().catch(() => {});
+      }
+
+      const statuses = [(await pendingA).status, (await pendingB).status].sort();
+      expect(statuses).toEqual([200, 403]);
+
+      // Exactly one stamp, one token, one fanout. The loser threw the typed sentinel,
+      // rolled back, and dispatched nothing.
+      const rows = await Group.findAll({ where: { id: group.id }, paranoid: false });
+      expect(rows).toHaveLength(1);
+      expect(rows[0].deletedAt).toBeInstanceOf(Date);
+      expect(
+        await SingleUseToken.count({ where: { group_id: group.id, purpose: 'group_restore' } })
+      ).toBe(1);
+      expect(sendGroupOwnershipOffers).toHaveBeenCalledTimes(1);
+    });
+
+    // NOTE: the join-by-token race invariant ("no live UserGroup row on a stamped
+    // group") is deliberately NOT tested here. This handler's row lock does not close
+    // it — a soft delete leaves the Groups row in place, so a waiting join's FK check
+    // still succeeds. That invariant belongs to the join-by-token liveness gate and is
+    // pinned deterministically in tests/routes/groups.invite.test.js (plan 04 Task 4).
   });
 });

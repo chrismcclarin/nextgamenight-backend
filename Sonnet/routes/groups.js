@@ -12,9 +12,7 @@ const {
   EventBring,
   EventBallotOption,
   EventBallotVote,
-  GameReview,
   UserGame,
-  GroupInvite,
   PendingAuth0Deletion,
   sequelize,
 } = require('../models');
@@ -34,6 +32,8 @@ const {
   isActiveMember,
   stripMemberPII,
 } = require('../services/authorizationService');
+const { softDeleteGroup, GroupAlreadyDeletedError } = require('../services/groupRecoveryService');
+const { sendGroupOwnershipOffers } = require('../services/groupOwnershipOfferService');
 
 // Phase 71.1-02 (post-checkpoint scope expansion): when a user leaves a group
 // (voluntary self-leave OR admin/owner removal), cascade-delete their per-user
@@ -778,6 +778,12 @@ router.post('/join-by-token', async (req, res) => {
 });
 
 // Delete group - owner only (must come before /:group_id/users/:target_user_id)
+//
+// Phase 88.2 (SPEC-REQ-1 / SPEC-REQ-2): this DESTROYS NOTHING. It stamps the group,
+// its memberships and its events with one timestamp, writes a 30-day recovery
+// deadline onto the Groups row, mints a single-use restore token and emails every
+// remaining member an offer to take the group over. The purge sweep erases it only
+// after the deadline passes.
 router.delete('/:group_id', async (req, res) => {
   try {
     // Use verified user_id from token
@@ -785,65 +791,98 @@ router.delete('/:group_id', async (req, res) => {
     if (!userId) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
-    
+
     const { group_id } = req.params;
-    
-    // Check if user is owner
+
+    // DECISION Phase 88.2 AF-15: authorization-before-existence is RETAINED here,
+    // chosen OVER the existence-first order the deletion-impact endpoint below uses.
+    // The two handlers differ ON PURPOSE — that one must produce a SPEC-required 404
+    // for a soft-deleted group (AF-2), this one must not widen its disclosure.
+    //
+    // Consequence, and it is the intended one: isOwner resolves through
+    // getUserRoleInGroup, whose UserGroup.findOne is paranoid-filtered. After the
+    // first soft delete the owner's OWN membership row is stamped, so a SECOND
+    // DELETE fails right here and answers 403 — Group.findByPk is never reached and
+    // a 404 is unreachable on this route. Nothing is double-stamped, so no
+    // already-deleted branch is needed. Do NOT "fix" the asymmetry by adding a
+    // paranoid: false read or by reordering these two guards; SPEC-REQ-6 pins this
+    // route's authorization to the ownership check and nothing more.
+    //
+    // SPEC-REQ-6 also forbids adding a pre-flight refusal, a member-count block or a
+    // server-side name check here. Disclosure-not-refusal is an owner-approved
+    // accepted-forever decision recorded in 88.2-SPEC.md; a gate re-litigates it.
     const hasPermission = await isOwner(userId, group_id);
     if (!hasPermission) {
       return res.status(403).json({ error: 'Only the group owner can delete the group' });
     }
-    
+
     const group = await Group.findByPk(group_id);
     if (!group) {
       return res.status(404).json({ error: 'Group not found' });
     }
-    
-    // One transaction (87.5 review IN-03, owner-approved fix): these were six
-    // independent writes, so a mid-sequence failure left a half-deleted group
-    // (events gone, roster intact). Same delete order as before; mirrors the
-    // in-transaction replica in accountDeletionService Step 1.
-    // DECISION Phase 88.2 F-02: the three paranoid-model destroys below (Event,
-    // UserGroup, group) carry an explicit `force` flag, chosen OVER excluding these lines from the
-    // new CI grep gate by line number. A line-number exclusion is a blind spot with an
-    // expiry date nobody sets — plan 06 rewrites this block, after which such a filter
-    // would silently skip completely different code forever. Forcing costs nothing (a
-    // no-op pre-plan-01, identical after) and buys a GREEN gate in wave 1, the wave that
-    // changes 15 destroy sites and so most needs the gate proving the sweep was complete.
-    // SUPERSEDED BY PLAN 06 (wave 3), which replaces this whole transaction with the
-    // soft-delete path. This marker disappearing with it is the accepted end state, not
-    // a regression — do NOT re-add it in plan 06.
-    await sequelize.transaction(async (t) => {
-      // Delete all event participations for events in this group (not a paranoid model,
-      // so no `force` — D-01's paranoid set is exactly Group/UserGroup/Event)
-      const events = await Event.findAll({ where: { group_id }, transaction: t });
-      const eventIds = events.map(e => e.id);
-      if (eventIds.length > 0) {
-        await EventParticipation.destroy({ where: { event_id: { [Op.in]: eventIds } }, transaction: t });
+
+    // Capture the name BEFORE the group becomes unreadable — the email is built
+    // after the transaction has hidden the row.
+    const groupName = group.name;
+
+    // Resolve the acting user's Users.id UUID, the same resolution
+    // getUserRoleInGroup performs, so the deleting owner can be excluded from the
+    // roster (SPEC-REQ-8 requires 0 emails to them).
+    const actor = await User.findOne({ where: { user_id: userId } });
+
+    let purgeAfter;
+    let nonce;
+    let recipients;
+    try {
+      ({ purgeAfter, nonce, recipients } = await softDeleteGroup(group_id, {
+        excludeUserUuid: actor?.id,
+      }));
+    } catch (err) {
+      if (err instanceof GroupAlreadyDeletedError) {
+        // A concurrent DELETE won the row lock. Answer with the SAME 403 an ordinary
+        // repeat delete produces above, so the two paths are indistinguishable.
+        return res.status(403).json({ error: 'Only the group owner can delete the group' });
       }
+      throw err;
+    }
 
-      // Delete all events for this group (F-02: hard delete, see marker above)
-      await Event.destroy({ where: { group_id }, transaction: t, force: true });
+    // Plan 10 serves this path in the frontend repo. Same FRONTEND_URL fallback idiom
+    // as workers/promptWorker.js and services/promptInvitationService.js.
+    const restoreUrl = `${process.env.FRONTEND_URL || 'http://localhost:3000'}/restore/group/${nonce}`;
 
-      // Delete all game reviews for this group (not paranoid — no `force`)
-      await GameReview.destroy({ where: { group_id }, transaction: t });
+    // Respond FIRST. `message` is unchanged so no existing FE consumer breaks;
+    // recoverable_until is additive.
+    res.json({ message: 'Group deleted successfully', recoverable_until: purgeAfter });
 
-      // Delete all pending invites for this group. This EXPLICIT delete inside the
-      // transaction is correct independent of any cascade disposition — it does not
-      // depend on the database's FK configuration matching what a model file or a
-      // migration implies. The live, environment-labelled disposition of every FK
-      // referencing `Groups` is recorded in `88.2-CASCADE-AUDIT.md`. Skipping this
-      // risks orphaning rows carrying invitee email PII. (Not paranoid — no `force`.)
-      await GroupInvite.destroy({ where: { group_id }, transaction: t });
-
-      // Delete all user-group associations (F-02: hard delete, see marker above)
-      await UserGroup.destroy({ where: { group_id }, transaction: t, force: true });
-
-      // Finally, delete the group (F-02: hard delete, see marker above)
-      await group.destroy({ transaction: t, force: true });
-    });
-    
-    res.json({ message: 'Group deleted successfully' });
+    // DECISION Phase 88.2 AF-11: the fanout is FIRE-AND-FORGET, chosen OVER awaiting
+    // it. Precedent copied verbatim in form from routes/availabilityPrompt.js, which
+    // says in its own comment "Don't await — fanout can take seconds for large
+    // groups; the client already has its 201."
+    //
+    // Why awaiting is wrong here specifically: the dispatch loop is strictly serial
+    // (one Resend round-trip per member), so an awaited dispatch makes DELETE latency
+    // O(members) x RTT. The FE call traverses the Vercel BFF proxy, which sets no
+    // maxDuration and therefore runs at the default serverless cap. On a ~20-member
+    // group the request exceeds it, GroupSettings' handleDeleteGroup takes its catch
+    // and toasts "Failed to delete group", and the owner is left staring at the modal
+    // AFTER the delete has committed and every member has already been emailed. Their
+    // retry then hits the repeat-DELETE 403 above. None of it surfaces in CI, where
+    // the dispatcher is mocked and returns instantly.
+    //
+    // D-03 forbids inventing a queue for this, so fire-and-forget is the correct match
+    // to the existing pattern. Re-adding await for "reliability" trades a delivery
+    // guarantee the dispatcher cannot make anyway for a delete flow that fails
+    // visibly after committing.
+    //
+    // The outer try/catch covers a SYNCHRONOUS throw from the call itself, which the
+    // trailing .catch cannot — and it must not reach the handler's own catch, which
+    // would try to send a second response.
+    try {
+      sendGroupOwnershipOffers({ groupName, purgeAfter, restoreUrl, recipients })
+        .catch((err) => console.error('[DELETE /groups] ownership-offer fanout error (non-fatal):', err.message));
+    } catch (err) {
+      console.error('[DELETE /groups] ownership-offer dispatch error (non-fatal):', err.message);
+    }
   } catch (error) {
     console.error('Error deleting group:', error);
     res.status(500).json({ error: error.message });
