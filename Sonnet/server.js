@@ -208,6 +208,7 @@ app.use((req, res, next) => {
     '/api/feedback', // Feedback is public (or optional auth)
     '/health', // Health check is public
     '/api/groups/invite-preview', // QR code group invite preview (public)
+    '/api/groups/restore-preview', // Phase 88.2 D-02: emailed group-restore preview (public)
     '/api/events/invite-preview', // QR code game invite preview (public)
   ];
   
@@ -293,6 +294,13 @@ const PUBLIC_EXACT = [
   { method: 'GET', re: /^\/groups\/invite-preview(\/|$)/ },
   { method: 'GET', re: /^\/events\/invite-preview(\/|$)/ },
   { method: 'GET', re: /^\/invites\/info(\/|$)/ },
+  // Phase 88.2 (D-02): the emailed group-restore PREVIEW is public — the 32-byte
+  // nonce is the only credential and the body is a group name plus a date. Its
+  // authenticated POST sibling (the acceptance action that actually grants ownership)
+  // is deliberately NOT here and must stay behind this gate: the token identifies the
+  // group, the SESSION identifies the person entitled to claim it. This file is
+  // grep-asserted to name that route ZERO times, so do not spell it out here.
+  { method: 'GET', re: /^\/groups\/restore-preview(\/|$)/ },
 ];
 
 // Wholly-public prefixes (router self-authenticates via magic token, is an
