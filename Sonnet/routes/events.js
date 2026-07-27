@@ -322,9 +322,25 @@ router.get('/user/:user_id', requireParamMatchesToken('user_id'), async (req, re
       where: { [Op.or]: orClauses },
       include: [
         { model: Game, attributes: ['id', 'name', 'image_url', 'theme'] },
+        // DECISION Phase 88.2 D-01: marking this Group include required (INNER JOIN)
+        // was chosen OVER relying on the paranoid root `Event` filter alone. This
+        // marker covers all five Group includes in this file (this site plus the
+        // group-events list, the single-event read, the invite preview and the
+        // token lookup).
+        // The leak IS already closed transitively — a group delete stamps its Events
+        // in the same transaction, so they never reach this join. But that is a
+        // CONDITIONAL guarantee: one unstamped event, or an event created against an
+        // already-hidden group, resurfaces a ghost card carrying `Group: null`
+        // (Sequelize emits the paranoid clause in the JOIN's ON clause, which does
+        // NOT drop the parent row). An INNER JOIN makes it unconditional, and it is
+        // lossless because models/Event.js declares `group_id: { allowNull: false }`
+        // — no legitimate event has a null group.
+        // This is defence in depth OVER an existing correct mechanism, not a
+        // replacement for it. Removing the flag re-arms the ghost-card path.
         {
           model: Group,
-          attributes: ['id', 'name', 'profile_picture_url', 'background_color', 'background_image_url']
+          attributes: ['id', 'name', 'profile_picture_url', 'background_color', 'background_image_url'],
+          required: true
         },
         // PR-C (87.3-09 Task 2b): Winner include sub-free — id/username only.
         { model: User, as: 'Winner', attributes: ['id', 'username'] },
@@ -374,9 +390,11 @@ router.get('/group/:group_id', async (req, res) => {
       where: { group_id: req.params.group_id },
       include: [
         { model: Game, attributes: ['name', 'image_url', 'theme'] },
+        // Phase 88.2 D-01 — see the marker on the GET /user/:user_id include above.
         {
           model: Group,
-          attributes: ['id', 'name', 'profile_picture_url', 'background_color', 'background_image_url']
+          attributes: ['id', 'name', 'profile_picture_url', 'background_color', 'background_image_url'],
+          required: true
         },
         // PR-C (87.3-09 Task 2b): Winner include sub-free — id/username only.
         { model: User, as: 'Winner', attributes: ['id', 'username'] },
@@ -440,7 +458,7 @@ router.get('/:event_id', async (req, res) => {
     const event = await Event.findByPk(req.params.event_id, {
       include: [
         { model: Game, attributes: ['name', 'image_url', 'theme'] },
-        { model: Group, attributes: ['id', 'name'] },
+        { model: Group, attributes: ['id', 'name'], required: true }, // Phase 88.2 D-01 (see GET /user/:user_id)
         // PR-C (87.3-09 Task 2b): Winner include sub-free — id/username only.
         { model: User, as: 'Winner', attributes: ['id', 'username'] },
         { model: User, as: 'PickedBy', attributes: ['id', 'username'] },
@@ -1214,7 +1232,7 @@ router.get('/invite-preview/:token', async (req, res) => {
     const event = await Event.findOne({
       where: { invite_token: req.params.token },
       include: [
-        { model: Group, attributes: ['id', 'name'] },
+        { model: Group, attributes: ['id', 'name'], required: true }, // Phase 88.2 D-01 (see GET /user/:user_id)
         { model: Game, attributes: ['id', 'name'] },
       ],
     });
@@ -1263,7 +1281,7 @@ router.post('/join-game-by-token', async (req, res) => {
 
     const event = await Event.findOne({
       where: { invite_token: token },
-      include: [{ model: Group, attributes: ['id', 'name'] }],
+      include: [{ model: Group, attributes: ['id', 'name'], required: true }], // Phase 88.2 D-01 (see GET /user/:user_id)
     });
 
     if (!event) {
