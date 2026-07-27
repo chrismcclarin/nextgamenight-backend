@@ -2,7 +2,7 @@
 const request = require('supertest');
 const express = require('express');
 const gameRoutes = require('../../routes/games');
-const { Game, Event, GameReview, sequelize } = require('../../models');
+const { Game, Event, GameReview, Group, User, UserGroup, sequelize } = require('../../models');
 
 // Create test app
 const app = express();
@@ -13,7 +13,12 @@ describe('Game Routes', () => {
   // Clean up database before each test
   beforeEach(async () => {
     await GameReview.destroy({ where: {} });
-    await Event.destroy({ where: {} });
+    // Phase 88.2: Event is paranoid (plan 01), so a plain destroy here STAMPS
+    // rows and leaves them physically in place — a leftover soft-deleted row is
+    // indistinguishable from the regression the 88.2 tests below exist to catch.
+    // tests/ is deliberately outside the F-02 CI gate (fixtures legitimately
+    // clean up), so nothing else would have flagged this.
+    await Event.destroy({ where: {}, force: true });
     await Game.destroy({ where: {} });
   });
 
@@ -120,3 +125,100 @@ describe('Game Routes', () => {
   });
 });
 
+
+// ============================================================================
+// Phase 88.2 plan 04 Task 5 (AF-10 / AF-12): GET /api/games/:id must not return
+// a soft-deleted group's GameReview rows.
+//
+// This route is authenticated but GROUP-AGNOSTIC — it never passes through the
+// isActiveMember choke point the rest of the phase relies on — and GameReview is
+// deliberately NON-paranoid (D-01), so it has no self-defence. The nested
+// { model: Group, attributes: [], required: true } INNER JOIN is what drops the
+// hidden group's reviews.
+// ============================================================================
+describe('88.2 AF-10 — GET /api/games/:id hides a soft-deleted group\'s reviews', () => {
+  let game;
+  let liveGroup;
+  let deadGroup;
+  let reviewer;
+
+  beforeEach(async () => {
+    // Note: this harness injects no req.user at all, which is a STRICTER caller
+    // than the plan's "member of neither group" — nothing here can be mistaken for
+    // an implicit membership grant.
+    reviewer = await User.create({
+      user_id: 'auth0|af10-reviewer', username: 'af10-reviewer', email: 'af10-reviewer@example.com',
+    });
+    liveGroup = await Group.create({ group_id: 'af10-live', name: 'AF10 Live Group' });
+    deadGroup = await Group.create({ group_id: 'af10-dead', name: 'AF10 Doomed Group' });
+
+    // ONE shared game so the join is exercised with a live AND a hidden review
+    // on the same parent row.
+    game = await Game.create({ name: 'AF10 Shared Game', is_custom: true });
+
+    await GameReview.create({
+      game_id: game.id, group_id: liveGroup.id, user_id: reviewer.id,
+      rating: 5, review_text: 'LIVE-GROUP-REVIEW-TEXT',
+    });
+    await GameReview.create({
+      game_id: game.id, group_id: deadGroup.id, user_id: reviewer.id,
+      rating: 1, review_text: 'HIDDEN-GROUP-REVIEW-TEXT',
+    });
+  });
+
+  const softDelete = async (group) => {
+    const deletedAt = new Date();
+    await Group.update({ deletedAt }, { where: { id: group.id }, silent: true });
+    await UserGroup.update({ deletedAt }, { where: { group_id: group.id }, silent: true });
+    await Event.update({ deletedAt }, { where: { group_id: group.id }, silent: true });
+  };
+
+  // Recursive scan — the hidden group's id must not appear at ANY nesting depth.
+  const containsValue = (node, needle) => {
+    if (node === null || node === undefined) return false;
+    if (typeof node === 'string') return node === needle;
+    if (Array.isArray(node)) return node.some((v) => containsValue(v, needle));
+    if (typeof node === 'object') return Object.values(node).some((v) => containsValue(v, needle));
+    return false;
+  };
+
+  it('returns the LIVE group\'s review and ZERO rows from the soft-deleted group, for a caller who is a member of neither', async () => {
+    await softDelete(deadGroup);
+
+    const res = await request(app).get(`/api/games/${game.id}`).expect(200);
+
+    const reviews = res.body.GameReviews || [];
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0].group_id).toBe(liveGroup.id);
+    expect(reviews.filter((r) => r.group_id === deadGroup.id)).toHaveLength(0);
+
+    // Neither the id at any depth nor the review text itself.
+    expect(containsValue(res.body, deadGroup.id)).toBe(false);
+    expect(JSON.stringify(res.body)).not.toContain('HIDDEN-GROUP-REVIEW-TEXT');
+    expect(JSON.stringify(res.body)).toContain('LIVE-GROUP-REVIEW-TEXT');
+  });
+
+  it('(non-regression) returns BOTH reviews while both groups are live — the INNER JOIN drops nothing legitimate', async () => {
+    const res = await request(app).get(`/api/games/${game.id}`).expect(200);
+
+    const reviews = res.body.GameReviews || [];
+    expect(reviews).toHaveLength(2);
+    expect(reviews.map((r) => r.group_id).sort()).toEqual([liveGroup.id, deadGroup.id].sort());
+  });
+
+  it('(shape unchanged) reviews still carry User.username, and no Group object is added to the payload', async () => {
+    await softDelete(deadGroup);
+
+    const res = await request(app).get(`/api/games/${game.id}`).expect(200);
+    const reviews = res.body.GameReviews || [];
+    expect(reviews).toHaveLength(1);
+
+    // The User include must be undisturbed by the sibling filter join.
+    expect(reviews[0].User).toBeTruthy();
+    expect(reviews[0].User.username).toBe(reviewer.username);
+
+    // attributes: [] means the join is purely a filter — no group data enters the
+    // response, so the gameDetail consumer's payload shape is unchanged.
+    expect(reviews[0].Group).toBeUndefined();
+  });
+});
