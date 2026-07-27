@@ -118,6 +118,111 @@ describe('BSEC-04 content escaping', () => {
       // Subject is a plain-text header; CRLF must never survive there.
       expect(subject).not.toMatch(/[\r\n]/);
     });
+
+    // Phase 88.2 / T-88.2-19 + T-88.2-20 (SPEC-REQ-8 ownership offer).
+    it('generateGroupOwnershipOfferEmailTemplate escapes groupName and recipientName', () => {
+      const { html } = emailService.generateGroupOwnershipOfferEmailTemplate({
+        recipientName: XSS,
+        groupName: `${XSS} "quoted"`,
+        deadlineDate: 'Aug 24, 2026',
+        restoreUrl: 'https://app.test/groups/restore/abc123',
+      });
+      expect(html).toContain(ESCAPED_XSS);
+      expect(html).not.toContain('<script>alert(1)</script>');
+      // The raw double quote must not survive into the body either — it is the
+      // attribute-breakout character.
+      expect(html).toContain('&quot;quoted&quot;');
+      expect(html).not.toContain('"quoted"');
+    });
+
+    it('generateGroupOwnershipOfferEmailTemplate returns a CRLF-free subject', () => {
+      const { subject } = emailService.generateGroupOwnershipOfferEmailTemplate({
+        recipientName: 'Member',
+        groupName: 'Tuesday Knights\r\nBcc: attacker@example.com',
+        deadlineDate: 'Aug 24, 2026',
+        restoreUrl: 'https://app.test/groups/restore/abc123',
+      });
+      // The security property: no CR/LF survives, so no second mail header can
+      // be forged from a group name.
+      expect(subject).not.toMatch(/[\r\n]/);
+      expect(subject).toContain('Bcc: attacker@example.com'); // collapsed inline, harmless
+    });
+
+    it('generateGroupOwnershipOfferEmailTemplate never claims the delete is permanent (SPEC-REQ-7)', () => {
+      const { html, text, subject } = emailService.generateGroupOwnershipOfferEmailTemplate({
+        recipientName: 'Member',
+        groupName: 'Tuesday Knights',
+        deadlineDate: 'Aug 24, 2026',
+        restoreUrl: 'https://app.test/groups/restore/abc123',
+        memberCount: 4,
+        eventCount: 12,
+      });
+      const forbidden = /cannot be undone|permanently remove|permanently delete/i;
+      expect(html).not.toMatch(forbidden);
+      expect(text).not.toMatch(forbidden);
+      expect(subject).not.toMatch(forbidden);
+      // The load-bearing facts SPEC-REQ-8 requires in every offer email.
+      expect(html).toContain('Tuesday Knights');
+      expect(html).toContain('Aug 24, 2026');
+      expect(html).toContain('https://app.test/groups/restore/abc123');
+      expect(text).toContain('https://app.test/groups/restore/abc123');
+      expect(html).toContain('4 members and 12 events');
+    });
+
+    it('generateGroupOwnershipOfferEmailTemplate omits the count sentence when counts are absent', () => {
+      const { html, text } = emailService.generateGroupOwnershipOfferEmailTemplate({
+        recipientName: 'Member',
+        groupName: 'Tuesday Knights',
+        deadlineDate: 'Aug 24, 2026',
+        restoreUrl: 'https://app.test/groups/restore/abc123',
+      });
+      expect(html).not.toContain('undefined');
+      expect(text).not.toContain('undefined');
+      expect(html).not.toContain('It has');
+    });
+  });
+
+  // Phase 88.2 / MED #24: the From display name is built from the raw groupName
+  // in emailService.send (`fromName`). A CR/LF-bearing group name there forges a
+  // header for EVERY transactional email, not just the ownership offer, so the
+  // strip is applied at that shared site rather than in one caller.
+  describe('emailService.send strips CRLF from the From display name', () => {
+    let savedApiKey;
+    let savedResend;
+    let captured;
+
+    beforeEach(() => {
+      savedApiKey = emailService.apiKey;
+      savedResend = emailService.resend;
+      captured = null;
+      emailService.apiKey = 'test-key';
+      emailService.resend = {
+        emails: {
+          send: jest.fn(async (msg) => {
+            captured = msg;
+            return { data: { id: 'test-id' }, error: null };
+          }),
+        },
+      };
+    });
+
+    afterEach(() => {
+      emailService.apiKey = savedApiKey;
+      emailService.resend = savedResend;
+    });
+
+    it('produces a single-line from value for a CR/LF-bearing group name', async () => {
+      const result = await emailService.send({
+        to: 'member@example.com',
+        subject: 'Subject',
+        html: '<p>Body</p>',
+        groupName: 'Tuesday Knights\r\nBcc: attacker@example.com',
+      });
+      expect(result.success).toBe(true);
+      expect(captured).not.toBeNull();
+      expect(captured.from).not.toMatch(/[\r\n]/);
+      expect(captured.from).toContain('Tuesday Knights');
+    });
   });
 
   describe('feedback route renders escaped content (template-level)', () => {

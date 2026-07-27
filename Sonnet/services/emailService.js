@@ -48,8 +48,14 @@ class EmailService {
     }
 
     try {
+      // DECISION Phase 88.2 MED-24: stripCrlf is applied HERE, at the shared
+      // From-header construction, over doing it in the new ownership-offer
+      // dispatcher only. `groupName` is fully user-controlled and every
+      // transactional email routes it into this display name, so fixing the one
+      // new caller would have left the same header surface open for all the
+      // pre-existing ones. Removing this strip is a decision, not a cleanup.
       const fromName = groupName
-        ? `${groupName} via NextGameNight`
+        ? `${this.stripCrlf(groupName)} via NextGameNight`
         : 'NextGameNight';
 
       // Multipart (text + html) emails score better with spam filters
@@ -625,6 +631,137 @@ This is an automated notification from Next Game Night.
     `.trim();
 
     return { html, text };
+  }
+
+  // ============================================
+  // Group Ownership Offer Email Template (Phase 88.2 / SPEC-REQ-8, D-03)
+  // ============================================
+
+  /**
+   * Generate the ownership-offer email sent to every remaining active member
+   * when a group owner soft-deletes their group (Phase 88.2 / SPEC-REQ-8).
+   *
+   * Copy contract (SPEC-REQ-7 / SPEC-REQ-8): the message states the group name,
+   * that it was deleted, that the recipient can take it over, and the exact
+   * calendar date carried by the group's `purge_after` stamp. SPEC-REQ-7
+   * forbids any user-facing string in the group-delete flow from claiming the
+   * delete is permanent, and that applies to this new copy as much as to the
+   * Danger Zone. The three prohibited phrases are enumerated in the regex in
+   * tests/services/emailService.escape.test.js — deliberately NOT repeated here,
+   * because the acceptance grep for them scans this file and comment prose would
+   * inflate it (the trap plan 88.2-04 hit twice).
+   *
+   * All user-controlled strings (groupName, recipientName) are HTML-escaped
+   * per BSEC-04 / T-88.2-19.
+   *
+   * DECISION Phase 88.2 T-88.2-20: the SUBJECT is produced HERE and returned as
+   * a third key, already stripCrlf'd, rather than left to the caller like
+   * `generateGroupInviteEmailTemplate` does (`:645`). Keeping the header strip
+   * adjacent to the interpolation means a new caller cannot forget it. Moving
+   * subject construction back out to the dispatcher is a decision, not a tidy-up.
+   *
+   * `deadlineDate` arrives PRE-FORMATTED as a display string. This method does
+   * no date math and no timezone resolution — the dispatcher formats per
+   * recipient timezone (see services/groupOwnershipOfferService.js).
+   *
+   * `restoreUrl` is server-generated (a crypto nonce appended to FRONTEND_URL),
+   * not user input, so it is placed raw in the href and as a bare URL in the
+   * plaintext part.
+   *
+   * @param {Object} params
+   * @param {string} params.recipientName - Display name of the member being offered ownership
+   * @param {string} params.groupName - Name of the deleted group (user-controlled)
+   * @param {string} params.deadlineDate - Pre-formatted purge_after display date
+   * @param {string} params.restoreUrl - Fully-formed acceptance link
+   * @param {number} [params.memberCount] - Optional blast-radius detail; sentence omitted when absent
+   * @param {number} [params.eventCount] - Optional blast-radius detail; sentence omitted when absent
+   * @returns {{html: string, text: string, subject: string}} Email content
+   */
+  generateGroupOwnershipOfferEmailTemplate({ recipientName, groupName, deadlineDate, restoreUrl, memberCount, eventCount }) {
+    const safeRecipientName = this.escapeHtml(recipientName || 'there');
+    const safeGroupName = this.escapeHtml(groupName);
+    const safeDeadline = this.escapeHtml(deadlineDate);
+
+    // memberCount / eventCount are optional. Omit the whole sentence when
+    // neither is supplied rather than rendering "undefined members".
+    const scopeParts = [];
+    if (Number.isFinite(memberCount)) {
+      scopeParts.push(`${memberCount} member${memberCount === 1 ? '' : 's'}`);
+    }
+    if (Number.isFinite(eventCount)) {
+      scopeParts.push(`${eventCount} event${eventCount === 1 ? '' : 's'}`);
+    }
+    const scopeSentence = scopeParts.length > 0
+      ? `It has ${scopeParts.join(' and ')}.`
+      : '';
+    const safeScopeSentence = this.escapeHtml(scopeSentence);
+
+    const html = `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+    .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+    .header { background-color: #2563EB; color: white; padding: 20px; text-align: center; border-radius: 5px 5px 0 0; }
+    .content { background-color: #f9fafb; padding: 30px; border-radius: 0 0 5px 5px; }
+    .button { display: inline-block; padding: 12px 24px; background-color: #2563EB; color: white; text-decoration: none; border-radius: 5px; font-weight: bold; }
+    .deadline { font-weight: bold; }
+    .footer { text-align: center; color: #6B7280; font-size: 12px; margin-top: 30px; padding-top: 20px; border-top: 1px solid #E5E7EB; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>Your group was deleted</h1>
+    </div>
+    <div class="content">
+      <p>Hi ${safeRecipientName},</p>
+
+      <p><strong>${safeGroupName}</strong> was deleted by its owner.</p>
+
+      <p>Nothing is gone yet. The group and all of its events, members and reviews are being held until <span class="deadline">${safeDeadline}</span>.${safeScopeSentence ? ` ${safeScopeSentence}` : ''}</p>
+
+      <p>If you want to keep it, you can take it over. Follow the link below and you become the group's owner, and everything comes back exactly as it was.</p>
+
+      <div style="text-align: center; margin: 30px 0;">
+        <a href="${restoreUrl}" class="button">Take over this group</a>
+      </div>
+
+      <p>If nobody takes it over by <span class="deadline">${safeDeadline}</span>, the group and everything in it is erased.</p>
+
+      <div class="footer">
+        <p>This is an automated notification from Next Game Night.</p>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
+    `.trim();
+
+    const text = `
+Your group was deleted
+
+Hi ${recipientName || 'there'},
+
+${groupName} was deleted by its owner.
+
+Nothing is gone yet. The group and all of its events, members and reviews are being held until ${deadlineDate}.${scopeSentence ? ` ${scopeSentence}` : ''}
+
+If you want to keep it, you can take it over. Follow the link below and you become the group's owner, and everything comes back exactly as it was.
+
+Take over this group: ${restoreUrl}
+
+If nobody takes it over by ${deadlineDate}, the group and everything in it is erased.
+
+---
+This is an automated notification from Next Game Night.
+    `.trim();
+
+    const subject = this.stripCrlf(`${groupName} was deleted - take it over by ${deadlineDate}`);
+
+    return { html, text, subject };
   }
 
   /**
