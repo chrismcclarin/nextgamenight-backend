@@ -41,12 +41,33 @@ const sequelize = require('../config/database');
 // the user_uuid FK column. The join now uses the DEFAULT source/target key (Users.id),
 // so no sourceKey/targetKey override is needed. ON DELETE CASCADE removes a deleted
 // user's group memberships.
+//
+// DECISION Phase 88.2 D-01: `through: { model: UserGroup, unique: false }` OVER the
+// bare `through: UserGroup` this used to be. Sequelize's belongsToMany defaults
+// `through.unique` to TRUE, which makes sync() emit a table-level composite UNIQUE
+// CONSTRAINT — `UserGroups_user_uuid_group_id_key` — on top of whatever the model's
+// own `indexes` array declares. That FULL constraint silently defeats the PARTIAL
+// unique index (`WHERE "deletedAt" IS NULL`) that models/UserGroup.js and migration
+// 20260725000001 both declare, so a soft-deleted membership would still occupy the
+// unique slot and POST /groups/join-by-token would 500 on re-join.
+//
+// This is a pure CI/prod drift: no migration has ever created that constraint, so
+// prod does not have it (prod's only composite uniqueness is
+// `usergroups_user_uuid_group_id_uq`, which 20260725000001 rebuilds as partial; the
+// legacy `UserGroups_user_id_group_id_key` went away with the column in
+// 20260720000004). It existed ONLY in the sync()-built test/CI database — which is
+// why the re-join regression test in tests/routes/groups.invite.test.js caught it
+// and nothing else would have.
+//
+// Uniqueness is NOT lost: the model's explicit partial unique index is the single
+// declared source, matching the migration byte-for-byte. Turning this back on would
+// re-break re-join in CI only. Changing it is a decision, not a cleanup.
 User.belongsToMany(Group, {
-  through: UserGroup,
+  through: { model: UserGroup, unique: false },
   foreignKey: 'user_uuid' // UUID FK column in UserGroup that references Users.id
 });
 Group.belongsToMany(User, {
-  through: UserGroup,
+  through: { model: UserGroup, unique: false },
   foreignKey: 'group_id', // Column in UserGroup that references Group
   otherKey: 'user_uuid' // UUID FK column in UserGroup that references Users.id
 });
