@@ -11,7 +11,6 @@
 // roster BEFORE the delete transaction and hands it in.
 
 const emailService = require('./emailService');
-const auth0Service = require('./auth0Service');
 
 // Matches the precedent's fallback when a member has no profile timezone
 // (services/promptInvitationService.js formatDeadlineForUser).
@@ -96,53 +95,23 @@ async function sendGroupOwnershipOffers({ groupName, purgeAfter, restoreUrl, rec
       let targetEmail = recipient.email;
 
       if (targetEmail.includes('@auth0')) {
-        // DECISION Phase 88.2 MED-AUTH0: an Auth0 Management API backfill is
-        // attempted here, over the blanket skip that every sibling dispatcher
-        // performs (services/promptInvitationService.js:143 skips any address
-        // containing '@auth0' outright). A synthetic '@auth0.local' placeholder
-        // (provisioned at routes/groups.js:644) does NOT mean the person has no
-        // real email — it means the UNVERIFIED copy in their token was not safe
-        // to persist. Treating it as proof of unreachability silently drops a
-        // member from the one notice this phase exists to deliver.
-        //
-        // The recovered address is used ONLY when Auth0 reports emailVerified
-        // === true. Emailing an address Auth0 itself has not verified would risk
-        // disclosing the group's name to a mailbox that may not belong to that
-        // person (T-88.2-25). The gate is for DISCLOSURE, not link security: the
-        // restore link is worthless to a non-member either way, since acceptance
-        // requires an authenticated session holding a membership row stamped by
-        // this deletion.
-        //
-        // The same blanket-skip blind spot still exists at
-        // services/promptInvitationService.js:143 for availability prompts.
-        // Deliberately OUT OF SCOPE for this phase — a recurring nudge has a very
-        // different cost/benefit from a one-time irreversible-consequence notice.
-        let recoveredEmail = null;
-        try {
-          const auth0User = await auth0Service.getUserById(recipient.user_id);
-          // getUserById RESOLVES null on a 404 rather than rejecting, so a
-          // try/catch alone does not cover this path — and extractUserDetails(null)
-          // would throw a TypeError inside the loop instead of degrading. Check
-          // the return value explicitly before dereferencing it.
-          if (auth0User) {
-            const details = auth0Service.extractUserDetails(auth0User);
-            if (details && details.emailVerified === true && details.email && !details.email.includes('@auth0')) {
-              recoveredEmail = details.email;
-            }
-          }
-        } catch (err) {
-          // Isolated from the send try/catch below on purpose: a Management API
-          // outage degrades this one recipient to "unreachable" and can never
-          // throw into, or abort, the rest of the fanout (T-88.2-26).
-          console.warn(`[groupOwnershipOffer] Auth0 backfill lookup failed for a member; treating as unreachable: ${err.message}`);
-          recoveredEmail = null;
-        }
-
-        if (!recoveredEmail) {
-          unreachable++;
-          continue;
-        }
-        targetEmail = recoveredEmail;
+        // DECISION Phase 88.2 NIX-AUTH0 (owner, 2026-07-27, REVERSING MED-AUTH0):
+        // synthetic '@auth0' placeholder addresses are BLANKET-SKIPPED — counted
+        // `unreachable`, no Auth0 Management API backfill — matching every sibling
+        // dispatcher (services/promptInvitationService.js:143). MED-AUTH0 (2026-07-26)
+        // originally mandated a send-time backfill here; the adversarial code review
+        // then found that backfill was dead code (gate read `emailVerified`, the real
+        // key is `email_verified` — 88.2-CODE-REVIEW.md H-1), and the owner chose
+        // REMOVAL over repair with better information than MED-AUTH0 had:
+        // routes/users.js's self-heal repairs a synthetic email on ANY profile load
+        // (no verified-flag requirement), so a row that is STILL synthetic belongs to
+        // a member who never opened the app again — and restore needs only ONE active
+        // member to act on their link. Do not re-add a backfill here as a "fix";
+        // that is a decision, not a cleanup. The broad '@auth0' substring (vs
+        // '@auth0.local') is likewise deliberate — it matches the sibling skips and
+        // legacy placeholder shapes (88.2-CODE-REVIEW.md L-2, accepted).
+        unreachable++;
+        continue;
       }
 
       // DECISION Phase 88.2 D-03: the sibling dispatchers skip any member whose

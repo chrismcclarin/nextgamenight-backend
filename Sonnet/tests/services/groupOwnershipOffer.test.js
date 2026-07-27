@@ -141,62 +141,27 @@ describe('sendGroupOwnershipOffers (Phase 88.2, SPEC-REQ-8 / D-03)', () => {
     });
   });
 
-  describe('MED-AUTH0: synthetic @auth0.local addresses get a Management API backfill', () => {
+  describe('NIX-AUTH0: synthetic @auth0 addresses are blanket-skipped (owner 2026-07-27, reversing MED-AUTH0)', () => {
+    // MED-AUTH0's send-time Management API backfill was REMOVED, not fixed, after
+    // the adversarial review found it dead (88.2-CODE-REVIEW.md H-1): the
+    // routes/users.js self-heal repairs a synthetic email on any profile load, so a
+    // still-synthetic row belongs to a member who never returned — and restore
+    // needs only one active member. This suite pins the removal: re-adding a
+    // lookup here is a DECISION (see the NIX-AUTH0 marker in the service), and it
+    // reds the not-called assertions below.
     const synthetic = () => member({
       email: 'auth0-abc123@auth0.local',
       user_id: 'auth0|abc123',
       username: 'Placeholder Person',
     });
 
-    it('sends to the recovered address when Auth0 reports it VERIFIED', async () => {
-      auth0Service.getUserById.mockResolvedValue({ email: 'real@example.com', email_verified: true });
-      auth0Service.extractUserDetails.mockReturnValue({ email: 'real@example.com', emailVerified: true });
-
+    it('skips a synthetic address, counts it unreachable, and NEVER consults the Management API', async () => {
       const result = await offer([synthetic()]);
 
-      expect(auth0Service.getUserById).toHaveBeenCalledWith('auth0|abc123');
-      expect(emailService.send).toHaveBeenCalledTimes(1);
-      // The recovered address, NOT the synthetic placeholder.
-      expect(emailService.send.mock.calls[0][0].to).toBe('real@example.com');
-      expect(result).toEqual({ sent: 1, failed: 0, unreachable: 0 });
-    });
-
-    it('skips and counts unreachable when Auth0 reports the address UNVERIFIED', async () => {
-      auth0Service.getUserById.mockResolvedValue({ email: 'maybe@example.com', email_verified: false });
-      auth0Service.extractUserDetails.mockReturnValue({ email: 'maybe@example.com', emailVerified: false });
-
-      const result = await offer([synthetic()]);
-
-      expect(emailService.send).not.toHaveBeenCalled();
-      expect(result).toEqual({ sent: 0, failed: 0, unreachable: 1 });
-    });
-
-    it('skips and counts unreachable when the Management API lookup REJECTS', async () => {
-      auth0Service.getUserById.mockRejectedValue(new Error('Failed to fetch Auth0 user: 429'));
-
-      await expect(offer([synthetic()])).resolves.toEqual({ sent: 0, failed: 0, unreachable: 1 });
-      expect(emailService.send).not.toHaveBeenCalled();
-    });
-
-    it('skips and counts unreachable when the Management API RESOLVES null (its real 404 behavior)', async () => {
-      // getUserById returns null on 404 rather than rejecting. A try/catch-only
-      // implementation sails past this and then throws a TypeError inside
-      // extractUserDetails(null) — this case is what makes the explicit null
-      // check load-bearing.
-      auth0Service.getUserById.mockResolvedValue(null);
-      // Reproduce the REAL extractUserDetails, which dereferences its argument
-      // unguarded (auth0Service.js:157) and therefore throws a TypeError on null.
-      // A bare jest.fn() would silently return undefined and hide the defect.
-      auth0Service.extractUserDetails.mockImplementation((u) => ({
-        email: u.email,
-        emailVerified: u.email_verified || false,
-      }));
-
-      await expect(offer([synthetic()])).resolves.toEqual({ sent: 0, failed: 0, unreachable: 1 });
-      // The load-bearing assertion: the explicit null check must short-circuit
-      // BEFORE the dereference. Removing it reds this line.
+      expect(auth0Service.getUserById).not.toHaveBeenCalled();
       expect(auth0Service.extractUserDetails).not.toHaveBeenCalled();
       expect(emailService.send).not.toHaveBeenCalled();
+      expect(result).toEqual({ sent: 0, failed: 0, unreachable: 1 });
     });
 
     it('counts a member with no stored address at all as unreachable', async () => {
@@ -206,7 +171,6 @@ describe('sendGroupOwnershipOffers (Phase 88.2, SPEC-REQ-8 / D-03)', () => {
     });
 
     it('an entirely unreachable roster reports the residual rather than a silent zero', async () => {
-      auth0Service.getUserById.mockResolvedValue(null);
       const recipients = [
         member({ email: 'a@auth0.local', user_id: 'auth0|a' }),
         member({ email: 'b@auth0.local', user_id: 'auth0|b' }),
@@ -225,7 +189,6 @@ describe('sendGroupOwnershipOffers (Phase 88.2, SPEC-REQ-8 / D-03)', () => {
     });
 
     it('one unreachable member does not stop the rest of the fanout', async () => {
-      auth0Service.getUserById.mockResolvedValue(null);
       const recipients = [
         member({ email: 'a@example.com', user_id: 'auth0|a' }),
         member({ email: 'b@auth0.local', user_id: 'auth0|b' }),
