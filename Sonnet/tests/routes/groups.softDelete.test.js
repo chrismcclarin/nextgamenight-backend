@@ -28,8 +28,14 @@
 const request = require('supertest');
 const express = require('express');
 const groupRoutes = require('../../routes/groups');
-const { Group, User, UserGroup, Event } = require('../../models');
+const { Group, User, UserGroup, Event, SingleUseToken } = require('../../models');
 const { getUserRoleInGroup } = require('../../services/authorizationService');
+const {
+  softDeleteGroup,
+  RECOVERY_WINDOW_DAYS,
+  TOKEN_EXPIRY_MARGIN_MS,
+  GroupAlreadyDeletedError,
+} = require('../../services/groupRecoveryService');
 const { makeUser, makeGroup, addToGroup } = require('../factories');
 
 const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
@@ -212,6 +218,160 @@ describe('Phase 88.2 — paranoid soft-delete is the central hide filter', () =>
 
     it('User is NOT paranoid (guards against paranoid creeping model-wide)', () => {
       expect(Boolean(User.options.paranoid)).toBe(false);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Plan 88.2-06 Task 1 — services/groupRecoveryService.softDeleteGroup
+  //
+  // Service-level contract. The endpoint-level assertions (six-table counts, the
+  // stamp equality across three models, the dispatch wiring) live in the plan-06
+  // Task 2 block below.
+  // ---------------------------------------------------------------------------
+  describe('softDeleteGroup — the service contract', () => {
+    /**
+     * Undo a soft delete by clearing the stamps directly. `restoreGroupByToken` is
+     * plan 07 (wave 4) and does not exist yet, so a re-delete scenario in wave 3
+     * has to reset the rows by hand.
+     */
+    async function clearStamps(groupId) {
+      await Group.update(
+        { deletedAt: null, purge_after: null },
+        { where: { id: groupId }, paranoid: false, silent: true }
+      );
+      await UserGroup.update(
+        { deletedAt: null },
+        { where: { group_id: groupId }, paranoid: false, silent: true }
+      );
+      await Event.update(
+        { deletedAt: null },
+        { where: { group_id: groupId }, paranoid: false, silent: true }
+      );
+    }
+
+    it('every recipient carries the Auth0 sub in user_id ALONGSIDE the Users.id UUID', async () => {
+      const memberA = await makeUser({ username: 'roster-member-a' });
+      const memberB = await makeUser({ username: 'roster-member-b' });
+      await addToGroup(memberA, group, 'member');
+      await addToGroup(memberB, group, 'admin');
+
+      const { recipients } = await softDeleteGroup(group.id, { excludeUserUuid: owner.id });
+
+      // Asserted on the RETURNED array, not on the mapping source — checking the
+      // source is exactly what would pass with the field missing.
+      expect(recipients).toHaveLength(2);
+      const byUuid = new Map(recipients.map((r) => [r.user_uuid, r]));
+      for (const seeded of [memberA, memberB]) {
+        const r = byUuid.get(seeded.id);
+        expect(r).toBeDefined();
+        // The dispatcher's Auth0 Management API backfill keys on the SUB, not the
+        // UUID. Omitting it fails silently: getUserById(undefined) rejects, the
+        // backfill catch degrades as designed, and every synthetic-address member
+        // is counted unreachable with plausible-looking counters and no error.
+        expect(typeof r.user_id).toBe('string');
+        expect(r.user_id).not.toBe(r.user_uuid);
+        expect(r.user_id).toBe(seeded.user_id);
+        // The include uses the contact-info scope; the default scope strips email.
+        expect(r.email).toBe(seeded.email);
+        expect(r.username).toBe(seeded.username);
+      }
+
+      // SPEC-REQ-8: the deleting owner is never offered their own group back.
+      expect(recipients.some((r) => r.user_uuid === owner.id)).toBe(false);
+    });
+
+    it('the roster survives the stamping — it is read BEFORE the transaction', async () => {
+      const member = await makeUser({ username: 'roster-survivor' });
+      await addToGroup(member, group, 'member');
+
+      const { recipients } = await softDeleteGroup(group.id, { excludeUserUuid: owner.id });
+      expect(recipients).toHaveLength(1);
+
+      // The same query run AFTER the transaction is paranoid-filtered to zero rows —
+      // this is the positive control proving the ordering is load-bearing, not
+      // stylistic (88.2-RESEARCH.md Pitfall 5).
+      const after = await UserGroup.findAll({ where: { group_id: group.id, status: 'active' } });
+      expect(after).toHaveLength(0);
+    });
+
+    it('a re-delete REVOKES the prior restore token instead of leaving two usable links', async () => {
+      const first = await softDeleteGroup(group.id, { excludeUserUuid: owner.id });
+      await clearStamps(group.id);
+      const second = await softDeleteGroup(group.id, { excludeUserUuid: owner.id });
+
+      expect(second.nonce).not.toBe(first.nonce);
+
+      const firstRow = await SingleUseToken.findOne({ where: { nonce: first.nonce } });
+      const secondRow = await SingleUseToken.findOne({ where: { nonce: second.nonce } });
+      expect(firstRow.status).toBe('revoked');
+      expect(secondRow.status).toBe('active');
+
+      // Asserting only that a second token exists would pass with the bug fully
+      // intact — the point is that exactly ONE link is live for the group.
+      const active = await SingleUseToken.count({
+        where: { group_id: group.id, purpose: 'group_restore', status: 'active' },
+      });
+      expect(active).toBe(1);
+    });
+
+    it('the revocation reaches an ALREADY-CONSUMED token — targeting only active rows would miss the whole case', async () => {
+      const first = await softDeleteGroup(group.id, { excludeUserUuid: owner.id });
+
+      // The member who already accepted the FIRST offer: consumeByNonce leaves the
+      // row at 'used' with its expiry still in the future, and plan 07's preview
+      // deliberately reads a consumed token (AF-9). Left un-revoked it renders a
+      // working recovery offer that then refuses the accept with 410.
+      const usedAt = new Date();
+      await SingleUseToken.update(
+        { status: 'used', used_at: usedAt },
+        { where: { nonce: first.nonce } }
+      );
+
+      await clearStamps(group.id);
+      await softDeleteGroup(group.id, { excludeUserUuid: owner.id });
+
+      const firstRow = await SingleUseToken.findOne({ where: { nonce: first.nonce } });
+      expect(firstRow.status).toBe('revoked');
+      // used_at is preserved, so the audit trail survives the revocation.
+      expect(firstRow.used_at).not.toBeNull();
+    });
+
+    it('a second softDeleteGroup on a stamped group throws the typed sentinel and changes nothing', async () => {
+      const first = await softDeleteGroup(group.id, { excludeUserUuid: owner.id });
+
+      await expect(
+        softDeleteGroup(group.id, { excludeUserUuid: owner.id })
+      ).rejects.toThrow(GroupAlreadyDeletedError);
+
+      const row = await Group.findByPk(group.id, { paranoid: false });
+      expect(row.deletedAt.getTime()).toBe(first.deletedAt.getTime());
+      expect(row.purge_after.getTime()).toBe(first.purgeAfter.getTime());
+
+      // What the sentinel actually prevents: the SECOND token mint (the paranoid
+      // clause on the updates already prevents the double-stamp on its own).
+      expect(
+        await SingleUseToken.count({ where: { group_id: group.id, purpose: 'group_restore' } })
+      ).toBe(1);
+    });
+
+    it('mints an active group_restore token with a null user_id and an expiry past purge_after', async () => {
+      const { nonce, purgeAfter, deletedAt } = await softDeleteGroup(group.id, {
+        excludeUserUuid: owner.id,
+      });
+
+      expect(purgeAfter.getTime() - deletedAt.getTime()).toBe(RECOVERY_WINDOW_DAYS * 24 * 60 * 60 * 1000);
+
+      const token = await SingleUseToken.findOne({ where: { nonce } });
+      expect(token).not.toBeNull();
+      expect(token.purpose).toBe('group_restore');
+      expect(token.group_id).toBe(group.id);
+      expect(token.user_id).toBeNull();
+      expect(token.status).toBe('active');
+      // MED #23: strictly greater, by exactly the margin — so purge_after is
+      // provably the binding deadline and a late accept is refused for the true
+      // reason rather than as an expired link.
+      expect(token.expires_at.getTime()).toBeGreaterThan(purgeAfter.getTime());
+      expect(token.expires_at.getTime() - purgeAfter.getTime()).toBe(TOKEN_EXPIRY_MARGIN_MS);
     });
   });
 });
