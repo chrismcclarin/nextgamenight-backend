@@ -32,7 +32,11 @@ const {
   isActiveMember,
   stripMemberPII,
 } = require('../services/authorizationService');
-const { softDeleteGroup, GroupAlreadyDeletedError } = require('../services/groupRecoveryService');
+const {
+  softDeleteGroup,
+  GroupAlreadyDeletedError,
+  RECOVERY_WINDOW_DAYS,
+} = require('../services/groupRecoveryService');
 const { sendGroupOwnershipOffers } = require('../services/groupOwnershipOfferService');
 
 // Phase 71.1-02 (post-checkpoint scope expansion): when a user leaves a group
@@ -805,7 +809,7 @@ router.delete('/:group_id', async (req, res) => {
     // DELETE fails right here and answers 403 — Group.findByPk is never reached and
     // a 404 is unreachable on this route. Nothing is double-stamped, so no
     // already-deleted branch is needed. Do NOT "fix" the asymmetry by adding a
-    // paranoid: false read or by reordering these two guards; SPEC-REQ-6 pins this
+    // carve-out escape read, or by reordering these two guards; SPEC-REQ-6 pins this
     // route's authorization to the ownership check and nothing more.
     //
     // SPEC-REQ-6 also forbids adding a pre-flight refusal, a member-count block or a
@@ -885,6 +889,87 @@ router.delete('/:group_id', async (req, res) => {
     }
   } catch (error) {
     console.error('Error deleting group:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Owner-only blast-radius preview for the Danger Zone (D-06 / SPEC-REQ-5).
+// Placed immediately after the DELETE handler so the delete-flow endpoints stay
+// adjacent. The two-segment path cannot collide with GET /:group_id.
+//
+// D-06 chose a DEDICATED route rather than extending the group-detail response
+// precisely so this can 403 a non-owner — group detail is legitimately read by
+// ordinary members and therefore cannot. Counts are computed server-side, never
+// client-side: a client-side count risks telling the owner "4 events" while the
+// delete hides 37, at the exact moment accuracy matters most.
+router.get('/:group_id/deletion-impact', validateUUID('group_id'), async (req, res) => {
+  try {
+    const userId = req.user?.user_id;
+    if (!userId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const { group_id } = req.params;
+
+    // DECISION Phase 88.2 AF-2: EXISTENCE-BEFORE-AUTHORIZATION here, chosen OVER
+    // matching the sibling handlers' authorization-first order (including the DELETE
+    // handler directly above, which keeps authz-first on purpose).
+    //
+    // Why the sibling order cannot be used: isOwner resolves through
+    // getUserRoleInGroup, whose UserGroup.findOne is paranoid-filtered. Once the group
+    // is soft-deleted the owner's OWN membership row is stamped too, so isOwner
+    // returns false and an authz-first order would answer 403 with this lookup never
+    // running — making SPEC-REQ-5's required 404 for a soft-deleted group unreachable,
+    // and the cheapest way out (relaxing the test to 403) would leave the SPEC
+    // criterion silently unmet. Reordering this back is a SPEC regression, not a
+    // consistency cleanup.
+    //
+    // It does not weaken authorization. Group ids are unguessable v4 UUIDs and the
+    // route validator has already rejected anything malformed, so the only new
+    // information a non-owner gains is "this UUID is not a live group" — for a UUID
+    // they had to already possess. The 403 for a LIVE group they do not own, which is
+    // the case the gate exists for, is unchanged.
+    //
+    // The model is paranoid, so this lookup IS the soft-deleted case. This handler is
+    // deliberately NOT one of the enumerated carve-outs — do not add an escape flag
+    // that would let it read a hidden group.
+    const group = await Group.findByPk(group_id);
+    if (!group) {
+      return res.status(404).json({ error: 'Group not found' });
+    }
+
+    const hasPermission = await isOwner(userId, group_id);
+    if (!hasPermission) {
+      return res.status(403).json({ error: 'Only the group owner can view deletion impact' });
+    }
+
+    // Independent counts, run concurrently — this endpoint's latency is directly
+    // visible as the delay before the blast-radius numbers appear in the Danger Zone.
+    // Both models are paranoid, so both automatically exclude anything already hidden.
+    //
+    // The role predicate matches the roster query in groupRecoveryService (see its
+    // MED-3 marker) and the in-repo "confirmed members" precedent further down this
+    // file. The two queries share a PREDICATE, not a result set: this count includes
+    // the acting owner while the fanout excludes them, so member_count is exactly one
+    // greater than the number of offers sent. That is intended — this number answers
+    // "how many people lose access", which includes the owner. Do NOT "fix" it by
+    // subtracting the owner.
+    const [member_count, event_count] = await Promise.all([
+      UserGroup.count({
+        where: {
+          group_id,
+          status: 'active',
+          role: { [Op.in]: ['member', 'admin', 'owner'] },
+        },
+      }),
+      Event.count({ where: { group_id } }),
+    ]);
+
+    // recovery_window_days is served so the Danger Zone copy reads the window from
+    // the server instead of hard-coding 30 in two places.
+    res.json({ member_count, event_count, recovery_window_days: RECOVERY_WINDOW_DAYS });
+  } catch (error) {
+    console.error('Error getting group deletion impact:', error);
     res.status(500).json({ error: error.message });
   }
 });
