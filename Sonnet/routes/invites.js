@@ -10,6 +10,7 @@ const emailService = require('../services/emailService');
 
 const { isOwnerOrAdmin } = require('../services/authorizationService');
 const { resolveTargetUserUuidOnly } = require('../utils/resolveTargetUser');
+const { lockGroupRow } = require('../utils/groupRowLock');
 
 const router = express.Router();
 
@@ -34,6 +35,24 @@ const router = express.Router();
 async function acceptInviteTransactional(invite, user) {
   const t = await sequelize.transaction();
   try {
+    // WR-01 (88.2 review): FIRST statement of the transaction is the shared
+    // Groups-row lock (utils/groupRowLock.js — the same guard softDeleteGroup,
+    // restore, purge and join-by-token take), then a paranoid liveness re-read
+    // INSIDE it. The routes' Group.findByPk gates run outside any lock, so a
+    // softDeleteGroup committing between that gate and this transaction would
+    // otherwise land a LIVE, UNSTAMPED membership row on a hidden group (create
+    // branch) or restore() a row the delete just stamped (carve-out #9 branch) —
+    // the identical race join-by-token closes the same way (routes/groups.js
+    // AF-3 marker has the full lock-serializes-but-cannot-refuse analysis).
+    // Callers map `{ gone: true }` to the same 410 their pre-transaction gates
+    // emit, so all gated write paths answer identically.
+    await lockGroupRow(invite.group_id, t);
+    const live = await Group.findByPk(invite.group_id, { transaction: t });
+    if (!live) {
+      await t.rollback();
+      return { gone: true };
+    }
+
     // Write 1: flip invite status
     await invite.update(
       { status: 'accepted', accepted_at: new Date() },
@@ -103,6 +122,7 @@ async function acceptInviteTransactional(invite, user) {
     }
 
     await t.commit();
+    return { gone: false };
   } catch (error) {
     await t.rollback();
     throw error;
@@ -585,7 +605,12 @@ router.post('/:invite_id/accept', async (req, res) => {
     }
 
     // Atomic three-write flow (status flip + UserGroup activation) — see helper.
-    await acceptInviteTransactional(invite, user);
+    // WR-01: the helper re-checks liveness under the shared row lock; `gone`
+    // maps to the same 410 the pre-transaction gate above emits.
+    const acceptResult = await acceptInviteTransactional(invite, user);
+    if (acceptResult.gone) {
+      return res.status(410).json({ error: 'This group is no longer available' });
+    }
 
     res.json({ success: true, group_id: invite.group_id });
   } catch (error) {
@@ -637,21 +662,43 @@ router.post('/:invite_id/decline', async (req, res) => {
       return res.status(410).json({ error: 'This group is no longer available' });
     }
 
-    // Update invite status
-    await invite.update({ status: 'declined' });
+    // WR-01 (88.2 review): the gate above runs outside any lock, so the writes
+    // below take the shared Groups-row lock (utils/groupRowLock.js) and re-read
+    // liveness INSIDE it. Without this, a softDeleteGroup committing in the gap
+    // lets the force-destroy hard-delete a row the delete just STAMPED — silently
+    // shortening the restorable roster and breaking SPEC-REQ-9's before/after
+    // row-set equality, the exact outcome the gate's own AF-3 marker exists to
+    // prevent. `gone` maps to the gate's identical 410.
+    const declineResult = await sequelize.transaction(async (t) => {
+      await lockGroupRow(invite.group_id, t);
+      const live = await Group.findByPk(invite.group_id, { transaction: t });
+      if (!live) {
+        return { gone: true };
+      }
 
-    // If a UserGroup row exists with status 'invited', destroy it (keyed on the
-    // Users.id UUID surrogate — D-11).
-    // F-02: hard delete — declining an invite physically removes the row. The `force`
-    // flag sits on the `.destroy(` line deliberately: the CI grep gate is LINE-scoped,
-    // so putting it on a later line would leave this call reported as a hit.
-    await UserGroup.destroy({ force: true,
-      where: {
-        user_uuid: user.id,
-        group_id: invite.group_id,
-        status: 'invited',
-      },
+      // Update invite status
+      await invite.update({ status: 'declined' }, { transaction: t });
+
+      // If a UserGroup row exists with status 'invited', destroy it (keyed on the
+      // Users.id UUID surrogate — D-11).
+      // F-02: hard delete — declining an invite physically removes the row. The `force`
+      // flag sits on the `.destroy(` line deliberately: the CI grep gate is LINE-scoped,
+      // so putting it on a later line would leave this call reported as a hit.
+      await UserGroup.destroy({ force: true,
+        where: {
+          user_uuid: user.id,
+          group_id: invite.group_id,
+          status: 'invited',
+        },
+        transaction: t,
+      });
+
+      return { gone: false };
     });
+
+    if (declineResult.gone) {
+      return res.status(410).json({ error: 'This group is no longer available' });
+    }
 
     res.json({ success: true });
   } catch (error) {
@@ -704,7 +751,12 @@ router.post('/accept-by-token', async (req, res) => {
 
     // Atomic three-write flow (status flip + UserGroup activation) — same shared
     // helper as the id-based route, so this PRIMARY email-link path is atomic too.
-    await acceptInviteTransactional(invite, user);
+    // WR-01: the helper re-checks liveness under the shared row lock; `gone`
+    // maps to the same 410 the pre-transaction gate above emits.
+    const acceptResult = await acceptInviteTransactional(invite, user);
+    if (acceptResult.gone) {
+      return res.status(410).json({ error: 'This group is no longer available' });
+    }
 
     res.json({ success: true, group_id: invite.group_id });
   } catch (error) {

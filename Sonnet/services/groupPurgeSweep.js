@@ -47,6 +47,7 @@ const {
   SchedulerRun,
   sequelize,
 } = require('../models');
+const { lockGroupRow } = require('../utils/groupRowLock');
 
 // Lazy-load Sentry — same shape as services/schedulerHealthService.js and
 // services/groupRecoveryService.js. Safe if @sentry/node is missing or SENTRY_DSN
@@ -161,8 +162,9 @@ async function purgeOneGroup(groupId) {
   return sequelize.transaction(async (t) => {
     // DECISION Phase 88.2 D-04: the FIRST statement of this transaction is the same
     // row-level `FOR UPDATE` lock on the `Groups` row that `softDeleteGroup` (plan
-    // 06) and `restoreGroupByToken` (plan 07) take, in the identical raw-query form
-    // and the identical first-statement position. It is chosen OVER an
+    // 06) and `restoreGroupByToken` (plan 07) take — the identical shared helper
+    // (utils/groupRowLock.js, WR-01 extraction) in the identical first-statement
+    // position. It is chosen OVER an
     // application-level "is anyone restoring this group" flag: the database can
     // serialize this, the application cannot.
     //
@@ -176,11 +178,7 @@ async function purgeOneGroup(groupId) {
     //
     // The two sides are ONE guard, not two: removing it from either side silently
     // disarms both. The matching marker lives in services/groupRecoveryService.js.
-    await sequelize.query('SELECT id FROM "Groups" WHERE id = :id FOR UPDATE', {
-      replacements: { id: groupId },
-      type: sequelize.QueryTypes.SELECT,
-      transaction: t,
-    });
+    await lockGroupRow(groupId, t);
 
     // Carve-out #7 — re-read INSIDE the lock. This is the half of D-04 that makes a
     // concurrent acceptance safe: between candidate selection and lock acquisition a

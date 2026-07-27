@@ -21,6 +21,7 @@ const { sendError, ERROR_REGISTRY } = require('../utils/errors');
 // resolveTargetUser (dual-key) removed with POST /:group_id/users (Phase 87.6
 // groups-add-user); the UUID-only resolver remains for the role/transfer routes.
 const { resolveTargetUserUuidOnly } = require('../utils/resolveTargetUser');
+const { lockGroupRow } = require('../utils/groupRowLock');
 const { matchesSelf } = require('../middleware/objectAuth');
 const { Op } = require('sequelize');
 const { body, validationResult } = require('express-validator');
@@ -815,11 +816,7 @@ router.post('/join-by-token', async (req, res) => {
     // gated write paths answer identically. Placed AFTER the tombstone check above so
     // its `410 account_deleted` envelope is unchanged.
     const joinResult = await sequelize.transaction(async (t) => {
-      await sequelize.query('SELECT id FROM "Groups" WHERE id = :id FOR UPDATE', {
-        replacements: { id: group.id },
-        type: sequelize.QueryTypes.SELECT,
-        transaction: t,
-      });
+      await lockGroupRow(group.id, t);
 
       // Group is paranoid (D-01) → null once the delete transaction has stamped it.
       const live = await Group.findByPk(group.id, { transaction: t });

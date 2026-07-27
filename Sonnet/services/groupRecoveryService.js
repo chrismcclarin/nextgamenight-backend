@@ -85,6 +85,7 @@ const {
   SingleUseToken,
   sequelize,
 } = require('../models');
+const { lockGroupRow } = require('../utils/groupRowLock');
 
 // Lazy-load Sentry — same shape as services/schedulerHealthService.js. Safe if
 // @sentry/node is missing or SENTRY_DSN is unset (both are true in the Jest env).
@@ -242,9 +243,10 @@ async function softDeleteGroup(groupId, { excludeUserUuid } = {}) {
   // paranoid UserGroup choke point in services/authorizationService.js.
   await sequelize.transaction(async (t) => {
     // DECISION Phase 88.2 D-04: this row lock is the THIRD side of a guard plans 07
-    // (restore) and 08 (purge) take on the same row, and all three must keep the
-    // identical `SELECT id FROM "Groups" WHERE id = :id FOR UPDATE` form in the same
-    // first-statement position. It serializes this delete against a concurrent
+    // (restore) and 08 (purge) take on the same row. All sides call the shared
+    // utils/groupRowLock.js helper (WR-01 extraction) in the same first-statement
+    // position — the one query lives in one place, so the sides cannot drift
+    // apart textually. It serializes this delete against a concurrent
     // restore, a concurrent purge and a concurrent second delete, so exactly one of
     // them stamps, mints a token and fans out a roster.
     //
@@ -259,11 +261,7 @@ async function softDeleteGroup(groupId, { excludeUserUuid } = {}) {
     // The lock changes the timing, not the outcome. That race is closed by the
     // group-liveness gate on join-by-token (plan 04 Task 4), not here — do not
     // re-add a claim that this lock covers it.
-    await sequelize.query('SELECT id FROM "Groups" WHERE id = :id FOR UPDATE', {
-      replacements: { id: groupId },
-      type: sequelize.QueryTypes.SELECT,
-      transaction: t,
-    });
+    await lockGroupRow(groupId, t);
 
     // In-lock liveness re-check. Group is paranoid, so an already-stamped row
     // resolves to null. Belt-and-braces rather than the primary guard: the paranoid
@@ -411,8 +409,9 @@ async function restoreGroupByToken(nonce, actorAuth0Sub) {
     // DECISION Phase 88.2 D-04: the single-winner guard is a `SELECT ... FOR UPDATE`
     // on the GROUPS ROW, chosen OVER an application-level "is anyone else restoring"
     // flag. The database serializes this; the application cannot. It is the same
-    // query, in the same first-position-of-the-transaction form, that
-    // `softDeleteGroup` above takes and that plan 08's purge sweep MUST take.
+    // shared helper (utils/groupRowLock.js), in the same first-position-of-the-
+    // transaction form, that `softDeleteGroup` above takes and that plan 08's
+    // purge sweep MUST take.
     //
     // Two accepters racing is benign — the loser's re-read in step 3 sees a live
     // group and gets `already_restored`. An acceptance racing THE PURGE is not:
@@ -422,15 +421,11 @@ async function restoreGroupByToken(nonce, actorAuth0Sub) {
     // phase. If the purge sweep's lock is ever removed, this one stops protecting
     // anything — the two sides are one guard, not two.
     //
-    // Raw query rather than `findByPk({ lock })`: it is the house style
-    // (services/accountDeletionService.js), it is what D-04 cites, and it is not
-    // subject to the paranoid clause at all — which matters here, because the row we
-    // need to lock is by definition already stamped.
-    await sequelize.query('SELECT id FROM "Groups" WHERE id = :id FOR UPDATE', {
-      replacements: { id: token.group_id },
-      type: sequelize.QueryTypes.SELECT,
-      transaction: t,
-    });
+    // Raw query (inside the shared helper) rather than `findByPk({ lock })`: it
+    // is the house style (services/accountDeletionService.js), it is what D-04
+    // cites, and it is not subject to the paranoid clause at all — which matters
+    // here, because the row we need to lock is by definition already stamped.
+    await lockGroupRow(token.group_id, t);
 
     // --- 3. Carve-out #2 — re-read the group INSIDE the lock -----------------
     //

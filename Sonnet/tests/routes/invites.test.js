@@ -1044,3 +1044,150 @@ describe('88.2 AF-3 — invite WRITE paths refuse a soft-deleted group', () => {
     expect(rows[0].status).toBe('active');
   });
 });
+
+// ============================================================================
+// 88.2 WR-01: the AF-3 route gates above run OUTSIDE any lock, so a
+// softDeleteGroup committing between the gate and the write transaction used to
+// land anyway. The fix takes the shared Groups-row lock (utils/groupRowLock.js)
+// as the FIRST statement of each write transaction and re-reads liveness INSIDE
+// it — the same closure join-by-token got (see the twin harness in
+// groups.invite.test.js, whose comments explain why a gate without the lock
+// leaves the same gap reopening between re-read and write).
+// ============================================================================
+describe('88.2 WR-01 — invite write paths refuse a soft delete that lands MID-REQUEST (deterministic race)', () => {
+  const sequelize = require('../../config/database');
+  const { lockGroupRow } = require('../../utils/groupRowLock');
+
+  let inviter;
+  let invitee;
+  let group;
+  let invite;
+
+  beforeEach(async () => {
+    inviter = await User.create({
+      user_id: 'auth0|wr1-inviter',
+      username: 'wr1-inviter',
+      email: 'wr1-inviter@example.com',
+    });
+    invitee = await User.create({
+      user_id: 'auth0|wr1-invitee',
+      username: 'wr1-invitee',
+      email: 'wr1-invitee@example.com',
+    });
+    group = await Group.create({ group_id: 'wr1-group', name: 'WR1 Group' });
+    await UserGroup.create({
+      user_uuid: inviter.id, group_id: group.id, role: 'owner', status: 'active',
+    });
+    invite = await GroupInvite.create({
+      group_id: group.id,
+      invited_email: invitee.email.toLowerCase(),
+      invited_by_uuid: inviter.id,
+      token: 'wr1-accept-token',
+      status: 'pending',
+    });
+    currentActor = invitee.user_id;
+  });
+
+  const stamp = async (transaction) => {
+    const deletedAt = new Date();
+    await Group.update({ deletedAt }, { where: { id: group.id }, silent: true, transaction });
+    await UserGroup.update({ deletedAt }, { where: { group_id: group.id }, silent: true, transaction });
+    return deletedAt;
+  };
+
+  // Poll for the handler's transaction actually BLOCKING on our row lock — an
+  // observable database condition, not a sleep (same helper as the join-by-token
+  // race test in groups.invite.test.js).
+  async function waitForLockWaiter({ timeoutMs = 10000 } = {}) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const [row] = await sequelize.query(
+        `SELECT count(*)::int AS n FROM pg_stat_activity
+           WHERE wait_event_type = 'Lock'
+             AND query ILIKE '%FOR UPDATE%'
+             AND pid <> pg_backend_pid()`,
+        { type: sequelize.QueryTypes.SELECT }
+      );
+      if (row && row.n > 0) return true;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    return false;
+  }
+
+  // Runs `fire` (which dispatches the request) while holding the Groups-row
+  // lock, stamps the group under that lock once the handler is provably
+  // blocked on it, then releases and returns the response.
+  async function raceAgainstSoftDelete(fire) {
+    const t1 = await sequelize.transaction();
+    await lockGroupRow(group.id, t1);
+
+    let released = false;
+    let pending;
+    try {
+      // `.then()` is REQUIRED: a supertest Test is lazy and does not dispatch
+      // until end()/then() is called.
+      pending = fire().then((r) => r, (e) => e);
+
+      const blocked = await waitForLockWaiter();
+      expect(blocked).toBe(true);
+
+      await stamp(t1);
+      await t1.commit();
+      released = true;
+    } finally {
+      // Never leave the row lock held — a leaked lock hangs the global
+      // truncateAll in tests/setup.js.
+      if (!released) {
+        await t1.rollback().catch(() => {});
+      }
+    }
+    return pending;
+  }
+
+  it('DETERMINISTIC RACE: an accept that passes its liveness gate, then blocks on the delete\'s row lock, is REFUSED with 410 — no membership row, invite stays pending', async () => {
+    const res = await raceAgainstSoftDelete(() =>
+      request(app)
+        .post('/api/invites/accept-by-token')
+        .send({ token: invite.token })
+    );
+
+    expect(res.status).toBe(410);
+    expect(res.body.error).toMatch(/no longer available/i);
+
+    // No row — live OR stamped — was created for the pair, and the status flip
+    // rolled back with the transaction.
+    const rows = await UserGroup.findAll({
+      where: { user_uuid: invitee.id, group_id: group.id },
+      paranoid: false,
+    });
+    expect(rows).toHaveLength(0);
+    const reloaded = await GroupInvite.findByPk(invite.id);
+    expect(reloaded.status).toBe('pending');
+  });
+
+  it('DETERMINISTIC RACE: a decline that passes its liveness gate, then blocks on the delete\'s row lock, is REFUSED with 410 — the STAMPED invited row survives for restore', async () => {
+    await UserGroup.create({
+      user_uuid: invitee.id, group_id: group.id, role: 'member', status: 'invited',
+    });
+
+    const res = await raceAgainstSoftDelete(() =>
+      request(app)
+        .post(`/api/invites/${invite.id}/decline`)
+        .send({})
+    );
+
+    expect(res.status).toBe(410);
+    expect(res.body.error).toMatch(/no longer available/i);
+
+    // The force-destroy must NOT have fired: the stamped row is still present
+    // for plan 07's stamp-matched restore, and the invite was not flipped.
+    const stamped = await UserGroup.findOne({
+      where: { user_uuid: invitee.id, group_id: group.id },
+      paranoid: false,
+    });
+    expect(stamped).not.toBeNull();
+    expect(stamped.deletedAt).not.toBeNull();
+    const reloaded = await GroupInvite.findByPk(invite.id);
+    expect(reloaded.status).toBe('pending');
+  });
+});
