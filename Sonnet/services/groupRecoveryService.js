@@ -1,14 +1,79 @@
 // services/groupRecoveryService.js
 //
-// Phase 88.2 / SPEC-REQ-1, SPEC-REQ-2, D-03, D-04 — the DELETE half of the group
-// recovery window. Plan 88.2-07 adds the restore half (`restoreGroupByToken`) to
-// this same file, together with the module-level `paranoid: false` carve-out table.
+// Phase 88.2 / SPEC-REQ-1, SPEC-REQ-2, SPEC-REQ-9, D-02, D-03, D-04 — BOTH halves
+// of the group recovery window: `softDeleteGroup` (the DELETE half) and
+// `restoreGroupByToken` (the restore half), plus the module-level carve-out table
+// below.
 //
 // Deleting a group no longer destroys anything. `softDeleteGroup` stamps ONE
 // timestamp across `Groups`, `UserGroups` and `Events`, writes the recovery
 // deadline onto the `Groups` row, and mints the single-use restore token inside
 // the same transaction — so a committed delete always has a recovery path and a
 // rolled-back one leaves nothing behind.
+//
+// =====================================================================
+// THE paranoid:false CARVE-OUT TABLE — a CLOSED set of NINE entries
+// =====================================================================
+//
+// Note on spelling: every reference in THIS comment block writes the flag as
+// `paranoid:false` (no space) on purpose. The acceptance criteria for this file
+// COUNT the spaced literal, and a header that spells it out a dozen times inflates
+// the count it is meant to describe. The exact spaced literal is reserved for real
+// code. (The counting commands also filter comment lines, so both defences have to
+// fail before the census drifts.)
+//
+// Once Group / UserGroup / Event went paranoid (D-01), the paranoid clause IS the
+// central hide filter for a soft-deleted group. Escaping it is therefore a
+// deliberate, enumerated act. These are the only nine sites in the application
+// permitted to do it:
+//
+//   #  Site                                                    File
+//   1  Restore-preview handler — Group read                    routes/groups.js
+//   2  Accept-ownership — Group re-read inside the lock        this file
+//   3  Accept-ownership — UserGroup membership verification    this file
+//   4  Restore — purge_after nulling update                    this file
+//   5  Restore — AF-3 duplicate-membership scan (TWO reads)    this file
+//   6  Purge sweep — candidate Group.findAll                   services/groupPurgeSweep.js
+//   7  Purge sweep — per-group re-read inside the lock         services/groupPurgeSweep.js
+//   8  Purge sweep — event-id gather                           services/groupPurgeSweep.js
+//   9  acceptInviteTransactional — membership lookup           routes/invites.js
+//
+// Entry #5 is TWO literal occurrences (the stamped scan and the live scan), so the
+// nine entries are TEN literal occurrences across four files:
+//
+//   services/groupRecoveryService.js   5   (#2, #3, #4, #5 x2)
+//   services/groupPurgeSweep.js        3   (#6, #7, #8)
+//   routes/groups.js                   1   (#1)
+//   routes/invites.js                  1   (#9)
+//   ------------------------------------------------------------------
+//   total                             10
+//
+// WHY #3 EXISTS AT ALL. The accepter's own membership row is itself soft-deleted,
+// so `getUserRoleInGroup` / `isActiveMember` (services/authorizationService.js)
+// return null — exactly the choke point D-01 uses to deny everyone else. The
+// natural implementation of "verify the caller holds an active membership" will
+// therefore deny the ONE person who is legitimately entitled to accept, 100% of the
+// time. See the D-02 marker at the read itself.
+//
+// WHY #9 IS DIFFERENT IN KIND, and must be labelled as such: it is a WRITE-PATH
+// INTEGRITY read, not a soft-deleted-content read. It exists so
+// `acceptInviteTransactional` cannot create a second LIVE UserGroup row alongside a
+// stamped one — the state that permanently aborts a restore (AF-3). It discloses
+// nothing; it prevents a duplicate.
+//
+// NOT A CARVE-OUT — NEEDS NO FLAG: `Model.restore` (`Event.restore` /
+// `UserGroup.restore`) inherently skips the paranoid clause (sequelize/lib/model.js
+// :1848-1885) and passes `options.where` through verbatim to bulkUpdate. It is
+// recorded here as a FOOTNOTE precisely so nobody re-adds it to the numbered list —
+// an earlier revision of this table did exactly that, which is how a five-entry
+// flagged set came to be described as six and made every derived count wrong.
+//
+// Every other read path in the application must NOT escape the paranoid clause. An
+// ELEVENTH literal occurrence is a bug, not an addition — but reconcile against the
+// per-file breakdown above before concluding that, because this list has been wrong
+// before (it once said "six" while the code it specified had ten). Waves land in
+// order: at the end of plan 07 the tree holds 7 of the 10 (#1-#5 = six occurrences,
+// plus #9); plan 08 adds the remaining three.
 
 const crypto = require('crypto');
 const { Op } = require('sequelize');
@@ -20,6 +85,17 @@ const {
   SingleUseToken,
   sequelize,
 } = require('../models');
+
+// Lazy-load Sentry — same shape as services/schedulerHealthService.js. Safe if
+// @sentry/node is missing or SENTRY_DSN is unset (both are true in the Jest env).
+let Sentry = null;
+if (process.env.SENTRY_DSN) {
+  try {
+    Sentry = require('@sentry/node');
+  } catch (err) {
+    console.warn('[groupRecovery] Sentry not available:', err.message);
+  }
+}
 
 /**
  * How long a soft-deleted group is held before the purge sweep erases it.
@@ -268,9 +344,341 @@ async function softDeleteGroup(groupId, { excludeUserUuid } = {}) {
   return { deletedAt, purgeAfter, nonce, recipients };
 }
 
+/**
+ * Restore a soft-deleted group from an emailed restore link (SPEC-REQ-9 / D-04).
+ *
+ * The token identifies the GROUP; the session identifies the PERSON. A forwarded or
+ * leaked link is therefore worthless to anyone who does not already hold a
+ * membership row stamped by this exact deletion.
+ *
+ * Returns RESULT CODES, never HTTP statuses — the route owns that mapping:
+ *   { ok: true,  groupId, groupName }
+ *   { ok: false, code: 'not_a_member' }
+ *   { ok: false, code: 'invalid_token' }
+ *   { ok: false, code: 'window_expired' }
+ *   { ok: false, code: 'already_used' }
+ *   { ok: false, code: 'already_restored', groupId, groupName }
+ *
+ * AF-9 / MED #20 — `already_restored` is the ONLY failure branch carrying the group
+ * id and name, and it carries them deliberately: the route maps it to 409 and the
+ * frontend redirects the caller into the now-live group with that id. A bare
+ * `{ ok: false, code }` would leave the redirect silently dead while every test
+ * still passed. The other failure codes stay bare on purpose — disclosing a group
+ * name to a non-member or an expired-link holder is exactly what the
+ * indistinguishable-failure discipline protects.
+ *
+ * @param {string} nonce - the `group_restore` token nonce from the emailed link.
+ * @param {string} actorAuth0Sub - `req.user.user_id` (the Auth0 sub) of the accepter.
+ * @returns {Promise<{ok: true, groupId: string, groupName: string} |
+ *   {ok: false, code: string, groupId?: string, groupName?: string}>}
+ */
+async function restoreGroupByToken(nonce, actorAuth0Sub) {
+  // Resolve the actor OUTSIDE the transaction — nothing below can proceed without a
+  // Users row, and a missing one can never be a legitimate accepter (unlike
+  // join-by-token, this path deliberately does not auto-provision).
+  const actor = await User.findOne({ where: { user_id: actorAuth0Sub } });
+  if (!actor) {
+    return { ok: false, code: 'not_a_member' };
+  }
+
+  return sequelize.transaction(async (t) => {
+    // --- 1. Load the token, WITHOUT a status predicate -----------------------
+    //
+    // AF-9: do NOT filter on `status: 'active'` here. Plan 06 mints ONE nonce and
+    // fans the SAME link to every remaining member, so after the winner consumes it
+    // the token is 'used' for everybody else. With an active-only predicate a
+    // genuine concurrent loser finds nothing and gets `invalid_token` -> 410, and
+    // the `already_restored` -> 409 branch below (plus the frontend's whole 409
+    // state and its group_id redirect) becomes dead code in production. Letting a
+    // consumed token through to step 3 is what makes that state reachable: the
+    // in-lock re-read sees a live group and answers `already_restored` BEFORE the
+    // consume in step 5 ever runs. A consumed token whose group is still
+    // soft-deleted (winner consumed, then rolled back) still falls through to
+    // step 5 -> null -> `already_used`, unchanged.
+    const token = await SingleUseToken.findOne({
+      where: { nonce, purpose: 'group_restore' },
+      transaction: t,
+    });
+    if (!token || token.status === 'revoked') {
+      return { ok: false, code: 'invalid_token' };
+    }
+    if (token.expires_at <= new Date()) {
+      return { ok: false, code: 'window_expired' };
+    }
+
+    // --- 2. Take the lock ----------------------------------------------------
+    //
+    // DECISION Phase 88.2 D-04: the single-winner guard is a `SELECT ... FOR UPDATE`
+    // on the GROUPS ROW, chosen OVER an application-level "is anyone else restoring"
+    // flag. The database serializes this; the application cannot. It is the same
+    // query, in the same first-position-of-the-transaction form, that
+    // `softDeleteGroup` above takes and that plan 08's purge sweep MUST take.
+    //
+    // Two accepters racing is benign — the loser's re-read in step 3 sees a live
+    // group and gets `already_restored`. An acceptance racing THE PURGE is not:
+    // without the purge taking this same lock and re-checking inside it, an
+    // acceptance can report success over data that is already half-deleted. That
+    // makes this the single highest-consequence correctness requirement in the
+    // phase. If the purge sweep's lock is ever removed, this one stops protecting
+    // anything — the two sides are one guard, not two.
+    //
+    // Raw query rather than `findByPk({ lock })`: it is the house style
+    // (services/accountDeletionService.js), it is what D-04 cites, and it is not
+    // subject to the paranoid clause at all — which matters here, because the row we
+    // need to lock is by definition already stamped.
+    await sequelize.query('SELECT id FROM "Groups" WHERE id = :id FOR UPDATE', {
+      replacements: { id: token.group_id },
+      type: sequelize.QueryTypes.SELECT,
+      transaction: t,
+    });
+
+    // --- 3. Carve-out #2 — re-read the group INSIDE the lock -----------------
+    //
+    // Three DISJOINT branches, evaluated in this order. The order and the explicit
+    // null guard on `purge_after` are both load-bearing (see the preview handler in
+    // routes/groups.js, which pins the identical ordering for the identical reason).
+    const group = await Group.findByPk(token.group_id, { paranoid: false, transaction: t });
+
+    // (a) No row: the group was PURGED — its recovery window ran out and its data is
+    //     gone. `window_expired` is the honest code; `already_restored` would tell
+    //     the caller their group is back and hand the frontend a redirect into a
+    //     group that no longer exists. This is precisely the race D-04 exists to
+    //     make safe, so getting the code right here is the point.
+    if (!group) {
+      return { ok: false, code: 'window_expired' };
+    }
+    // (b) Live row: somebody already restored it (or won the concurrent race).
+    if (group.deletedAt === null) {
+      return { ok: false, code: 'already_restored', groupId: group.id, groupName: group.name };
+    }
+    // (c) Deadline gone. The `== null` arm is written explicitly rather than relying
+    //     on `null <= new Date()` coercing to true: a soft-deleted group with a NULL
+    //     purge_after is the uncollectable orphan RESEARCH F-02 describes and IS
+    //     genuinely unrecoverable, so `window_expired` is the right answer — but
+    //     leaning on coercion for it is how the preview's ordering bug happened one
+    //     branch away. State the intent.
+    if (group.purge_after == null || group.purge_after <= new Date()) {
+      return { ok: false, code: 'window_expired' };
+    }
+
+    // THE stamp. Every match below uses this exact value — see the F-05 marker.
+    const stamp = group.deletedAt;
+
+    // --- 4. Carve-out #3 — verify membership ---------------------------------
+    //
+    // DECISION Phase 88.2 D-02: this read escapes the paranoid clause, chosen OVER
+    // `isActiveMember` / `getUserRoleInGroup`. Those are paranoid-filtered BY DESIGN
+    // — that filtering is the choke point D-01 relies on to deny every OTHER caller
+    // — so using them here denies the legitimate accepter 100% of the time. The
+    // additional `deletedAt: stamp` predicate is what preserves the authorization
+    // property the normal helpers would have provided: a member removed BEFORE this
+    // deletion carries an older stamp (or no row at all) and cannot claim the group.
+    // Dropping that predicate turns this into "anyone who was ever a member".
+    //
+    // The `role` predicate mirrors the roster query in `softDeleteGroup` above and is
+    // CONSISTENCY HARDENING, not a security fix (see that function's MED-3 marker for
+    // the full reasoning and the skeptic refutation). Keeping the two queries
+    // identical is the actual point: the set of people emailed the offer and the set
+    // allowed to accept it must be the same set, or the phase promises a recovery
+    // path to someone it will then refuse.
+    const membership = await UserGroup.findOne({
+      where: {
+        user_uuid: actor.id,
+        group_id: group.id,
+        status: 'active',
+        role: { [Op.in]: ['member', 'admin', 'owner'] },
+        deletedAt: stamp,
+      },
+      paranoid: false,
+      transaction: t,
+    });
+    if (!membership) {
+      return { ok: false, code: 'not_a_member' };
+    }
+
+    // --- 5. Consume the token INSIDE this transaction ------------------------
+    //
+    // Consuming outside the transaction means a rollback burns the token permanently
+    // and the group becomes unclaimable by anyone (RESEARCH F-12 / Pitfall 9). Plan
+    // 02 added the `transaction` pass-through for exactly this call.
+    const consumed = await SingleUseToken.consumeByNonce(nonce, { transaction: t });
+    if (!consumed) {
+      return { ok: false, code: 'already_used' };
+    }
+
+    // --- 6. Restore the children, matched on THIS deletion's stamp -----------
+    //
+    // DECISION Phase 88.2 F-05: children are matched on `deletedAt === stamp`, chosen
+    // OVER restoring on `{ group_id }` alone. Restoring on group_id alone resurrects
+    // rows that were ALREADY soft-deleted before this deletion — a member removed
+    // last month reappears on the roster, and SPEC-REQ-9's "no row is resurrected
+    // that was already absent before the delete" is silently violated. This only
+    // works because `softDeleteGroup` stamps ONE explicitly-computed timestamp:
+    // three `.destroy()` calls would give three millisecond-apart timestamps and this
+    // match would find nothing at all.
+    //
+    // `Model.restore` passes `options.where` through verbatim to bulkUpdate and does
+    // NOT apply the paranoid clause — which is exactly the primitive needed here, and
+    // is why it is a footnote in the header's table rather than a numbered carve-out.
+    await Event.restore({ where: { group_id: group.id, deletedAt: stamp }, transaction: t });
+
+    // --- 6a. Carve-out #5 — the AF-3 duplicate-membership guard --------------
+    //
+    // DECISION Phase 88.2 AF-3: a stamped row whose (user_uuid, group_id) pair
+    // ALREADY holds a live row is HARD-DELETED here, chosen OVER two alternatives:
+    //   (a) letting the un-stamp violate the partial unique index
+    //       `usergroups_user_uuid_group_id_uq` (WHERE "deletedAt" IS NULL) and abort
+    //       the whole transaction. Because the token is consumed in-transaction the
+    //       rollback un-burns it, so every retry fails IDENTICALLY and the group is
+    //       unrecoverable until it is purged at day 30 while its members are actively
+    //       trying to save it. That is the worst outcome this phase can produce.
+    //   (b) skipping the stamped row instead of deleting it, which leaves it
+    //       invisible forever and the restored roster permanently short by one.
+    //
+    // THIS IS A REAL, NAMED EXCEPTION TO SPEC-REQ-9. That requirement's acceptance is
+    // "before-delete and after-acceptance row sets are IDENTICAL except the two role
+    // changes". On this branch a row id disappears and a role may differ, so equality
+    // does NOT hold. The exception is reachable ONLY when plan 04's AF-3 gate on the
+    // invite-accept path has already failed — it is defence in depth, not the fix,
+    // and its existence is not an argument for weakening that gate.
+    //
+    // The set is NOT restricted to bystanders — the ACCEPTER can be in it, and
+    // frequently will be: the state is constructed by a post-delete invite acceptance
+    // by whoever then follows the restore link. `membership` (step 4) is that same
+    // stamped row, so it can be destroyed right here. That is why step 8's promote
+    // keys on identity and never on `membership.id`.
+    const stampedRows = await UserGroup.findAll({
+      where: { group_id: group.id, deletedAt: stamp },
+      paranoid: false,
+      transaction: t,
+    });
+    const liveRows = await UserGroup.findAll({
+      where: { group_id: group.id, deletedAt: null },
+      paranoid: false,
+      transaction: t,
+    });
+    const liveByUuid = new Map(liveRows.map((r) => [r.user_uuid, r]));
+    const dupes = stampedRows.filter((r) => liveByUuid.has(r.user_uuid));
+
+    if (dupes.length > 0) {
+      // Reaching this branch means something upstream is already broken, so it must
+      // be LOUD. The payload carries each discarded row's role and joined_at because
+      // THIS BRANCH SILENTLY DEMOTES PEOPLE: the surviving live row was created by a
+      // post-delete join, so it is role 'member' with a fresh joined_at, while the
+      // stamped row being destroyed may have been 'admin' with the group's original
+      // join date. Once the stamped row is gone nothing else records that it
+      // happened — this alert is the only repair instruction an operator will have.
+      //
+      // Deliberately a straight drop-and-shout: no logic copies the higher role onto
+      // the live row. A silent auto-repair here would mask the very leak this warning
+      // exists to surface. Record the discarded values, alert, let a human decide.
+      const discarded = dupes.map((d) => ({
+        user_uuid: d.user_uuid,
+        stamped_role: d.role,
+        stamped_joined_at: d.joined_at,
+        live_role: liveByUuid.get(d.user_uuid).role,
+      }));
+      console.warn(
+        `[groupRecovery] AF-3 duplicate membership rows discarded during restore of group ${group.id}:`,
+        JSON.stringify(discarded)
+      );
+      if (Sentry) {
+        try {
+          Sentry.withScope((scope) => {
+            scope.setLevel('warning');
+            scope.setTag('phase', '88.2');
+            scope.setTag('guard', 'AF-3');
+            scope.setContext('group_restore_duplicate_memberships', {
+              group_id: group.id,
+              discarded,
+            });
+            Sentry.captureMessage(
+              `AF-3 gate leaked: ${dupes.length} duplicate UserGroup row(s) discarded restoring group ${group.id}`
+            );
+          });
+        } catch (sentryErr) {
+          console.error('[groupRecovery] Sentry capture failed:', sentryErr.message);
+        }
+      }
+
+      const dupeIds = dupes.map((d) => d.id);
+      // `force: true` FIRST, on the `.destroy(` line itself — the CI gate that
+      // catches force-less destroys on the three paranoid models is LINE-SCOPED, so
+      // wrapping this call reds the gate on correct code. Never loosen the gate to
+      // accommodate formatting.
+      await UserGroup.destroy({ force: true, where: { id: { [Op.in]: dupeIds } }, transaction: t });
+    }
+
+    await UserGroup.restore({ where: { group_id: group.id, deletedAt: stamp }, transaction: t });
+
+    // --- 7. Restore the group itself and clear its deadline ------------------
+    await Group.restore({ where: { id: group.id }, transaction: t });
+    // Carve-out #4. `silent: true` keeps updatedAt untouched so SPEC-REQ-9's
+    // before/after row-set equality assertion is not tripped by this write.
+    await Group.update(
+      { purge_after: null },
+      { where: { id: group.id }, transaction: t, paranoid: false, silent: true }
+    );
+
+    // --- 8. Swap roles: DEMOTE first, then PROMOTE BY IDENTITY ----------------
+    //
+    // Demote-before-promote is deliberate and handles the case where the accepter IS
+    // the prior owner (they still hold a restorable owner row and could follow a
+    // forwarded link): demote-then-promote leaves them owner, whereas
+    // promote-then-demote would leave the group with NO owner at all.
+    await UserGroup.update(
+      { role: 'member' },
+      { where: { group_id: group.id, role: 'owner' }, transaction: t, silent: true }
+    );
+
+    // The promote is keyed on IDENTITY — (user_uuid, group_id) — and NEVER on
+    // `membership.id`. This is a distinct bug from the ordering one above and it is
+    // the one that actually loses the owner: `membership` is specifically the
+    // accepter's STAMPED row, and step 6a can hard-delete exactly that row. A promote
+    // keyed on `membership.id` would then match ZERO rows, `Model.update` would
+    // return [0] and raise nothing, the transaction would COMMIT, the route would
+    // answer 200 { success: true } — and the restored group would have no owner row
+    // at all: nobody could delete it, transfer ownership, reset the invite token or
+    // manage members, with no admin repair path. Keying on identity targets whichever
+    // row now represents the actor (the surviving live row if 6a dropped the stamped
+    // dupe, the just-restored stamped row if it did not), so the promote is correct
+    // independent of which literal row id survived.
+    const [promotedCount] = await UserGroup.update(
+      { role: 'owner' },
+      { where: { user_uuid: actor.id, group_id: group.id }, transaction: t, silent: true }
+    );
+
+    // A silent no-op must never reach the commit. Throwing rolls the whole restore
+    // back — and because the token was consumed in THIS transaction (step 5) the
+    // rollback un-burns it, so the accepter can simply retry rather than being left
+    // with a restored, ownerless, unrepairable group.
+    if (promotedCount !== 1) {
+      throw new Error(
+        `Group restore aborted: promote of user ${actor.id} in group ${group.id} affected ${promotedCount} rows, expected exactly 1`
+      );
+    }
+
+    // --- 9. Revoke sibling restore tokens ------------------------------------
+    // One nonce is shared by the whole roster, but a re-issue or an earlier delete
+    // can leave other active rows pointing at this group. They must not survive a
+    // completed restore.
+    await SingleUseToken.update(
+      { status: 'revoked' },
+      {
+        where: { group_id: group.id, purpose: 'group_restore', status: 'active' },
+        transaction: t,
+        silent: true,
+      }
+    );
+
+    return { ok: true, groupId: group.id, groupName: group.name };
+  });
+}
+
 module.exports = {
   RECOVERY_WINDOW_DAYS,
   TOKEN_EXPIRY_MARGIN_MS,
   GroupAlreadyDeletedError,
   softDeleteGroup,
+  restoreGroupByToken,
 };
