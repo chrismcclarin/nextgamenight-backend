@@ -6,6 +6,23 @@
 
 const emailService = require('../../services/emailService');
 
+// WR-02 (88.2 review): requiring workers/promptWorker instantiates its BullMQ
+// Worker and Redis connection at module load — neutralize both so the builder
+// can be exercised as a pure function (same mocks as promptWorker.softDelete.test.js).
+jest.mock('bullmq', () => ({
+  Worker: jest.fn().mockImplementation(function () {
+    this.on = jest.fn();
+    this.close = jest.fn().mockResolvedValue();
+  }),
+}));
+jest.mock('ioredis', () => jest.fn().mockImplementation(() => ({
+  on: jest.fn(),
+  disconnect: jest.fn(),
+})));
+
+const { buildPromptEmailHtml } = require('../../workers/promptWorker');
+const { generateEventConfirmationEmailTemplate } = require('../../services/eventCreationService');
+
 // A representative XSS payload + a CRLF header-injection payload.
 const XSS = '<script>alert(1)</script>';
 const ESCAPED_XSS = '&lt;script&gt;alert(1)&lt;/script&gt;';
@@ -243,6 +260,48 @@ describe('BSEC-04 content escaping', () => {
     // the escaper it now routes through to lock the behavior.
     it('escapeHtml neutralizes a customMessage payload', () => {
       expect(emailService.escapeHtml(XSS)).toBe(ESCAPED_XSS);
+    });
+  });
+
+  // WR-02 (88.2 review): the three pre-existing builders that interpolated
+  // user-controlled strings raw. One case per builder.
+  describe('WR-02 — pre-existing email builders escape user-supplied content', () => {
+    it('generateEventConfirmationEmailTemplate escapes groupName, gameName, comments and participants in the HTML part', () => {
+      const { html, text } = generateEventConfirmationEmailTemplate({
+        gameName: XSS,
+        groupName: XSS,
+        startDate: '2026-08-01T18:00:00Z',
+        durationMinutes: 120,
+        participants: [XSS, 'plain-player'],
+        eventUrl: 'https://app.test/event/1',
+        comments: XSS,
+        timezone: 'UTC',
+      });
+      expect(html).toContain(ESCAPED_XSS);
+      expect(html).not.toContain('<script>alert(1)</script>');
+      // The text part is text/plain — it must stay raw, not entity-encoded.
+      expect(text).toContain(XSS);
+    });
+
+    it('buildPromptEmailHtml escapes recipientName, groupName and gameName', () => {
+      const html = buildPromptEmailHtml({
+        recipientName: XSS,
+        groupName: XSS,
+        gameName: XSS,
+        weekDescription: 'this week',
+        responseDeadline: 'Friday',
+        formUrl: 'https://app.test/availability/tok',
+      });
+      expect(html).toContain(ESCAPED_XSS);
+      expect(html).not.toContain('<script>alert(1)</script>');
+    });
+
+    it('availabilityPrompt remind builder relies on primitives that neutralize its payloads (template-level)', () => {
+      // The reminder HTML/subject construction lives inline in
+      // routes/availabilityPrompt.js (same precedent as the feedback route
+      // above): assert the two primitives it now routes through.
+      expect(emailService.escapeHtml(XSS)).toBe(ESCAPED_XSS);
+      expect(emailService.stripCrlf(`Reminder: ${CRLF_SUBJECT} availability request`)).not.toMatch(/[\r\n]/);
     });
   });
 });

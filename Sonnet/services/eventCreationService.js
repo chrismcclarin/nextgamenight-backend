@@ -352,7 +352,9 @@ async function sendConfirmationEmails(event, users, group, game) {
 
       const result = await emailService.send({
         to: user.email,
-        subject: `Game Night Confirmed: ${game?.name || 'Game Night'} - ${formatDateForEmail(event.start_date, recipientTz)}`,
+        // WR-02: user-controlled game name goes into a mail header — strip CR/LF
+        // (BSEC-04 header-injection guard; same discipline as the shared From-name).
+        subject: `Game Night Confirmed: ${emailService.stripCrlf(game?.name || 'Game Night')} - ${formatDateForEmail(event.start_date, recipientTz)}`,
         html,
         text,
         groupName: group?.name,
@@ -407,6 +409,14 @@ function generateEventConfirmationEmailTemplate(data) {
     ? participants.join(', ')
     : 'TBD';
 
+  // WR-02 (88.2 review, BSEC-04): group names, game names, comments and usernames
+  // are end-user-controlled — escape them for the HTML part only. The text part
+  // is text/plain, where escaping would render literal entities.
+  const safeGroupName = emailService.escapeHtml(groupName);
+  const safeGameName = emailService.escapeHtml(gameName);
+  const safeComments = emailService.escapeHtml(comments);
+  const safeParticipants = (participants || []).map((p) => emailService.escapeHtml(p));
+
   const html = `
 <!DOCTYPE html>
 <html>
@@ -442,12 +452,12 @@ function generateEventConfirmationEmailTemplate(data) {
       <p>Your session has been scheduled</p>
     </div>
     <div class="content">
-      <p>Great news! A game night has been confirmed for <strong>${groupName}</strong>.</p>
+      <p>Great news! A game night has been confirmed for <strong>${safeGroupName}</strong>.</p>
 
       <div class="event-card">
         <div class="event-detail">
           <span class="event-label">Game</span>
-          <span class="event-value"><strong>${gameName}</strong></span>
+          <span class="event-value"><strong>${safeGameName}</strong></span>
         </div>
         <div class="event-detail">
           <span class="event-label">Date</span>
@@ -464,14 +474,14 @@ function generateEventConfirmationEmailTemplate(data) {
         ${comments ? `
         <div class="event-detail">
           <span class="event-label">Notes</span>
-          <span class="event-value">${comments}</span>
+          <span class="event-value">${safeComments}</span>
         </div>
         ` : ''}
 
         <div class="participants-section">
           <span class="event-label">Who's Playing</span>
           <div class="participants-list">
-            ${participants.map(p => `<span class="participant-badge">${p}</span>`).join('')}
+            ${safeParticipants.map(p => `<span class="participant-badge">${p}</span>`).join('')}
           </div>
         </div>
       </div>

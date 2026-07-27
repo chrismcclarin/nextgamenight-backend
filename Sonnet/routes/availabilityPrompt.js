@@ -303,14 +303,21 @@ router.post('/prompts/:promptId/remind/:userId', verifyAuth0Token, async (req, r
       day: 'numeric'
     });
 
+    // WR-02 (88.2 review, BSEC-04): username, game name and group name are
+    // end-user-controlled — escape for the HTML part, strip CR/LF for the subject
+    // header. The text part is text/plain and stays raw.
+    const safeUsername = emailService.escapeHtml(targetUser.username || 'there');
+    const safeGameName = emailService.escapeHtml(gameName);
+    const safeGroupName = emailService.escapeHtml(groupName);
+
     const emailResult = await emailService.send({
       to: targetUser.email,
-      subject: `Reminder: ${groupName} availability request`,
+      subject: `Reminder: ${emailService.stripCrlf(groupName)} availability request`,
       html: `
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
           <h2 style="color: #4F46E5;">Availability Reminder</h2>
-          <p>Hi ${targetUser.username || 'there'},</p>
-          <p>This is a friendly reminder to submit your availability for the upcoming <strong>${gameName}</strong> session with <strong>${groupName}</strong>.</p>
+          <p>Hi ${safeUsername},</p>
+          <p>This is a friendly reminder to submit your availability for the upcoming <strong>${safeGameName}</strong> session with <strong>${safeGroupName}</strong>.</p>
           <p>The deadline to respond is <strong>${deadline}</strong>.</p>
           <p>Please check your email for the original availability link.</p>
           <p style="color: #6B7280; font-size: 12px; margin-top: 30px;">
