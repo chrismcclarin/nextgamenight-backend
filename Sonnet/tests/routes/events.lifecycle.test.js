@@ -193,6 +193,37 @@ describe('Event lifecycle: cancellation cutoff', () => {
     expect(event.destroy).toHaveBeenCalled();
   });
 
+  // Phase 88.2 / F-02. Event is `paranoid: true` as of plan 88.2-01, so an unforced
+  // destroy is an UPDATE deletedAt rather than a DELETE.
+  //
+  // WHY THIS IS A CALL-OPTIONS ASSERTION AND NOT A `paranoid: false` READBACK: every
+  // model in this file is jest.mock'd (see the header) — there is no database here, so
+  // there is no row to read back. The equivalent pin at this grain is the flag itself.
+  // The real `paranoid: false` readback for this same route lives in
+  // tests/routes/events.test.js ("hard delete: the event row is physically GONE"),
+  // which runs against the real test Postgres.
+  it('hard delete: the event destroy is FORCED so the row is physically removed (F-02)', async () => {
+    const event = buildEvent({ startOffsetMs: 60 * 60 * 1000 }); // +1h
+    mockEventFindByPk.mockResolvedValue(event);
+
+    const res = await request(app).delete(`/api/events/${TEST_EVENT_ID}`);
+    expect(res.status).toBe(200);
+
+    expect(event.destroy).toHaveBeenCalledWith(
+      expect.objectContaining({ force: true })
+    );
+
+    // The children are NOT forced — EventRsvp and EventParticipation are not paranoid
+    // models, so `force` there would be noise. Asserting it keeps a future sweep from
+    // spraying the flag across every destroy in the transaction.
+    expect(mockEventRsvpDestroy).not.toHaveBeenCalledWith(
+      expect.objectContaining({ force: true })
+    );
+    expect(mockEventParticipationDestroy).not.toHaveBeenCalledWith(
+      expect.objectContaining({ force: true })
+    );
+  });
+
   // Test 2: Cancellation within 15-min grace AFTER start
   it('still fires cancellation emails when start is 5 min ago (within 15-min grace)', async () => {
     const event = buildEvent({ startOffsetMs: -5 * 60 * 1000 }); // -5min

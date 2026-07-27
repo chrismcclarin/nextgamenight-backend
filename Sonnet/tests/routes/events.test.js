@@ -384,6 +384,34 @@ describe('Event Routes', () => {
       expect(deletedEvent).toBeNull();
     });
 
+    // Phase 88.2 / F-02. Event is `paranoid: true` as of plan 88.2-01, so an unforced
+    // destroy is an UPDATE deletedAt, not a DELETE. This assertion is the ONLY one in
+    // this describe block that can tell the difference.
+    it('hard delete: the event row is physically GONE, not soft-deleted (F-02)', async () => {
+      const event = await Event.create({
+        group_id: testGroup.id,
+        game_id: testGame.id,
+        start_date: new Date(),
+        status: 'completed',
+      });
+
+      await request(makeApp(testUser1))
+        .delete(`/api/events/${event.id}`)
+        .expect(200);
+
+      // `paranoid: false` is the whole point of this test — DO NOT SIMPLIFY IT AWAY.
+      // A plain findByPk returns null for a soft-deleted row just as it does for a
+      // hard-deleted one, so the "should delete an event" test above passes either
+      // way. Only a paranoid: false read distinguishes "gone" from "hidden".
+      const raw = await Event.findByPk(event.id, { paranoid: false });
+      expect(raw).toBeNull();
+
+      // The SPEC's Boundaries record single-event delete as permanent forever — only
+      // GROUP deletion becomes recoverable in 88.2. A soft delete here would also
+      // leave a hollow ghost, because this event's EventRsvp and EventParticipation
+      // children (routes/events.js) are still hard-deleted in the same transaction.
+    });
+
     it('should delete event and its participations', async () => {
       const event = await Event.create({
         group_id: testGroup.id,

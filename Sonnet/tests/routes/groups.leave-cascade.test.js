@@ -68,9 +68,14 @@ describe('Group leave cascade (Phase 71.1-02)', () => {
     await EventBring.destroy({ where: {} });
     await EventRsvp.destroy({ where: {} });
     await EventParticipation.destroy({ where: {} });
-    await Event.destroy({ where: {} });
-    await UserGroup.destroy({ where: {} });
-    await Group.destroy({ where: {} });
+    // 88.2 / F-02: Event, UserGroup and Group are paranoid, so an unforced destroy here
+    // would only STAMP deletedAt and leave the rows in place — a teardown that does not
+    // tear down. The `paranoid: false` assertions in this suite read raw rows, so a
+    // leftover soft-deleted row from a sibling test would be indistinguishable from the
+    // regression they exist to catch.
+    await Event.destroy({ where: {}, force: true });
+    await UserGroup.destroy({ where: {}, force: true });
+    await Group.destroy({ where: {}, force: true });
     await User.destroy({ where: { user_id: [owner.user_id, leaver.user_id, bystander.user_id] } });
     await Game.destroy({ where: { is_custom: true, name: 'CascadeTestGame' } });
   }
@@ -178,6 +183,24 @@ describe('Group leave cascade (Phase 71.1-02)', () => {
           where: { option_id: futureOptions.map(o => o.id), user_uuid: leaverRow.id },
         })
       ).toBe(0);
+    });
+
+    // Phase 88.2 / F-02. UserGroup is `paranoid: true` as of plan 88.2-01, so an
+    // unforced destroy is an UPDATE deletedAt rather than a DELETE.
+    it('hard delete: the leaver membership row is physically GONE, not soft-deleted (F-02)', async () => {
+      const app = makeApp(leaver.user_id);
+      await request(app).post(`/api/groups/${group.id}/leave`).send().expect(200);
+
+      // `paranoid: false` is the whole point of this assertion — DO NOT SIMPLIFY IT
+      // AWAY to a plain findOne. A plain read returns null for a soft-deleted row
+      // exactly as it does for a hard-deleted one (the assertion at the top of this
+      // describe block would pass either way); only a paranoid: false read tells
+      // "gone" apart from "hidden".
+      const raw = await UserGroup.findOne({
+        where: { user_uuid: leaverRow.id, group_id: group.id },
+        paranoid: false,
+      });
+      expect(raw).toBeNull();
     });
 
     it('preserves past-event rows for the leaving user (history is sacred)', async () => {
@@ -301,6 +324,24 @@ describe('Group leave cascade (Phase 71.1-02)', () => {
       expect(
         await EventParticipation.count({ where: { event_id: futureEvent.id, user_id: bystanderRow.id } })
       ).toBe(1);
+    });
+
+    // Phase 88.2 / F-02 — the owner-removal counterpart of the self-leave assertion.
+    it('hard delete: the removed member row is physically GONE, not soft-deleted (F-02)', async () => {
+      const app = makeApp(owner.user_id);
+      await request(app)
+        .delete(`/api/groups/${group.id}/users/${leaverRow.id}`)
+        .send()
+        .expect(200);
+
+      // `paranoid: false` is the whole point — DO NOT SIMPLIFY IT AWAY. The plain
+      // findOne above returns null for a soft-deleted row too, so it would pass
+      // whether this is a DELETE or an UPDATE deletedAt.
+      const raw = await UserGroup.findOne({
+        where: { user_uuid: leaverRow.id, group_id: group.id },
+        paranoid: false,
+      });
+      expect(raw).toBeNull();
     });
   });
 });
