@@ -531,7 +531,10 @@ router.post('/:invite_id/decline', async (req, res) => {
 
     // If a UserGroup row exists with status 'invited', destroy it (keyed on the
     // Users.id UUID surrogate — D-11).
-    await UserGroup.destroy({
+    // F-02: hard delete — declining an invite physically removes the row. The `force`
+    // flag sits on the `.destroy(` line deliberately: the CI grep gate is LINE-scoped,
+    // so putting it on a later line would leave this call reported as a hit.
+    await UserGroup.destroy({ force: true,
       where: {
         user_uuid: user.id,
         group_id: invite.group_id,

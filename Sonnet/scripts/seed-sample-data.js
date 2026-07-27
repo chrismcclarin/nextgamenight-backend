@@ -164,12 +164,14 @@ async function seedDatabase() {
 
     // Clear existing data (optional - comment out if you want to keep existing data)
     console.log('🗑️  Clearing existing data...');
+    // F-02: the three paranoid models are FORCED (Event/UserGroup/Group) — a
+    // reseed must WIPE rows, not accumulate soft-deleted ones run after run.
     await GameReview.destroy({ where: {} });
     await EventParticipation.destroy({ where: {} });
-    await Event.destroy({ where: {} });
-    await UserGroup.destroy({ where: {} });
+    await Event.destroy({ where: {}, force: true });
+    await UserGroup.destroy({ where: {}, force: true });
     await Game.destroy({ where: {} });
-    await Group.destroy({ where: {} });
+    await Group.destroy({ where: {}, force: true });
     await User.destroy({ where: {} });
     console.log('✅ Existing data cleared\n');
 

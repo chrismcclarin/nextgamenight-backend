@@ -128,7 +128,9 @@ async function main() {
     defaults: { requester_uuid: alice.id, addressee_uuid: friend.id, status: 'accepted' },
   });
   // Make sure Bob is NOT in the invite group (so the friend checkbox stays enabled).
-  await UserGroup.destroy({ where: { user_uuid: friend.id, group_id: inviteGroup.id } });
+  // F-02: hard delete — a soft-deleted membership row still occupies the roster from
+  // the fixture's point of view on the next run, so the teardown must really remove it.
+  await UserGroup.destroy({ where: { user_uuid: friend.id, group_id: inviteGroup.id }, force: true });
 
   console.log(`E2E_FIXTURES_JSON=${JSON.stringify({
     group_id: group.id,

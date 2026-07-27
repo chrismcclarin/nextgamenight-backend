@@ -1760,7 +1760,14 @@ router.delete('/:id', async (req, res) => {
       await EventParticipation.destroy({ where: { event_id: event.id }, transaction: t });
 
       // Delete event
-      await event.destroy({ transaction: t });
+      // DECISION Phase 88.2 F-02: forcing a HARD delete was chosen OVER letting this become a
+      // soft delete once Group/UserGroup/Event went paranoid in plan 01. The SPEC's
+      // Boundaries record deleting a SINGLE event as permanent forever — only GROUP
+      // deletion becomes recoverable — and this event's EventRsvp (:1757) and
+      // EventParticipation (:1760) children are still hard-deleted two lines up, so a
+      // soft delete would leave a hollow ghost event restorable only to an inconsistent
+      // state. Removing `force` here is a BEHAVIOR CHANGE, not a cleanup.
+      await event.destroy({ transaction: t, force: true });
     });
 
     res.json({ message: 'Event deleted successfully' });

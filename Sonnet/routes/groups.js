@@ -742,29 +742,44 @@ router.delete('/:group_id', async (req, res) => {
     // independent writes, so a mid-sequence failure left a half-deleted group
     // (events gone, roster intact). Same delete order as before; mirrors the
     // in-transaction replica in accountDeletionService Step 1.
+    // DECISION Phase 88.2 F-02: the three paranoid-model destroys below (Event,
+    // UserGroup, group) carry an explicit `force` flag, chosen OVER excluding these lines from the
+    // new CI grep gate by line number. A line-number exclusion is a blind spot with an
+    // expiry date nobody sets — plan 06 rewrites this block, after which such a filter
+    // would silently skip completely different code forever. Forcing costs nothing (a
+    // no-op pre-plan-01, identical after) and buys a GREEN gate in wave 1, the wave that
+    // changes 15 destroy sites and so most needs the gate proving the sweep was complete.
+    // SUPERSEDED BY PLAN 06 (wave 3), which replaces this whole transaction with the
+    // soft-delete path. This marker disappearing with it is the accepted end state, not
+    // a regression — do NOT re-add it in plan 06.
     await sequelize.transaction(async (t) => {
-      // Delete all event participations for events in this group
+      // Delete all event participations for events in this group (not a paranoid model,
+      // so no `force` — D-01's paranoid set is exactly Group/UserGroup/Event)
       const events = await Event.findAll({ where: { group_id }, transaction: t });
       const eventIds = events.map(e => e.id);
       if (eventIds.length > 0) {
         await EventParticipation.destroy({ where: { event_id: { [Op.in]: eventIds } }, transaction: t });
       }
 
-      // Delete all events for this group
-      await Event.destroy({ where: { group_id }, transaction: t });
+      // Delete all events for this group (F-02: hard delete, see marker above)
+      await Event.destroy({ where: { group_id }, transaction: t, force: true });
 
-      // Delete all game reviews for this group
+      // Delete all game reviews for this group (not paranoid — no `force`)
       await GameReview.destroy({ where: { group_id }, transaction: t });
 
-      // Delete all pending invites for this group — GroupInvite.group_id has NO FK,
-      // so skipping this orphans rows carrying invitee email PII.
+      // Delete all pending invites for this group. This EXPLICIT delete inside the
+      // transaction is correct independent of any cascade disposition — it does not
+      // depend on the database's FK configuration matching what a model file or a
+      // migration implies. The live, environment-labelled disposition of every FK
+      // referencing `Groups` is recorded in `88.2-CASCADE-AUDIT.md`. Skipping this
+      // risks orphaning rows carrying invitee email PII. (Not paranoid — no `force`.)
       await GroupInvite.destroy({ where: { group_id }, transaction: t });
 
-      // Delete all user-group associations
-      await UserGroup.destroy({ where: { group_id }, transaction: t });
+      // Delete all user-group associations (F-02: hard delete, see marker above)
+      await UserGroup.destroy({ where: { group_id }, transaction: t, force: true });
 
-      // Finally, delete the group
-      await group.destroy({ transaction: t });
+      // Finally, delete the group (F-02: hard delete, see marker above)
+      await group.destroy({ transaction: t, force: true });
     });
     
     res.json({ message: 'Group deleted successfully' });
@@ -850,7 +865,8 @@ router.post('/:group_id/users/:target_user_id/reject', async (req, res) => {
       return res.status(404).json({ error: 'Pending member not found' });
     }
 
-    await targetUserGroup.destroy();
+    // F-02: hard delete — a rejected pending membership must physically leave the roster.
+    await targetUserGroup.destroy({ force: true });
 
     res.json({ success: true, message: 'Member rejected and removed from group' });
   } catch (error) {
@@ -896,7 +912,8 @@ router.post('/:group_id/leave', async (req, res) => {
         group_id,
         transaction: t,
       });
-      await userGroup.destroy({ transaction: t });
+      // F-02: hard delete — leaving a group physically removes the membership row.
+      await userGroup.destroy({ transaction: t, force: true });
     });
 
     res.json({ success: true, message: 'You have left the group' });
@@ -1041,7 +1058,8 @@ router.delete('/:group_id/users/:target_user_id', async (req, res) => {
         group_id,
         transaction: t,
       });
-      await targetUserGroup.destroy({ transaction: t });
+      // F-02: hard delete — removing a member physically removes the membership row.
+      await targetUserGroup.destroy({ transaction: t, force: true });
     });
 
     res.json({ message: 'User removed from group successfully' });
