@@ -38,7 +38,24 @@ router.get('/prompts/:promptId/respondents', verifyAuth0Token, async (req, res) 
 
     // 1. Get prompt with group
     const prompt = await AvailabilityPrompt.findByPk(promptId, {
-      include: [{ model: Group }]
+      include: [
+      // DECISION Phase 88.2 MED-1: the INNER-JOIN flag on this Group include was
+      // chosen OVER a hand-written group filter and OVER making AvailabilityPrompt
+      // paranoid (which would change prompt lifecycle semantics far outside this
+      // phase). This marker covers all THREE AvailabilityPrompt-rooted Group
+      // includes: here, POST /prompts/:promptId/remind/:userId below, and
+      // services/tentativeHoldService.js.
+      //
+      // AvailabilityPrompt is a NON-PARANOID ROOT, which puts these in exactly the
+      // same class as the two GroupInvite-rooted includes in routes/invites.js
+      // (Phase 88.2 F-04) — read those two together with these as ONE decision.
+      // Sequelize emits `LEFT OUTER JOIN "Groups" ... AND ("Group"."deletedAt" IS
+      // NULL)`, so the PROMPT row survives with `Group: null` and the central D-01
+      // filter cannot reach it. The INNER JOIN drops the row instead, findByPk
+      // returns null, and the existing `if (!prompt)` 404 below fires. Removing the
+      // flag reopens the leak — this is D-01's one structural blind spot.
+        { model: Group, required: true }
+      ]
     });
 
     if (!prompt) {
@@ -174,7 +191,8 @@ router.post('/prompts/:promptId/remind/:userId', verifyAuth0Token, async (req, r
     // 1. Get prompt with group and game
     const prompt = await AvailabilityPrompt.findByPk(promptId, {
       include: [
-        { model: Group },
+        // Phase 88.2 MED-1 — see the marker on GET /prompts/:promptId/respondents.
+        { model: Group, required: true },
         { model: Game }
       ]
     });

@@ -36,7 +36,7 @@ const request = require('supertest');
 const express = require('express');
 
 const availabilityPromptRoutes = require('../../routes/availabilityPrompt');
-const { AvailabilityPrompt, AvailabilityResponse } = require('../../models');
+const { AvailabilityPrompt, AvailabilityResponse, Group, UserGroup, Event } = require('../../models');
 const emailService = require('../../services/emailService');
 const { makeUser, makeGroup, addToGroup } = require('../factories');
 
@@ -458,5 +458,100 @@ describe('GET /api/prompts/:promptId — membership gate + created_by_user_id st
     expect(res.body.prompt.id).toBe(prompt.id);
     // T-71.2-02: raw creator UUID stripped from the wire.
     expect(res.body.prompt.created_by_user_id).toBeUndefined();
+  });
+});
+
+// ============================================================================
+// Phase 88.2 plan 04 Task 7 (MED #1): the AvailabilityPrompt-rooted Group
+// includes are INNER JOINs, so neither prompt endpoint can surface a
+// soft-deleted group.
+//
+// Same defect class as Task 1's two routes/invites.js leaks: AvailabilityPrompt
+// is a NON-paranoid root, so the paranoid clause lands in the JOIN's ON clause
+// and yields `prompt.Group === null` rather than dropping the row. The central
+// D-01 filter provably cannot reach these — this is its one structural blind spot.
+//
+// GET /prompts/:promptId/respondents is deliberately covered TWICE: Task 3's wire
+// sweep proves the group id is absent from the body; this suite proves the status
+// code and the guard path.
+// ============================================================================
+describe('88.2 MED-1 — AvailabilityPrompt endpoints hide a soft-deleted group', () => {
+  let owner;
+  let target;
+  let group;
+  let prompt;
+
+  beforeEach(async () => {
+    owner = await makeUser({ username: 'med1-owner' });
+    target = await makeUser({ username: 'med1-target' });
+    group = await makeGroup({ name: 'MED1 Doomed Group' });
+    await addToGroup(owner, group, 'owner');
+    await addToGroup(target, group, 'member');
+
+    prompt = await AvailabilityPrompt.create({
+      group_id: group.id,
+      prompt_date: new Date(),
+      deadline: new Date(Date.now() + 72 * 60 * 60 * 1000),
+      status: 'active',
+      week_identifier: '2026-W30',
+    });
+  });
+
+  const softDelete = async () => {
+    const deletedAt = new Date();
+    await Group.update({ deletedAt }, { where: { id: group.id }, silent: true });
+    await UserGroup.update({ deletedAt }, { where: { group_id: group.id }, silent: true });
+    await Event.update({ deletedAt }, { where: { group_id: group.id }, silent: true });
+    return deletedAt;
+  };
+
+  it('GET /api/prompts/:promptId/respondents returns 404 for a soft-deleted group and leaks neither its id nor its name', async () => {
+    await softDelete();
+
+    const res = await request(makeApp(owner))
+      .get(`/api/prompts/${prompt.id}/respondents`)
+      .send();
+
+    expect(res.status).toBe(404);
+    const bodyStr = JSON.stringify(res.body);
+    expect(bodyStr).not.toContain(group.id);
+    expect(bodyStr).not.toContain(group.name);
+  });
+
+  it('POST /api/prompts/:promptId/remind/:userId returns 404 for a soft-deleted group and leaks neither its id nor its name', async () => {
+    await softDelete();
+
+    const res = await request(makeApp(owner))
+      .post(`/api/prompts/${prompt.id}/remind/${encodeURIComponent(target.id)}`)
+      .send({});
+
+    expect(res.status).toBe(404);
+    const bodyStr = JSON.stringify(res.body);
+    expect(bodyStr).not.toContain(group.id);
+    expect(bodyStr).not.toContain(group.name);
+  });
+
+  it('(non-regression) GET /api/prompts/:promptId/respondents still resolves normally for a LIVE group', async () => {
+    const res = await request(makeApp(owner))
+      .get(`/api/prompts/${prompt.id}/respondents`)
+      .send();
+
+    // The INNER JOIN must drop nothing legitimate: the prompt still resolves and
+    // the membership gate (not a missing prompt) decides the outcome.
+    expect(res.status).not.toBe(404);
+    expect(res.status).toBe(200);
+  });
+
+  it('(non-regression) POST /api/prompts/:promptId/remind/:userId still resolves the prompt for a LIVE group', async () => {
+    jest.spyOn(emailService, 'send').mockResolvedValue({ success: true });
+
+    const res = await request(makeApp(owner))
+      .post(`/api/prompts/${prompt.id}/remind/${encodeURIComponent(target.id)}`)
+      .send({});
+
+    // Whatever the downstream outcome, it must NOT be 'Prompt not found'.
+    expect(res.status).not.toBe(404);
+
+    jest.restoreAllMocks();
   });
 });
