@@ -662,10 +662,22 @@ async function restoreGroupByToken(nonce, actorAuth0Sub) {
     // One nonce is shared by the whole roster, but a re-issue or an earlier delete
     // can leave other active rows pointing at this group. They must not survive a
     // completed restore.
+    //
+    // `status: 'active'` here is NOT the AF-9 anti-pattern the two LOOKUP queries
+    // forbid — it is a write predicate, and it is the correct one: the token this
+    // restore just consumed is already 'used', and flipping it to 'revoked' would
+    // destroy the audit distinction between "consumed" and "superseded". Only
+    // still-offerable siblings need revoking. (`softDeleteGroup`'s revocation uses
+    // `[Op.ne]: 'revoked'` instead, because there the 'used' row IS the case — see
+    // its MED-10 comment.)
     await SingleUseToken.update(
       { status: 'revoked' },
       {
-        where: { group_id: group.id, purpose: 'group_restore', status: 'active' },
+        where: {
+          group_id: group.id,
+          purpose: 'group_restore',
+          status: 'active',
+        },
         transaction: t,
         silent: true,
       }
