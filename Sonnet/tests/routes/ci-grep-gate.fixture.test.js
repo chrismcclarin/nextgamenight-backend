@@ -27,11 +27,23 @@ const PATTERNS = {
   // identical to the regex in the "force-less destroy on a paranoid model" gate.
   forcelessParanoidDestroy:
     '\\b(Group|UserGroup|Event|group|userGroup|event|targetUserGroup)\\.destroy\\(',
+  // 88.2 / SPEC-REQ-10: the two REQUIRED-PRESENT strings in
+  // services/groupPurgeSweep.js. Unlike every other entry above, an absence of
+  // these is the failure. Byte-for-byte identical to the two greps in the
+  // "purge sweep must delete GroupInvite + SingleUseToken explicitly" gate.
+  purgeDeletesInvites: 'GroupInvite\\.destroy',
+  purgeDeletesTokens: 'SingleUseToken\\.destroy',
 };
 
 // The two filter stages the F-02 gate applies AFTER the regex, byte-for-byte from ci.yml.
 const F02_COMMENT_FILTER = '^[^:]+:[0-9]+:[[:space:]]*(//|\\*)';
 const F02_FORCE_FILTER = 'force:[[:space:]]*true';
+
+// The comment filter the SPEC-REQ-10 presence gate applies. NOTE the anchor differs
+// from F02_COMMENT_FILTER: that gate runs `grep -rn` over directories, so its lines
+// are `<file>:<line>:<content>`; this one runs `grep -n` over ONE file, so its lines
+// are `<line>:<content>`. Byte-for-byte from ci.yml.
+const REQ10_COMMENT_FILTER = '^[0-9]+:[[:space:]]*(//|\\*)';
 
 /**
  * Run `grep -E <pattern>` against `input` exactly as the CI gate does, and return
@@ -71,6 +83,26 @@ function f02GateHits(input) {
   ].join(' | ');
   // Mirror the workflow's `|| true` — grep exits 1 on no-match, which is the PASS path.
   return execSync(`${cmd} || true`, { input, encoding: 'utf8', shell: '/bin/sh' });
+}
+
+/**
+ * Run the SPEC-REQ-10 presence gate's pipeline — `grep -n <pattern>` then the comment
+ * filter then a line count — exactly as `.github/workflows/ci.yml` composes it, and
+ * return the resulting COUNT.
+ *
+ * The gate fails when this count is ZERO. That inversion is the whole point: the
+ * explicit deletes in services/groupPurgeSweep.js cannot be pinned by an integration
+ * assertion, because the sync()-built CI database has an ON DELETE CASCADE on every
+ * NOT NULL group_id and removes those rows on its own.
+ */
+function req10PresenceCount(pattern, input) {
+  const cmd = [
+    `grep -nE '${pattern.replace(/'/g, `'\\''`)}'`,
+    `grep -vE '${REQ10_COMMENT_FILTER}'`,
+    'wc -l',
+  ].join(' | ');
+  const out = execSync(`${cmd} || true`, { input, encoding: 'utf8', shell: '/bin/sh' });
+  return Number(out.trim());
 }
 
 describe('CI grep-gate idiom self-test (D-06)', () => {
@@ -188,6 +220,59 @@ describe('CI grep-gate idiom self-test (D-06)', () => {
       // workflow regex and PATTERNS.forcelessParanoidDestroy above.
       const invisible = 'await membership.destroy({ transaction: t });';
       expect(f02GateHits(invisible)).toBe('');
+    });
+  });
+
+  // ---- 88.2 / SPEC-REQ-10 — the purge sweep's explicit child deletes ----------
+  //
+  // This gate is INVERTED relative to every other one in this file: it fails when a
+  // required string is ABSENT. It exists because no integration test in this repo can
+  // honestly verify the clause it protects — the CI database is sequelize.sync()-built
+  // and Sequelize's belongsTo adds ON DELETE CASCADE to every NOT NULL group_id, so a
+  // "no invite rows remain after one sweep" assertion passes whether or not
+  // services/groupPurgeSweep.js contains the explicit delete. Those rows carry invitee
+  // email PII. THIS gate, not that test, is the control.
+  describe('SPEC-REQ-10 — purge sweep must delete GroupInvite + SingleUseToken explicitly (88.2)', () => {
+    test('a real explicit delete SATISFIES the presence check (gate passes)', () => {
+      const real = 'await GroupInvite.destroy({ where: { group_id }, transaction: t });';
+      expect(req10PresenceCount(PATTERNS.purgeDeletesInvites, real)).toBe(1);
+    });
+
+    test('the token delete likewise satisfies its own presence check', () => {
+      const real = 'await SingleUseToken.destroy({ where: { group_id }, transaction: t });';
+      expect(req10PresenceCount(PATTERNS.purgeDeletesTokens, real)).toBe(1);
+    });
+
+    test('a COMMENTED-OUT delete does NOT satisfy the check — the comment filter is what rejects it', () => {
+      // The regression this whole gate exists to catch: someone concludes the line is
+      // redundant with the cascade, comments it out, and CI stays green because the
+      // sync()-built database removes the rows anyway. Stage 1 DOES match here —
+      // proving the line is only rejected by the comment filter downstream, exactly as
+      // in the F-02 pair above.
+      const commented = '  // GroupInvite.destroy is handled by the cascade';
+      expect(grepHits(PATTERNS.purgeDeletesInvites, commented)).not.toBe('');
+      expect(req10PresenceCount(PATTERNS.purgeDeletesInvites, commented)).toBe(0);
+    });
+
+    test('a jsdoc-style `*` comment line is ALSO rejected', () => {
+      const jsdoc = ' * SingleUseToken.destroy rows are collected by the group cascade.';
+      expect(req10PresenceCount(PATTERNS.purgeDeletesTokens, jsdoc)).toBe(0);
+    });
+
+    test('an EMPTY file satisfies neither check (gate fails on a deleted sweep)', () => {
+      expect(req10PresenceCount(PATTERNS.purgeDeletesInvites, '')).toBe(0);
+      expect(req10PresenceCount(PATTERNS.purgeDeletesTokens, '')).toBe(0);
+    });
+
+    test('the REAL services/groupPurgeSweep.js passes both halves of the gate', () => {
+      // Not a fixture — the live file. If this reds, the shipped sweep no longer
+      // deletes those rows explicitly and CI is about to red for the same reason.
+      const src = require('fs').readFileSync(
+        require('path').join(__dirname, '../../services/groupPurgeSweep.js'),
+        'utf8'
+      );
+      expect(req10PresenceCount(PATTERNS.purgeDeletesInvites, src)).toBeGreaterThan(0);
+      expect(req10PresenceCount(PATTERNS.purgeDeletesTokens, src)).toBeGreaterThan(0);
     });
   });
 });
