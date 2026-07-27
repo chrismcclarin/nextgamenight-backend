@@ -117,6 +117,33 @@ async function processPromptJob(job) {
   const dedupScheduleKey = triggeringSchedule?.id || scheduleId || 'legacy';
   const dedupKey = `${weekIdentifier}-${dedupScheduleKey}`;
 
+  // DECISION Phase 88.2 F-A3: an EARLY RETURN was chosen OVER letting the
+  // per-recipient try/catch swallow the TypeError that a null `group` produces.
+  // That catch only logs per recipient and execution still falls through to
+  // `prompt.update({ status: 'active' })` — leaving an ACTIVE prompt bound to a
+  // group that no longer exists, with zero emails sent.
+  //
+  // Guarding BEFORE AvailabilityPrompt.create was chosen OVER guarding after it
+  // and disposing of the orphaned row: all three sibling skip branches above
+  // (`schedule_deleted`, `schedule_inactive`, `duplicate_week`) return pre-create
+  // and none creates a row to dispose of, so a post-create guard would invent a
+  // fourth disposition inconsistent with every one of them. With the guard here
+  // there is no orphan to clean up and `status: 'pending'` is never written for a
+  // dead group. Do NOT add a prompt.destroy()/update() cleanup.
+  //
+  // Shape copied verbatim from workers/reminderWorker.js's `group_not_found` guard.
+  //
+  // RELOCATED: this lookup previously sat AFTER the create, just above the send
+  // loop. Moving it back there silently reintroduces the orphan-row path — it is
+  // a decision, not stray ordering. `groupId` is a function parameter, available
+  // from the first line, so the lookup has no dependency on anything between here
+  // and its old position.
+  const group = await Group.findByPk(groupId);
+  if (!group) {
+    console.log(`[PromptWorker] Group ${groupId} not found (soft-deleted or purged), skipping`);
+    return { skipped: true, reason: 'group_not_found' };
+  }
+
   const existingPrompt = await AvailabilityPrompt.findOne({
     where: { group_id: groupId, week_identifier: dedupKey }
   });
@@ -197,7 +224,8 @@ async function processPromptJob(job) {
     include: [userInclude]
   });
 
-  const group = await Group.findByPk(groupId);
+  // `group` is resolved and null-guarded above, before AvailabilityPrompt.create
+  // (Phase 88.2 F-A3). It used to be looked up here.
   let emailsSent = 0;
 
   // Send emails to each member
