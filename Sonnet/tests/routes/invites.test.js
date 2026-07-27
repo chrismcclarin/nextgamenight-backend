@@ -518,10 +518,18 @@ describe('POST invite-accept — atomicity rollback on BOTH paths (87-02 BINT-01
     jest.restoreAllMocks();
   });
 
+  // Phase 88.2 AF-3: the spy target moved from UserGroup.findOrCreate to
+  // UserGroup.create. acceptInviteTransactional no longer calls findOrCreate — it was
+  // replaced with findOne({ paranoid: false }) + restore-or-create, because
+  // findOrCreate's paranoid-filtered CREATE branch could emit a SECOND live membership
+  // row that permanently aborts a group restore. These two tests still pin the SAME
+  // invariant (a failure during membership activation rolls back the status flip);
+  // only the injection point changed. This suite seeds NO pre-existing membership row,
+  // so the pair takes the no-row branch and UserGroup.create is the write to fail.
   it('(id-based) a failure during UserGroup activation rolls back the status flip → invite stays pending, no active membership', async () => {
     // Force the SECOND write (membership) to fail AFTER the status flip.
     jest
-      .spyOn(UserGroup, 'findOrCreate')
+      .spyOn(UserGroup, 'create')
       .mockRejectedValueOnce(new Error('simulated UserGroup failure'));
 
     await request(app)
@@ -542,7 +550,7 @@ describe('POST invite-accept — atomicity rollback on BOTH paths (87-02 BINT-01
 
   it('(accept-by-token) a failure during UserGroup activation rolls back the status flip → invite stays pending, no active membership', async () => {
     jest
-      .spyOn(UserGroup, 'findOrCreate')
+      .spyOn(UserGroup, 'create')
       .mockRejectedValueOnce(new Error('simulated UserGroup failure'));
 
     await request(app)
@@ -820,5 +828,219 @@ describe('88.2 F-04 — invite READ paths hide soft-deleted groups', () => {
       expect(entry.group_name).not.toBe('Unknown Group');
     }
     expect(JSON.stringify(res.body)).not.toContain(deadGroup.id);
+  });
+});
+
+// ============================================================================
+// Phase 88.2 plan 04 Task 4 (AF-3 / AF-5 / AF-8): no invite WRITE path can act
+// on a soft-deleted group, and the duplicate-membership state that would make a
+// group restore abort forever cannot be constructed.
+// ============================================================================
+describe('88.2 AF-3 — invite WRITE paths refuse a soft-deleted group', () => {
+  let inviter;
+  let invitee;
+  let group;
+  let invite;
+
+  beforeEach(async () => {
+    inviter = await User.create({
+      user_id: 'auth0|af3-inviter',
+      username: 'af3-inviter',
+      email: 'af3-inviter@example.com',
+    });
+    invitee = await User.create({
+      user_id: 'auth0|af3-invitee',
+      username: 'af3-invitee',
+      email: 'af3-invitee@example.com',
+    });
+    group = await Group.create({ group_id: 'af3-group', name: 'AF3 Group' });
+    await UserGroup.create({
+      user_uuid: inviter.id, group_id: group.id, role: 'owner', status: 'active',
+    });
+    invite = await GroupInvite.create({
+      group_id: group.id,
+      invited_email: invitee.email.toLowerCase(),
+      invited_by_uuid: inviter.id,
+      token: 'af3-accept-token',
+      status: 'pending',
+    });
+    currentActor = invitee.user_id;
+  });
+
+  const softDelete = async () => {
+    const deletedAt = new Date();
+    await Group.update({ deletedAt }, { where: { id: group.id }, silent: true });
+    await UserGroup.update({ deletedAt }, { where: { group_id: group.id }, silent: true });
+    return deletedAt;
+  };
+
+  const rawUserGroupCount = () =>
+    UserGroup.count({ where: { group_id: group.id }, paranoid: false });
+
+  // --- accept by id -------------------------------------------------------
+  it('POST /:invite_id/accept returns 410 for a soft-deleted group and creates ZERO UserGroup rows', async () => {
+    await softDelete();
+    const before = await rawUserGroupCount();
+
+    const res = await request(app)
+      .post(`/api/invites/${invite.id}/accept`)
+      .send({})
+      .expect(410);
+    expect(res.body.error).toMatch(/no longer available/i);
+
+    expect(await rawUserGroupCount()).toBe(before);
+    // The invite must not have been flipped either.
+    const reloaded = await GroupInvite.findByPk(invite.id);
+    expect(reloaded.status).toBe('pending');
+  });
+
+  it('(non-regression) POST /:invite_id/accept still succeeds for a LIVE group and ends with an active membership', async () => {
+    const res = await request(app)
+      .post(`/api/invites/${invite.id}/accept`)
+      .send({})
+      .expect(200);
+    expect(res.body.success).toBe(true);
+
+    const ug = await UserGroup.findOne({ where: { user_uuid: invitee.id, group_id: group.id } });
+    expect(ug).not.toBeNull();
+    expect(ug.status).toBe('active');
+  });
+
+  // --- accept by token ----------------------------------------------------
+  it('POST /accept-by-token returns 410 for a soft-deleted group and creates ZERO UserGroup rows', async () => {
+    await softDelete();
+    const before = await rawUserGroupCount();
+
+    const res = await request(app)
+      .post('/api/invites/accept-by-token')
+      .send({ token: invite.token })
+      .expect(410);
+    expect(res.body.error).toMatch(/no longer available/i);
+
+    expect(await rawUserGroupCount()).toBe(before);
+    const reloaded = await GroupInvite.findByPk(invite.id);
+    expect(reloaded.status).toBe('pending');
+  });
+
+  it('(non-regression) POST /accept-by-token still succeeds for a LIVE group and ends with an active membership', async () => {
+    const res = await request(app)
+      .post('/api/invites/accept-by-token')
+      .send({ token: invite.token })
+      .expect(200);
+    expect(res.body.success).toBe(true);
+
+    const ug = await UserGroup.findOne({ where: { user_uuid: invitee.id, group_id: group.id } });
+    expect(ug).not.toBeNull();
+    expect(ug.status).toBe('active');
+  });
+
+  // --- decline ------------------------------------------------------------
+  it('POST /:invite_id/decline returns 410 for a soft-deleted group and the STAMPED UserGroup row survives', async () => {
+    // The invitee holds an 'invited' membership row (the invite-send path creates
+    // one for an already-registered invitee). The group delete stamps it; plan 07's
+    // restore must be able to bring it back, so decline must not hard-delete it.
+    await UserGroup.create({
+      user_uuid: invitee.id, group_id: group.id, role: 'member', status: 'invited',
+    });
+    await softDelete();
+
+    const res = await request(app)
+      .post(`/api/invites/${invite.id}/decline`)
+      .send({})
+      .expect(410);
+    expect(res.body.error).toMatch(/no longer available/i);
+
+    const stamped = await UserGroup.findOne({
+      where: { user_uuid: invitee.id, group_id: group.id },
+      paranoid: false,
+    });
+    expect(stamped).not.toBeNull();
+    expect(stamped.deletedAt).not.toBeNull();
+
+    const reloaded = await GroupInvite.findByPk(invite.id);
+    expect(reloaded.status).toBe('pending');
+  });
+
+  it('(non-regression) POST /:invite_id/decline still succeeds for a LIVE group and removes the invited row', async () => {
+    await UserGroup.create({
+      user_uuid: invitee.id, group_id: group.id, role: 'member', status: 'invited',
+    });
+
+    await request(app)
+      .post(`/api/invites/${invite.id}/decline`)
+      .send({})
+      .expect(200);
+
+    const reloaded = await GroupInvite.findByPk(invite.id);
+    expect(reloaded.status).toBe('declined');
+    const gone = await UserGroup.findOne({
+      where: { user_uuid: invitee.id, group_id: group.id },
+      paranoid: false,
+    });
+    expect(gone).toBeNull();
+  });
+
+  // --- the unrecoverability PRECONDITION, at the row level -----------------
+  it('AF-3 / T-88.2-18c: a refused accept leaves the pair with EXACTLY ONE UserGroup row — the stamped one', async () => {
+    // The reachable-in-practice state: a member who ALSO still holds a pending
+    // invite (QR / join-by-token leaves the invite pending). The group delete
+    // stamps their membership row.
+    await UserGroup.create({
+      user_uuid: invitee.id, group_id: group.id, role: 'member', status: 'active',
+    });
+    const deletedAt = await softDelete();
+
+    await request(app)
+      .post('/api/invites/accept-by-token')
+      .send({ token: invite.token })
+      .expect(410);
+
+    // EXACTLY ONE row for the pair, and it is the stamped one. A SECOND, LIVE row
+    // here is what the partial index `usergroups_user_uuid_group_id_uq`
+    // (WHERE "deletedAt" IS NULL) permits and what would make plan 07's
+    // UserGroup.restore({ deletedAt: stamp }) violate that index — aborting the
+    // whole restore transaction identically on every retry, forever.
+    //
+    // The end-to-end half (refuse, then restore successfully via
+    // POST /api/groups/accept-ownership) lives in plan 07 Task 3 — that endpoint
+    // is registered in WAVE 4 and does not exist yet in wave 2. Do not add the
+    // request here; it would 404.
+    const rows = await UserGroup.findAll({
+      where: { user_uuid: invitee.id, group_id: group.id },
+      paranoid: false,
+    });
+    expect(rows).toHaveLength(1);
+    expect(rows[0].deletedAt).not.toBeNull();
+    expect(new Date(rows[0].deletedAt).getTime()).toBe(deletedAt.getTime());
+    expect(rows.filter((r) => r.deletedAt === null)).toHaveLength(0);
+  });
+
+  // --- Fix 2 on its own terms ---------------------------------------------
+  it('AF-3 Fix 2: acceptInviteTransactional RESTORES a stamped membership row rather than creating a second one', async () => {
+    // Reaching this while the group is soft-deleted should be impossible once the
+    // route gates hold — but Fix 2 removes the failure mode structurally, so prove
+    // it independently: a pair with a stamped row on a LIVE group must end with
+    // ONE live row, not two.
+    const ug = await UserGroup.create({
+      user_uuid: invitee.id, group_id: group.id, role: 'member', status: 'invited',
+    });
+    await UserGroup.update(
+      { deletedAt: new Date() },
+      { where: { id: ug.id }, silent: true }
+    );
+
+    await request(app)
+      .post('/api/invites/accept-by-token')
+      .send({ token: invite.token })
+      .expect(200);
+
+    const rows = await UserGroup.findAll({
+      where: { user_uuid: invitee.id, group_id: group.id },
+      paranoid: false,
+    });
+    expect(rows).toHaveLength(1);          // restored, NOT duplicated
+    expect(rows[0].id).toBe(ug.id);        // the SAME row
+    expect(rows[0].deletedAt).toBeNull();  // un-stamped
+    expect(rows[0].status).toBe('active');
   });
 });

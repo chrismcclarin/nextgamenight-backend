@@ -677,37 +677,98 @@ router.post('/join-by-token', async (req, res) => {
       }
     }
 
-    // Check for existing UserGroup
-    const existingMembership = await UserGroup.findOne({
-      where: { user_uuid: user.id, group_id: group.id },
-    });
-
-    if (existingMembership) {
-      // Already an active member
-      if (existingMembership.status === 'active' && existingMembership.role !== 'pending') {
-        return res.json({ already_member: true, group_id: group.id });
-      }
-
-      // Re-activate declined or pending membership as full member
-      await existingMembership.update({
-        role: 'member',
-        status: 'active',
-        joined_at: new Date(),
+    // DECISION Phase 88.2 AF-3: the membership write below runs inside a transaction
+    // that takes the SAME `FOR UPDATE` row lock on Groups the other writers use, and
+    // RE-READS group liveness inside that lock. This was chosen OVER relying on the
+    // delete side's lock to refuse a concurrent join.
+    //
+    // Why the delete-side lock does NOT close this (read before "simplifying" the
+    // gate away): services/accountDeletionService.js's lock makes a concurrent join
+    // "wait until the deletion transaction decides", and that refuses the join ONLY
+    // because ACCOUNT DELETION DESTROYS THE Groups ROW — the waiting join then fails
+    // its FK check. A SOFT delete leaves the Groups row physically in place, so when
+    // the lock releases the join's FOR KEY SHARE FK check SUCCEEDS and the row lands.
+    // The lock changes timing, not outcome. Only a liveness gate refuses.
+    //
+    // The lock is what makes the re-read meaningful: without it the same gap simply
+    // reopens between the re-read and the insert. The plain `Group.findOne` above is
+    // paranoid-filtered too, but it runs several round-trips earlier (auto-provision,
+    // tombstone check, User.findOrCreate) with no transaction of its own, so a QR
+    // scan landing while an owner deletes passes it against a still-live group and
+    // would commit its membership AFTER the delete stamped everything.
+    //
+    // Harm this refuses: a LIVE UserGroup row on a hidden group for the whole 30-day
+    // window — getUserRoleInGroup returns 'member', isActiveMember passes, and the
+    // joiner reads the hidden group's non-paranoid GameReview content and its lists
+    // through the very choke point the rest of this phase assumes is denying. It also
+    // leaves an UNSTAMPED live row that survives plan 07's stamp-matched restore,
+    // breaking SPEC-REQ-9 row-set equality.
+    //
+    // 410 with the same message as the three invite write-path gates, so all four
+    // gated write paths answer identically. Placed AFTER the tombstone check above so
+    // its `410 account_deleted` envelope is unchanged.
+    const joinResult = await sequelize.transaction(async (t) => {
+      await sequelize.query('SELECT id FROM "Groups" WHERE id = :id FOR UPDATE', {
+        replacements: { id: group.id },
+        type: sequelize.QueryTypes.SELECT,
+        transaction: t,
       });
 
-      return res.json({ success: true, group_id: group.id });
+      // Group is paranoid (D-01) → null once the delete transaction has stamped it.
+      const live = await Group.findByPk(group.id, { transaction: t });
+      if (!live) {
+        return { gone: true };
+      }
+
+      // Check for existing UserGroup
+      const existingMembership = await UserGroup.findOne({
+        where: { user_uuid: user.id, group_id: group.id },
+        transaction: t,
+      });
+
+      if (existingMembership) {
+        // Already an active member
+        if (existingMembership.status === 'active' && existingMembership.role !== 'pending') {
+          return { alreadyMember: true };
+        }
+
+        // Re-activate declined or pending membership as full member
+        await existingMembership.update(
+          {
+            role: 'member',
+            status: 'active',
+            joined_at: new Date(),
+          },
+          { transaction: t }
+        );
+
+        return { joined: true };
+      }
+
+      // Create new membership -- CRITICAL: role is 'member' NOT 'pending' (QR invites bypass pending)
+      // Phase 87.1 (Plan 09 cutover): keyed on user_uuid — the old Auth0-string user_id
+      // column was removed from the model.
+      await UserGroup.create(
+        {
+          user_uuid: user.id, // Users.id UUID (the join key)
+          group_id: group.id,
+          role: 'member',
+          status: 'active',
+          joined_at: new Date(),
+        },
+        { transaction: t }
+      );
+
+      return { joined: true };
+    });
+
+    if (joinResult.gone) {
+      return res.status(410).json({ error: 'This group is no longer available' });
     }
 
-    // Create new membership -- CRITICAL: role is 'member' NOT 'pending' (QR invites bypass pending)
-    // Phase 87.1 (Plan 09 cutover): keyed on user_uuid — the old Auth0-string user_id
-    // column was removed from the model.
-    await UserGroup.create({
-      user_uuid: user.id, // Users.id UUID (the join key)
-      group_id: group.id,
-      role: 'member',
-      status: 'active',
-      joined_at: new Date(),
-    });
+    if (joinResult.alreadyMember) {
+      return res.json({ already_member: true, group_id: group.id });
+    }
 
     res.json({ success: true, group_id: group.id });
   } catch (error) {
