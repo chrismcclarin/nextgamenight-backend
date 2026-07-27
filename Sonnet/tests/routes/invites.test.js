@@ -711,3 +711,114 @@ describe('POST /invites/send — friend_user_id UUID-only resolution (87.3 PR-C 
     expect(count).toBe(0);
   });
 });
+
+// ============================================================================
+// Phase 88.2 plan 04 Task 1 (SPEC-REQ-4 / F-04): the two GroupInvite-rooted
+// `model: Group` includes are INNER JOINs, so a soft-deleted group's invites
+// can never reach the wire.
+//
+// GroupInvite is deliberately NON-paranoid (D-01), so the central paranoid
+// filter does NOT drop these rows on its own — it emits the deletedAt clause in
+// the JOIN's ON clause and yields `Group: null`. `required: true` is the fix.
+// ============================================================================
+describe('88.2 F-04 — invite READ paths hide soft-deleted groups', () => {
+  let owner;
+  let invitee;
+  let liveGroup;
+  let deadGroup;
+
+  // Soft-delete by STAMPING, never destroy() — matches the phase-wide discipline
+  // (one shared timestamp across Group / UserGroup / Event) so plan 07's
+  // stamp-matched restore can find the rows again.
+  const stamp = async (group) => {
+    const deletedAt = new Date();
+    await Group.update({ deletedAt }, { where: { id: group.id }, silent: true });
+    await UserGroup.update({ deletedAt }, { where: { group_id: group.id }, silent: true });
+    return deletedAt;
+  };
+
+  beforeEach(async () => {
+    owner = await User.create({
+      user_id: 'auth0|f04-owner',
+      username: 'f04-owner',
+      email: 'f04-owner@example.com',
+    });
+    invitee = await User.create({
+      user_id: 'auth0|f04-invitee',
+      username: 'f04-invitee',
+      email: 'f04-invitee@example.com',
+    });
+
+    liveGroup = await Group.create({ group_id: 'f04-live', name: 'F04 Live Group' });
+    deadGroup = await Group.create({ group_id: 'f04-dead', name: 'F04 Doomed Group' });
+
+    for (const g of [liveGroup, deadGroup]) {
+      await UserGroup.create({
+        user_uuid: owner.id,
+        group_id: g.id,
+        role: 'owner',
+        status: 'active',
+      });
+    }
+
+    currentActor = invitee.user_id;
+  });
+
+  const seedInvite = (group, token) =>
+    GroupInvite.create({
+      group_id: group.id,
+      invited_email: invitee.email.toLowerCase(),
+      invited_by_uuid: owner.id,
+      token,
+      status: 'pending',
+    });
+
+  // --- SPEC-REQ-4b: the PUBLIC endpoint -----------------------------------
+  it('(4b) GET /invites/info/:token returns 404 for a soft-deleted group, leaking neither the name nor the Unknown Group fallback', async () => {
+    await seedInvite(deadGroup, 'f04-dead-token');
+    await stamp(deadGroup);
+
+    const res = await request(app)
+      .get('/api/invites/info/f04-dead-token')
+      .expect(404);
+
+    const bodyStr = JSON.stringify(res.body);
+    expect(bodyStr).not.toContain('Unknown Group');
+    expect(bodyStr).not.toContain(deadGroup.name);
+    expect(bodyStr).not.toContain(deadGroup.id);
+  });
+
+  it('(4b non-regression) GET /invites/info/:token still returns 200 with the group name for a LIVE group', async () => {
+    await seedInvite(liveGroup, 'f04-live-token');
+
+    const res = await request(app)
+      .get('/api/invites/info/f04-live-token')
+      .expect(200);
+
+    expect(res.body.group_name).toBe(liveGroup.name);
+    expect(res.body.group_name).not.toBe('Unknown Group');
+  });
+
+  // --- SPEC-REQ-4c: the authenticated pending list ------------------------
+  it('(4c) GET /invites/pending returns exactly the LIVE group invite when one of two groups is soft-deleted', async () => {
+    await seedInvite(liveGroup, 'f04-pending-live');
+    await seedInvite(deadGroup, 'f04-pending-dead');
+    await stamp(deadGroup);
+
+    const res = await request(app).get('/api/invites/pending').expect(200);
+
+    expect(Array.isArray(res.body)).toBe(true);
+    expect(res.body).toHaveLength(1);
+    expect(res.body[0].group_id).toBe(liveGroup.id);
+    expect(res.body[0].group_name).toBe(liveGroup.name);
+
+    // The endpoint returns a FLAT body and never emits the `Group` association
+    // (routes/invites.js enrichment loop). The property that actually proves the
+    // INNER JOIN worked is that no entry carries the 'Unknown Group' fallback —
+    // which is exactly what a LEFT JOIN yielding `Group: null` would produce.
+    for (const entry of res.body) {
+      expect(entry.group_name).not.toBe('Unknown Group');
+    }
+    expect(JSON.stringify(res.body)).not.toContain(deadGroup.id);
+  });
+});

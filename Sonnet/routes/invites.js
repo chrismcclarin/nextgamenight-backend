@@ -86,9 +86,22 @@ router.get('/info/:token', async (req, res) => {
     const invite = await GroupInvite.findOne({
       where: { token, status: 'pending' },
       include: [
+        // DECISION Phase 88.2 F-04: the INNER-JOIN flag below was chosen OVER a
+        // hand-written `where`/`deletedAt` filter on the outer query, and OVER making
+        // GroupInvite paranoid. D-01 deliberately leaves GroupInvite non-paranoid, so
+        // Sequelize puts Group's paranoid clause in the JOIN's ON clause — the invite
+        // row SURVIVES with `Group: null` instead of being dropped. Marking the include
+        // required makes it an INNER JOIN, so a soft-deleted group's invite yields no
+        // row and the `if (!invite)` 404 below fires.
+        // THIS ROUTE IS ON THE PUBLIC ALLOWLIST (server.js: GET /invites/info). Without
+        // the flag an UNAUTHENTICATED caller holding an old invite token gets HTTP 200
+        // disclosing that a group existed (degraded to 'Unknown Group'). Removing it
+        // reopens a public information-disclosure leak — it is not cosmetic and it is
+        // not a redundant flag.
         {
           model: Group,
           attributes: ['name'],
+          required: true,
         },
         {
           model: User,
@@ -421,9 +434,18 @@ router.get('/pending', async (req, res) => {
         status: 'pending',
       },
       include: [
+        // DECISION Phase 88.2 F-04: the INNER-JOIN flag below was chosen OVER a
+        // hand-written `where`/`deletedAt` filter on the outer query, and OVER making
+        // GroupInvite paranoid. Same root cause as the GET /info/:token include above:
+        // GroupInvite is a NON-paranoid root (D-01), so Group's paranoid clause lands
+        // in the JOIN's ON clause and nulls the association instead of dropping the
+        // invite. With INNER JOIN, a soft-deleted group's invites leave the list
+        // entirely and the enrichment loop below never sees a null `invite.Group`
+        // (which would otherwise surface as `group_name: 'Unknown Group'`).
         {
           model: Group,
           attributes: ['id', 'name'],
+          required: true,
         },
         {
           model: User,
