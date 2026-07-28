@@ -714,7 +714,11 @@ router.get('/restore-preview/:token', async (req, res) => {
     res.json({ group_name: group.name, purge_after: group.purge_after });
   } catch (error) {
     console.error('Error getting group restore preview:', error);
-    res.status(500).json({ error: error.message });
+    // Code-review L-5: this route is PUBLIC and unauthenticated — never echo
+    // error.message to the caller (the house pattern elsewhere predates this
+    // route; Phase 93/BAPI-03 owns converting the rest). Detail stays in the
+    // console line above.
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
