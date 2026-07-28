@@ -79,6 +79,17 @@ const UserGroup = sequelize.define('UserGroup', {
       name: 'usergroups_user_uuid_group_id_uq'
     },
     {
+      // Phase 88.2 code-review M-1: plain NON-unique (group_id, user_uuid). The
+      // partial unique index above is invisible to `paranoid: false` lookups
+      // (soft-deleted rows aren't in it) and leads on user_uuid, so group_id-
+      // leading queries (roster reads, counts, purge destroys) and the in-lock
+      // invite-accept membership checks were sequential scans. Dual-declared
+      // with migration 20260727000001; explicit name keeps sync() and the
+      // migration identical.
+      fields: ['group_id', 'user_uuid'],
+      name: 'usergroups_group_id_user_uuid'
+    },
+    {
       fields: ['status']
     }
   ]
