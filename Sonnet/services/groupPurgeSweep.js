@@ -112,7 +112,10 @@ const PURGE_JOB_NAME = 'group_purge';
  * @param {number} durationMs
  */
 async function recordPurgeRun(counters, failedGroupIds, durationMs) {
-  const degraded = counters.errors > 0 || counters.batch_saturated;
+  // L-4: anomalies and orphans are degradations — they land in the `error` column
+  // a stuck-purge investigation reads first, not just in Sentry.
+  const degraded = counters.errors > 0 || counters.batch_saturated
+    || counters.anomalies > 0 || counters.orphaned_null_deadline > 0;
   try {
     await SchedulerRun.create({
       job_name: PURGE_JOB_NAME,
@@ -199,7 +202,17 @@ async function purgeOneGroup(groupId) {
     // too. A soft-deleted group with a NULL purge_after means something went wrong
     // upstream (RESEARCH F-02's uncollectable orphan), and silently destroying it is
     // the worst possible response to that.
-    if (group.purge_after == null || group.purge_after > new Date()) {
+    //
+    // Code-review L-4 (owner-approved 2026-07-27): the NULL-deadline case returns
+    // its own outcome instead of folding into 'skipped' — the caller counts and
+    // Sentry-warns it. Note this in-lock branch is DEFENSIVE (a NULL-deadline row
+    // cannot be selected as a candidate); the population-level detection for
+    // orphans the selection can never see is the census in runGroupPurgeSweep.
+    if (group.purge_after == null) {
+      return 'anomaly_null_deadline';
+    }
+    if (group.purge_after > new Date()) {
+      // Re-deleted between selection and the lock — new deadline in the future.
       return 'skipped';
     }
 
@@ -340,7 +353,8 @@ async function purgeOneGroup(groupId) {
  *   PURGE_BATCH_LIMIT; tests inject a small value to exercise saturation without
  *   seeding hundreds of rows on the shared test Postgres.
  * @returns {Promise<{candidates: number, purged: number, skipped_restored: number,
- *   errors: number, batch_saturated: boolean}>}
+ *   anomalies: number, orphaned_null_deadline: number, errors: number,
+ *   batch_saturated: boolean}>}
  */
 async function runGroupPurgeSweep(options = {}) {
   const startedAt = Date.now();
@@ -352,6 +366,13 @@ async function runGroupPurgeSweep(options = {}) {
     candidates: 0,
     purged: 0,
     skipped_restored: 0,
+    // L-4: in-lock NULL-deadline skips — near-unreachable defensive branch, but no
+    // longer indistinguishable from a benign skip if it ever fires.
+    anomalies: 0,
+    // L-4: nightly census of RESEARCH F-02's uncollectable orphans — soft-deleted
+    // groups with NULL purge_after. These can NEVER be selected as candidates
+    // (SQL: NULL < x is false), so without this count they are invisible forever.
+    orphaned_null_deadline: 0,
     errors: 0,
     batch_saturated: false,
   };
@@ -377,6 +398,17 @@ async function runGroupPurgeSweep(options = {}) {
         const outcome = await purgeOneGroup(groupId);
         if (outcome === 'purged') {
           counters.purged++;
+        } else if (outcome === 'anomaly_null_deadline') {
+          // The code above says this state must not be silent — make it true in
+          // telemetry too. Group id ONLY (V7).
+          counters.anomalies++;
+          console.warn(
+            `[groupPurge] ANOMALY: group ${groupId} is soft-deleted with NULL purge_after — not purged, needs operator attention.`
+          );
+          reportToSentry(
+            'Group purge anomaly: soft-deleted group has NULL purge_after',
+            { group_id: groupId }
+          );
         } else {
           counters.skipped_restored++;
         }
@@ -390,6 +422,26 @@ async function runGroupPurgeSweep(options = {}) {
           { group_id: groupId, error: groupErr.message }
         );
       }
+    }
+
+    // L-4 orphan census. A soft-deleted group whose purge_after is NULL is
+    // RESEARCH F-02's uncollectable orphan: the candidate query above can never
+    // select it (NULL < x is false in SQL), so it sits holding invitee email PII
+    // forever with no signal anywhere. Count them every night; ids-only warning
+    // when any exist. Same never-throws discipline as everything else here — a
+    // census failure must not fail the sweep, hence inside this try.
+    const orphaned = await Group.count({
+      where: { deletedAt: { [Op.ne]: null }, purge_after: null },
+      paranoid: false,
+    });
+    if (orphaned > 0) {
+      counters.orphaned_null_deadline = orphaned;
+      console.warn(
+        `[groupPurge] ${orphaned} soft-deleted group(s) with NULL purge_after — uncollectable orphans the sweep cannot select; operator repair needed.`
+      );
+      reportToSentry('Group purge sweep found uncollectable orphans (NULL purge_after)', {
+        orphaned_null_deadline: orphaned,
+      });
     }
   } catch (sweepErr) {
     console.error('[groupPurge] sweep failed (non-fatal):', sweepErr.message);

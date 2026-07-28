@@ -158,63 +158,15 @@ class GroupAlreadyDeletedError extends Error {
  * @throws {GroupAlreadyDeletedError} if the group was already stamped by a racing delete.
  */
 async function softDeleteGroup(groupId, { excludeUserUuid } = {}) {
-  // DECISION Phase 88.2 D-03: the roster is read HERE, before the transaction, and
-  // mapped to PLAIN OBJECTS rather than model instances — chosen OVER reading it
-  // inside or after the delete transaction. Once `UserGroup` is stamped this exact
-  // query is paranoid-filtered and returns ZERO rows, so a roster read placed after
-  // the transaction dispatches zero emails and nothing fails (88.2-RESEARCH.md
-  // Pitfall 5). Plain objects mean the dispatch path structurally cannot re-query
-  // the now-hidden group. Moving this read below the transaction is not a
-  // reordering — it silently deletes the notice this phase exists to send.
-  //
-  // DECISION Phase 88.2 MED-3: the role predicate below is CONSISTENCY HARDENING,
-  // chosen OVER status-only filtering to match the in-repo "confirmed members"
-  // precedent at routes/groups.js (the group-members read). It is NOT a security
-  // fix and NOT a patched vulnerability. A claim that unapproved join-requesters
-  // could be emailed the restore link was raised and REFUTED by all three skeptics
-  // in 88.2-PLAN-REVIEW-RAW.json on verified grounds: no code path writes the
-  // pending role (every membership creation site writes owner/member), the
-  // role-change endpoint hard-validates the same three values, rejection destroys
-  // the row outright, and the auto-promotion scheduler promotes any surviving
-  // pending row to member within 24h. The pending workflow has been frozen since
-  // Phase 36. Check that refutation before re-raising it as an escalation.
-  //
-  // The withContactInfo scope is MANDATORY, not decorative: User's defaultScope
-  // strips `email` (BSEC-01), so without it every recipient carries an undefined
-  // address and is silently skipped — the same trap workers/promptWorker.js
-  // documents at its own member include.
-  const memberships = await UserGroup.findAll({
-    where: {
-      group_id: groupId,
-      status: 'active',
-      role: { [Op.in]: ['member', 'admin', 'owner'] },
-    },
-    include: [{ model: User.scope('withContactInfo'), required: true }],
-  });
-
-  const recipients = memberships
-    .filter((m) => m.user_uuid !== excludeUserUuid)
-    .map((m) => ({
-      user_uuid: m.user_uuid,
-      // The Auth0 sub. REQUIRED and NOT redundant with user_uuid: the dispatcher's
-      // Management API backfill (services/groupOwnershipOfferService.js) keys on the
-      // sub, not on the Users.id UUID. Dropping this field fails SILENTLY —
-      // getUserById(undefined) rejects, the backfill's catch degrades exactly as
-      // designed, and every synthetic-address member lands in `unreachable` with
-      // plausible-looking counters and no error. `user_uuid` is what excludeUserUuid
-      // compares against; `user_id` is what the lookup needs. Both are load-bearing.
-      user_id: m.User.user_id,
-      email: m.User.email,
-      username: m.User.username,
-      timezone: m.User.timezone,
-    }));
-
   // ONE timestamp for all three models. See the F-05 marker below.
   const deletedAt = new Date();
   const purgeAfter = new Date(deletedAt.getTime() + RECOVERY_WINDOW_DAYS * 24 * 60 * 60 * 1000);
   const tokenExpiresAt = new Date(purgeAfter.getTime() + TOKEN_EXPIRY_MARGIN_MS);
   // Same nonce idiom as the group invite token (routes/groups.js).
   const nonce = crypto.randomBytes(32).toString('hex');
+
+  // Populated inside the transaction — the roster read holds the row lock (L-1).
+  let recipients;
 
   // DECISION Phase 88.2 F-05: every write below uses `Model.update` with the ONE
   // explicitly-computed JS Date above, chosen OVER the obvious
@@ -272,6 +224,63 @@ async function softDeleteGroup(groupId, { excludeUserUuid } = {}) {
     if (!stillLive) {
       throw new GroupAlreadyDeletedError(groupId);
     }
+
+    // DECISION Phase 88.2 D-03 (amended by code-review L-1, owner-approved
+    // 2026-07-27): the roster is read HERE — inside the transaction, after the
+    // row lock, BEFORE the stamps — and mapped to PLAIN OBJECTS rather than
+    // model instances. Chosen OVER two alternatives:
+    //   (a) before the transaction (the original D-03 placement): a member
+    //       joining or leaving in the read→lock gap gets the wrong disposition —
+    //       stamped but unemailed, or emailed after leaving (L-1);
+    //   (b) after the stamps: once `UserGroup` is stamped this exact query is
+    //       paranoid-filtered and returns ZERO rows, so it dispatches zero
+    //       emails and nothing fails (88.2-RESEARCH.md Pitfall 5). Moving this
+    //       read below the stamps is not a reordering — it silently deletes the
+    //       notice this phase exists to send.
+    // Plain objects mean the dispatch path structurally cannot re-query the
+    // now-hidden group.
+    //
+    // DECISION Phase 88.2 MED-3: the role predicate below is CONSISTENCY
+    // HARDENING, chosen OVER status-only filtering to match the in-repo
+    // "confirmed members" precedent at routes/groups.js (the group-members
+    // read). It is NOT a security fix and NOT a patched vulnerability. A claim
+    // that unapproved join-requesters could be emailed the restore link was
+    // raised and REFUTED by all three skeptics in 88.2-PLAN-REVIEW-RAW.json on
+    // verified grounds: no code path writes the pending role (every membership
+    // creation site writes owner/member), the role-change endpoint
+    // hard-validates the same three values, rejection destroys the row
+    // outright, and the auto-promotion scheduler promotes any surviving pending
+    // row to member within 24h. The pending workflow has been frozen since
+    // Phase 36. Check that refutation before re-raising it as an escalation.
+    //
+    // The withContactInfo scope is MANDATORY, not decorative: User's
+    // defaultScope strips `email` (BSEC-01), so without it every recipient
+    // carries an undefined address and is silently skipped — the same trap
+    // workers/promptWorker.js documents at its own member include.
+    const memberships = await UserGroup.findAll({
+      where: {
+        group_id: groupId,
+        status: 'active',
+        role: { [Op.in]: ['member', 'admin', 'owner'] },
+      },
+      include: [{ model: User.scope('withContactInfo'), required: true }],
+      transaction: t,
+    });
+
+    recipients = memberships
+      .filter((m) => m.user_uuid !== excludeUserUuid)
+      .map((m) => ({
+        user_uuid: m.user_uuid,
+        // The Auth0 sub. `user_uuid` is what excludeUserUuid compares against;
+        // `user_id` is the Auth0-sub identity some downstream consumers key on.
+        // (The dispatcher's Management API backfill that once made this field
+        // load-bearing was removed by NIX-AUTH0, 2026-07-27 — see
+        // services/groupOwnershipOfferService.js.)
+        user_id: m.User.user_id,
+        email: m.User.email,
+        username: m.User.username,
+        timezone: m.User.timezone,
+      }));
 
     await Event.update(
       { deletedAt },
@@ -557,12 +566,18 @@ async function restoreGroupByToken(nonce, actorAuth0Sub) {
 
     if (dupes.length > 0) {
       // Reaching this branch means something upstream is already broken, so it must
-      // be LOUD. The payload carries each discarded row's role and joined_at because
-      // THIS BRANCH SILENTLY DEMOTES PEOPLE: the surviving live row was created by a
-      // post-delete join, so it is role 'member' with a fresh joined_at, while the
-      // stamped row being destroyed may have been 'admin' with the group's original
-      // join date. Once the stamped row is gone nothing else records that it
-      // happened — this alert is the only repair instruction an operator will have.
+      // be LOUD. The CONSOLE payload carries each discarded row's role and joined_at
+      // because THIS BRANCH SILENTLY DEMOTES PEOPLE: the surviving live row was
+      // created by a post-delete join, so it is role 'member' with a fresh
+      // joined_at, while the stamped row being destroyed may have been 'admin' with
+      // the group's original join date. Once the stamped row is gone nothing else
+      // records that it happened — this server-side log line is the only repair
+      // instruction an operator will have.
+      //
+      // Code-review M-4 (owner-approved 2026-07-27): Sentry gets group_id + count
+      // ONLY — the per-user tuples (user_uuid, roles, join dates) stay in the
+      // server-side console.warn. Same ids-only telemetry discipline the purge
+      // sweep enforces (V7); the Sentry event is the pager, the log is the detail.
       //
       // Deliberately a straight drop-and-shout: no logic copies the higher role onto
       // the live row. A silent auto-repair here would mask the very leak this warning
@@ -585,7 +600,7 @@ async function restoreGroupByToken(nonce, actorAuth0Sub) {
             scope.setTag('guard', 'AF-3');
             scope.setContext('group_restore_duplicate_memberships', {
               group_id: group.id,
-              discarded,
+              discarded_count: dupes.length,
             });
             Sentry.captureMessage(
               `AF-3 gate leaked: ${dupes.length} duplicate UserGroup row(s) discarded restoring group ${group.id}`

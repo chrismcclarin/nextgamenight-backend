@@ -391,7 +391,7 @@ describe('runGroupPurgeSweep (88.2 / SPEC-REQ-10)', () => {
   // ==========================================================================
   // T-88.2-44 — a NULL deadline is never a candidate
   // ==========================================================================
-  it('T-88.2-44: a soft-deleted group with a NULL purge_after is never selected', async () => {
+  it('T-88.2-44: a soft-deleted group with a NULL purge_after is never selected — and the orphan census reports it (L-4)', async () => {
     const { group } = await seedDoomedGroup();
     await forceDeadline(group.id, null);
 
@@ -399,6 +399,11 @@ describe('runGroupPurgeSweep (88.2 / SPEC-REQ-10)', () => {
 
     expect(counters.candidates).toBe(0);
     expect(counters.purged).toBe(0);
+    // Code-review L-4 (owner-approved 2026-07-27): the uncollectable orphan the
+    // candidate query can never see must not be silent. The census counts it; the
+    // in-lock anomaly branch stays unreached (nothing selected it).
+    expect(counters.orphaned_null_deadline).toBe(1);
+    expect(counters.anomalies).toBe(0);
 
     const row = await findGroupRaw(group.id);
     expect(row).not.toBeNull();
