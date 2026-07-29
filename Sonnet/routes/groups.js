@@ -649,7 +649,7 @@ router.get('/restore-preview/:token', async (req, res) => {
 
     // DECISION Phase 88.2 D-02: this read escapes the paranoid clause deliberately —
     // this route exists specifically to read a SOFT-DELETED group, and it is
-    // carve-out #1 of the nine-entry table enumerated in the header of
+    // carve-out #1 of the ten-entry table enumerated in the header of
     // services/groupRecoveryService.js. Removing the escape breaks recovery entirely;
     // copying the pattern to any other read path reopens the leak this phase closes.
     //

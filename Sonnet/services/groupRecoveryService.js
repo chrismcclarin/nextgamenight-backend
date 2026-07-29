@@ -37,16 +37,24 @@
 //   7  Purge sweep — per-group re-read inside the lock         services/groupPurgeSweep.js
 //   8  Purge sweep — event-id gather                           services/groupPurgeSweep.js
 //   9  acceptInviteTransactional — membership lookup           routes/invites.js
+//  10  Purge sweep — nightly NULL-purge_after orphan census    services/groupPurgeSweep.js
 //
 // Entry #5 is TWO literal occurrences (the stamped scan and the live scan), so the
-// nine entries are TEN literal occurrences across four files:
+// ten entries are ELEVEN literal occurrences across four files:
 //
 //   services/groupRecoveryService.js   5   (#2, #3, #4, #5 x2)
-//   services/groupPurgeSweep.js        3   (#6, #7, #8)
+//   services/groupPurgeSweep.js        4   (#6, #7, #8, #10)
 //   routes/groups.js                   1   (#1)
 //   routes/invites.js                  1   (#9)
 //   ------------------------------------------------------------------
-//   total                             10
+//   total                             11
+//
+// WHY #10 IS DIFFERENT IN KIND: it is a COUNT, not a row read — `Group.count`
+// over soft-deleted rows with a NULL purge_after (the orphans the sweep's
+// candidate query can never select, RESEARCH F-02). It surfaces zero content and
+// zero PII; it exists so those orphans are Sentry-visible instead of silent
+// forever. Added by the L-4 fix (owner-approved 2026-07-27); an earlier revision
+// of this table omitted it, which read as an instruction to delete the census.
 //
 // WHY #3 EXISTS AT ALL. The accepter's own membership row is itself soft-deleted,
 // so `getUserRoleInGroup` / `isActiveMember` (services/authorizationService.js)
@@ -68,12 +76,13 @@
 // an earlier revision of this table did exactly that, which is how a five-entry
 // flagged set came to be described as six and made every derived count wrong.
 //
-// Every other read path in the application must NOT escape the paranoid clause. An
-// ELEVENTH literal occurrence is a bug, not an addition — but reconcile against the
+// Every other read path in the application must NOT escape the paranoid clause. A
+// TWELFTH literal occurrence is a bug, not an addition — but reconcile against the
 // per-file breakdown above before concluding that, because this list has been wrong
-// before (it once said "six" while the code it specified had ten). Waves land in
-// order: at the end of plan 07 the tree holds 7 of the 10 (#1-#5 = six occurrences,
-// plus #9); plan 08 adds the remaining three.
+// before (it once said "six" while the code it specified had ten, and later said
+// "ten" after the L-4 census made it eleven). Waves land in order: at the end of
+// plan 07 the tree holds 7 (#1-#5 = six occurrences, plus #9); plan 08 adds three
+// more (#6-#8); the L-4 census (#10) landed in the post-review fix batch.
 
 const crypto = require('crypto');
 const { Op } = require('sequelize');

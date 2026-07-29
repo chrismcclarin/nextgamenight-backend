@@ -674,6 +674,34 @@ describe('Phase 88.2 — SPEC-REQ-9: restoring a soft-deleted group', () => {
       const bodies = [garbage, revoked, purged, expired].map((r) => JSON.stringify(r.body));
       expect(new Set(bodies).size).toBe(1);
     });
+
+    it('R-10 / L-5: an internal failure returns a GENERIC 500 body — never error.message', async () => {
+      // This route is PUBLIC and unauthenticated, so its catch deliberately
+      // breaks the house pattern (echoing error.message) that Phase 93/BAPI-03
+      // owns converting everywhere else. Without this pin, a tidy-up back to
+      // the house pattern regresses silently — every other test here exercises
+      // the happy and refusal paths, never the throw.
+      const SECRET = 'connect ECONNREFUSED db.internal:5432 (password=hunter2)';
+      const findOneSpy = jest
+        .spyOn(SingleUseToken, 'findOne')
+        .mockRejectedValueOnce(new Error(SECRET));
+      // The detail belongs on the console (that half of L-5 stays) — swallow it
+      // here so the suite's output stays clean, but assert it was logged.
+      const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+      try {
+        currentActor = null;
+        const res = await request(app).get('/api/groups/restore-preview/deadbeef-throws');
+
+        expect(res.status).toBe(500);
+        expect(res.body).toEqual({ error: 'Internal server error' });
+        expect(JSON.stringify(res.body)).not.toContain(SECRET);
+        expect(consoleSpy).toHaveBeenCalled();
+      } finally {
+        findOneSpy.mockRestore();
+        consoleSpy.mockRestore();
+      }
+    });
   });
 
   // ==========================================================================

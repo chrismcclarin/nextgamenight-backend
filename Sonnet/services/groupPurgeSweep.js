@@ -159,7 +159,7 @@ function reportToSentry(message, context) {
  * Purge one group and everything that hangs off it, inside one transaction.
  *
  * @param {string} groupId
- * @returns {Promise<'purged'|'skipped'>}
+ * @returns {Promise<'purged'|'skipped'|'anomaly_null_deadline'>}
  */
 async function purgeOneGroup(groupId) {
   return sequelize.transaction(async (t) => {
