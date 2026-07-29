@@ -352,9 +352,12 @@ describe('accountDeletion integrity — full disposition table on real Postgres 
     expect(Object.keys(suggAfter.tentative_calendar_event_ids || {})).not.toContain(target.user_id);
 
     // sole-member owned group + its event are GONE (replicated group-delete).
-    expect(await Group.findByPk(soloGroup.id)).toBeNull();
-    expect(await Event.findByPk(soloEvent.id)).toBeNull();
-    expect(await UserGroup.findByPk(soloOwnerRow.id)).toBeNull();
+    // paranoid: false because these three models soft-delete (88.2-01): a
+    // default-scoped read returns null for a merely-soft-deleted row too, so
+    // it cannot pin the HARD delete this path promises (deferred D-2).
+    expect(await Group.findByPk(soloGroup.id, { paranoid: false })).toBeNull();
+    expect(await Event.findByPk(soloEvent.id, { paranoid: false })).toBeNull();
+    expect(await UserGroup.findByPk(soloOwnerRow.id, { paranoid: false })).toBeNull();
 
     // -------------------------------------------------------------------
     // SPEC Req 2 Test C — group SURVIVES a non-owner member's deletion.
