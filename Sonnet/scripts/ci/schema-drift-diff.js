@@ -3,10 +3,16 @@
 //
 // scripts/ci/schema-drift-diff.js
 //
-// Phase 88.4 (SPEC R3 + R4; decisions D-03, D-04, D-06): the schema-drift differ for the
-// migrate-cli-replay CI job. It introspects TWO Postgres databases via pg_catalog — one
-// built by replaying the migration chain through sequelize-cli, one built by sync()ing the
-// models — and compares them STRUCTURALLY (not as dump text).
+// Phase 88.4 (SPEC R3 + R4 + R6; decisions D-03, D-04, D-06, D-07, D-08): the schema-drift
+// differ for the migrate-cli-replay CI job. It introspects TWO Postgres databases via
+// pg_catalog — one built by replaying the migration chain through sequelize-cli, one built by
+// sync()ing the models — and compares them STRUCTURALLY (not as dump text).
+//
+// FOUR STAGES, in order: dump (`dumpSchema`) -> canonicalize to name-free identities
+// (`canonicalize`) -> structural set diff (`diffSchemas`) -> subtract the owner-signed accepted
+// -drift policy (`subtractAllowlist` over `scripts/ci/schema-drift-allowlist.js`). Then print,
+// then gate the exit code. Stages 2-4 are PURE and DB-free, which is why
+// `tests/unit/schema-drift-diff.test.js` can pin every mismatch class with no Postgres at all.
 //
 // LINEAGE: the four queries below supersede the single hand-run foreign-key query recorded
 // in `.planning/phases/88.2-group-soft-delete-recovery-window-inserted-2026-07-25/
@@ -16,9 +22,12 @@
 // of nondeterministic diffs — SPEC R4), plus PK/UNIQUE constraints, the full index set, and
 // a table inventory.
 //
-// ENV CONTRACT (D-06) — exactly two variables, and `DATABASE_URL` is deliberately NOT one:
-//   MIGRATE_DB_URL   the migration-chain-built database
-//   SYNC_DB_URL      the models/sync()-built database
+// ENV CONTRACT (D-06) — exactly two connection variables, and `DATABASE_URL` is deliberately
+// NOT one:
+//   MIGRATE_DB_URL              the migration-chain-built database   (required)
+//   SYNC_DB_URL                 the models/sync()-built database     (required)
+//   SCHEMA_DRIFT_REPORT_ONLY    '1' = print findings but exit 0 (D-08). Optional; see the
+//                               report-only DECISION marker near the bottom of this file.
 //
 // DECISION Phase 88.4 D-03: raw `pg` Client OVER the Sequelize instance exported by the
 // models barrel (`../../models`) or the config module (`../config/database`). Both of those
@@ -55,6 +64,14 @@
 //   node scripts/ci/schema-drift-diff.js
 
 const { Client } = require('pg');
+
+// Load and validate the accepted-drift policy at STARTUP (T-88.4-13). This throw propagates
+// out of `require()` itself, so it is structurally unreachable by the report-only suppression
+// further down — which only ever gates `process.exitCode` on FINDINGS. A malformed policy file
+// is a CRASH, not a finding: an entry the validator half-understood would suppress real drift
+// that nobody signed off, which is the false-green this phase exists to prevent.
+const { ENTRIES: ALLOWLIST_ENTRIES, validateAllowlist } = require('./schema-drift-allowlist');
+validateAllowlist(ALLOWLIST_ENTRIES);
 
 // Verbatim from scripts/log-db-resolution.js:19-27. Credential masking is a security
 // control (T-88.4-06), not cosmetics — never log an unmasked connection string.
@@ -569,10 +586,516 @@ function canonicalize({ fks = [], cons = [], idxs = [], tables = [] } = {}) {
   return { identities, tables: tableNames };
 }
 
+// ---------------------------------------------------------------------------------------
+// The structural set diff (SPEC R3 + R4).
+//
+// `diffSchemas` is a PURE function of two canonicalized results, exported so
+// `tests/unit/schema-drift-diff.test.js` can drive every mismatch class with no database.
+//
+// Four finding types:
+//   MIGRATION-ONLY  identity present only in the migration-chain-built schema
+//   SYNC-ONLY       identity present only in the sync()-built schema
+//   DIFFERS         same identity PREFIX (kind + table + keySpec) on both sides, but one
+//                   identity-bearing ATTRIBUTE differs. This is the class that catches the
+//                   88.2 CASCADE->SET NULL flip: an FK whose onDelete is 'c' on one side and
+//                   'n' on the other is ONE finding naming both values, NOT a MIGRATION-ONLY
+//                   plus a SYNC-ONLY pair (which is what a naive identity-set diff produces,
+//                   and which reads as "two unrelated objects" instead of "this FK is wrong").
+//   TABLE-MISSING   a table from Q_TABLES is absent on one side; its per-object findings are
+//                   SUPPRESSED into this one finding, so a missing table reads as one line
+//                   rather than fifteen.
+// ---------------------------------------------------------------------------------------
+
+// The DIFFERS grouping prefix. Everything in IDENTITY_FIELDS that is NOT in the prefix is a
+// candidate DIFFERS attribute — derived, not listed, so promoting a field in IDENTITY_FIELDS
+// (e.g. FK deferrability, per the D-04 marker above) automatically makes it diffable here with
+// no second edit. `pk`'s identity IS its prefix, so a pk can never produce a DIFFERS finding.
+const PREFIX_FIELDS = ['kind', 'table', 'keySpec'];
+
+const str = (v) => (v === null || v === undefined ? '' : String(v));
+const prefixOf = (rec) => PREFIX_FIELDS.map((f) => str(rec[f])).join('|');
+const diffAttributesOf = (kind) => (IDENTITY_FIELDS[kind] || []).filter((f) => !PREFIX_FIELDS.includes(f));
+
+// Catalog letter -> the word a human signed off on. Printing a raw `confdeltype` of 'n' at a
+// developer who has never read this phase is a finding they cannot act on (SPEC R3: "naming
+// the offender" means naming it in terms they recognize from the migration they wrote).
+const ACTION_WORDS = { a: 'NO ACTION', r: 'RESTRICT', c: 'CASCADE', n: 'SET NULL', d: 'SET DEFAULT' };
+const MATCH_WORDS = { f: 'FULL', p: 'PARTIAL', s: 'SIMPLE' };
+const DECODED_ATTRS = { onDelete: ACTION_WORDS, onUpdate: ACTION_WORDS, matchType: MATCH_WORDS };
+
+/**
+ * Render one attribute value for human output AND for allowlist comparison — the two are the
+ * SAME string on purpose, so an owner reading a CI log line can copy the value straight into
+ * an allowlist `accepted` pin without re-deriving it.
+ */
+function renderAttrValue(attribute, raw) {
+  const v = str(raw);
+  const table = DECODED_ATTRS[attribute];
+  if (table) {
+    if (v === '') return '(none)';
+    return table[v] || `(unrecognized catalog code "${v}")`;
+  }
+  return v === '' ? '(none)' : v;
+}
+
+function presenceFinding(side, rec) {
+  return {
+    type: side === 'migration-only' ? 'MIGRATION-ONLY' : 'SYNC-ONLY',
+    side,
+    kind: rec.kind,
+    table: rec.table,
+    keySpec: rec.keySpec,
+    predicate: rec.predicate,
+    attribute: '',
+    values: null,
+    migration: side === 'migration-only' ? rec : null,
+    sync: side === 'sync-only' ? rec : null,
+    collapsedObjectCount: 0,
+    notCovered: [],
+  };
+}
+
+function differsFinding(mRec, sRec, attribute) {
+  return {
+    type: 'DIFFERS',
+    side: 'differs',
+    kind: mRec.kind,
+    table: mRec.table,
+    keySpec: mRec.keySpec,
+    // The allowlist-matching `predicate` of a DIFFERS finding is the MIGRATION side's value,
+    // ALWAYS — including when `predicate` is itself the diverging attribute (the 88.2 D-01
+    // class: a full UNIQUE on one side vs a partial unique index on the other). A finding with
+    // two predicates cannot have a single key, and picking a side arbitrarily per-finding would
+    // make an allowlist entry unwritable. Both values are still pinned, in `accepted`.
+    predicate: mRec.predicate,
+    attribute,
+    values: {
+      migration: renderAttrValue(attribute, mRec[attribute]),
+      sync: renderAttrValue(attribute, sRec[attribute]),
+    },
+    migration: mRec,
+    sync: sRec,
+    collapsedObjectCount: 0,
+    notCovered: [],
+  };
+}
+
+function tableFinding(side, table) {
+  return {
+    type: 'TABLE-MISSING',
+    side,
+    kind: 'table',
+    table,
+    keySpec: '',
+    predicate: '',
+    attribute: '',
+    values: null,
+    migration: null,
+    sync: null,
+    collapsedObjectCount: 0,
+    notCovered: [],
+  };
+}
+
+// TABLE-MISSING sorts FIRST inside its table group (rank 0) — a reader needs to see "this whole
+// table is absent" before anything else about that table. Plain byte comparison throughout, NOT
+// localeCompare: a locale-dependent collation would make "deterministic" mean "deterministic on
+// this runner" (SPEC R4).
+const NUL = '\u0000';
+const sortKeyOf = (f) =>
+  [
+    f.table,
+    f.kind === 'table' ? '0' : '1',
+    f.kind,
+    f.keySpec,
+    f.predicate,
+    f.type,
+    f.attribute,
+    f.values ? f.values.migration : '',
+    f.values ? f.values.sync : '',
+  ].join(NUL);
+
+const byString = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+const sortFindings = (findings) => [...findings].sort((a, b) => byString(sortKeyOf(a), sortKeyOf(b)));
+
+function bucketByPrefix(records) {
+  const buckets = new Map();
+  for (const rec of records) {
+    const key = prefixOf(rec);
+    if (!buckets.has(key)) buckets.set(key, []);
+    buckets.get(key).push(rec);
+  }
+  return buckets;
+}
+
+const countByIdentity = (records) => {
+  const counts = new Map();
+  for (const rec of records) counts.set(rec.identity, (counts.get(rec.identity) || 0) + 1);
+  return counts;
+};
+
+/**
+ * Diff two canonicalized sides.
+ *
+ * @param {{identities: object[], tables: string[]}} migrationSide
+ * @param {{identities: object[], tables: string[]}} syncSide
+ * @returns {object[]} findings, deterministically sorted
+ */
+function diffSchemas(migrationSide, syncSide) {
+  const mIds = (migrationSide && migrationSide.identities) || [];
+  const sIds = (syncSide && syncSide.identities) || [];
+  const mTables = (migrationSide && migrationSide.tables) || [];
+  const sTables = (syncSide && syncSide.tables) || [];
+
+  const findings = [];
+
+  // (1) Table inventory first, so the per-object collapse below knows which tables are gone.
+  const mTableSet = new Set(mTables);
+  const sTableSet = new Set(sTables);
+  const missingTables = new Map(); // table -> its TABLE-MISSING finding
+  for (const t of mTables) {
+    if (!sTableSet.has(t)) {
+      const f = tableFinding('migration-only', t);
+      missingTables.set(t, f);
+      findings.push(f);
+    }
+  }
+  for (const t of sTables) {
+    if (!mTableSet.has(t)) {
+      const f = tableFinding('sync-only', t);
+      missingTables.set(t, f);
+      findings.push(f);
+    }
+  }
+
+  // (2) Per-object set diff, bucketed by DIFFERS prefix.
+  const mBuckets = bucketByPrefix(mIds);
+  const sBuckets = bucketByPrefix(sIds);
+  const prefixes = [...new Set([...mBuckets.keys(), ...sBuckets.keys()])].sort(byString);
+
+  for (const prefix of prefixes) {
+    const mList = mBuckets.get(prefix) || [];
+    const sList = sBuckets.get(prefix) || [];
+
+    // Cancel out exact identity matches, MULTISET-wise: two records on one side can share a
+    // prefix (a partial unique and a full unique on the same columns), and one of them matching
+    // must not silently absorb the other.
+    const sRemaining = countByIdentity(sList);
+    const mLeft = [];
+    for (const rec of mList) {
+      const n = sRemaining.get(rec.identity) || 0;
+      if (n > 0) {
+        sRemaining.set(rec.identity, n - 1);
+        continue;
+      }
+      mLeft.push(rec);
+    }
+    const mRemaining = countByIdentity(mList);
+    const sLeft = [];
+    for (const rec of sList) {
+      const n = mRemaining.get(rec.identity) || 0;
+      if (n > 0) {
+        mRemaining.set(rec.identity, n - 1);
+        continue;
+      }
+      sLeft.push(rec);
+    }
+
+    // Leftovers on BOTH sides of one prefix = the same object with a differing attribute.
+    // Pair positionally: both lists arrive identity-sorted from `canonicalize`, so the pairing
+    // is deterministic. Pairing never DROPS anything — an unpaired leftover still yields a
+    // presence finding below, so the worst case of a mis-pairing is a differently-worded
+    // finding, never a missing one.
+    const pairs = Math.min(mLeft.length, sLeft.length);
+    for (let i = 0; i < pairs; i++) {
+      const mRec = mLeft[i];
+      const sRec = sLeft[i];
+      const attrs = diffAttributesOf(mRec.kind).filter((a) => str(mRec[a]) !== str(sRec[a]));
+      if (attrs.length === 0) {
+        // Unreachable by construction (identity = prefix + diff attributes, and these two
+        // identities differ). Kept as a never-drop fallback rather than a throw: if a future
+        // IDENTITY_FIELDS edit ever put a field in neither set, under-reporting would be
+        // silent, whereas two presence findings are merely noisier than one DIFFERS.
+        findings.push(presenceFinding('migration-only', mRec));
+        findings.push(presenceFinding('sync-only', sRec));
+        continue;
+      }
+      // One finding per diverging attribute, so each is separately reviewable and separately
+      // allowlistable — a single lumped finding could only be signed off wholesale.
+      for (const attribute of attrs) findings.push(differsFinding(mRec, sRec, attribute));
+    }
+    for (let i = pairs; i < mLeft.length; i++) findings.push(presenceFinding('migration-only', mLeft[i]));
+    for (let i = pairs; i < sLeft.length; i++) findings.push(presenceFinding('sync-only', sLeft[i]));
+  }
+
+  // (3) Collapse: a table that exists on one side only has already been reported once, so its
+  // per-object findings are noise. Count them onto the TABLE-MISSING finding instead of
+  // discarding them silently.
+  const kept = [];
+  for (const f of findings) {
+    if (f.kind !== 'table' && missingTables.has(f.table)) {
+      missingTables.get(f.table).collapsedObjectCount += 1;
+      continue;
+    }
+    kept.push(f);
+  }
+
+  return sortFindings(kept);
+}
+
+// ---------------------------------------------------------------------------------------
+// Allowlist subtraction (SPEC R6, D-07).
+// ---------------------------------------------------------------------------------------
+
+// The object-level key. A `kind: 'table'` entry matches on (side, table) alone — there is no
+// per-object key for a whole-table difference.
+function entryMatchesObject(entry, finding) {
+  if (entry.side !== finding.side) return false;
+  if (entry.kind !== finding.kind) return false;
+  if (entry.table !== finding.table) return false;
+  if (entry.kind === 'table') return true;
+  return entry.keySpec === finding.keySpec && entry.predicate === finding.predicate;
+}
+
+// A `differs` entry additionally has to pin THE divergence that was found. Anything else on the
+// same object is un-reviewed drift and must still fail the gate (T-88.4-13).
+function entryMatchesFinding(entry, finding) {
+  if (!entryMatchesObject(entry, finding)) return false;
+  if (finding.side !== 'differs') return true;
+  const acc = entry.accepted;
+  return Boolean(
+    acc &&
+      acc.attribute === finding.attribute &&
+      acc.migration === finding.values.migration &&
+      acc.sync === finding.values.sync
+  );
+}
+
+/**
+ * Subtract the allowlist from a finding set.
+ *
+ * @returns {{kept: object[], suppressed: Array<{finding: object, entry: object}>}}
+ */
+function subtractAllowlist(findings, entries = ALLOWLIST_ENTRIES) {
+  const list = Array.isArray(entries) ? entries : [];
+  const kept = [];
+  const suppressed = [];
+
+  for (const finding of findings) {
+    const match = list.find((e) => entryMatchesFinding(e, finding));
+    if (match) {
+      suppressed.push({ finding, entry: match });
+      continue;
+    }
+    // Near miss: an allowlisted OBJECT whose divergence is not the accepted one. Say so out
+    // loud on the finding's own line — otherwise the author of the entry reads "Friendships
+    // again?" and assumes the allowlist is broken, rather than "this is a DIFFERENT drift".
+    const notCovered = list
+      .filter((e) => e.side === 'differs' && entryMatchesObject(e, finding) && e.accepted)
+      .map(
+        (e) =>
+          `allowlisted divergence is ${e.accepted.migration} vs ${e.accepted.sync} (${e.accepted.attribute}); ` +
+          `found ${finding.values ? finding.values.migration : '(n/a)'} vs ` +
+          `${finding.values ? finding.values.sync : '(n/a)'} (${finding.attribute || 'n/a'}) — not covered`
+      );
+    kept.push(notCovered.length ? { ...finding, notCovered } : finding);
+  }
+
+  return { kept, suppressed };
+}
+
+// ---------------------------------------------------------------------------------------
+// Human output (SPEC R3 + R4). Deterministic: every list is sorted before rendering, so two
+// runs on the same commit — and a shuffled input array — produce byte-identical text.
+//
+// SECURITY (T-88.4-16, ASVS V7): table / constraint / index / column NAMES and catalog-rendered
+// DEFINITIONS only. No row data reaches this output, because no query in this file selects any.
+// ---------------------------------------------------------------------------------------
+
+const show = (v) => (str(v) === '' ? '(none)' : str(v));
+
+function formatFinding(finding) {
+  const lines = [];
+  const head = [`  [${finding.type}]`, finding.kind];
+  if (finding.kind !== 'table') {
+    head.push(`key=${show(finding.keySpec)}`);
+    head.push(`predicate=${show(finding.predicate)}`);
+  }
+  if (finding.kind === 'fk') {
+    const ref = finding.migration || finding.sync;
+    head.push(`parent=${show(ref && ref.parentTable)}(${show(ref && ref.parentColumns)})`);
+  }
+  lines.push(head.join('  '));
+
+  if (finding.type === 'TABLE-MISSING') {
+    const has = finding.side === 'migration-only' ? 'migration side' : 'sync side';
+    const lacks = finding.side === 'migration-only' ? 'sync side' : 'migration side';
+    lines.push(`      table exists on the ${has} ONLY — absent from the ${lacks}`);
+    lines.push(
+      `      ${finding.collapsedObjectCount} per-object finding(s) for this table were collapsed ` +
+        `into this one finding`
+    );
+  } else if (finding.type === 'DIFFERS') {
+    lines.push(
+      `      ${finding.attribute}: ${finding.values.migration} (migration) vs ${finding.values.sync} (sync)`
+    );
+  } else {
+    const has = finding.side === 'migration-only' ? 'migration side' : 'sync side';
+    const lacks = finding.side === 'migration-only' ? 'sync side' : 'migration side';
+    lines.push(`      present on the ${has} ONLY — absent from the ${lacks}`);
+  }
+
+  // Labels padded to a fixed width so the migration and sync lines align in the log — a
+  // side-by-side comparison is the whole point of a DIFFERS finding and ragged colons make
+  // the two definitions much harder to scan for the one differing clause.
+  const label = (s) => s.padEnd(14);
+  for (const [side, rec] of [['migration', finding.migration], ['sync', finding.sync]]) {
+    if (!rec) continue;
+    lines.push(`      ${label(`${side} name`)}: ${show(rec.displayName)}`);
+    lines.push(`      ${label(`${side} def`)}: ${show(rec.definition)}`);
+  }
+  for (const note of finding.notCovered || []) lines.push(`      NOTE: ${note}`);
+  return lines;
+}
+
+/**
+ * Render a finding set, grouped by table and deterministically ordered.
+ * @returns {string}
+ */
+function formatFindings(findings) {
+  const sorted = sortFindings(findings);
+  const tables = [...new Set(sorted.map((f) => f.table))].sort(byString);
+  const out = [
+    `=== SCHEMA DRIFT: ${sorted.length} finding(s) across ${tables.length} table(s) ===`,
+    '    migration side = the sequelize-cli migration chain replayed from an empty database',
+    '    sync side      = sequelize.sync() from THIS commit\'s models',
+    '',
+  ];
+  for (const table of tables) {
+    out.push(table);
+    for (const f of sorted.filter((x) => x.table === table)) out.push(...formatFinding(f));
+    out.push('');
+  }
+  return out.join('\n');
+}
+
+/**
+ * Render the allowlist accounting. An allowlisted instance must be VISIBLE in the log rather
+ * than invisible — suppression with no trace is indistinguishable from a differ that never
+ * looked. An entry that matched NOTHING is also called out: that is either drift someone
+ * reconciled (remove the entry) or a mistyped pin that is silently protecting nothing.
+ * @returns {string}
+ */
+function formatSuppressionSummary(total, suppressed, entries = ALLOWLIST_ENTRIES) {
+  const list = Array.isArray(entries) ? entries : [];
+  if (list.length === 0) {
+    return (
+      `[88.4] allowlist: EMPTY (0 entries) — nothing suppressed of ${total} finding(s). An empty ` +
+      `allowlist is the correct state until the day-one census is signed off (D-08).`
+    );
+  }
+
+  const out = [
+    `[88.4] allowlist: ${suppressed.length} of ${total} finding(s) suppressed by ` +
+      `${list.length} entr${list.length === 1 ? 'y' : 'ies'} in scripts/ci/schema-drift-allowlist.js`,
+  ];
+  for (const { finding, entry } of sortFindings(suppressed.map((s) => s.finding)).map((f) => ({
+    finding: f,
+    entry: suppressed.find((s) => s.finding === f).entry,
+  }))) {
+    const pin = entry.kind === 'table' ? `${entry.side}/${entry.kind}/${entry.table}` : `${entry.side}/${entry.kind}/${entry.table}/${show(entry.keySpec)}`;
+    const acc = entry.accepted
+      ? ` accepted ${entry.accepted.migration} vs ${entry.accepted.sync} (${entry.accepted.attribute})`
+      : '';
+    out.push(
+      `         - ${finding.type} ${finding.kind} ${finding.table} key=${show(finding.keySpec)} ` +
+        `<- entry ${pin}${acc} [signed off by ${entry.signedOffBy} on ${entry.signedOffOn}]`
+    );
+  }
+
+  const unused = list.filter((e) => !suppressed.some((s) => s.entry === e));
+  for (const e of unused) {
+    out.push(
+      `         - UNUSED entry ${e.side}/${e.kind}/${e.table}/${show(e.keySpec)} matched no finding. ` +
+        `Either the drift was reconciled (delete this entry) or the pin is stale/mistyped and is ` +
+        `protecting nothing.`
+    );
+  }
+  return out.join('\n');
+}
+
+// ---------------------------------------------------------------------------------------
+// Report-only gating (D-08).
+//
+// DECISION Phase 88.4 D-08: report-only is an ENV VAR THIS CODE READS
+// (`SCHEMA_DRIFT_REPORT_ONLY=1`), chosen OVER GitHub Actions' step-level failure-tolerance key
+// — the workflow option that renders a failed step as a warning and lets the job pass anyway.
+// (That option's name is deliberately not spelled anywhere in this file: the phase's
+// verification greps for it and treats a hit as "the differ delegated its gating to the
+// workflow".) Three reasons, the third decisive:
+//   1. The workflow option makes the JOB green but still renders the step with a warning, so
+//      the signal is muddy — "did it find drift, or did it break?"
+//   2. The env var is read by code we control, so the differ can print an unmissable banner
+//      naming the exact arming step.
+//   3. It SWALLOWS CRASHES. A differ that throws on a bad connection string would look
+//      identical to a differ that found drift, and a gate whose crash is indistinguishable from
+//      its pass is not a gate (T-88.4-15). Here, report-only gates ONLY the findings branch;
+//      an uncaught exception sets a failing exit code in BOTH modes.
+// Arming is then a reviewable one-line diff in ci.yml. Swapping this for the workflow option is
+// a decision, not a cleanup.
+//
+// Strictly the string '1'. Anything else (including 'true' or '0') means ARMED — the ambiguous
+// direction must fail closed, and a surprising red is a loud, fixable mistake whereas a
+// surprising green is the failure mode this file exists to prevent.
+// ---------------------------------------------------------------------------------------
+const isReportOnly = () => process.env.SCHEMA_DRIFT_REPORT_ONLY === '1';
+
+/**
+ * The whole gate verdict, as a pure function so it can be unit-tested without spawning a
+ * process. A throw outranks report-only, always.
+ * @returns {number} 0 or 1
+ */
+function decideExitCode({ findingCount = 0, reportOnly = false, threw = false } = {}) {
+  if (threw) return 1;
+  if (findingCount > 0) return reportOnly ? 0 : 1;
+  return 0;
+}
+
+const ARMED_ERROR = (n) =>
+  `::error::[88.4] SCHEMA DRIFT — ${n} finding(s): the schema built by replaying the migration ` +
+  `chain and the schema built by sequelize.sync() from this commit's models are NOT structurally ` +
+  `equivalent (see the grouped findings printed above this line). REMEDY, per finding: reconcile ` +
+  `the two sides — add/adjust the model definition, or write a prod-safe migration — OR, if the ` +
+  `divergence is correct and permanent, add an owner-signed entry to ` +
+  `scripts/ci/schema-drift-allowlist.js pinned to the NORMALIZED identity (never to a constraint ` +
+  `or index name) with a full 'DECISION Phase 88.4 <accepted> OVER <rejected> — <why>' comment ` +
+  `block; a bare allowlist addition WITHOUT that marker fails the quality job's marker gate. WHY ` +
+  `THIS GATE EXISTS: this repo's CI test database is built by sync() while production is built by ` +
+  `the migration chain, so any divergence means the whole suite is validating a schema that does ` +
+  `not exist in prod — that is exactly how 88.2's ON DELETE CASCADE -> SET NULL flip reached ` +
+  `production unnoticed. If you are deliberately accepting one of these, allowlist it with a ` +
+  `signed-off marker in the same commit — do not weaken the differ.`;
+
+const REPORT_ONLY_WARNING = (n) =>
+  `::warning::[88.4] REPORT-ONLY MODE — ${n} schema-drift finding(s) found; this job is PASSING ` +
+  `anyway by design (D-08: the day-one census is read off this output and every finding gets an ` +
+  `owner-signed disposition before the gate arms). To ARM the gate, delete the ` +
+  `SCHEMA_DRIFT_REPORT_ONLY line from the migrate-cli-replay job in .github/workflows/ci.yml. ` +
+  `Note that a CRASH in this differ already fails the job in this mode — only findings are ` +
+  `suppressed.`;
+
 module.exports = {
   dumpSchema,
   canonicalize,
   identityOf,
+  diffSchemas,
+  subtractAllowlist,
+  formatFindings,
+  formatFinding,
+  formatSuppressionSummary,
+  renderAttrValue,
+  decideExitCode,
+  isReportOnly,
   Q_FOREIGN_KEYS,
   Q_CONSTRAINTS,
   Q_INDEXES,
@@ -616,24 +1139,66 @@ async function main() {
   console.log(`[88.4] migration side: ${mask(migrateUrl)}`);
   console.log(`[88.4] sync side:      ${mask(syncUrl)}`);
 
-  const [migrationSide, syncSide] = await Promise.all([
+  const [migrationRaw, syncRaw] = await Promise.all([
     dumpSchema(migrateUrl, 'migration side'),
     dumpSchema(syncUrl, 'sync side'),
   ]);
 
-  for (const [label, side] of [['migration side', migrationSide], ['sync side', syncSide]]) {
-    const canon = canonicalize(side);
+  const canon = {};
+  for (const [key, label, raw] of [
+    ['migration', 'migration side', migrationRaw],
+    ['sync', 'sync side', syncRaw],
+  ]) {
+    canon[key] = canonicalize(raw);
     console.log(
-      `[88.4] ${label}: ${side.tables.length} table(s), ${side.fks.length} FK(s), ` +
-        `${side.cons.length} PK/UNIQUE constraint(s), ${side.idxs.length} index(es) ` +
-        `-> ${canon.identities.length} canonical identit(ies) across ${canon.tables.length} table(s)`
+      `[88.4] ${label}: ${raw.tables.length} table(s), ${raw.fks.length} FK(s), ` +
+        `${raw.cons.length} PK/UNIQUE constraint(s), ${raw.idxs.length} index(es) ` +
+        `-> ${canon[key].identities.length} canonical identit(ies) across ${canon[key].tables.length} table(s)`
     );
   }
+
+  // T-88.4-08, second false-green: two EMPTY databases are structurally equivalent, so a build
+  // step that silently failed to create anything produces a clean, confident, meaningless pass.
+  // The identical-URL guard above does not catch this — the URLs differ, both databases just
+  // have nothing in them. Refuse rather than report equivalence.
+  for (const [key, label] of [['migration', 'migration side'], ['sync', 'sync side']]) {
+    if (canon[key].tables.length === 0) {
+      console.error(
+        `[88.4] refusing to run: the ${label} database has ZERO tables in schema "public".\n` +
+          '       Two empty schemas are trivially equivalent, so continuing would report a clean\n' +
+          '       pass for a build step that produced nothing. Check the preceding step (the\n' +
+          '       migration replay, or the sync build) — that is what actually failed.'
+      );
+      process.exitCode = 1;
+      return;
+    }
+  }
+
+  const findings = diffSchemas(canon.migration, canon.sync);
+  const { kept, suppressed } = subtractAllowlist(findings, ALLOWLIST_ENTRIES);
+  console.log(formatSuppressionSummary(findings.length, suppressed, ALLOWLIST_ENTRIES));
+
+  if (kept.length === 0) {
+    console.log(
+      '[88.4] NO SCHEMA DRIFT — the migration-chain-built and sync()-built schemas are\n' +
+        '       structurally equivalent across foreign keys (incl. ON DELETE / ON UPDATE / MATCH),\n' +
+        '       primary keys, unique constraints/indexes, and the index set.'
+    );
+    return;
+  }
+
+  console.log(formatFindings(kept));
+
+  const reportOnly = isReportOnly();
+  console.log(reportOnly ? REPORT_ONLY_WARNING(kept.length) : ARMED_ERROR(kept.length));
+  process.exitCode = decideExitCode({ findingCount: kept.length, reportOnly });
 }
 
 if (require.main === module) {
+  // An uncaught throw fails the step in BOTH modes (T-88.4-15) — `decideExitCode` puts `threw`
+  // ahead of `reportOnly` precisely so a crash can never be mistaken for a suppressed finding.
   main().catch((err) => {
     console.error(`[88.4] differ failed: ${err && err.message ? err.message : err}`);
-    process.exitCode = 1;
+    process.exitCode = decideExitCode({ threw: true, reportOnly: isReportOnly() });
   });
 }
