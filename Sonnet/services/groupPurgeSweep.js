@@ -332,10 +332,14 @@ async function purgeOneGroup(groupId) {
     // prod, so the whole prompt chain goes when the group row goes. The SET NULL is
     // transient.
     //
-    // The residual, stated rather than hidden: that chain is protected by cascades
-    // measured in two local databases and (for the prompt-to-group hop only) in
-    // prod, whereas everything above is protected by an explicit statement. See
-    // 88.2-08-SUMMARY.md, which recommends an owner for it.
+    // Residual CLOSED (owner, 2026-07-29): the three prompt-child hops
+    // (AvailabilityResponses / AvailabilitySuggestions / MagicTokens ->
+    // AvailabilityPrompts) were measured CASCADE on prod via the Railway query
+    // interface — the full chain is now prod-measured end to end, and the owner
+    // recorded an accepted-forever decision that group-scoped cascades are trusted
+    // here (88.2 deferred-items.md, D-3 disposition). Do NOT extend this list to
+    // the prompt chain as a "hardening" cleanup — that is reversing a measured,
+    // owner-accepted decision.
 
     await UserGroup.destroy({ where: { group_id: groupId }, force: true, transaction: t });
     await Group.destroy({ where: { id: groupId }, force: true, transaction: t });
