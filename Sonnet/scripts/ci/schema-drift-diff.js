@@ -214,8 +214,365 @@ async function dumpSchema(url, label) {
   }
 }
 
+// ---------------------------------------------------------------------------------------
+// Canonicalization (D-04).
+//
+// Turns raw catalog rows into flat, name-free identity records. This half is deliberately
+// PURE and DB-free so `tests/unit/schema-drift-canonicalize.test.js` can drive it with
+// hand-written catalog-row fixtures in the fast (no-Postgres) Jest lane. Every hand-rolled
+// shortcut in this phase fails SILENTLY GREEN — a differ that under-reports looks exactly
+// like a healthy schema — so those unit tests are the only control against that, and this
+// code is written to be testable without a database on purpose.
+// ---------------------------------------------------------------------------------------
+
+// Which named fields participate in each kind's IDENTITY, and in what order.
+//
+// DECISION Phase 88.4 D-04: object NAMES are excluded from every identity, over the obvious
+// name-keyed diff. A name-keyed differ reports 20-40 phantom findings of the form "migration
+// has x_idx, sync has x" (RESEARCH Pitfall 3) — the same index created by a migration with
+// an explicit `name` and by sync()'s auto-generated name is ONE object, not two.
+// The exclusion is STRUCTURAL rather than a convention: `identityOf` reads this table
+// instead of building a string by hand, so `displayName` / `definition` cannot leak into an
+// identity even by accident. Re-adding a name to any row here is a decision, not a cleanup.
+//
+// DECISION Phase 88.4 D-04: FK deferrability (`condeferrable` / `condeferred`) is
+// deliberately NOT part of the FK identity, even though the query selects it. D-04 fixes the
+// FK tuple at (table, childCols, parentTable, parentCols, onDelete, onUpdate, matchType);
+// nothing in this codebase declares a deferrable constraint, and a `differs`-class finding on
+// deferrability would be pure noise on day one. The fields are CARRIED on the record so a
+// later phase can promote them by adding one entry to this row — not by re-plumbing. Same
+// reasoning for `method` on `unique`: a UNIQUE enforced by a btree is the same CONSTRAINT
+// whatever index method backs it, so `method` is identity-bearing for `index` only.
+const IDENTITY_FIELDS = {
+  fk: ['kind', 'table', 'keySpec', 'parentTable', 'parentColumns', 'onDelete', 'onUpdate', 'matchType'],
+  pk: ['kind', 'table', 'keySpec'],
+  unique: ['kind', 'table', 'keySpec', 'predicate'],
+  index: ['kind', 'table', 'keySpec', 'predicate', 'method'],
+};
+
+/**
+ * Derive the canonical identity string for a record. Adding a future column-level `kind`
+ * is a new row in IDENTITY_FIELDS plus a new emitter — not a rewrite (SPEC boundary:
+ * the format must not structurally preclude a later column diff).
+ */
+function identityOf(record) {
+  const fields = IDENTITY_FIELDS[record && record.kind];
+  if (!fields) {
+    throw new Error(`[88.4] cannot derive an identity for unknown kind "${record && record.kind}"`);
+  }
+  return fields
+    .map((f) => {
+      const v = record[f];
+      return v === null || v === undefined ? '' : String(v);
+    })
+    .join('|');
+}
+
+// A uniform record shape for every kind. Fields that do not apply to a kind stay at their
+// empty default rather than being absent, so the diff layer can read any field off any
+// record without existence checks.
+function makeRecord(fields) {
+  return {
+    kind: '',
+    table: '',
+    keySpec: '',
+    predicate: '',
+    parentTable: '',
+    parentColumns: '',
+    onDelete: '',
+    onUpdate: '',
+    matchType: '',
+    method: '',
+    // Human-output only — never identity-bearing (see IDENTITY_FIELDS).
+    deferrable: false,
+    deferred: false,
+    displayName: '',
+    definition: '',
+    ...fields,
+  };
+}
+
+// `oid` has no pg-types parser, so node-postgres hands it back as a string while a
+// hand-written fixture is likely to use a number. Normalize both before comparing, or the
+// unique-fold silently never fires and every UNIQUE constraint shows up twice.
+const oidKey = (v) => (v === null || v === undefined ? '' : String(v));
+
+const joinCols = (arr) =>
+  Array.isArray(arr) ? arr.map((c) => (c === null || c === undefined ? '' : String(c))).join(',') : '';
+
+// Normalization rule 3: the predicate is `pg_get_expr(indpred, indrelid)` VERBATIM. Both
+// `WHERE "deletedAt" IS NULL` written in a migration (20260725000001:113-116) and
+// Sequelize's `where: { deletedAt: null }` (models/userGroup.js:76-80) go through the SAME
+// Postgres deparser and therefore render identically by construction. Hand-normalizing
+// whitespace or parens here could only introduce FALSE equivalences.
+const predicateOf = (idx) => (idx.predicate === null || idx.predicate === undefined ? '' : String(idx.predicate));
+
+/**
+ * Pull the top-level key-list terms out of a `pg_get_indexdef` string.
+ *
+ * pg_get_indexdef renders:
+ *   CREATE [UNIQUE] INDEX name ON [ONLY] schema.table USING method (keys...) [INCLUDE (...)] [WHERE pred]
+ *
+ * Anchoring on `USING <method> (` rather than "the first open paren" means a '(' inside a
+ * quoted table name cannot be mistaken for the start of the key list. INCLUDE columns sit
+ * OUTSIDE this paren group, which is why the term count agrees with `indnkeyatts`.
+ *
+ * @returns {string[]|null} the terms, or null when the shape is unrecognizable
+ */
+function parseKeyTerms(fullDef) {
+  if (typeof fullDef !== 'string' || fullDef.length === 0) return null;
+
+  const anchor = /\sUSING\s+(?:"(?:[^"]|"")+"|[A-Za-z0-9_]+)\s*\(/i.exec(fullDef);
+  if (!anchor) return null;
+  const open = anchor.index + anchor[0].length - 1;
+
+  // Balanced, quote-aware scan for the matching close paren.
+  let depth = 0;
+  let inSingle = false;
+  let inDouble = false;
+  let close = -1;
+  for (let i = open; i < fullDef.length; i++) {
+    const ch = fullDef[i];
+    if (inSingle) {
+      if (ch === "'") {
+        if (fullDef[i + 1] === "'") i++;
+        else inSingle = false;
+      }
+      continue;
+    }
+    if (inDouble) {
+      if (ch === '"') {
+        if (fullDef[i + 1] === '"') i++;
+        else inDouble = false;
+      }
+      continue;
+    }
+    if (ch === "'") { inSingle = true; continue; }
+    if (ch === '"') { inDouble = true; continue; }
+    if (ch === '(') { depth++; continue; }
+    if (ch === ')') {
+      depth--;
+      if (depth === 0) { close = i; break; }
+    }
+  }
+  if (close === -1) return null;
+
+  // Split the inner list on TOP-LEVEL commas only: the comma inside
+  // `LEAST(requester_uuid, addressee_uuid)` is at depth 1 and must not split a term.
+  const inner = fullDef.slice(open + 1, close);
+  const terms = [];
+  let buf = '';
+  depth = 0;
+  inSingle = false;
+  inDouble = false;
+  for (let i = 0; i < inner.length; i++) {
+    const ch = inner[i];
+    if (inSingle) {
+      buf += ch;
+      if (ch === "'") {
+        if (inner[i + 1] === "'") buf += inner[++i];
+        else inSingle = false;
+      }
+      continue;
+    }
+    if (inDouble) {
+      buf += ch;
+      if (ch === '"') {
+        if (inner[i + 1] === '"') buf += inner[++i];
+        else inDouble = false;
+      }
+      continue;
+    }
+    if (ch === "'") { inSingle = true; buf += ch; continue; }
+    if (ch === '"') { inDouble = true; buf += ch; continue; }
+    if (ch === '(') { depth++; buf += ch; continue; }
+    if (ch === ')') { depth--; buf += ch; continue; }
+    if (ch === ',' && depth === 0) {
+      terms.push(buf.trim());
+      buf = '';
+      continue;
+    }
+    buf += ch;
+  }
+  if (buf.trim().length > 0) terms.push(buf.trim());
+  return terms;
+}
+
+// Strip ONE wrapping pair of double quotes from a bare quoted identifier, so a camelCase
+// column reads `deletedAt` (matching `pg_attribute.attname`, and matching what a human
+// writes in an allowlist entry) rather than `"deletedAt"`. Expression terms and terms
+// carrying modifiers (`col DESC`, `col varchar_pattern_ops`) are left untouched.
+function unquoteIdent(term) {
+  const m = /^"((?:[^"]|"")*)"$/.exec(term);
+  return m ? m[1].replace(/""/g, '"') : term;
+}
+
+/**
+ * Normalization rule 4: derive `keySpec` from the `pg_get_indexdef` key list.
+ *
+ * DECISION Phase 88.4 D-04: keySpec comes from the `pg_get_indexdef` key list, OVER
+ * `pg_get_expr(indexprs)` and OVER the `key_columns` attname array alone.
+ *   - `indexprs` gives only the expression LIST with no positional context relative to the
+ *     plain columns in a mixed index, so `(group_id, LOWER(invited_email))` would lose the
+ *     ordering that makes the key meaningful.
+ *   - `key_columns` has a NULL element wherever `indkey` carries a 0 (an expression slot),
+ *     so it cannot render a functional index at all — and the Friendships LEAST/GREATEST
+ *     pair-unique (20260703000002:137-140) is exactly that shape.
+ *   - Using the rendered key list ALSO keeps per-column modifiers (DESC, opclass,
+ *     collation) inside the identity, so changing one is reported instead of swallowed.
+ * `pg_get_indexdef` is Postgres's own renderer; a hand-built DDL reconstructor would
+ * mishandle opclasses, collations, NULLS NOT DISTINCT and INCLUDE columns — a false-green
+ * factory (RESEARCH "Don't Hand-Roll").
+ *
+ * Refuses to guess: an unparseable definition THROWS rather than falling back to a
+ * partial keySpec, because a wrong keySpec under-reports drift silently, whereas a throw
+ * fails the CI step loudly.
+ */
+function keySpecOfIndex(idx) {
+  const terms = parseKeyTerms(idx.full_def);
+  if (!terms) {
+    throw new Error(
+      `[88.4] could not locate the key list in pg_get_indexdef for index "${idx.index_name}" ` +
+        `on table "${idx.table_name}". Refusing to guess a keySpec — a wrong one under-reports ` +
+        `drift silently. Definition was: ${idx.full_def}`
+    );
+  }
+  const nKeys = Number.isInteger(idx.indnkeyatts) ? idx.indnkeyatts : terms.length;
+  if (terms.length !== nKeys) {
+    throw new Error(
+      `[88.4] index "${idx.index_name}" on "${idx.table_name}" reports indnkeyatts=${nKeys} but ` +
+        `${terms.length} key term(s) parsed out of pg_get_indexdef. Refusing to guess. ` +
+        `Definition was: ${idx.full_def}`
+    );
+  }
+  return terms.map(unquoteIdent).join(',');
+}
+
+/**
+ * Canonicalize one side's raw catalog rows into name-free identity records.
+ *
+ * @param {{fks?: object[], cons?: object[], idxs?: object[], tables?: object[]}} raw
+ * @returns {{identities: object[], tables: string[]}}
+ */
+function canonicalize({ fks = [], cons = [], idxs = [], tables = [] } = {}) {
+  const records = [];
+
+  const idxByOid = new Map();
+  for (const idx of idxs) idxByOid.set(oidKey(idx.indexrelid), idx);
+  // Rule 1's bookkeeping: indexes already spoken for by a constraint.
+  const consumedIndexOids = new Set();
+
+  for (const fk of fks) {
+    records.push(
+      makeRecord({
+        kind: 'fk',
+        table: fk.child_table,
+        keySpec: joinCols(fk.child_columns),
+        parentTable: fk.parent_table,
+        parentColumns: joinCols(fk.parent_columns),
+        onDelete: fk.on_delete || '',
+        onUpdate: fk.on_update || '',
+        matchType: fk.match_type || '',
+        deferrable: Boolean(fk.condeferrable),
+        deferred: Boolean(fk.condeferred),
+        displayName: fk.constraint_name || '',
+        definition: fk.definition || '',
+      })
+    );
+  }
+
+  // Normalization rule 1: FOLD a table-level UNIQUE constraint into its backing unique
+  // index. `conindid` names the index Postgres built to enforce the constraint, so the two
+  // are one object; emitting both would make the 88.2 D-01 class (a table-level composite
+  // UNIQUE on one side vs a PARTIAL unique index on the other) read as two unrelated
+  // objects instead of one DIFFERS finding on the predicate.
+  for (const con of cons) {
+    const backing = idxByOid.get(oidKey(con.backing_index_oid));
+    if (backing) consumedIndexOids.add(oidKey(backing.indexrelid));
+
+    if (con.kind === 'p') {
+      records.push(
+        makeRecord({
+          kind: 'pk',
+          table: con.table_name,
+          keySpec: joinCols(con.columns),
+          displayName: con.constraint_name || '',
+          definition: con.definition || '',
+        })
+      );
+      continue;
+    }
+    if (con.kind === 'u') {
+      records.push(
+        makeRecord({
+          kind: 'unique',
+          table: con.table_name,
+          // Prefer the backing index's rendered key list so a UNIQUE CONSTRAINT and an
+          // equivalent unique INDEX produce byte-identical keySpecs and fold to one
+          // identity. The `columns` fallback only fires if the catalog handed us a
+          // constraint with no resolvable backing index, which Postgres does not do for
+          // 'p'/'u' — it is there so a malformed fixture degrades rather than crashes.
+          keySpec: backing ? keySpecOfIndex(backing) : joinCols(con.columns),
+          predicate: backing ? predicateOf(backing) : '',
+          method: backing ? backing.method || '' : '',
+          displayName: con.constraint_name || '',
+          definition: con.definition || (backing && backing.full_def) || '',
+        })
+      );
+      continue;
+    }
+    throw new Error(
+      `[88.4] Q_CONSTRAINTS returned contype "${con.kind}" for "${con.table_name}"; ` +
+        `only 'p' and 'u' are expected. Refusing to drop it silently.`
+    );
+  }
+
+  for (const idx of idxs) {
+    // Normalization rule 2: a PK-backing index is already emitted as `pk` from
+    // Q_CONSTRAINTS. Checked independently of the consumed set so the skip still holds if
+    // the constraint rows are absent (e.g. a fixture that supplies only the index).
+    if (idx.indisprimary === true) continue;
+    if (consumedIndexOids.has(oidKey(idx.indexrelid))) continue;
+
+    const isUnique = idx.indisunique === true;
+    records.push(
+      makeRecord({
+        kind: isUnique ? 'unique' : 'index',
+        table: idx.table_name,
+        keySpec: keySpecOfIndex(idx),
+        predicate: predicateOf(idx),
+        method: idx.method || '',
+        displayName: idx.index_name || '',
+        definition: idx.full_def || '',
+      })
+    );
+  }
+
+  // Normalization rule 5: sort by identity so output ordering is stable run-to-run
+  // (SPEC R4). Plain byte comparison, NOT localeCompare — a locale-dependent collation
+  // would make "deterministic" mean "deterministic on this runner". `displayName` is the
+  // tie-break only, so the ORDER is total even when two objects share an identity; it is
+  // still not part of the identity itself.
+  const byString = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+  const identities = records
+    .map((r) => ({ ...r, identity: identityOf(r) }))
+    .sort((a, b) => byString(a.identity, b.identity) || byString(a.displayName, b.displayName));
+
+  const tableNames = [
+    ...new Set(
+      tables
+        .map((t) => (t && (t.table_name !== undefined ? t.table_name : t.relname)) || '')
+        .filter((n) => n.length > 0)
+    ),
+  ].sort(byString);
+
+  return { identities, tables: tableNames };
+}
+
 module.exports = {
   dumpSchema,
+  canonicalize,
+  identityOf,
   Q_FOREIGN_KEYS,
   Q_CONSTRAINTS,
   Q_INDEXES,
@@ -265,9 +622,11 @@ async function main() {
   ]);
 
   for (const [label, side] of [['migration side', migrationSide], ['sync side', syncSide]]) {
+    const canon = canonicalize(side);
     console.log(
       `[88.4] ${label}: ${side.tables.length} table(s), ${side.fks.length} FK(s), ` +
-        `${side.cons.length} PK/UNIQUE constraint(s), ${side.idxs.length} index(es)`
+        `${side.cons.length} PK/UNIQUE constraint(s), ${side.idxs.length} index(es) ` +
+        `-> ${canon.identities.length} canonical identit(ies) across ${canon.tables.length} table(s)`
     );
   }
 }
