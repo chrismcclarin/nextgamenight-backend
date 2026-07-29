@@ -5,8 +5,18 @@
 //
 // Used by:
 //   - Local dev: `npx sequelize-cli db:migrate:status`
-//   - CI: .github/workflows/migrations-check.yml
+//   - CI: the `migrate-cli-replay` job in .github/workflows/ci.yml
+//     (corrected in Phase 88.4 Plan 05 — the standalone migrations-check workflow this
+//     line previously cited no longer exists)
 //   - Railway pre-deploy step: `npm run migrate:apply`
+//
+// CI CONSUMER OF THE URL CHAIN BELOW (Phase 88.4, D-06): `migrate-cli-replay` builds TWO
+// databases in one job and replays the whole migration chain from empty into one of them,
+// so it sets DATABASE_URL PER STEP rather than job-wide, and never sets POSTGRES_URL /
+// POSTGRES_PRIVATE_URL / PGDATABASE_URL at all. Any future change to the precedence chain
+// below therefore has a named CI consumer: re-read that job's env comments first, because
+// a change here can silently point the CLI and the 32 self-connecting migrations at
+// different databases and turn the drift diff into a false green.
 //
 // Do NOT export a `sequelize` instance here — sequelize-cli expects a config object,
 // not a live connection. Runtime DB connection lives in config/database.js.

@@ -48,9 +48,10 @@
 const EXPECTED_DB_NAME = 'schema_sync';
 
 (async () => {
-  // Non-production refusal, BEFORE any schema verb -- mirrors
-  // scripts/ci/provision-premigration-schema.js:104-106 and tests/globalSetup.js:68-73.
-  // CI leaves NODE_ENV unset; local proof may set test.
+  // Non-production refusal, BEFORE any schema verb -- mirrors the retired provision script
+  // (retired in Plan 88.4-05; see the DECISION Phase 88.4 D-05 marker in ci.yml's
+  // migrate-cli-replay job) and tests/globalSetup.js:68-73. CI leaves NODE_ENV unset;
+  // local proof may set test.
   if (process.env.NODE_ENV === 'production') {
     console.error(
       '[88.4-sync] refusing to run: NODE_ENV=production ' +

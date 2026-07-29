@@ -342,10 +342,11 @@ jobs:
   # Phase 88.4 additionally makes migration-vs-model DRIFT visible, which requires two
   # independently-built schemas on one service container — a from-empty replay cannot
   # detect drift against anything if the only database in the job is the one it built.
-  # (Provenance: this job replaces the earlier design that leaned on
-  # `Sonnet/scripts/ci/provision-premigration-schema.js` to SIMULATE a pre-migration
-  # schema and replay only the 17 newest migrations. That script is retired — see the
-  # DECISION marker inside the job below for the full lineage.)
+  # (Provenance, HISTORICAL — do not go looking for this file, it is gone: this job
+  # replaces the earlier design that leaned on the since-DELETED
+  # `Sonnet/scripts/ci/provision-premigration-schema.js` to SIMULATE a pre-migration schema
+  # and replay only the 17 newest migrations. Recoverable from git history if ever needed;
+  # see the DECISION marker inside the job below for the full lineage.)
   #
   # What the job does:
   #   1. create a second, throwaway `schema_sync` database on the same service container;

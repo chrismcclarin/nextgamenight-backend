@@ -59,9 +59,10 @@ const mask = (url) => {
 (async () => {
   // Non-production refusal, BEFORE the client is opened. This script runs the most
   // destructive verb in the phase (DROP DATABASE), so it carries the refusal at least as
-  // firmly as its sync-side sibling -- wording mirrors
-  // scripts/ci/provision-premigration-schema.js:104-106 and the first guard in
-  // tests/globalSetup.js:68-73. CI leaves NODE_ENV unset; local proof may set test.
+  // firmly as its sync-side sibling -- wording mirrors the retired provision script
+  // (retired in Plan 88.4-05; see the DECISION Phase 88.4 D-05 marker in ci.yml's
+  // migrate-cli-replay job) and the first guard in tests/globalSetup.js:68-73.
+  // CI leaves NODE_ENV unset; local proof may set test.
   if (process.env.NODE_ENV === 'production') {
     console.error(
       `[88.4-createdb] refusing to run: NODE_ENV=production ` +

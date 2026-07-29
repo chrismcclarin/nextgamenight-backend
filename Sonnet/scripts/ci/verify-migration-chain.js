@@ -10,11 +10,13 @@
 // would then report that shortfall as model/migration drift instead of as the replay bug it
 // actually is. This script names the real cause first.
 //
-// REPLACES `scripts/ci/provision-premigration-schema.js verify` (:149-168), which Plan 05
-// deletes. Two deliberate deviations from that analog:
+// REPLACES the `verify` mode of the retired provision script (historical: it lived at
+// `scripts/ci/provision-*.js:149-168` until Plan 88.4-05 deleted it -- see the DECISION
+// Phase 88.4 D-05 marker in ci.yml's migrate-cli-replay job). Two deliberate deviations
+// from that analog:
 //
 // DECISION Phase 88.4: raw `pg` on MIGRATE_DB_URL OVER the analog's models-barrel import
-// (provision-premigration-schema.js:46). That barrel resolves the shared precedence
+// (historically at its :46). That barrel resolves the shared precedence
 // chain `POSTGRES_PRIVATE_URL || POSTGRES_URL || DATABASE_URL || PGDATABASE_URL`
 // (config/database.js:16-19), so it would verify whichever database that chain happens to
 // resolve -- in a two-database job that is a false green waiting to happen. A purpose-named
@@ -23,9 +25,10 @@
 // cleanup.
 //
 // DECISION Phase 88.4: FULL-DIRECTORY comparison OVER the analog's pinned filename set
-// (its CLI_APPLIED_FILES, :98). That pinned set existed because the provision script
-// simulated a pre-migration shape and hand-seeded SequelizeMeta with everything EXCEPT the
-// re-key/data migrations it wanted the CLI to run -- so only those could be asserted. The
+// (its CLI_APPLIED_FILES, historically at its :98). That pinned set existed because the
+// retired provision script simulated a pre-migration shape and hand-seeded SequelizeMeta
+// with everything EXCEPT the re-key/data migrations it wanted the CLI to run -- so only
+// those could be asserted. The
 // from-empty design replays the WHOLE chain, so the assertion widens to the whole directory
 // and needs no edit when migrations are added. Narrowing it back to a pinned list is a
 // decision, not a cleanup.
@@ -68,7 +71,7 @@ const mask = (url) => {
     return;
   }
 
-  // Same shape as provision-premigration-schema.js:131-134.
+  // Same shape as the retired provision script's own migrations-directory read.
   const files = fs
     .readdirSync(MIGRATIONS_DIR)
     .filter((f) => f.endsWith('.js'))
