@@ -152,6 +152,50 @@ async function convertSuggestionToEvent(suggestionId, creatorUserId, options = {
     const group = prompt.Group;
     const game = prompt.Game;
 
+    // DECISION Phase 88.2 MED-6: an explicit null check was chosen OVER adding
+    // `required: true` to the `{ model: Group }` include above (the fix every other
+    // site in this plan uses) and OVER relying on the include to drop the row.
+    //
+    // Why the include cannot do it here: neither AvailabilitySuggestion nor
+    // AvailabilityPrompt is paranoid (D-01 makes only Group/UserGroup/Event
+    // paranoid), so a group soft-delete leaves both rows untouched and this job
+    // still runs. Group IS paranoid, and the include is a LEFT JOIN, so Sequelize
+    // puts the deletedAt clause in the ON clause and the prompt row returns with
+    // `Group === null` rather than being dropped.
+    //
+    // Why NOT `required: true` here specifically: this query carries a
+    // `FOR UPDATE OF AvailabilitySuggestion` row lock and a deliberately-scoped
+    // outer-join shape (see the comment above the findByPk — Postgres rejects a
+    // bare FOR UPDATE spanning the nullable side of an outer join, SQLSTATE 0A000).
+    // Converting the Group include to an INNER JOIN would silently return null for
+    // the WHOLE suggestion and route this case into the `if (!suggestion)`
+    // 'Suggestion not found' branch, losing the distinct disposition. The explicit
+    // guard keeps the refusal legible. DO NOT ADD `required: true` TO THAT INCLUDE —
+    // it would make this guard dead code.
+    //
+    // Without this guard a backlogged deadline conversion creates a LIVE, UNSTAMPED
+    // Event on a hidden group and emails its members a confirmation naming the
+    // literal 'Your Group' (the null-group fallback) — days after they were told the
+    // group was deleted and they have 30 days to claim it. The non-obvious half is
+    // the row: an unstamped Event does NOT match plan 07's
+    // `Event.restore({ where: { group_id, deletedAt: stamp } })`, so the restored
+    // group gains an event that did not exist before the delete, breaking
+    // SPEC-REQ-9's before/after row-set equality. Task 3's wire sweep cannot see it
+    // (Task 2's INNER JOINs make the event invisible during the window), so nothing
+    // else in this phase catches it.
+    //
+    // Rollback-and-return, NOT a throw: all three refusals above it
+    // ('Suggestion not found', 'already converted', 'Associated prompt not found')
+    // roll back and return { success: false, message }, and the callers branch on
+    // that shape. Throwing would invent a fourth disposition.
+    if (!group) {
+      await transaction.rollback();
+      return {
+        success: false,
+        message: 'group_not_found'
+      };
+    }
+
     // 2. Calculate duration from suggested time slot
     const durationMinutes = calculateDuration(
       suggestion.suggested_start,
@@ -308,7 +352,9 @@ async function sendConfirmationEmails(event, users, group, game) {
 
       const result = await emailService.send({
         to: user.email,
-        subject: `Game Night Confirmed: ${game?.name || 'Game Night'} - ${formatDateForEmail(event.start_date, recipientTz)}`,
+        // WR-02: user-controlled game name goes into a mail header — strip CR/LF
+        // (BSEC-04 header-injection guard; same discipline as the shared From-name).
+        subject: `Game Night Confirmed: ${emailService.stripCrlf(game?.name || 'Game Night')} - ${formatDateForEmail(event.start_date, recipientTz)}`,
         html,
         text,
         groupName: group?.name,
@@ -363,6 +409,14 @@ function generateEventConfirmationEmailTemplate(data) {
     ? participants.join(', ')
     : 'TBD';
 
+  // WR-02 (88.2 review, BSEC-04): group names, game names, comments and usernames
+  // are end-user-controlled — escape them for the HTML part only. The text part
+  // is text/plain, where escaping would render literal entities.
+  const safeGroupName = emailService.escapeHtml(groupName);
+  const safeGameName = emailService.escapeHtml(gameName);
+  const safeComments = emailService.escapeHtml(comments);
+  const safeParticipants = (participants || []).map((p) => emailService.escapeHtml(p));
+
   const html = `
 <!DOCTYPE html>
 <html>
@@ -398,12 +452,12 @@ function generateEventConfirmationEmailTemplate(data) {
       <p>Your session has been scheduled</p>
     </div>
     <div class="content">
-      <p>Great news! A game night has been confirmed for <strong>${groupName}</strong>.</p>
+      <p>Great news! A game night has been confirmed for <strong>${safeGroupName}</strong>.</p>
 
       <div class="event-card">
         <div class="event-detail">
           <span class="event-label">Game</span>
-          <span class="event-value"><strong>${gameName}</strong></span>
+          <span class="event-value"><strong>${safeGameName}</strong></span>
         </div>
         <div class="event-detail">
           <span class="event-label">Date</span>
@@ -420,14 +474,14 @@ function generateEventConfirmationEmailTemplate(data) {
         ${comments ? `
         <div class="event-detail">
           <span class="event-label">Notes</span>
-          <span class="event-value">${comments}</span>
+          <span class="event-value">${safeComments}</span>
         </div>
         ` : ''}
 
         <div class="participants-section">
           <span class="event-label">Who's Playing</span>
           <div class="participants-list">
-            ${participants.map(p => `<span class="participant-badge">${p}</span>`).join('')}
+            ${safeParticipants.map(p => `<span class="participant-badge">${p}</span>`).join('')}
           </div>
         </div>
       </div>

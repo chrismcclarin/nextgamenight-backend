@@ -61,6 +61,14 @@ const GroupInvite = sequelize.define('GroupInvite', {
     {
       fields: ['status'],
     },
+    // Phase 88.2 code-review L-9: the purge sweep's destroy({ where: { group_id } })
+    // had no group_id index (the partial-unique pending-invite index can't serve a
+    // plain group_id lookup). Dual-declared with migration 20260727000001; explicit
+    // name keeps sync() and the migration identical.
+    {
+      fields: ['group_id'],
+      name: 'group_invites_group_id',
+    },
     // Partial unique index on (group_id, LOWER(invited_email)) WHERE status='pending'
     // is handled in the migration via raw SQL since Sequelize doesn't support partial indexes
   ],

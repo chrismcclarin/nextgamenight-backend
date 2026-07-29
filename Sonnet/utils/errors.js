@@ -41,6 +41,25 @@ const ERROR_REGISTRY = Object.freeze({
   owner_of_active_groups:  { httpStatus: 409, message: 'You still own one or more groups with other members. Transfer ownership or remove members before deleting your account.' },
   // 410 tombstone/JIT guard: repeat-DELETE and post-deletion re-auth refusals emit this (never a raw 410).
   account_deleted:         { httpStatus: 410, message: 'This account has been deleted.' },
+  // Phase 88.2 (group soft-delete recovery) — append-only per D-11. Emitted by the
+  // hand-rolled bodies in POST /groups/accept-ownership, NOT via sendError (see below).
+  // NOTE: `invalid_token` (410, restore link) is NOT `token_invalid` (400, magic-token
+  // reject) above. Two codes, two statuses, deliberately distinct — do not merge them.
+  //
+  // DECISION Phase 88.2 MED-1: registration WITHOUT converting the handlers to
+  // sendError was chosen OVER (a) converting them, because sendError nests caller data
+  // under `details` and plan 10 reads the 409's id off the RAW body as
+  // `err.details.group_id` — the envelope accessor getEnvelopeDetails reads
+  // `err.details.details` and would return undefined, silently killing the redirect;
+  // and OVER (b) leaving them unregistered, which would put four codes on the wire
+  // that this contract file does not know exist. These entries are the canonical
+  // status/message record; the routes keep their raw shape. Same forward-compat
+  // pattern `not_found` / `forbidden` above already occupy — registered, documented
+  // as not-emitted-through-the-chokepoint, and explicitly NOT a gap.
+  already_restored:        { httpStatus: 409, message: 'This group has already been restored.' },
+  invalid_token:           { httpStatus: 410, message: 'This restore link is no longer valid.' },
+  already_used:            { httpStatus: 410, message: 'This restore link is no longer valid.' },
+  window_expired:          { httpStatus: 410, message: 'This link has expired.' },
   internal:                { httpStatus: 500, message: 'An internal error occurred' }, // 500 fallback
 });
 

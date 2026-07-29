@@ -208,6 +208,7 @@ app.use((req, res, next) => {
     '/api/feedback', // Feedback is public (or optional auth)
     '/health', // Health check is public
     '/api/groups/invite-preview', // QR code group invite preview (public)
+    '/api/groups/restore-preview', // Phase 88.2 D-02: emailed group-restore preview (public)
     '/api/events/invite-preview', // QR code game invite preview (public)
   ];
   
@@ -293,6 +294,13 @@ const PUBLIC_EXACT = [
   { method: 'GET', re: /^\/groups\/invite-preview(\/|$)/ },
   { method: 'GET', re: /^\/events\/invite-preview(\/|$)/ },
   { method: 'GET', re: /^\/invites\/info(\/|$)/ },
+  // Phase 88.2 (D-02): the emailed group-restore PREVIEW is public — the 32-byte
+  // nonce is the only credential and the body is a group name plus a date. Its
+  // authenticated POST sibling (the acceptance action that actually grants ownership)
+  // is deliberately NOT here and must stay behind this gate: the token identifies the
+  // group, the SESSION identifies the person entitled to claim it. This file is
+  // grep-asserted to name that route ZERO times, so do not spell it out here.
+  { method: 'GET', re: /^\/groups\/restore-preview(\/|$)/ },
 ];
 
 // Wholly-public prefixes (router self-authenticates via magic token, is an
@@ -578,6 +586,35 @@ const startServer = async () => {
           console.log('PendingAuth0Deletion reconciliation sweep started (every 30 min)');
         } catch (err) {
           console.error('PendingAuth0Deletion sweep failed to start:', err.message);
+        }
+      }
+
+      // Group purge sweep (Phase 88.2 / SPEC-REQ-10, D-05; production +
+      // ENABLE_SCHEDULER only, UTC). Permanently destroys every group whose stamped
+      // `purge_after` deadline has passed, together with its events, roster, reviews,
+      // pending invites and restore tokens — see services/groupPurgeSweep.js.
+      //
+      // DAILY at 03:00 UTC rather than the every-30-minutes cadence its two siblings
+      // above use (D-05): purge timing is invisible to users because the group
+      // vanished at delete time, so a tighter cadence buys nothing and costs 48x the
+      // log noise and 48x the chances of colliding with a live restore acceptance.
+      // It deletes for real from day one — a log-only first month would have depended
+      // on somebody remembering to flip a switch ~30 days after launch, and forgotten,
+      // it leaves deleted groups accumulating while still holding invitee email PII.
+      if (process.env.NODE_ENV === 'production' || process.env.ENABLE_SCHEDULER === 'true') {
+        try {
+          const cron = require('node-cron');
+          const { runGroupPurgeSweep } = require('./services/groupPurgeSweep');
+          cron.schedule('0 3 * * *', async () => {
+            try {
+              await runGroupPurgeSweep();
+            } catch (err) {
+              console.error('Group purge sweep error:', err.message);
+            }
+          }, { timezone: 'UTC' });
+          console.log('Group purge sweep started (daily 03:00 UTC)');
+        } catch (err) {
+          console.error('Group purge sweep failed to start:', err.message);
         }
       }
 

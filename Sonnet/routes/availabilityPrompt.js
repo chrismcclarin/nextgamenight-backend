@@ -38,7 +38,24 @@ router.get('/prompts/:promptId/respondents', verifyAuth0Token, async (req, res) 
 
     // 1. Get prompt with group
     const prompt = await AvailabilityPrompt.findByPk(promptId, {
-      include: [{ model: Group }]
+      include: [
+      // DECISION Phase 88.2 MED-1: the INNER-JOIN flag on this Group include was
+      // chosen OVER a hand-written group filter and OVER making AvailabilityPrompt
+      // paranoid (which would change prompt lifecycle semantics far outside this
+      // phase). This marker covers all THREE AvailabilityPrompt-rooted Group
+      // includes: here, POST /prompts/:promptId/remind/:userId below, and
+      // services/tentativeHoldService.js.
+      //
+      // AvailabilityPrompt is a NON-PARANOID ROOT, which puts these in exactly the
+      // same class as the two GroupInvite-rooted includes in routes/invites.js
+      // (Phase 88.2 F-04) — read those two together with these as ONE decision.
+      // Sequelize emits `LEFT OUTER JOIN "Groups" ... AND ("Group"."deletedAt" IS
+      // NULL)`, so the PROMPT row survives with `Group: null` and the central D-01
+      // filter cannot reach it. The INNER JOIN drops the row instead, findByPk
+      // returns null, and the existing `if (!prompt)` 404 below fires. Removing the
+      // flag reopens the leak — this is D-01's one structural blind spot.
+        { model: Group, required: true }
+      ]
     });
 
     if (!prompt) {
@@ -174,7 +191,8 @@ router.post('/prompts/:promptId/remind/:userId', verifyAuth0Token, async (req, r
     // 1. Get prompt with group and game
     const prompt = await AvailabilityPrompt.findByPk(promptId, {
       include: [
-        { model: Group },
+        // Phase 88.2 MED-1 — see the marker on GET /prompts/:promptId/respondents.
+        { model: Group, required: true },
         { model: Game }
       ]
     });
@@ -285,14 +303,21 @@ router.post('/prompts/:promptId/remind/:userId', verifyAuth0Token, async (req, r
       day: 'numeric'
     });
 
+    // WR-02 (88.2 review, BSEC-04): username, game name and group name are
+    // end-user-controlled — escape for the HTML part, strip CR/LF for the subject
+    // header. The text part is text/plain and stays raw.
+    const safeUsername = emailService.escapeHtml(targetUser.username || 'there');
+    const safeGameName = emailService.escapeHtml(gameName);
+    const safeGroupName = emailService.escapeHtml(groupName);
+
     const emailResult = await emailService.send({
       to: targetUser.email,
-      subject: `Reminder: ${groupName} availability request`,
+      subject: `Reminder: ${emailService.stripCrlf(groupName)} availability request`,
       html: `
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
           <h2 style="color: #4F46E5;">Availability Reminder</h2>
-          <p>Hi ${targetUser.username || 'there'},</p>
-          <p>This is a friendly reminder to submit your availability for the upcoming <strong>${gameName}</strong> session with <strong>${groupName}</strong>.</p>
+          <p>Hi ${safeUsername},</p>
+          <p>This is a friendly reminder to submit your availability for the upcoming <strong>${safeGameName}</strong> session with <strong>${safeGroupName}</strong>.</p>
           <p>The deadline to respond is <strong>${deadline}</strong>.</p>
           <p>Please check your email for the original availability link.</p>
           <p style="color: #6B7280; font-size: 12px; margin-top: 30px;">

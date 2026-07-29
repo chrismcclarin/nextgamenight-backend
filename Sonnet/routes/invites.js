@@ -10,6 +10,7 @@ const emailService = require('../services/emailService');
 
 const { isOwnerOrAdmin } = require('../services/authorizationService');
 const { resolveTargetUserUuidOnly } = require('../utils/resolveTargetUser');
+const { lockGroupRow } = require('../utils/groupRowLock');
 
 const router = express.Router();
 
@@ -34,6 +35,24 @@ const router = express.Router();
 async function acceptInviteTransactional(invite, user) {
   const t = await sequelize.transaction();
   try {
+    // WR-01 (88.2 review): FIRST statement of the transaction is the shared
+    // Groups-row lock (utils/groupRowLock.js — the same guard softDeleteGroup,
+    // restore, purge and join-by-token take), then a paranoid liveness re-read
+    // INSIDE it. The routes' Group.findByPk gates run outside any lock, so a
+    // softDeleteGroup committing between that gate and this transaction would
+    // otherwise land a LIVE, UNSTAMPED membership row on a hidden group (create
+    // branch) or restore() a row the delete just stamped (carve-out #9 branch) —
+    // the identical race join-by-token closes the same way (routes/groups.js
+    // AF-3 marker has the full lock-serializes-but-cannot-refuse analysis).
+    // Callers map `{ gone: true }` to the same 410 their pre-transaction gates
+    // emit, so all gated write paths answer identically.
+    await lockGroupRow(invite.group_id, t);
+    const live = await Group.findByPk(invite.group_id, { transaction: t });
+    if (!live) {
+      await t.rollback();
+      return { gone: true };
+    }
+
     // Write 1: flip invite status
     await invite.update(
       { status: 'accepted', accepted_at: new Date() },
@@ -44,23 +63,58 @@ async function acceptInviteTransactional(invite, user) {
     // D-11 (Phase 87.1, BINT-02): UserGroup is keyed on the Users.id UUID surrogate
     // (user_uuid). Plan 09 cutover: the old Auth0-string user_id column was removed
     // from the model.
-    const [userGroup, created] = await UserGroup.findOrCreate({
+    //
+    // DECISION Phase 88.2 AF-3: an explicit findOne({ paranoid: false }) +
+    // restore-or-create was chosen OVER findOrCreate. findOrCreate is
+    // paranoid-filtered, so once UserGroup went paranoid (plan 01) it CANNOT SEE a
+    // membership row that a group soft-delete stamped — it takes the CREATE branch,
+    // which the new PARTIAL unique index `usergroups_user_uuid_group_id_uq`
+    // (WHERE "deletedAt" IS NULL) explicitly permits. That yields a SECOND, live row
+    // for the same (user_uuid, group_id) pair. The group restore then un-stamps the
+    // first row, two rows have deletedAt IS NULL for the same pair, the unique index
+    // is violated, and the WHOLE restore transaction aborts — identically on every
+    // retry. The group becomes permanently unrecoverable and is purged at day 30
+    // while its members are actively trying to save it.
+    //
+    // The route gates below (410 on a soft-deleted group) should make the stamped
+    // branch unreachable, but this lookup removes the failure mode STRUCTURALLY
+    // rather than depending on a gate holding: restoring one row is always safe,
+    // creating a second is catastrophic.
+    //
+    // `paranoid: false` here is a WRITE-PATH INTEGRITY read, not a soft-deleted-content
+    // read — it exists solely to prevent a duplicate row and discloses nothing. It is
+    // carve-out #9 in the table plan 07 writes into groupRecoveryService.js's header.
+    const existing = await UserGroup.findOne({
       where: {
         user_uuid: user.id,
         group_id: invite.group_id,
       },
-      defaults: {
-        user_uuid: user.id,
-        group_id: invite.group_id,
-        role: 'member',
-        status: 'active',
-        joined_at: new Date(),
-      },
+      paranoid: false, // AF-3: must see rows a group soft-delete stamped
       transaction: t,
     });
 
-    // Write 3: if the membership row already existed, activate it
-    if (!created) {
+    let userGroup = existing;
+
+    if (!existing) {
+      // No row at all — create one, exactly the previous `defaults` object.
+      userGroup = await UserGroup.create(
+        {
+          user_uuid: user.id,
+          group_id: invite.group_id,
+          role: 'member',
+          status: 'active',
+          joined_at: new Date(),
+        },
+        { transaction: t }
+      );
+    } else {
+      // A stamped row means this pair ALREADY has a membership record. Reuse it —
+      // never create alongside it.
+      if (existing.deletedAt !== null && existing.deletedAt !== undefined) {
+        await existing.restore({ transaction: t });
+      }
+
+      // Write 3: activate the existing (or just-restored) membership row.
       await userGroup.update(
         { role: 'member', status: 'active', joined_at: new Date() },
         { transaction: t }
@@ -68,6 +122,7 @@ async function acceptInviteTransactional(invite, user) {
     }
 
     await t.commit();
+    return { gone: false };
   } catch (error) {
     await t.rollback();
     throw error;
@@ -86,9 +141,22 @@ router.get('/info/:token', async (req, res) => {
     const invite = await GroupInvite.findOne({
       where: { token, status: 'pending' },
       include: [
+        // DECISION Phase 88.2 F-04: the INNER-JOIN flag below was chosen OVER a
+        // hand-written `where`/`deletedAt` filter on the outer query, and OVER making
+        // GroupInvite paranoid. D-01 deliberately leaves GroupInvite non-paranoid, so
+        // Sequelize puts Group's paranoid clause in the JOIN's ON clause — the invite
+        // row SURVIVES with `Group: null` instead of being dropped. Marking the include
+        // required makes it an INNER JOIN, so a soft-deleted group's invite yields no
+        // row and the `if (!invite)` 404 below fires.
+        // THIS ROUTE IS ON THE PUBLIC ALLOWLIST (server.js: GET /invites/info). Without
+        // the flag an UNAUTHENTICATED caller holding an old invite token gets HTTP 200
+        // disclosing that a group existed (degraded to 'Unknown Group'). Removing it
+        // reopens a public information-disclosure leak — it is not cosmetic and it is
+        // not a redundant flag.
         {
           model: Group,
           attributes: ['name'],
+          required: true,
         },
         {
           model: User,
@@ -334,7 +402,18 @@ router.post(
         status: 'pending',
       });
 
-      // If invited email matches an existing user, also create/update UserGroup row
+      // If invited email matches an existing user, also create/update UserGroup row.
+      //
+      // Phase 88.2 AF-3 disposition: this is the SAME paranoid-filtered findOrCreate
+      // shape that acceptInviteTransactional had to abandon, and it is left as-is
+      // DELIBERATELY. Its safety rests entirely on the `Group.findByPk(group_id)`
+      // liveness check earlier in this handler (the "Verify group exists" 404 above),
+      // which is paranoid after plan 01 — so a soft-deleted group is refused upstream
+      // and this call only ever runs for a LIVE group. IF THAT CHECK IS EVER REMOVED
+      // OR MOVED BELOW THIS POINT, this site inherits the accept-path defect: a
+      // paranoid-filtered create branch that the partial unique index
+      // `usergroups_user_uuid_group_id_uq` permits, producing a duplicate live row
+      // that makes a group restore abort permanently.
       if (existingUser) {
         const [userGroup, created] = await UserGroup.findOrCreate({
           where: {
@@ -421,9 +500,18 @@ router.get('/pending', async (req, res) => {
         status: 'pending',
       },
       include: [
+        // DECISION Phase 88.2 F-04: the INNER-JOIN flag below was chosen OVER a
+        // hand-written `where`/`deletedAt` filter on the outer query, and OVER making
+        // GroupInvite paranoid. Same root cause as the GET /info/:token include above:
+        // GroupInvite is a NON-paranoid root (D-01), so Group's paranoid clause lands
+        // in the JOIN's ON clause and nulls the association instead of dropping the
+        // invite. With INNER JOIN, a soft-deleted group's invites leave the list
+        // entirely and the enrichment loop below never sees a null `invite.Group`
+        // (which would otherwise surface as `group_name: 'Unknown Group'`).
         {
           model: Group,
           attributes: ['id', 'name'],
+          required: true,
         },
         {
           model: User,
@@ -488,8 +576,41 @@ router.post('/:invite_id/accept', async (req, res) => {
       return res.status(403).json({ error: 'This invite is not for you' });
     }
 
+    // DECISION Phase 88.2 AF-3: an explicit Group.findByPk liveness gate was chosen
+    // OVER making GroupInvite paranoid (D-01 deliberately does not) and OVER relying
+    // on the READ-path filters from Task 1 (those are reads; nothing on this WRITE
+    // path looks at Group at all). Group IS paranoid, so findByPk returns null for a
+    // soft-deleted group.
+    //
+    // Without this gate an invitee following an emailed link into a group inside its
+    // recovery window gets { success: true } and — because the membership lookup is
+    // paranoid-filtered — a LIVE UserGroup{status:'active'} row on a hidden group.
+    // getUserRoleInGroup then returns 'member' and isActiveMember/isMemberOrHigher
+    // PASS, which is the exact choke point the rest of this phase relies on to deny
+    // access to the hidden group's retained GameReview rows and lists.
+    //
+    // PLACEMENT AFTER THE EMAIL-MATCH 403 IS DELIBERATE AND MUST NOT BE TIDIED
+    // EARLIER. GroupInvite is non-paranoid, so an UNMATCHED caller can reach the
+    // invite lookup; gating before the match check would turn this endpoint into an
+    // existence oracle for any authenticated user holding an invite id or token.
+    // After the match, the only person who learns anything is the addressee, who
+    // already knew the group existed.
+    //
+    // 410 here, not the read paths' indistinguishable 404: by this point the caller
+    // is authenticated AND email-matched, so a precise answer costs no disclosure
+    // and a vague one just strands them.
+    const group = await Group.findByPk(invite.group_id);
+    if (!group) {
+      return res.status(410).json({ error: 'This group is no longer available' });
+    }
+
     // Atomic three-write flow (status flip + UserGroup activation) — see helper.
-    await acceptInviteTransactional(invite, user);
+    // WR-01: the helper re-checks liveness under the shared row lock; `gone`
+    // maps to the same 410 the pre-transaction gate above emits.
+    const acceptResult = await acceptInviteTransactional(invite, user);
+    if (acceptResult.gone) {
+      return res.status(410).json({ error: 'This group is no longer available' });
+    }
 
     res.json({ success: true, group_id: invite.group_id });
   } catch (error) {
@@ -526,18 +647,58 @@ router.post('/:invite_id/decline', async (req, res) => {
       return res.status(403).json({ error: 'This invite is not for you' });
     }
 
-    // Update invite status
-    await invite.update({ status: 'declined' });
+    // DECISION Phase 88.2 AF-3 — the decline path gets the gate too. Its
+    // UserGroup.destroy below is a HARD delete (force: true, plan 03). On a
+    // soft-deleted group that row is one of the STAMPED rows plan 07's restore must
+    // bring back, so declining would silently drop that member from the restored
+    // roster and break SPEC-REQ-9's before/after row-set equality. Chosen OVER
+    // leaving decline ungated (the "it only removes their own invite" reading), which
+    // ignores that the row is shared state during the recovery window. No UX cost:
+    // Task 1's INNER JOIN on GET /pending already removes soft-deleted groups'
+    // invites from the list, so nobody is left staring at an invite they cannot
+    // dismiss. Placement AFTER the email-match 403 is the anti-oracle choice.
+    const group = await Group.findByPk(invite.group_id);
+    if (!group) {
+      return res.status(410).json({ error: 'This group is no longer available' });
+    }
 
-    // If a UserGroup row exists with status 'invited', destroy it (keyed on the
-    // Users.id UUID surrogate — D-11).
-    await UserGroup.destroy({
-      where: {
-        user_uuid: user.id,
-        group_id: invite.group_id,
-        status: 'invited',
-      },
+    // WR-01 (88.2 review): the gate above runs outside any lock, so the writes
+    // below take the shared Groups-row lock (utils/groupRowLock.js) and re-read
+    // liveness INSIDE it. Without this, a softDeleteGroup committing in the gap
+    // lets the force-destroy hard-delete a row the delete just STAMPED — silently
+    // shortening the restorable roster and breaking SPEC-REQ-9's before/after
+    // row-set equality, the exact outcome the gate's own AF-3 marker exists to
+    // prevent. `gone` maps to the gate's identical 410.
+    const declineResult = await sequelize.transaction(async (t) => {
+      await lockGroupRow(invite.group_id, t);
+      const live = await Group.findByPk(invite.group_id, { transaction: t });
+      if (!live) {
+        return { gone: true };
+      }
+
+      // Update invite status
+      await invite.update({ status: 'declined' }, { transaction: t });
+
+      // If a UserGroup row exists with status 'invited', destroy it (keyed on the
+      // Users.id UUID surrogate — D-11).
+      // F-02: hard delete — declining an invite physically removes the row. The `force`
+      // flag sits on the `.destroy(` line deliberately: the CI grep gate is LINE-scoped,
+      // so putting it on a later line would leave this call reported as a hit.
+      await UserGroup.destroy({ force: true,
+        where: {
+          user_uuid: user.id,
+          group_id: invite.group_id,
+          status: 'invited',
+        },
+        transaction: t,
+      });
+
+      return { gone: false };
     });
+
+    if (declineResult.gone) {
+      return res.status(410).json({ error: 'This group is no longer available' });
+    }
 
     res.json({ success: true });
   } catch (error) {
@@ -579,9 +740,23 @@ router.post('/accept-by-token', async (req, res) => {
       return res.status(403).json({ error: 'This invite is not for you' });
     }
 
+    // DECISION Phase 88.2 AF-3 — same liveness gate as POST /:invite_id/accept; see
+    // the full rationale there. Chosen OVER making GroupInvite paranoid and OVER
+    // relying on the Task 1 read-path filters. Placement AFTER the email-match 403
+    // is the anti-oracle choice, not incidental ordering.
+    const group = await Group.findByPk(invite.group_id);
+    if (!group) {
+      return res.status(410).json({ error: 'This group is no longer available' });
+    }
+
     // Atomic three-write flow (status flip + UserGroup activation) — same shared
     // helper as the id-based route, so this PRIMARY email-link path is atomic too.
-    await acceptInviteTransactional(invite, user);
+    // WR-01: the helper re-checks liveness under the shared row lock; `gone`
+    // maps to the same 410 the pre-transaction gate above emits.
+    const acceptResult = await acceptInviteTransactional(invite, user);
+    if (acceptResult.gone) {
+      return res.status(410).json({ error: 'This group is no longer available' });
+    }
 
     res.json({ success: true, group_id: invite.group_id });
   } catch (error) {

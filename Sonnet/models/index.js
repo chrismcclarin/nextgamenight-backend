@@ -41,12 +41,33 @@ const sequelize = require('../config/database');
 // the user_uuid FK column. The join now uses the DEFAULT source/target key (Users.id),
 // so no sourceKey/targetKey override is needed. ON DELETE CASCADE removes a deleted
 // user's group memberships.
+//
+// DECISION Phase 88.2 D-01: `through: { model: UserGroup, unique: false }` OVER the
+// bare `through: UserGroup` this used to be. Sequelize's belongsToMany defaults
+// `through.unique` to TRUE, which makes sync() emit a table-level composite UNIQUE
+// CONSTRAINT — `UserGroups_user_uuid_group_id_key` — on top of whatever the model's
+// own `indexes` array declares. That FULL constraint silently defeats the PARTIAL
+// unique index (`WHERE "deletedAt" IS NULL`) that models/UserGroup.js and migration
+// 20260725000001 both declare, so a soft-deleted membership would still occupy the
+// unique slot and POST /groups/join-by-token would 500 on re-join.
+//
+// This is a pure CI/prod drift: no migration has ever created that constraint, so
+// prod does not have it (prod's only composite uniqueness is
+// `usergroups_user_uuid_group_id_uq`, which 20260725000001 rebuilds as partial; the
+// legacy `UserGroups_user_id_group_id_key` went away with the column in
+// 20260720000004). It existed ONLY in the sync()-built test/CI database — which is
+// why the re-join regression test in tests/routes/groups.invite.test.js caught it
+// and nothing else would have.
+//
+// Uniqueness is NOT lost: the model's explicit partial unique index is the single
+// declared source, matching the migration byte-for-byte. Turning this back on would
+// re-break re-join in CI only. Changing it is a decision, not a cleanup.
 User.belongsToMany(Group, {
-  through: UserGroup,
+  through: { model: UserGroup, unique: false },
   foreignKey: 'user_uuid' // UUID FK column in UserGroup that references Users.id
 });
 Group.belongsToMany(User, {
-  through: UserGroup,
+  through: { model: UserGroup, unique: false },
   foreignKey: 'group_id', // Column in UserGroup that references Group
   otherKey: 'user_uuid' // UUID FK column in UserGroup that references Users.id
 });
@@ -164,8 +185,31 @@ MagicToken.belongsTo(AvailabilityPrompt, { foreignKey: 'prompt_id' });
 
 // Single-Use Tokens (One-to-Many from User) — OAuth state nonce + RSVP single-use
 // Note: Uses sourceKey/targetKey because user_id is STRING (Auth0 ID), not UUID
-User.hasMany(SingleUseToken, { foreignKey: 'user_id', sourceKey: 'user_id' });
-SingleUseToken.belongsTo(User, { foreignKey: 'user_id', targetKey: 'user_id' });
+//
+// DECISION Phase 88.2 D-02: `onDelete: 'CASCADE'` is stated EXPLICITLY here, chosen
+// OVER letting Sequelize infer it. Inference is not stable: Sequelize derives the
+// FK's ON DELETE from the attribute's `allowNull`, so the moment 88.2 relaxed
+// SingleUseToken.user_id to nullable (so group_restore rows can leave it NULL), the
+// sync-built CI database silently re-emitted this constraint as ON DELETE SET NULL.
+// Measured before/after against a real Postgres, not inferred.
+//
+// That flip is not cosmetic. services/pendingAuth0DeletionSweep.js:180-187 destroys
+// the ghost Users row FIRST and only then runs
+// `SingleUseToken.destroy({ where: { user_id: sub } })` — under SET NULL the delete of
+// the user nulls `user_id` out from under that predicate, so the sweep matches zero
+// rows and orphans the tokens forever, with a NULL user_id that is now
+// indistinguishable from a legitimate group_restore token.
+// (services/accountDeletionService.js:273 destroys tokens before the user, so it is
+// unaffected either way — the sweep is the one that breaks.)
+//
+// Prod has NO foreign key on this column at all: migrations/20260618000002-create-
+// single-use-tokens.js:49-53 declares `user_id` with no `references`. So this line
+// governs the CI/test database only; pinning it keeps that database's behavior
+// IDENTICAL to what it was before 88.2 rather than changing it as a side effect.
+// group_restore rows are unaffected regardless — their user_id is NULL, so no user
+// deletion can ever cascade to them, which is the entire point of D-02.
+User.hasMany(SingleUseToken, { foreignKey: 'user_id', sourceKey: 'user_id', onDelete: 'CASCADE' });
+SingleUseToken.belongsTo(User, { foreignKey: 'user_id', targetKey: 'user_id', onDelete: 'CASCADE' });
 
 // Friendships (Social Graph)
 // Phase 87.1 (BINT-02, D-05): re-keyed onto Users.id via requester_uuid/addressee_uuid,

@@ -10,6 +10,12 @@ const { scheduleReminders, scheduleDeadlineJob } = require('../services/reminder
 const { isUuid } = require('../utils/resolveTargetUser');
 
 function buildPromptEmailHtml({ recipientName, groupName, gameName, weekDescription, responseDeadline, formUrl }) {
+  // WR-02 (88.2 review, BSEC-04): recipient, group and game names are
+  // end-user-controlled — escape them before HTML interpolation. The remaining
+  // fields (week description, deadline, form URL) are system-generated.
+  const safeRecipient = emailService.escapeHtml(recipientName);
+  const safeGroupName = emailService.escapeHtml(groupName);
+  const safeGameName = emailService.escapeHtml(gameName);
   return `<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
@@ -18,8 +24,8 @@ function buildPromptEmailHtml({ recipientName, groupName, gameName, weekDescript
     <tr><td align="center">
       <table width="600" cellpadding="0" cellspacing="0" style="background:#fff;border-radius:8px;overflow:hidden;max-width:600px;width:100%">
         <tr><td style="padding:32px 40px">
-          <h1 style="margin:0 0 16px;font-size:24px;font-weight:bold;color:#111827">Hey ${recipientName}!</h1>
-          <p style="margin:0 0 16px;font-size:16px;line-height:1.6;color:#333">${groupName} is planning a ${gameName} session! Let us know when you're free ${weekDescription}.</p>
+          <h1 style="margin:0 0 16px;font-size:24px;font-weight:bold;color:#111827">Hey ${safeRecipient}!</h1>
+          <p style="margin:0 0 16px;font-size:16px;line-height:1.6;color:#333">${safeGroupName} is planning a ${safeGameName} session! Let us know when you're free ${weekDescription}.</p>
           <table width="100%" cellpadding="0" cellspacing="0" style="margin:24px 0;text-align:center">
             <tr><td align="center">
               <a href="${formUrl}" target="_blank" style="display:inline-block;padding:12px 24px;background:#4F46E5;color:#fff;text-decoration:none;border-radius:5px;font-weight:bold;font-size:16px">When Can You Play?</a>
@@ -28,7 +34,7 @@ function buildPromptEmailHtml({ recipientName, groupName, gameName, weekDescript
           <p style="margin:0 0 16px;font-size:16px;line-height:1.6;color:#333">Please respond by ${responseDeadline} so we can find a time that works for everyone.</p>
         </td></tr>
         <tr><td style="padding:20px 40px;border-top:1px solid #e5e7eb;text-align:center">
-          <p style="margin:0;font-size:12px;color:#6b7280">Sent by NextGameNight on behalf of ${groupName}</p>
+          <p style="margin:0;font-size:12px;color:#6b7280">Sent by NextGameNight on behalf of ${safeGroupName}</p>
         </td></tr>
       </table>
     </td></tr>
@@ -117,6 +123,33 @@ async function processPromptJob(job) {
   const dedupScheduleKey = triggeringSchedule?.id || scheduleId || 'legacy';
   const dedupKey = `${weekIdentifier}-${dedupScheduleKey}`;
 
+  // DECISION Phase 88.2 F-A3: an EARLY RETURN was chosen OVER letting the
+  // per-recipient try/catch swallow the TypeError that a null `group` produces.
+  // That catch only logs per recipient and execution still falls through to
+  // `prompt.update({ status: 'active' })` — leaving an ACTIVE prompt bound to a
+  // group that no longer exists, with zero emails sent.
+  //
+  // Guarding BEFORE AvailabilityPrompt.create was chosen OVER guarding after it
+  // and disposing of the orphaned row: all three sibling skip branches above
+  // (`schedule_deleted`, `schedule_inactive`, `duplicate_week`) return pre-create
+  // and none creates a row to dispose of, so a post-create guard would invent a
+  // fourth disposition inconsistent with every one of them. With the guard here
+  // there is no orphan to clean up and `status: 'pending'` is never written for a
+  // dead group. Do NOT add a prompt.destroy()/update() cleanup.
+  //
+  // Shape copied verbatim from workers/reminderWorker.js's `group_not_found` guard.
+  //
+  // RELOCATED: this lookup previously sat AFTER the create, just above the send
+  // loop. Moving it back there silently reintroduces the orphan-row path — it is
+  // a decision, not stray ordering. `groupId` is a function parameter, available
+  // from the first line, so the lookup has no dependency on anything between here
+  // and its old position.
+  const group = await Group.findByPk(groupId);
+  if (!group) {
+    console.log(`[PromptWorker] Group ${groupId} not found (soft-deleted or purged), skipping`);
+    return { skipped: true, reason: 'group_not_found' };
+  }
+
   const existingPrompt = await AvailabilityPrompt.findOne({
     where: { group_id: groupId, week_identifier: dedupKey }
   });
@@ -197,7 +230,8 @@ async function processPromptJob(job) {
     include: [userInclude]
   });
 
-  const group = await Group.findByPk(groupId);
+  // `group` is resolved and null-guarded above, before AvailabilityPrompt.create
+  // (Phase 88.2 F-A3). It used to be looked up here.
   let emailsSent = 0;
 
   // Send emails to each member
@@ -226,7 +260,9 @@ async function processPromptJob(job) {
 
       await emailService.send({
         to: user.email,
-        subject: `${group.name} - ${gameName} - When are you available?`,
+        // WR-02: user-controlled names go into a mail header — strip CR/LF
+        // (BSEC-04 header-injection guard; same discipline as the shared From-name).
+        subject: `${emailService.stripCrlf(group.name)} - ${emailService.stripCrlf(gameName)} - When are you available?`,
         html,
         text,
         groupName: group.name,
@@ -300,3 +336,5 @@ module.exports.handleJobFailed = handleJobFailed;
 // live BullMQ/Redis runtime so the A1 selected-member-subset bridge (Pitfall 4)
 // can be proven against the real test DB.
 module.exports.processPromptJob = processPromptJob;
+// WR-02: exported so emailService.escape.test.js can pin the builder's escaping.
+module.exports.buildPromptEmailHtml = buildPromptEmailHtml;

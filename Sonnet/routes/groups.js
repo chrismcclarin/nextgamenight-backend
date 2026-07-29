@@ -12,16 +12,16 @@ const {
   EventBring,
   EventBallotOption,
   EventBallotVote,
-  GameReview,
   UserGame,
-  GroupInvite,
   PendingAuth0Deletion,
+  SingleUseToken,
   sequelize,
 } = require('../models');
-const { sendError } = require('../utils/errors');
+const { sendError, ERROR_REGISTRY } = require('../utils/errors');
 // resolveTargetUser (dual-key) removed with POST /:group_id/users (Phase 87.6
 // groups-add-user); the UUID-only resolver remains for the role/transfer routes.
 const { resolveTargetUserUuidOnly } = require('../utils/resolveTargetUser');
+const { lockGroupRow } = require('../utils/groupRowLock');
 const { matchesSelf } = require('../middleware/objectAuth');
 const { Op } = require('sequelize');
 const { body, validationResult } = require('express-validator');
@@ -34,6 +34,13 @@ const {
   isActiveMember,
   stripMemberPII,
 } = require('../services/authorizationService');
+const {
+  softDeleteGroup,
+  restoreGroupByToken,
+  GroupAlreadyDeletedError,
+  RECOVERY_WINDOW_DAYS,
+} = require('../services/groupRecoveryService');
+const { sendGroupOwnershipOffers } = require('../services/groupOwnershipOfferService');
 
 // Phase 71.1-02 (post-checkpoint scope expansion): when a user leaves a group
 // (voluntary self-leave OR admin/owner removal), cascade-delete their per-user
@@ -610,6 +617,111 @@ router.get('/invite-preview/:token', async (req, res) => {
   }
 });
 
+// Public: preview a soft-deleted group from a restore token (no auth required).
+//
+// Phase 88.2 / SPEC-REQ-9, D-02. Modelled on the QR invite preview directly above:
+// a public preview plus an authenticated action (POST /accept-ownership below). The
+// token identifies the GROUP; the session identifies the PERSON. Two path segments,
+// so it cannot collide with GET /:group_id.
+//
+// It is registered in BOTH server.js public allow-lists — the `publicRoutes` prefix
+// array feeding the no-origin production block AND the `PUBLIC_EXACT` regex list
+// feeding the default-deny gate. Updating only one fails in production in a way local
+// dev will not reproduce.
+router.get('/restore-preview/:token', async (req, res) => {
+  try {
+    // ONE indistinguishable body for every genuine failure, so this endpoint cannot
+    // be used to probe which tokens ever existed. Deliberately identical across a
+    // garbage nonce, a revoked token, a purged group and a past deadline.
+    const INVALID = { error: 'Invalid or expired restore link' };
+
+    // AF-9: NO `status` predicate. One nonce is shared by the whole roster, so after
+    // the first acceptance every other member holds a consumed link — filtering to
+    // active here would 404 all of them and make the already-restored branch below
+    // unreachable for the COMMON case.
+    const token = await SingleUseToken.findOne({
+      where: { nonce: req.params.token, purpose: 'group_restore' },
+    });
+
+    if (!token || token.status === 'revoked' || token.expires_at <= new Date()) {
+      return res.status(404).json(INVALID);
+    }
+
+    // DECISION Phase 88.2 D-02: this read escapes the paranoid clause deliberately —
+    // this route exists specifically to read a SOFT-DELETED group, and it is
+    // carve-out #1 of the ten-entry table enumerated in the header of
+    // services/groupRecoveryService.js. Removing the escape breaks recovery entirely;
+    // copying the pattern to any other read path reopens the leak this phase closes.
+    //
+    // The response is also deliberately NARROWER than invite-preview's. An invite link
+    // is meant to be shared with non-members, so its preview earns its exposure; a
+    // restore link only ever goes to existing members, so a public preview buys no
+    // reach — it only saves a login step. Adding member_count, event_count or the
+    // group id to the SUCCESS body is a disclosure regression, not a convenience.
+    const group = await Group.findByPk(token.group_id, {
+      paranoid: false,
+      attributes: ['id', 'name', 'purge_after', 'deletedAt'],
+    });
+
+    // THE BRANCH ORDER BELOW IS LOAD-BEARING AND THE OBVIOUS ORDER IS WRONG.
+    // 1. purged row
+    if (!group) {
+      return res.status(404).json(INVALID);
+    }
+
+    // 2. already back
+    //
+    // DECISION Phase 88.2 AF-9: this distinct 200 was chosen OVER folding the branch
+    // into the blanket 404, and OVER minting one token per recipient. Plan 06 mints
+    // ONE nonce and fans the SAME link to every remaining member, so the moment one
+    // member accepts, the other N-1 — all legitimate members of a group that is now
+    // healthy — follow their emailed link. A blanket 404 tells every one of them
+    // "this restore link is no longer valid", which is the majority case, not an edge
+    // case. Per-recipient tokens would also make the state reachable, but they
+    // multiply token rows by roster size, complicate sibling revocation, and give
+    // every member an independently-forwardable credential for the same outcome.
+    //
+    // The anti-probing property survives intact: a caller without a real 32-byte
+    // nonce still gets the same 404 for every input, and the only person who can
+    // reach this 200 is someone holding a nonce this system emailed to a member of
+    // that exact group — who already knew it existed and can read it anyway. That is
+    // why group_id is safe here and NOT in the success body below.
+    //
+    // The indistinguishable-404 rule still governs every OTHER failure mode.
+    // Collapsing this branch back into it silently breaks the majority case.
+    if (group.deletedAt === null) {
+      return res.json({
+        status: 'already_restored',
+        group_name: group.name,
+        group_id: group.id,
+      });
+    }
+
+    // 3. deadline gone — AFTER the deletedAt check, and with an EXPLICIT null guard.
+    // A successful restore sets purge_after to NULL, and `null <= new Date()` is
+    // `true` in JavaScript (null coerces to 0). With this test written bare and
+    // placed first, EVERY restored group would fall into the 404 branch and the
+    // already-restored 200 above would be unreachable — the exact state AF-9 exists
+    // to expose, dead again and silently. Both defences are required: this ordering
+    // AND the null guard, so neither a reorder nor a dropped guard alone resurrects
+    // the bug. restoreGroupByToken's in-lock re-read pins the identical three
+    // branches for the identical reason.
+    if (group.purge_after == null || group.purge_after <= new Date()) {
+      return res.status(404).json(INVALID);
+    }
+
+    // 4. success — a name and a date, and NOTHING else.
+    res.json({ group_name: group.name, purge_after: group.purge_after });
+  } catch (error) {
+    console.error('Error getting group restore preview:', error);
+    // Code-review L-5: this route is PUBLIC and unauthenticated — never echo
+    // error.message to the caller (the house pattern elsewhere predates this
+    // route; Phase 93/BAPI-03 owns converting the rest). Detail stays in the
+    // console line above.
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Join a group by invite token (authenticated)
 router.post('/join-by-token', async (req, res) => {
   try {
@@ -677,37 +789,94 @@ router.post('/join-by-token', async (req, res) => {
       }
     }
 
-    // Check for existing UserGroup
-    const existingMembership = await UserGroup.findOne({
-      where: { user_uuid: user.id, group_id: group.id },
-    });
+    // DECISION Phase 88.2 AF-3: the membership write below runs inside a transaction
+    // that takes the SAME `FOR UPDATE` row lock on Groups the other writers use, and
+    // RE-READS group liveness inside that lock. This was chosen OVER relying on the
+    // delete side's lock to refuse a concurrent join.
+    //
+    // Why the delete-side lock does NOT close this (read before "simplifying" the
+    // gate away): services/accountDeletionService.js's lock makes a concurrent join
+    // "wait until the deletion transaction decides", and that refuses the join ONLY
+    // because ACCOUNT DELETION DESTROYS THE Groups ROW — the waiting join then fails
+    // its FK check. A SOFT delete leaves the Groups row physically in place, so when
+    // the lock releases the join's FOR KEY SHARE FK check SUCCEEDS and the row lands.
+    // The lock changes timing, not outcome. Only a liveness gate refuses.
+    //
+    // The lock is what makes the re-read meaningful: without it the same gap simply
+    // reopens between the re-read and the insert. The plain `Group.findOne` above is
+    // paranoid-filtered too, but it runs several round-trips earlier (auto-provision,
+    // tombstone check, User.findOrCreate) with no transaction of its own, so a QR
+    // scan landing while an owner deletes passes it against a still-live group and
+    // would commit its membership AFTER the delete stamped everything.
+    //
+    // Harm this refuses: a LIVE UserGroup row on a hidden group for the whole 30-day
+    // window — getUserRoleInGroup returns 'member', isActiveMember passes, and the
+    // joiner reads the hidden group's non-paranoid GameReview content and its lists
+    // through the very choke point the rest of this phase assumes is denying. It also
+    // leaves an UNSTAMPED live row that survives plan 07's stamp-matched restore,
+    // breaking SPEC-REQ-9 row-set equality.
+    //
+    // 410 with the same message as the three invite write-path gates, so all four
+    // gated write paths answer identically. Placed AFTER the tombstone check above so
+    // its `410 account_deleted` envelope is unchanged.
+    const joinResult = await sequelize.transaction(async (t) => {
+      await lockGroupRow(group.id, t);
 
-    if (existingMembership) {
-      // Already an active member
-      if (existingMembership.status === 'active' && existingMembership.role !== 'pending') {
-        return res.json({ already_member: true, group_id: group.id });
+      // Group is paranoid (D-01) → null once the delete transaction has stamped it.
+      const live = await Group.findByPk(group.id, { transaction: t });
+      if (!live) {
+        return { gone: true };
       }
 
-      // Re-activate declined or pending membership as full member
-      await existingMembership.update({
-        role: 'member',
-        status: 'active',
-        joined_at: new Date(),
+      // Check for existing UserGroup
+      const existingMembership = await UserGroup.findOne({
+        where: { user_uuid: user.id, group_id: group.id },
+        transaction: t,
       });
 
-      return res.json({ success: true, group_id: group.id });
+      if (existingMembership) {
+        // Already an active member
+        if (existingMembership.status === 'active' && existingMembership.role !== 'pending') {
+          return { alreadyMember: true };
+        }
+
+        // Re-activate declined or pending membership as full member
+        await existingMembership.update(
+          {
+            role: 'member',
+            status: 'active',
+            joined_at: new Date(),
+          },
+          { transaction: t }
+        );
+
+        return { joined: true };
+      }
+
+      // Create new membership -- CRITICAL: role is 'member' NOT 'pending' (QR invites bypass pending)
+      // Phase 87.1 (Plan 09 cutover): keyed on user_uuid — the old Auth0-string user_id
+      // column was removed from the model.
+      await UserGroup.create(
+        {
+          user_uuid: user.id, // Users.id UUID (the join key)
+          group_id: group.id,
+          role: 'member',
+          status: 'active',
+          joined_at: new Date(),
+        },
+        { transaction: t }
+      );
+
+      return { joined: true };
+    });
+
+    if (joinResult.gone) {
+      return res.status(410).json({ error: 'This group is no longer available' });
     }
 
-    // Create new membership -- CRITICAL: role is 'member' NOT 'pending' (QR invites bypass pending)
-    // Phase 87.1 (Plan 09 cutover): keyed on user_uuid — the old Auth0-string user_id
-    // column was removed from the model.
-    await UserGroup.create({
-      user_uuid: user.id, // Users.id UUID (the join key)
-      group_id: group.id,
-      role: 'member',
-      status: 'active',
-      joined_at: new Date(),
-    });
+    if (joinResult.alreadyMember) {
+      return res.json({ already_member: true, group_id: group.id });
+    }
 
     res.json({ success: true, group_id: group.id });
   } catch (error) {
@@ -716,7 +885,93 @@ router.post('/join-by-token', async (req, res) => {
   }
 });
 
+// Accept ownership of a soft-deleted group and restore it (authenticated).
+//
+// Phase 88.2 / SPEC-REQ-9, D-02, D-04. The authenticated half of the pair: the token
+// (in the BODY, mirroring join-by-token above — not a path param) identifies the
+// group, the session identifies the person. It is deliberately NOT on either public
+// allow-list in server.js and must stay behind the default-deny gate.
+//
+// Result code -> HTTP status, the mapping plans 09 and 10 are written against:
+//   ok               -> 200 { success: true, group_id, group_name }
+//   not_a_member     -> 403 { error }
+//   already_restored -> 409 { error, code: 'already_restored', group_id }
+//   invalid_token    -> 410 { error, code }
+//   already_used     -> 410 { error, code }
+//   window_expired   -> 410 { error, code }
+//
+// The bodies are RAW (not the Phase 85 envelope), matching every other handler in
+// this file. All four codes ARE registered in utils/errors.js's ERROR_REGISTRY as the
+// canonical status/message record — but they are NOT routed through the canonical
+// envelope helper, which nests caller data under `details`; the frontend reads the
+// 409's id off the raw body as `err.details.group_id`, and one more level of nesting
+// would silently kill that redirect. See the MED-1 marker in utils/errors.js.
+// (This file's use of that helper is grep-counted, so the name is not spelled out
+// here — hazard: a comment inflating the very count a criterion measures.)
+router.post('/accept-ownership', async (req, res) => {
+  try {
+    const userId = req.user?.user_id;
+    if (!userId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const { token } = req.body;
+    if (!token) {
+      return res.status(400).json({ error: 'Token is required' });
+    }
+
+    // NO auto-provisioning of a Users row here, unlike join-by-token above: a restore
+    // accepter must ALREADY hold a membership row stamped by this deletion, so a
+    // brand-new user can never be legitimate on this path.
+    const result = await restoreGroupByToken(token, userId);
+
+    // The wire keys are snake_case and are written out KEY BY KEY on purpose. The
+    // service returns camelCase (groupId / groupName); the contract plan 09 types and
+    // plan 10 reads is snake_case. A `{ success: true, ...result }` spread would emit
+    // groupId/groupName, the frontend would read result.group_id as undefined and
+    // redirect to a broken page — with every suite on both sides still green, because
+    // the backend tests assert DB state and the frontend test controls its own mock.
+    if (result.ok) {
+      return res.json({
+        success: true,
+        group_id: result.groupId,
+        group_name: result.groupName,
+      });
+    }
+
+    if (result.code === 'not_a_member') {
+      return res.status(403).json({ error: 'You were not a member of this group' });
+    }
+
+    if (result.code === 'already_restored') {
+      return res.status(409).json({
+        error: ERROR_REGISTRY.already_restored.message,
+        code: 'already_restored',
+        // AF-9 / MED #20: the id is what lets the frontend redirect the caller into
+        // the now-live group instead of dead-ending them. Without it the 409 state is
+        // reachable but useless.
+        group_id: result.groupId,
+      });
+    }
+
+    // invalid_token / already_used / window_expired all share 410, so the CODE must
+    // ride on the wire — it is the only way the frontend can tell "your group was
+    // erased" from "this link is stale" and split its copy by cause.
+    const entry = ERROR_REGISTRY[result.code] || ERROR_REGISTRY.internal;
+    return res.status(entry.httpStatus).json({ error: entry.message, code: result.code });
+  } catch (error) {
+    console.error('Error accepting group ownership:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Delete group - owner only (must come before /:group_id/users/:target_user_id)
+//
+// Phase 88.2 (SPEC-REQ-1 / SPEC-REQ-2): this DESTROYS NOTHING. It stamps the group,
+// its memberships and its events with one timestamp, writes a 30-day recovery
+// deadline onto the Groups row, mints a single-use restore token and emails every
+// remaining member an offer to take the group over. The purge sweep erases it only
+// after the deadline passes.
 router.delete('/:group_id', async (req, res) => {
   try {
     // Use verified user_id from token
@@ -724,52 +979,181 @@ router.delete('/:group_id', async (req, res) => {
     if (!userId) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
-    
+
     const { group_id } = req.params;
-    
-    // Check if user is owner
+
+    // DECISION Phase 88.2 AF-15: authorization-before-existence is RETAINED here,
+    // chosen OVER the existence-first order the deletion-impact endpoint below uses.
+    // The two handlers differ ON PURPOSE — that one must produce a SPEC-required 404
+    // for a soft-deleted group (AF-2), this one must not widen its disclosure.
+    //
+    // Consequence, and it is the intended one: isOwner resolves through
+    // getUserRoleInGroup, whose UserGroup.findOne is paranoid-filtered. After the
+    // first soft delete the owner's OWN membership row is stamped, so a SECOND
+    // DELETE fails right here and answers 403 — Group.findByPk is never reached and
+    // a 404 is unreachable on this route. Nothing is double-stamped, so no
+    // already-deleted branch is needed. Do NOT "fix" the asymmetry by adding a
+    // carve-out escape read, or by reordering these two guards; SPEC-REQ-6 pins this
+    // route's authorization to the ownership check and nothing more.
+    //
+    // SPEC-REQ-6 also forbids adding a pre-flight refusal, a member-count block or a
+    // server-side name check here. Disclosure-not-refusal is an owner-approved
+    // accepted-forever decision recorded in 88.2-SPEC.md; a gate re-litigates it.
     const hasPermission = await isOwner(userId, group_id);
     if (!hasPermission) {
       return res.status(403).json({ error: 'Only the group owner can delete the group' });
     }
-    
+
     const group = await Group.findByPk(group_id);
     if (!group) {
       return res.status(404).json({ error: 'Group not found' });
     }
-    
-    // One transaction (87.5 review IN-03, owner-approved fix): these were six
-    // independent writes, so a mid-sequence failure left a half-deleted group
-    // (events gone, roster intact). Same delete order as before; mirrors the
-    // in-transaction replica in accountDeletionService Step 1.
-    await sequelize.transaction(async (t) => {
-      // Delete all event participations for events in this group
-      const events = await Event.findAll({ where: { group_id }, transaction: t });
-      const eventIds = events.map(e => e.id);
-      if (eventIds.length > 0) {
-        await EventParticipation.destroy({ where: { event_id: { [Op.in]: eventIds } }, transaction: t });
+
+    // Capture the name BEFORE the group becomes unreadable — the email is built
+    // after the transaction has hidden the row.
+    const groupName = group.name;
+
+    // Resolve the acting user's Users.id UUID, the same resolution
+    // getUserRoleInGroup performs, so the deleting owner can be excluded from the
+    // roster (SPEC-REQ-8 requires 0 emails to them).
+    const actor = await User.findOne({ where: { user_id: userId } });
+
+    let purgeAfter;
+    let nonce;
+    let recipients;
+    try {
+      ({ purgeAfter, nonce, recipients } = await softDeleteGroup(group_id, {
+        excludeUserUuid: actor?.id,
+      }));
+    } catch (err) {
+      if (err instanceof GroupAlreadyDeletedError) {
+        // A concurrent DELETE won the row lock. Answer with the SAME 403 an ordinary
+        // repeat delete produces above, so the two paths are indistinguishable.
+        return res.status(403).json({ error: 'Only the group owner can delete the group' });
       }
+      throw err;
+    }
 
-      // Delete all events for this group
-      await Event.destroy({ where: { group_id }, transaction: t });
+    // Plan 10 serves this path in the frontend repo. Same FRONTEND_URL fallback idiom
+    // as workers/promptWorker.js and services/promptInvitationService.js.
+    const restoreUrl = `${process.env.FRONTEND_URL || 'http://localhost:3000'}/restore/group/${nonce}`;
 
-      // Delete all game reviews for this group
-      await GameReview.destroy({ where: { group_id }, transaction: t });
+    // Respond FIRST. `message` is unchanged so no existing FE consumer breaks;
+    // recoverable_until is additive.
+    res.json({ message: 'Group deleted successfully', recoverable_until: purgeAfter });
 
-      // Delete all pending invites for this group — GroupInvite.group_id has NO FK,
-      // so skipping this orphans rows carrying invitee email PII.
-      await GroupInvite.destroy({ where: { group_id }, transaction: t });
-
-      // Delete all user-group associations
-      await UserGroup.destroy({ where: { group_id }, transaction: t });
-
-      // Finally, delete the group
-      await group.destroy({ transaction: t });
-    });
-    
-    res.json({ message: 'Group deleted successfully' });
+    // DECISION Phase 88.2 AF-11: the fanout is FIRE-AND-FORGET, chosen OVER awaiting
+    // it. Precedent copied verbatim in form from routes/availabilityPrompt.js, which
+    // says in its own comment "Don't await — fanout can take seconds for large
+    // groups; the client already has its 201."
+    //
+    // Why awaiting is wrong here specifically: the dispatch loop is strictly serial
+    // (one Resend round-trip per member), so an awaited dispatch makes DELETE latency
+    // O(members) x RTT. The FE call traverses the Vercel BFF proxy, which sets no
+    // maxDuration and therefore runs at the default serverless cap. On a ~20-member
+    // group the request exceeds it, GroupSettings' handleDeleteGroup takes its catch
+    // and toasts "Failed to delete group", and the owner is left staring at the modal
+    // AFTER the delete has committed and every member has already been emailed. Their
+    // retry then hits the repeat-DELETE 403 above. None of it surfaces in CI, where
+    // the dispatcher is mocked and returns instantly.
+    //
+    // D-03 forbids inventing a queue for this, so fire-and-forget is the correct match
+    // to the existing pattern. Re-adding await for "reliability" trades a delivery
+    // guarantee the dispatcher cannot make anyway for a delete flow that fails
+    // visibly after committing.
+    //
+    // The outer try/catch covers a SYNCHRONOUS throw from the call itself, which the
+    // trailing .catch cannot — and it must not reach the handler's own catch, which
+    // would try to send a second response.
+    try {
+      sendGroupOwnershipOffers({ groupName, purgeAfter, restoreUrl, recipients })
+        .catch((err) => console.error('[DELETE /groups] ownership-offer fanout error (non-fatal):', err.message));
+    } catch (err) {
+      console.error('[DELETE /groups] ownership-offer dispatch error (non-fatal):', err.message);
+    }
   } catch (error) {
     console.error('Error deleting group:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Owner-only blast-radius preview for the Danger Zone (D-06 / SPEC-REQ-5).
+// Placed immediately after the DELETE handler so the delete-flow endpoints stay
+// adjacent. The two-segment path cannot collide with GET /:group_id.
+//
+// D-06 chose a DEDICATED route rather than extending the group-detail response
+// precisely so this can 403 a non-owner — group detail is legitimately read by
+// ordinary members and therefore cannot. Counts are computed server-side, never
+// client-side: a client-side count risks telling the owner "4 events" while the
+// delete hides 37, at the exact moment accuracy matters most.
+router.get('/:group_id/deletion-impact', validateUUID('group_id'), async (req, res) => {
+  try {
+    const userId = req.user?.user_id;
+    if (!userId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const { group_id } = req.params;
+
+    // DECISION Phase 88.2 AF-2: EXISTENCE-BEFORE-AUTHORIZATION here, chosen OVER
+    // matching the sibling handlers' authorization-first order (including the DELETE
+    // handler directly above, which keeps authz-first on purpose).
+    //
+    // Why the sibling order cannot be used: isOwner resolves through
+    // getUserRoleInGroup, whose UserGroup.findOne is paranoid-filtered. Once the group
+    // is soft-deleted the owner's OWN membership row is stamped too, so isOwner
+    // returns false and an authz-first order would answer 403 with this lookup never
+    // running — making SPEC-REQ-5's required 404 for a soft-deleted group unreachable,
+    // and the cheapest way out (relaxing the test to 403) would leave the SPEC
+    // criterion silently unmet. Reordering this back is a SPEC regression, not a
+    // consistency cleanup.
+    //
+    // It does not weaken authorization. Group ids are unguessable v4 UUIDs and the
+    // route validator has already rejected anything malformed, so the only new
+    // information a non-owner gains is "this UUID is not a live group" — for a UUID
+    // they had to already possess. The 403 for a LIVE group they do not own, which is
+    // the case the gate exists for, is unchanged.
+    //
+    // The model is paranoid, so this lookup IS the soft-deleted case. This handler is
+    // deliberately NOT one of the enumerated carve-outs — do not add an escape flag
+    // that would let it read a hidden group.
+    const group = await Group.findByPk(group_id);
+    if (!group) {
+      return res.status(404).json({ error: 'Group not found' });
+    }
+
+    const hasPermission = await isOwner(userId, group_id);
+    if (!hasPermission) {
+      return res.status(403).json({ error: 'Only the group owner can view deletion impact' });
+    }
+
+    // Independent counts, run concurrently — this endpoint's latency is directly
+    // visible as the delay before the blast-radius numbers appear in the Danger Zone.
+    // Both models are paranoid, so both automatically exclude anything already hidden.
+    //
+    // The role predicate matches the roster query in groupRecoveryService (see its
+    // MED-3 marker) and the in-repo "confirmed members" precedent further down this
+    // file. The two queries share a PREDICATE, not a result set: this count includes
+    // the acting owner while the fanout excludes them, so member_count is exactly one
+    // greater than the number of offers sent. That is intended — this number answers
+    // "how many people lose access", which includes the owner. Do NOT "fix" it by
+    // subtracting the owner.
+    const [member_count, event_count] = await Promise.all([
+      UserGroup.count({
+        where: {
+          group_id,
+          status: 'active',
+          role: { [Op.in]: ['member', 'admin', 'owner'] },
+        },
+      }),
+      Event.count({ where: { group_id } }),
+    ]);
+
+    // recovery_window_days is served so the Danger Zone copy reads the window from
+    // the server instead of hard-coding 30 in two places.
+    res.json({ member_count, event_count, recovery_window_days: RECOVERY_WINDOW_DAYS });
+  } catch (error) {
+    console.error('Error getting group deletion impact:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -850,7 +1234,8 @@ router.post('/:group_id/users/:target_user_id/reject', async (req, res) => {
       return res.status(404).json({ error: 'Pending member not found' });
     }
 
-    await targetUserGroup.destroy();
+    // F-02: hard delete — a rejected pending membership must physically leave the roster.
+    await targetUserGroup.destroy({ force: true });
 
     res.json({ success: true, message: 'Member rejected and removed from group' });
   } catch (error) {
@@ -896,7 +1281,8 @@ router.post('/:group_id/leave', async (req, res) => {
         group_id,
         transaction: t,
       });
-      await userGroup.destroy({ transaction: t });
+      // F-02: hard delete — leaving a group physically removes the membership row.
+      await userGroup.destroy({ transaction: t, force: true });
     });
 
     res.json({ success: true, message: 'You have left the group' });
@@ -1041,7 +1427,8 @@ router.delete('/:group_id/users/:target_user_id', async (req, res) => {
         group_id,
         transaction: t,
       });
-      await targetUserGroup.destroy({ transaction: t });
+      // F-02: hard delete — removing a member physically removes the membership row.
+      await targetUserGroup.destroy({ transaction: t, force: true });
     });
 
     res.json({ message: 'User removed from group successfully' });

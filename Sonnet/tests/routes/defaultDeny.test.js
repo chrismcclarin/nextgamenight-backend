@@ -37,6 +37,9 @@ const PUBLIC_EXACT = [
   { method: 'GET', re: /^\/groups\/invite-preview(\/|$)/ },
   { method: 'GET', re: /^\/events\/invite-preview(\/|$)/ },
   { method: 'GET', re: /^\/invites\/info(\/|$)/ },
+  // Phase 88.2 (D-02): public group-restore preview. Its authenticated sibling
+  // POST /groups/accept-ownership is deliberately ABSENT — see Test 4.
+  { method: 'GET', re: /^\/groups\/restore-preview(\/|$)/ },
 ];
 const PUBLIC_PREFIX = [
   '/feedback',
@@ -69,6 +72,8 @@ function buildApp() {
   app.get('/api/auth/google/callback', ok);
   app.get('/api/rsvp/respond', ok);
   app.get('/api/groups/invite-preview/:token', ok);
+  app.get('/api/groups/restore-preview/:token', ok); // 88.2 D-02 — public preview
+  app.post('/api/groups/accept-ownership', ok); // 88.2 D-02 — MUST stay gated
   app.get('/api/events/invite-preview/:token', ok);
   app.get('/api/invites/info/:token', ok);
   app.post('/api/feedback', ok);
@@ -115,6 +120,7 @@ describe('Default-deny `/api` authn layer (DB-independent)', () => {
       ['GET', '/api/auth/google/callback'],
       ['GET', '/api/rsvp/respond'],
       ['GET', '/api/groups/invite-preview/tok123'],
+      ['GET', '/api/groups/restore-preview/tok123'],
       ['GET', '/api/events/invite-preview/tok123'],
       ['GET', '/api/invites/info/tok123'],
       ['POST', '/api/feedback'],
@@ -127,6 +133,21 @@ describe('Default-deny `/api` authn layer (DB-independent)', () => {
       const res = await request(app)[method.toLowerCase()](path);
       expect(res.status).toBe(200);
       expect(res.body).toEqual({ ok: true });
+    });
+  });
+
+  describe('Test 4 — Phase 88.2: the restore PAIR is split across the gate', () => {
+    // The single most likely half-done item in 88.2 plan 07: registering the public
+    // preview and accidentally registering the action alongside it. The preview is
+    // covered positively in Test 2; this pins the negative half.
+    it('POST /api/groups/accept-ownership with no token → 401 (NOT on the allow-list)', async () => {
+      const res = await request(app).post('/api/groups/accept-ownership').send({ token: 'tok123' });
+      expect(res.status).toBe(401);
+    });
+
+    it('GET /api/groups/restore-preview/:token with no token → reachable (200)', async () => {
+      const res = await request(app).get('/api/groups/restore-preview/tok123');
+      expect(res.status).toBe(200);
     });
   });
 

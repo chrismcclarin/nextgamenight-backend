@@ -32,6 +32,10 @@ const mockEPFindAll = jest.fn();
 const mockUGFindAll = jest.fn();
 const mockUGCount = jest.fn();
 const mockGroupFindByPk = jest.fn();
+// 88.2 / F-02: the Group mock previously had NO destroy at all, so the sole-owned-group
+// auto-delete branch in applyDispositions (Step 1) would have TypeError'd if any test
+// ever reached it. It now has one, and the F-02 test below is the first test to.
+const mockGroupDestroy = jest.fn();
 const mockSequelizeQuery = jest.fn();
 const mockSequelizeTransaction = jest.fn();
 const mockMarkerFindOne = jest.fn();
@@ -50,7 +54,10 @@ const callLog = [];
 
 jest.mock('../../models', () => ({
   User: { scope: (...a) => mockUserScope(...a) },
-  Group: { findByPk: (...a) => mockGroupFindByPk(...a) },
+  Group: {
+    findByPk: (...a) => mockGroupFindByPk(...a),
+    destroy: (...a) => mockGroupDestroy(...a),
+  },
   Event: { findAll: jest.fn().mockResolvedValue([]), destroy: jest.fn().mockResolvedValue(0) },
   EventParticipation: {
     findAll: (...a) => mockEPFindAll(...a),
@@ -130,6 +137,7 @@ beforeEach(() => {
   mockUGFindAll.mockResolvedValue([]); // no owned groups -> no blockers, no auto-delete
   mockUGCount.mockResolvedValue(0);
   mockGroupFindByPk.mockResolvedValue({ id: 'g1', name: 'Group One' });
+  mockGroupDestroy.mockResolvedValue(0);
   mockEPFindAll.mockResolvedValue([]);
   mockSequelizeQuery.mockResolvedValue([]);
   mockMarkerFindOne.mockResolvedValue({ update: jest.fn().mockResolvedValue(undefined) });
@@ -335,6 +343,78 @@ describe('deleteAccount — notice email (REQ-8)', () => {
     mockEmailSend.mockRejectedValue(new Error('Resend down'));
     const res = await deleteAccount({ userId: SUB });
     expect(res).toEqual({ status: 'deleted' });
+  });
+});
+
+describe('deleteAccount — sole-owned-group auto-delete stays a hard delete (88.2 / F-02)', () => {
+  // Group, UserGroup and Event became `paranoid: true` in plan 88.2-01, so an unforced
+  // destroy on any of them is an UPDATE deletedAt rather than a DELETE.
+  //
+  // WHY THESE ARE CALL-OPTIONS ASSERTIONS AND NOT `paranoid: false` READBACKS: every
+  // model in this file is jest.mock'd (see the header) — the pipeline runs with no
+  // Postgres, so there is no row to read back. The flag on the call IS the invariant at
+  // this grain, and asserting it catches exactly the regression that matters (someone
+  // dropping `force` in a later sweep).
+  //
+  // WHY IT MATTERS: a group soft-deleted HERE would carry a NULL `purge_after` —
+  // nothing on the account-deletion path stamps one, only the deliberate group-delete
+  // flow does. Plan 08's purge sweep filters on `purge_after < now`, so it could never
+  // collect the row: a permanent orphan holding invitee email PII, invisible to both
+  // the sweep and getDeletionBlockers. Removing `force` is a behavior change, not a
+  // cleanup (T-88.2-09).
+  const GID = 'g-sole-owned';
+
+  beforeEach(() => {
+    // The user solely owns GID: the owner-role query returns it, and the "any other
+    // member?" count returns 0, so applyDispositions Step 1 enters the auto-delete.
+    mockUGFindAll.mockResolvedValue([{ group_id: GID }]);
+    mockUGCount.mockResolvedValue(0);
+  });
+
+  test('hard delete: Group.destroy for the sole-owned group is FORCED', async () => {
+    const res = await deleteAccount({ userId: SUB });
+    expect(res).toEqual({ status: 'deleted' });
+
+    expect(mockGroupDestroy).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: GID }, force: true })
+    );
+    // And never the unforced form, which is what a soft delete would look like.
+    expect(mockGroupDestroy).not.toHaveBeenCalledWith(
+      expect.not.objectContaining({ force: true })
+    );
+  });
+
+  test('hard delete: the group Event and UserGroup sweeps are FORCED too', async () => {
+    const models = require('../../models');
+    await deleteAccount({ userId: SUB });
+
+    expect(models.Event.destroy).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { group_id: GID }, force: true })
+    );
+    expect(models.UserGroup.destroy).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { group_id: GID }, force: true })
+    );
+  });
+
+  test('hard delete: the NON-paranoid children in the same block are NOT forced', async () => {
+    const models = require('../../models');
+    await deleteAccount({ userId: SUB });
+
+    // GroupInvite / GameReview / EventParticipation are not paranoid models (D-01's set
+    // is exactly Group/UserGroup/Event), so `force` there would be noise. Pinning this
+    // stops a future sweep spraying the flag across every destroy in the transaction.
+    for (const call of models.GroupInvite.destroy.mock.calls) {
+      expect(call[0]).not.toHaveProperty('force');
+    }
+    for (const call of models.GameReview.destroy.mock.calls) {
+      expect(call[0]).not.toHaveProperty('force');
+    }
+    // GroupInvite is still deleted EXPLICITLY — correct independent of any cascade
+    // disposition, since an explicit delete inside the transaction does not depend on
+    // the database's FK configuration (see 88.2-CASCADE-AUDIT.md).
+    expect(models.GroupInvite.destroy).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { group_id: GID } })
+    );
   });
 });
 

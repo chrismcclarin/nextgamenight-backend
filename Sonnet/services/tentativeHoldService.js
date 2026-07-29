@@ -116,7 +116,12 @@ async function createHoldsForTopSuggestions(promptId, options = {}) {
     // Get prompt with group and game info
     const prompt = await AvailabilityPrompt.findByPk(promptId, {
       include: [
-        { model: Group },
+        // Phase 88.2 MED-1 — see the marker on
+        // routes/availabilityPrompt.js GET /prompts/:promptId/respondents.
+        // AvailabilityPrompt is a NON-paranoid root, so without the INNER JOIN the
+        // prompt row survives a group soft-delete with `Group: null`. With it,
+        // findByPk returns null and the existing guard below early-returns.
+        { model: Group, required: true },
         { model: Game }
       ]
     });

@@ -253,13 +253,26 @@ async function applyDispositions(user, t) {
           transaction: t,
         });
       }
-      await Event.destroy({ where: { group_id: groupId }, transaction: t });
+      // F-02: hard delete (paranoid model) — see the marker on the Group.destroy below.
+      await Event.destroy({ where: { group_id: groupId }, transaction: t, force: true });
       await GameReview.destroy({ where: { group_id: groupId }, transaction: t });
-      // GroupInvite.group_id has NO FK — without this, pending invites for the
-      // auto-deleted group would survive as orphans carrying invitee email PII.
+      // Delete pending invites EXPLICITLY. This is correct independent of any cascade
+      // disposition: an explicit delete inside the transaction does not depend on the
+      // database's foreign-key configuration matching what a model file or a migration
+      // implies. The live, environment-labelled disposition of every FK referencing
+      // `Groups` is recorded in `88.2-CASCADE-AUDIT.md`. Skipping this risks leaving
+      // orphaned rows carrying invitee email PII. (Not paranoid — no `force`.)
       await GroupInvite.destroy({ where: { group_id: groupId }, transaction: t });
-      await UserGroup.destroy({ where: { group_id: groupId }, transaction: t });
-      await Group.destroy({ where: { id: groupId }, transaction: t });
+      // F-02: hard delete (paranoid model) — see the marker below.
+      await UserGroup.destroy({ where: { group_id: groupId }, transaction: t, force: true });
+      // DECISION Phase 88.2 F-02: forcing a HARD delete was chosen OVER letting this become a
+      // soft delete once Group went paranoid in plan 01. A group soft-deleted HERE would
+      // carry a NULL `purge_after` (nothing on this path stamps one — only the deliberate
+      // group-delete flow does), and plan 08's purge sweep filters on `purge_after < now`,
+      // so it could never collect the row. The result is a permanent orphan holding
+      // invitee email PII, invisible to the sweep and to `getDeletionBlockers`.
+      // Removing `force` here is a BEHAVIOR CHANGE, not a cleanup.
+      await Group.destroy({ where: { id: groupId }, transaction: t, force: true });
     }
   }
 

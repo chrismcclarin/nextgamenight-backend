@@ -6,6 +6,23 @@
 
 const emailService = require('../../services/emailService');
 
+// WR-02 (88.2 review): requiring workers/promptWorker instantiates its BullMQ
+// Worker and Redis connection at module load — neutralize both so the builder
+// can be exercised as a pure function (same mocks as promptWorker.softDelete.test.js).
+jest.mock('bullmq', () => ({
+  Worker: jest.fn().mockImplementation(function () {
+    this.on = jest.fn();
+    this.close = jest.fn().mockResolvedValue();
+  }),
+}));
+jest.mock('ioredis', () => jest.fn().mockImplementation(() => ({
+  on: jest.fn(),
+  disconnect: jest.fn(),
+})));
+
+const { buildPromptEmailHtml } = require('../../workers/promptWorker');
+const { generateEventConfirmationEmailTemplate } = require('../../services/eventCreationService');
+
 // A representative XSS payload + a CRLF header-injection payload.
 const XSS = '<script>alert(1)</script>';
 const ESCAPED_XSS = '&lt;script&gt;alert(1)&lt;/script&gt;';
@@ -118,6 +135,111 @@ describe('BSEC-04 content escaping', () => {
       // Subject is a plain-text header; CRLF must never survive there.
       expect(subject).not.toMatch(/[\r\n]/);
     });
+
+    // Phase 88.2 / T-88.2-19 + T-88.2-20 (SPEC-REQ-8 ownership offer).
+    it('generateGroupOwnershipOfferEmailTemplate escapes groupName and recipientName', () => {
+      const { html } = emailService.generateGroupOwnershipOfferEmailTemplate({
+        recipientName: XSS,
+        groupName: `${XSS} "quoted"`,
+        deadlineDate: 'Aug 24, 2026',
+        restoreUrl: 'https://app.test/groups/restore/abc123',
+      });
+      expect(html).toContain(ESCAPED_XSS);
+      expect(html).not.toContain('<script>alert(1)</script>');
+      // The raw double quote must not survive into the body either — it is the
+      // attribute-breakout character.
+      expect(html).toContain('&quot;quoted&quot;');
+      expect(html).not.toContain('"quoted"');
+    });
+
+    it('generateGroupOwnershipOfferEmailTemplate returns a CRLF-free subject', () => {
+      const { subject } = emailService.generateGroupOwnershipOfferEmailTemplate({
+        recipientName: 'Member',
+        groupName: 'Tuesday Knights\r\nBcc: attacker@example.com',
+        deadlineDate: 'Aug 24, 2026',
+        restoreUrl: 'https://app.test/groups/restore/abc123',
+      });
+      // The security property: no CR/LF survives, so no second mail header can
+      // be forged from a group name.
+      expect(subject).not.toMatch(/[\r\n]/);
+      expect(subject).toContain('Bcc: attacker@example.com'); // collapsed inline, harmless
+    });
+
+    it('generateGroupOwnershipOfferEmailTemplate never claims the delete is permanent (SPEC-REQ-7)', () => {
+      const { html, text, subject } = emailService.generateGroupOwnershipOfferEmailTemplate({
+        recipientName: 'Member',
+        groupName: 'Tuesday Knights',
+        deadlineDate: 'Aug 24, 2026',
+        restoreUrl: 'https://app.test/groups/restore/abc123',
+        memberCount: 4,
+        eventCount: 12,
+      });
+      const forbidden = /cannot be undone|permanently remove|permanently delete/i;
+      expect(html).not.toMatch(forbidden);
+      expect(text).not.toMatch(forbidden);
+      expect(subject).not.toMatch(forbidden);
+      // The load-bearing facts SPEC-REQ-8 requires in every offer email.
+      expect(html).toContain('Tuesday Knights');
+      expect(html).toContain('Aug 24, 2026');
+      expect(html).toContain('https://app.test/groups/restore/abc123');
+      expect(text).toContain('https://app.test/groups/restore/abc123');
+      expect(html).toContain('4 members and 12 events');
+    });
+
+    it('generateGroupOwnershipOfferEmailTemplate omits the count sentence when counts are absent', () => {
+      const { html, text } = emailService.generateGroupOwnershipOfferEmailTemplate({
+        recipientName: 'Member',
+        groupName: 'Tuesday Knights',
+        deadlineDate: 'Aug 24, 2026',
+        restoreUrl: 'https://app.test/groups/restore/abc123',
+      });
+      expect(html).not.toContain('undefined');
+      expect(text).not.toContain('undefined');
+      expect(html).not.toContain('It has');
+    });
+  });
+
+  // Phase 88.2 / MED #24: the From display name is built from the raw groupName
+  // in emailService.send (`fromName`). A CR/LF-bearing group name there forges a
+  // header for EVERY transactional email, not just the ownership offer, so the
+  // strip is applied at that shared site rather than in one caller.
+  describe('emailService.send strips CRLF from the From display name', () => {
+    let savedApiKey;
+    let savedResend;
+    let captured;
+
+    beforeEach(() => {
+      savedApiKey = emailService.apiKey;
+      savedResend = emailService.resend;
+      captured = null;
+      emailService.apiKey = 'test-key';
+      emailService.resend = {
+        emails: {
+          send: jest.fn(async (msg) => {
+            captured = msg;
+            return { data: { id: 'test-id' }, error: null };
+          }),
+        },
+      };
+    });
+
+    afterEach(() => {
+      emailService.apiKey = savedApiKey;
+      emailService.resend = savedResend;
+    });
+
+    it('produces a single-line from value for a CR/LF-bearing group name', async () => {
+      const result = await emailService.send({
+        to: 'member@example.com',
+        subject: 'Subject',
+        html: '<p>Body</p>',
+        groupName: 'Tuesday Knights\r\nBcc: attacker@example.com',
+      });
+      expect(result.success).toBe(true);
+      expect(captured).not.toBeNull();
+      expect(captured.from).not.toMatch(/[\r\n]/);
+      expect(captured.from).toContain('Tuesday Knights');
+    });
   });
 
   describe('feedback route renders escaped content (template-level)', () => {
@@ -138,6 +260,48 @@ describe('BSEC-04 content escaping', () => {
     // the escaper it now routes through to lock the behavior.
     it('escapeHtml neutralizes a customMessage payload', () => {
       expect(emailService.escapeHtml(XSS)).toBe(ESCAPED_XSS);
+    });
+  });
+
+  // WR-02 (88.2 review): the three pre-existing builders that interpolated
+  // user-controlled strings raw. One case per builder.
+  describe('WR-02 — pre-existing email builders escape user-supplied content', () => {
+    it('generateEventConfirmationEmailTemplate escapes groupName, gameName, comments and participants in the HTML part', () => {
+      const { html, text } = generateEventConfirmationEmailTemplate({
+        gameName: XSS,
+        groupName: XSS,
+        startDate: '2026-08-01T18:00:00Z',
+        durationMinutes: 120,
+        participants: [XSS, 'plain-player'],
+        eventUrl: 'https://app.test/event/1',
+        comments: XSS,
+        timezone: 'UTC',
+      });
+      expect(html).toContain(ESCAPED_XSS);
+      expect(html).not.toContain('<script>alert(1)</script>');
+      // The text part is text/plain — it must stay raw, not entity-encoded.
+      expect(text).toContain(XSS);
+    });
+
+    it('buildPromptEmailHtml escapes recipientName, groupName and gameName', () => {
+      const html = buildPromptEmailHtml({
+        recipientName: XSS,
+        groupName: XSS,
+        gameName: XSS,
+        weekDescription: 'this week',
+        responseDeadline: 'Friday',
+        formUrl: 'https://app.test/availability/tok',
+      });
+      expect(html).toContain(ESCAPED_XSS);
+      expect(html).not.toContain('<script>alert(1)</script>');
+    });
+
+    it('availabilityPrompt remind builder relies on primitives that neutralize its payloads (template-level)', () => {
+      // The reminder HTML/subject construction lives inline in
+      // routes/availabilityPrompt.js (same precedent as the feedback route
+      // above): assert the two primitives it now routes through.
+      expect(emailService.escapeHtml(XSS)).toBe(ESCAPED_XSS);
+      expect(emailService.stripCrlf(`Reminder: ${CRLF_SUBJECT} availability request`)).not.toMatch(/[\r\n]/);
     });
   });
 });

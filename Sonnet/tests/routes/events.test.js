@@ -384,6 +384,34 @@ describe('Event Routes', () => {
       expect(deletedEvent).toBeNull();
     });
 
+    // Phase 88.2 / F-02. Event is `paranoid: true` as of plan 88.2-01, so an unforced
+    // destroy is an UPDATE deletedAt, not a DELETE. This assertion is the ONLY one in
+    // this describe block that can tell the difference.
+    it('hard delete: the event row is physically GONE, not soft-deleted (F-02)', async () => {
+      const event = await Event.create({
+        group_id: testGroup.id,
+        game_id: testGame.id,
+        start_date: new Date(),
+        status: 'completed',
+      });
+
+      await request(makeApp(testUser1))
+        .delete(`/api/events/${event.id}`)
+        .expect(200);
+
+      // `paranoid: false` is the whole point of this test — DO NOT SIMPLIFY IT AWAY.
+      // A plain findByPk returns null for a soft-deleted row just as it does for a
+      // hard-deleted one, so the "should delete an event" test above passes either
+      // way. Only a paranoid: false read distinguishes "gone" from "hidden".
+      const raw = await Event.findByPk(event.id, { paranoid: false });
+      expect(raw).toBeNull();
+
+      // The SPEC's Boundaries record single-event delete as permanent forever — only
+      // GROUP deletion becomes recoverable in 88.2. A soft delete here would also
+      // leave a hollow ghost, because this event's EventRsvp and EventParticipation
+      // children (routes/events.js) are still hard-deleted in the same transaction.
+    });
+
     it('should delete event and its participations', async () => {
       const event = await Event.create({
         group_id: testGroup.id,
@@ -640,5 +668,140 @@ describe('EventParticipation UUID consistency (Phase 87.1 BINT-02, Part B — as
     const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
     expect(mine.user_id).toMatch(UUID_V4);
     expect(mine.user_id).not.toMatch(/^(google-oauth2|auth0)\|/);
+  });
+});
+
+// ============================================================================
+// Phase 88.2 plan 04 Task 2 (SPEC-REQ-4a / D-01): GET /events/user/:user_id
+// returns zero events from a soft-deleted group on BOTH arms of its Op.or union.
+//
+//   arm 1 — roster member (group_id IN groupIds), closed by paranoid UserGroup
+//           dropping the membership AND by paranoid Event dropping the rows;
+//   arm 2 — game-only participant (id IN participatingEventIds, Phase 71.1 QR
+//           join), which is GROUP-BLIND by design and is therefore closed SOLELY
+//           by the paranoid Event filter. Asserted explicitly, not assumed.
+//
+// Plus the D-01 ghost-card property: no returned record may carry a null Group.
+// ============================================================================
+describe('88.2 SPEC-REQ-4a — GET /api/events/user/:user_id hides soft-deleted groups', () => {
+  let member;
+  let gameOnlyUser;
+  let liveGroup;
+  let deadGroup;
+  let game;
+  let deadEvent;
+  let liveEvent;
+
+  beforeEach(async () => {
+    member = await makeUser({ user_id: 'sd-events-member', username: 'sd-events-member' });
+    gameOnlyUser = await makeUser({ user_id: 'sd-events-guest', username: 'sd-events-guest' });
+
+    liveGroup = await makeGroup({ group_id: 'sd-events-live', name: 'SD Live Group' });
+    deadGroup = await makeGroup({ group_id: 'sd-events-dead', name: 'SD Doomed Group' });
+
+    game = await Game.create({ name: 'SD Test Game', is_custom: true });
+
+    await addToGroup(member, liveGroup, 'member');
+    await addToGroup(member, deadGroup, 'member');
+
+    liveEvent = await Event.create({
+      group_id: liveGroup.id, game_id: game.id, title: 'Live Night',
+      start_date: new Date(Date.now() + 86400000), created_by: member.user_id,
+    });
+    deadEvent = await Event.create({
+      group_id: deadGroup.id, game_id: game.id, title: 'Doomed Night',
+      start_date: new Date(Date.now() + 86400000), created_by: member.user_id,
+    });
+
+    // The game-only participant (Phase 71.1 QR-join arm): an EventParticipation
+    // row on each group's event and NO UserGroup row in either group.
+    for (const ev of [liveEvent, deadEvent]) {
+      await EventParticipation.create({ event_id: ev.id, user_id: gameOnlyUser.id });
+    }
+  });
+
+  // Stamp Group + UserGroup + Event with ONE shared timestamp — the discipline
+  // plan 06 implements, so plan 07's stamp-matched restore can find them again.
+  const softDeleteGroup = async (group) => {
+    const deletedAt = new Date();
+    await Group.update({ deletedAt }, { where: { id: group.id }, silent: true });
+    await UserGroup.update({ deletedAt }, { where: { group_id: group.id }, silent: true });
+    await Event.update({ deletedAt }, { where: { group_id: group.id }, silent: true });
+    return deletedAt;
+  };
+
+  it('(arm 1 — roster member) returns zero events from the soft-deleted group, and no record has a null Group', async () => {
+    await softDeleteGroup(deadGroup);
+
+    const res = await request(makeApp(member))
+      .get(`/api/events/user/${member.user_id}`)
+      .expect(200);
+
+    expect(Array.isArray(res.body)).toBe(true);
+    expect(res.body.filter((e) => e.group_id === deadGroup.id)).toHaveLength(0);
+    expect(res.body.some((e) => e.id === deadEvent.id)).toBe(false);
+    expect(JSON.stringify(res.body)).not.toContain(deadGroup.id);
+
+    // D-01 ghost-card property: the INNER JOIN means no record can carry Group: null.
+    for (const record of res.body) {
+      expect(record.Group === null || record.Group === undefined).toBe(false);
+    }
+  });
+
+  it('(arm 2 — game-only participant, Phase 71.1 QR-join) returns zero events from the soft-deleted group', async () => {
+    await softDeleteGroup(deadGroup);
+
+    // This user has NO UserGroup row anywhere — the Op.or arm that reaches their
+    // events is `id IN participatingEventIds`, which is group-blind. Only the
+    // paranoid Event filter (plus the INNER JOIN) can close it.
+    const res = await request(makeApp(gameOnlyUser))
+      .get(`/api/events/user/${gameOnlyUser.user_id}`)
+      .expect(200);
+
+    expect(res.body.some((e) => e.id === deadEvent.id)).toBe(false);
+    expect(res.body.filter((e) => e.group_id === deadGroup.id)).toHaveLength(0);
+    expect(JSON.stringify(res.body)).not.toContain(deadGroup.id);
+    for (const record of res.body) {
+      expect(record.Group === null || record.Group === undefined).toBe(false);
+    }
+  });
+
+  it('(non-regression) a LIVE group\'s events still appear, with a populated Group, for both user types', async () => {
+    await softDeleteGroup(deadGroup);
+
+    const memberRes = await request(makeApp(member))
+      .get(`/api/events/user/${member.user_id}`)
+      .expect(200);
+    const memberLive = memberRes.body.find((e) => e.id === liveEvent.id);
+    expect(memberLive).toBeDefined();
+    expect(memberLive.Group).toBeTruthy();
+    expect(memberLive.Group.id).toBe(liveGroup.id);
+
+    const guestRes = await request(makeApp(gameOnlyUser))
+      .get(`/api/events/user/${gameOnlyUser.user_id}`)
+      .expect(200);
+    const guestLive = guestRes.body.find((e) => e.id === liveEvent.id);
+    expect(guestLive).toBeDefined();
+    expect(guestLive.Group).toBeTruthy();
+    expect(guestLive.Group.id).toBe(liveGroup.id);
+  });
+
+  it('(D-01 unconditional) an UNSTAMPED event on a hidden group still cannot produce a ghost card', async () => {
+    // The transitive guarantee (every event stamped with its group) is what the
+    // INNER JOIN upgrades to an unconditional one. Simulate the conditional half
+    // failing: stamp the group and its memberships but NOT the event.
+    const deletedAt = new Date();
+    await Group.update({ deletedAt }, { where: { id: deadGroup.id }, silent: true });
+    await UserGroup.update({ deletedAt }, { where: { group_id: deadGroup.id }, silent: true });
+    // deadEvent deliberately left live.
+
+    const res = await request(makeApp(gameOnlyUser))
+      .get(`/api/events/user/${gameOnlyUser.user_id}`)
+      .expect(200);
+
+    expect(res.body.some((e) => e.id === deadEvent.id)).toBe(false);
+    for (const record of res.body) {
+      expect(record.Group === null || record.Group === undefined).toBe(false);
+    }
   });
 });

@@ -86,6 +86,14 @@ const Event = sequelize.define('Event', {
   },
 }, {
   timestamps: true,
+  // DECISION Phase 88.2 D-01: paranoid soft-delete, so a deleted group's events
+  // disappear from every read WITHOUT hand-written filters at the three
+  // GET /events/user/:user_id call sites — Group alone would have left those
+  // needing per-call-site filters, which is the design SPEC-REQ-3 rejects. No
+  // index changes needed: both indexes below are non-unique, and invite_token's
+  // UNIQUE constraint carries no soft-delete collision risk because its values are
+  // crypto.randomBytes output. See models/Group.js for the full rationale.
+  paranoid: true,
   indexes: [
     {
       fields: ['group_id']

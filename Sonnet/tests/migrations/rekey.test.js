@@ -30,7 +30,18 @@
 //   Sequelize model can't be used — it would emit the now-absent *_uuid column). Parent
 //   rows (Users/Groups/Events/Games/BallotOptions) are created via models since their
 //   schema is untouched. Finally `up` runs and we assert against the real backfill/orphan
-//   logic. Running `up` twice restores the baseline (uuid column present) for later files.
+//   logic.
+//
+// SCHEMA RESTORE (Phase 88.2 CI fix): "running `up` twice restores the baseline" stopped
+//   being true when 20260725000001 swapped the UserGroups (user_uuid, group_id) unique
+//   index to a PARTIAL one (`WHERE "deletedAt" IS NULL`) and 20260727000001 added the
+//   (group_id, user_uuid) lookup index. Both include user_uuid, so this file's
+//   usergroup down() auto-drops them, and the 87.1 up() then reinstates the index in its
+//   OLD FULL form — poisoning every later suite in the run (SPEC-REQ-3c re-join 500s,
+//   groups.restore duplicate-pair seeds fail). The afterAll below re-runs the two
+//   idempotent 88.2 migrations so the file leaves the CURRENT schema behind, not the
+//   87.1-era one. If a future migration changes these tables' indexes again, add its
+//   up() there too.
 //
 // AUTHORITY: CI Postgres is the authoritative gate. The local sandbox DB is unreachable
 //   (route/DB suites time out in beforeAll on sequelize.authenticate()), so this file is
@@ -70,6 +81,19 @@ const migrations = {
 
 const uuid = () => crypto.randomUUID();
 const qi = () => sequelize.getQueryInterface();
+
+// See SCHEMA RESTORE note in the header: leave the CURRENT schema (partial unique
+// index + lookup indexes), not the 87.1-era full index this file's replays reinstate.
+const schemaRestoreMigrations = [
+  require('../../migrations/20260725000001-group-usergroup-event-paranoid.js'),
+  require('../../migrations/20260727000001-add-group-id-lookup-indexes.js'),
+];
+
+afterAll(async () => {
+  for (const migration of schemaRestoreMigrations) {
+    await migration.up(qi());
+  }
+});
 
 // --- low-level helpers -------------------------------------------------------
 

@@ -467,3 +467,147 @@ describe('Group admin mutations — UUID-only target resolution (87.3 PR-C contr
     expect(memberUg.role).toBe('member');
   });
 });
+
+// ============================================================================
+// Phase 88.2 Plan 06 Task 3 — GET /api/groups/:group_id/deletion-impact (D-06)
+//
+// The Danger Zone's server-side source of truth for the blast radius. Owner-only,
+// 404 on a soft-deleted group, and counts computed here rather than in the client
+// (a client-side count risks telling the owner "4 events" while 37 are hidden).
+// ============================================================================
+describe('GET /api/groups/:group_id/deletion-impact', () => {
+  let owner;
+  let member;
+  let outsider;
+  let group;
+
+  beforeEach(async () => {
+    owner = await makeUser({ username: 'impact-owner' });
+    member = await makeUser({ username: 'impact-member' });
+    outsider = await makeUser({ username: 'impact-outsider' });
+    group = await Group.create({ group_id: `impact-${Date.now()}`, name: 'Impact Group' });
+    await addToGroup(owner, group, 'owner');
+    await addToGroup(member, group, 'member');
+  });
+
+  /** Stamp the group + its memberships, matching the real soft-delete discipline. */
+  async function stamp(groupId) {
+    const deletedAt = new Date();
+    await Group.update(
+      { deletedAt, purge_after: new Date(deletedAt.getTime() + 30 * 24 * 60 * 60 * 1000) },
+      { where: { id: groupId }, silent: true }
+    );
+    await UserGroup.update({ deletedAt }, { where: { group_id: groupId }, silent: true });
+    await Event.update({ deletedAt }, { where: { group_id: groupId }, silent: true });
+  }
+
+  it('returns the REAL member and event counts, cross-checked against direct model counts', async () => {
+    // 6 active members total (the owner + 5 more; `member` from the beforeEach is one).
+    for (let i = 0; i < 4; i += 1) {
+      const extra = await makeUser({ username: `impact-extra-${i}` });
+      await addToGroup(extra, group, i === 0 ? 'admin' : 'member');
+    }
+    await Event.bulkCreate(
+      Array.from({ length: 37 }, (_, i) => ({
+        group_id: group.id,
+        start_date: new Date(Date.UTC(2026, 8, 1 + i, 18, 0, 0)),
+        status: 'scheduled',
+      }))
+    );
+
+    const res = await request(makeApp(owner))
+      .get(`/api/groups/${group.id}/deletion-impact`)
+      .expect(200);
+
+    // Cross-checked against the database, not against the constants used to seed —
+    // a seeding bug would otherwise agree with itself.
+    const actualMembers = await UserGroup.count({
+      where: { group_id: group.id, status: 'active' },
+    });
+    const actualEvents = await Event.count({ where: { group_id: group.id } });
+
+    expect(res.body.member_count).toBe(actualMembers);
+    expect(res.body.event_count).toBe(actualEvents);
+    expect(res.body.member_count).toBe(6);
+    expect(res.body.event_count).toBe(37);
+  });
+
+  it('the response body keys are exactly member_count, event_count and recovery_window_days', async () => {
+    const res = await request(makeApp(owner))
+      .get(`/api/groups/${group.id}/deletion-impact`)
+      .expect(200);
+
+    expect(Object.keys(res.body).sort()).toEqual(
+      ['event_count', 'member_count', 'recovery_window_days'].sort()
+    );
+    // Served so the Danger Zone copy does not hard-code 30 in a second place.
+    expect(res.body.recovery_window_days).toBe(30);
+  });
+
+  it('excludes invited and declined memberships from member_count', async () => {
+    const invited = await makeUser({ username: 'impact-invited' });
+    const declined = await makeUser({ username: 'impact-declined' });
+    await UserGroup.create({
+      user_uuid: invited.id, group_id: group.id, role: 'member', status: 'invited',
+    });
+    await UserGroup.create({
+      user_uuid: declined.id, group_id: group.id, role: 'member', status: 'declined',
+    });
+
+    const res = await request(makeApp(owner))
+      .get(`/api/groups/${group.id}/deletion-impact`)
+      .expect(200);
+
+    // Only the owner + the active member.
+    expect(res.body.member_count).toBe(2);
+  });
+
+  it('403s a role-member caller ON A LIVE GROUP', async () => {
+    const res = await request(makeApp(member))
+      .get(`/api/groups/${group.id}/deletion-impact`)
+      .expect(403);
+    expect(res.body.error).toMatch(/owner/i);
+  });
+
+  it('403s a caller with no membership at all ON A LIVE GROUP', async () => {
+    await request(makeApp(outsider))
+      .get(`/api/groups/${group.id}/deletion-impact`)
+      .expect(403);
+  });
+
+  it('404s a SOFT-DELETED group for its own former OWNER (the AF-2 guard-order pin)', async () => {
+    await stamp(group.id);
+
+    // Asserted as the owner, not as a stranger: this is the exact case that flips to
+    // 403 if the existence check is ever reordered behind the ownership check, because
+    // the owner's own membership row is stamped too.
+    const res = await request(makeApp(owner))
+      .get(`/api/groups/${group.id}/deletion-impact`)
+      .expect(404);
+    expect(res.body.error).toBe('Group not found');
+  });
+
+  it('404s a well-formed UUID that was never a group', async () => {
+    await request(makeApp(owner))
+      .get('/api/groups/11111111-2222-4333-8444-555555555555/deletion-impact')
+      .expect(404);
+  });
+
+  it('rejects a malformed group_id at the validator, before any DB read', async () => {
+    const spy = jest.spyOn(Group, 'findByPk');
+    try {
+      await request(makeApp(owner))
+        .get('/api/groups/not-a-uuid/deletion-impact')
+        .expect(400);
+      expect(spy).not.toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('401s an unauthenticated caller', async () => {
+    await request(makeApp(null))
+      .get(`/api/groups/${group.id}/deletion-impact`)
+      .expect(401);
+  });
+});

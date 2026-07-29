@@ -32,6 +32,19 @@ const EXPECTED_STATUS = {
   // Phase 87.2 (account deletion): owner gate + tombstone codes.
   owner_of_active_groups: 409,
   account_deleted: 410,
+  // Phase 88.2 (group soft-delete recovery): the four codes POST
+  // /groups/accept-ownership puts on the wire. Registered as the canonical
+  // status/message record; the handler emits RAW bodies rather than routing through
+  // sendError, because the frontend reads the 409's group_id off the raw body and
+  // the envelope would nest it one level deeper (MED-1 marker in utils/errors.js).
+  //
+  // `invalid_token` (410) is DELIBERATELY DISTINCT from `token_invalid` (400) above:
+  // one is a stale group-restore link, the other a magic-token reject. This map is
+  // where the two would silently collapse into each other, so keep both lines.
+  already_restored: 409,
+  invalid_token: 410,
+  already_used: 410,
+  window_expired: 410,
 };
 
 describe('utils/errors — exports', () => {

@@ -1,6 +1,6 @@
 // routes/games.js
 const express = require('express');
-const { Game, Event, EventParticipation, GameReview, User, UserGame, UserGroup } = require('../models');
+const { Game, Event, EventParticipation, GameReview, Group, User, UserGame, UserGroup } = require('../models');
 const { Op } = require('sequelize');
 const { matchesSelf } = require('../middleware/objectAuth');
 const { optionalAuth } = require('../middleware/auth0');
@@ -225,7 +225,33 @@ router.get('/:id', async (req, res) => {
         },
         {
           model: GameReview,
-          include: [{ model: User, attributes: ['username'] }]
+          include: [
+            { model: User, attributes: ['username'] },
+            // DECISION Phase 88.2 AF-10: hiding a soft-deleted group's reviews BY JOIN
+            // was chosen OVER making GameReview paranoid. D-01 deliberately keeps
+            // GameReview non-paranoid — SPEC-REQ-1 requires its row count to be
+            // UNCHANGED across a group delete, and plan 07's restore touches nothing
+            // there. GameReview therefore has NO SELF-DEFENCE: every route that reads
+            // it OUTSIDE the isActiveMember choke point must filter by join, and this
+            // route is one of them — it is authenticated but GROUP-AGNOSTIC, so any
+            // logged-in user would otherwise receive every group's reviews for a game,
+            // including a hidden group's group_id, review_text and reviewer usernames,
+            // for the whole 30-day window. That is a regression against today's
+            // behavior, where the hard delete destroys those rows.
+            //
+            // `attributes: []` keeps the join purely a filter — no group data enters
+            // the response, so the payload shape the gameDetail consumer reads is
+            // unchanged for live groups. Marking it required makes it an INNER JOIN,
+            // which is what actually DROPS the parent GameReview row; without that,
+            // Sequelize emits the paranoid clause in the ON clause and merely nulls
+            // the association while KEEPING the review.
+            //
+            // REJECTED: scoping the reviews to groups the caller belongs to. Today
+            // gameDetail deliberately shows reviews from every group; narrowing that
+            // would be a silent product change riding on a soft-delete phase. Do not
+            // "simplify" this into a membership scope.
+            { model: Group, attributes: [], required: true }
+          ]
         }
       ]
     });

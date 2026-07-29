@@ -9,7 +9,11 @@
 # step sets `working-directory: Sonnet` with `cache-dependency-path: Sonnet/package-lock.json`.
 #
 # Two jobs (D-06 / BSEC-02):
-#   quality  — fast gate: install + three inverted grep backstops (D-01 / D-05 / BE-043)
+#   quality  — fast gate: install + six inverted grep backstops (D-01 / D-05 / BE-043,
+#              the two 83.1 test-hygiene gates, and the 88.2 F-02 paranoid-destroy gate),
+#              ONE presence gate that fails on an ABSENT string rather than a present one
+#              (88.2 SPEC-REQ-10, the purge sweep's explicit child deletes), plus the
+#              D-04 skip-count ratchet
 #   test     — slow gate (needs: quality): Jest/supertest against a Postgres service container
 name: CI
 
@@ -113,6 +117,94 @@ jobs:
             exit 1
           fi
           echo "Force-sync gate passed — no destructive force-sync outside globalSetup.js."
+
+      - name: "Grep gate — force-less destroy on a paranoid model (88.2 / F-02)"
+        working-directory: Sonnet
+        # Phase 88.2 made Group, UserGroup and Event `paranoid: true` (D-01). From that
+        # point on, `Model.destroy(...)` is an `UPDATE "deletedAt" = now()` rather than a
+        # DELETE whenever the model is paranoid and `options.force` is not set
+        # (sequelize/lib/model.js:1826-1838). Every hard delete that must STAY hard
+        # therefore has to say so explicitly. This gate keeps it that way.
+        #
+        # Two-stage LINE pipeline: match the call, then drop the sanctioned lines.
+        #   scope  — routes/ services/ workers/ scripts/ middleware/ queues/, *.js only.
+        #            tests/ is excluded on purpose (fixtures legitimately clean up) and
+        #            so is models/ (the paranoid flag itself lives there).
+        #   match  — the three paranoid model CLASSES plus the four instance-variable
+        #            names those models are bound to in this codebase. The literal `.`
+        #            straight after the identifier means EventParticipation.destroy,
+        #            EventRsvp.destroy, GroupInvite.destroy and GroupPromptSettings.destroy
+        #            do NOT match — correct, none of those models is paranoid.
+        #   filter — comment lines, then `force: true` specifically.
+        #
+        # KNOWN AND ACCEPTED LIMITATIONS (these are named, not oversights):
+        #  1. LINE-SCOPED. A `force: true` sitting on a DIFFERENT line from the
+        #     `.destroy(` is invisible to stage 2, so a multi-line call is reported as a
+        #     hit even when it is correctly forced (routes/invites.js is the one such
+        #     site, and it carries the flag on the call line for exactly this reason).
+        #     The correct response to a false positive is to REFORMAT THE CALL. Never
+        #     loosen the pattern — widening a data-retention control to accommodate
+        #     formatting is how it stops catching the thing it exists for.
+        #  2. FIXED INSTANCE-NAME ALLOWLIST. `group|userGroup|event|targetUserGroup` is
+        #     four identifiers, so a future `membership.destroy()`, `ug.destroy()` or
+        #     `g.destroy()` on a paranoid model is invisible here. Do NOT "fix" this by
+        #     broadening stage 1 to any `.destroy(` — that matches the dozens of
+        #     legitimate non-paranoid destroys and the resulting noise gets the gate
+        #     weakened or deleted. New instance-variable destroys on Group/UserGroup/Event
+        #     must use one of the allowlisted names, or be added to the list.
+        #  3. NO line-number exclusions, ever. A line-number filter is a blind spot with
+        #     an expiry date nobody sets — the code under those lines moves and the filter
+        #     silently starts skipping something else.
+        #
+        # The regex below is kept BYTE-FOR-BYTE in sync with PATTERNS.forcelessParanoidDestroy
+        # in tests/routes/ci-grep-gate.fixture.test.js, which self-tests this whole
+        # two-stage pipeline (not just the regex) against fixtures.
+        run: |
+          HITS=$(grep -rnE --include='*.js' '\b(Group|UserGroup|Event|group|userGroup|event|targetUserGroup)\.destroy\(' routes/ services/ workers/ scripts/ middleware/ queues/ | grep -vE '^[^:]+:[0-9]+:[[:space:]]*(//|\*)' | grep -vE 'force:[[:space:]]*true' || true)
+          if [ -n "$HITS" ]; then
+            echo "::error::destroy() on Group, UserGroup or Event WITHOUT force: true — those three models are paranoid (88.2 / D-01), so this is now a SOFT delete (UPDATE deletedAt), not a DELETE (sequelize/lib/model.js:1826-1838). If the row must really be removed, add force: true ON THE .destroy( LINE (this gate is line-scoped). If it is a deliberate soft delete, route it through the group soft-delete path rather than calling destroy. Known gap: the instance-name allowlist is exactly group|userGroup|event|targetUserGroup — an aliased name is NOT checked by this gate."
+            echo "$HITS"
+            exit 1
+          fi
+          echo "F-02 gate passed — no force-less destroy on Group/UserGroup/Event."
+
+      - name: "Grep gate — purge sweep must delete GroupInvite + SingleUseToken explicitly (88.2 / SPEC-REQ-10)"
+        working-directory: Sonnet
+        # INVERTED RELATIVE TO EVERY OTHER GATE HERE: this one fails when a REQUIRED
+        # string is ABSENT, not when a forbidden one is present. It pins the two
+        # explicit child deletes in services/groupPurgeSweep.js that no integration
+        # test in this repo can honestly verify.
+        #
+        # WHY A GATE AND NOT A TEST. The CI database is built by sequelize.sync()
+        # (see the `test` job's "NO migrate step (A5)" note), and Sequelize's
+        # `belongsTo` puts ON DELETE CASCADE on every NOT NULL foreign key. So the CI
+        # database cascades those rows away on its own, and an integration assertion
+        # reading "no invite rows remain after one sweep" passes whether or not the
+        # explicit delete exists. A contributor could delete the line as redundant,
+        # watch CI go green, and ship a weaker purge. THIS gate is the control.
+        #
+        # Those rows carry invitee email PII and the delete must not depend on a
+        # cascade whose production disposition is unconfirmed. The live,
+        # per-environment FK dispositions are recorded in
+        # .planning/.../88.2-CASCADE-AUDIT.md in the planning repo — the environments
+        # measured DISAGREE, which is exactly why the explicit delete exists.
+        #
+        # Comment lines are filtered before counting so a mention in prose cannot
+        # satisfy the gate.
+        run: |
+          FILE=services/groupPurgeSweep.js
+          if [ ! -f "$FILE" ]; then
+            echo "::error::$FILE is missing — SPEC-REQ-10's purge sweep must exist and must delete GroupInvite + SingleUseToken rows explicitly."
+            exit 1
+          fi
+          INVITES=$(grep -nE 'GroupInvite\.destroy' "$FILE" | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | wc -l | tr -d ' ')
+          TOKENS=$(grep -nE 'SingleUseToken\.destroy' "$FILE" | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | wc -l | tr -d ' ')
+          echo "purge-sweep explicit deletes: GroupInvite=$INVITES SingleUseToken=$TOKENS"
+          if [ "$INVITES" -eq 0 ] || [ "$TOKENS" -eq 0 ]; then
+            echo "::error::$FILE must delete GroupInvite AND SingleUseToken rows EXPLICITLY (SPEC-REQ-10 / 88.2 D-05). These lines are NOT redundant with the foreign keys: the CI database is sequelize.sync()-built, and Sequelize's belongsTo adds ON DELETE CASCADE to every NOT NULL group_id — so the integration test asserting those rows are gone passes whether or not this code exists, and CANNOT be the control. Invite rows carry invitee email PII; the delete must not depend on a cascade whose production disposition is unconfirmed (the environments measured in 88.2-CASCADE-AUDIT.md disagree). If you are deliberately removing this, change the gate and say why in the same commit."
+            exit 1
+          fi
+          echo "SPEC-REQ-10 purge-delete gate passed — both explicit deletes present."
 
       - name: "Grep gate — stray sequelize.close() in tests (D-01 / BTEST-02)"
         working-directory: Sonnet
