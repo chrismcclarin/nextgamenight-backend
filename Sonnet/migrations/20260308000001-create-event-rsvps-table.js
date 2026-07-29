@@ -1,5 +1,37 @@
 // migrations/20260308000001-create-event-rsvps-table.js
 // Creates EventRsvps table for event RSVP responses (yes/no/maybe with optional note)
+//
+// ---------------------------------------------------------------------------------------
+// AMENDED by Phase 88.4 Plan 01 (SPEC R1) — 2026-07-29. Unquoted ENUM type name.
+// ---------------------------------------------------------------------------------------
+// Identical defect and identical fix to 20260228000001-create-group-invites-table.js: the
+// `status` column's raw-STRING type went into the DDL verbatim and unquoted, so PostgreSQL
+// down-folded the mixed-case name and could not resolve it:
+//
+//   ERROR: type "enum_eventrsvps_status" does not exist
+//
+// The type IS created, correctly quoted, by the DO block above. One pair of quotes on the
+// column's type string is the whole fix.
+//
+// Never caught because Step 1's `describeTable('EventRsvps')` guard took the "already exists"
+// branch on every database that has run this migration (sync() had built the table from
+// models/EventRsvp.js first). The createTable branch had never executed anywhere until Phase
+// 88.4 opened the from-empty replay path.
+//
+// PROD IMPACT: none — booked in prod's SequelizeMeta, never re-run.
+//
+// A census of the whole chain found exactly two migrations with this defect (this one and
+// 20260228000001). `20260618000002-create-single-use-tokens.js:55,75` uses the same raw-string
+// form but its type names are ALL LOWERCASE (`enum_single_use_tokens_purpose`/`_status`), so
+// unquoted down-folding is a no-op there and it is correct as written — do not "fix" it.
+// `20260227000004-create-friendships-table.js:46` already carried the quoted form, which is
+// the in-repo precedent this amendment follows.
+//
+// DECISION Phase 88.4 R-1d: quote the existing raw type string OVER switching to
+// DataTypes.ENUM — the DO block above is this migration's deliberate, idempotent
+// type-creation mechanism; DataTypes.ENUM would emit a second competing CREATE TYPE and
+// schema-qualify the column type. See the fuller rationale in 20260228000001.
+// ---------------------------------------------------------------------------------------
 const sequelize = require('../config/database');
 const { DataTypes } = require('sequelize');
 
@@ -45,7 +77,9 @@ async function up() {
         // Auth0 string ID, not UUID -- matches UserGroup pattern
       },
       status: {
-        type: 'enum_EventRsvps_status',
+        // Phase 88.4 R-1d: QUOTED on purpose — an unquoted raw-string type folds to
+        // `enum_eventrsvps_status`, which does not exist. Do not remove these inner quotes.
+        type: '"enum_EventRsvps_status"',
         allowNull: false,
       },
       note: {

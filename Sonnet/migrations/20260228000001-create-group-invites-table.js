@@ -1,5 +1,43 @@
 // migrations/20260228000001-create-group-invites-table.js
 // Creates GroupInvites table for consent-based group membership invitations
+//
+// ---------------------------------------------------------------------------------------
+// AMENDED by Phase 88.4 Plan 01 (SPEC R1) — 2026-07-29. Unquoted ENUM type name.
+// ---------------------------------------------------------------------------------------
+// WHAT CHANGED: the `status` column's raw type string gained double quotes —
+// `'enum_GroupInvites_status'` became `'"enum_GroupInvites_status"'`. One pair of quotes.
+//
+// WHY: a raw-STRING `type:` is passed through into the DDL verbatim, so the unquoted form
+// emitted `"status" enum_GroupInvites_status`, which PostgreSQL down-folds to
+// `enum_groupinvites_status` and then cannot resolve:
+//
+//   ERROR: type "enum_groupinvites_status" does not exist
+//
+// The type is created (correctly quoted, mixed case) by the DO block a few lines below, so
+// the column definition had to quote it too. Verified with this repo's own installed
+// Sequelize 6.37.7 query generator: the quoted form emits
+// `"status" "enum_GroupInvites_status"` and is otherwise byte-identical DDL.
+//
+// WHY IT WAS NEVER CAUGHT: Step 1's `describeTable('GroupInvites')` guard. In the sync() era
+// this table already existed (sync() had built it from models/GroupInvite.js with a proper
+// Sequelize ENUM), so the guard took the "already exists, skipping creation" branch on every
+// database that has ever run this migration. The createTable branch below had NEVER executed
+// anywhere until Phase 88.4 opened the from-empty path. Same class of latent defect as R-1.
+//
+// PROD IMPACT: none. Booked in prod's SequelizeMeta, so `migrate:apply` never re-runs it.
+//
+// REJECTED: switching to `DataTypes.ENUM('pending','accepted','declined')`. That is the more
+// idiomatic Sequelize spelling, but it makes the query generator emit its OWN `CREATE TYPE`
+// for the enum in addition to the DO block above, and it schema-qualifies the column type as
+// `"public"."enum_GroupInvites_status"`. Two ways to create one type in one migration is worse
+// than a correctly quoted reference to the one the migration already deliberately creates by
+// hand. Do not "modernize" this to DataTypes.ENUM without deleting the DO block.
+//
+// DECISION Phase 88.4 R-1d: quote the existing raw type string OVER replacing it with
+// DataTypes.ENUM — the DO block above is the deliberate type-creation mechanism here (it
+// exists to be idempotent); DataTypes.ENUM would add a second, competing one and change the
+// emitted DDL. The quotes are the whole fix.
+// ---------------------------------------------------------------------------------------
 const sequelize = require('../config/database');
 const { DataTypes } = require('sequelize');
 
@@ -55,7 +93,10 @@ async function up() {
         unique: true,
       },
       status: {
-        type: 'enum_GroupInvites_status',
+        // Phase 88.4 R-1d: QUOTED on purpose — a raw-string type goes into the DDL verbatim,
+        // and unquoted PostgreSQL folds it to `enum_groupinvites_status`, which does not
+        // exist. Do not remove these inner quotes.
+        type: '"enum_GroupInvites_status"',
         defaultValue: 'pending',
         allowNull: false,
       },
