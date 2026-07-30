@@ -429,7 +429,7 @@ jobs:
   #      a short replay would otherwise be reported by step 6 as model drift);
   #   5. SYNC SIDE — sequelize.sync() from THIS commit's models into `schema_sync`;
   #   6. diff the two schemas (tables / FKs / PKs / uniques / indexes) minus the
-  #      signed-off allowlist. REPORT-ONLY until Plan 09 arms it (D-08);
+  #      signed-off allowlist. ARMED as of Plan 88.4-09 (D-08) — a finding FAILS this job;
   #   7. baseline no-op proof — run the baseline migration ALONE against the sync-built
   #      database: the exact shape prod sees on the first deploy after this merges.
   migrate-cli-replay:
@@ -583,13 +583,40 @@ jobs:
         env:
           MIGRATE_DB_URL: ${{ env.MIGRATE_DB_URL }}
           SYNC_DB_URL: ${{ env.SYNC_DB_URL }}
-          # D-08 REPORT-ONLY MODE. Findings are printed and the job still passes, so the
-          # gate can ship before the day-one drift census exists. TO ARM THE GATE: delete
-          # this ONE line (Plan 09 does exactly that, and nothing else). Report-only gates
-          # the FINDINGS exit code only — a differ crash still fails the step, which is why
-          # this is an env flag the differ reads rather than a step-level failure-tolerance
-          # option: that option would make a crash indistinguishable from a clean run.
-          SCHEMA_DRIFT_REPORT_ONLY: "1"
+        # ============================ THE GATE IS ARMED ============================
+        # ARMED by Plan 88.4-09 (D-08 flip, SPEC R7). `SCHEMA_DRIFT_REPORT_ONLY` USED TO SIT
+        # IN THE env BLOCK ABOVE AND HAS BEEN DELETED. A schema-drift finding now FAILS this
+        # job and blocks the PR. There is no report-only mode in backend CI any more.
+        #
+        # It could be armed because the drift was driven to ZERO first and MEASURED, not
+        # predicted: 88.4-DRIFT-CENSUS.md carries all 43 day-one findings, every one of them
+        # dispositioned `reconcile` with an owner sign-off dated 2026-07-30 (its § 7), all 43
+        # were executed in Plan 08, and CI run 30513558890 then reported 164 vs 164 canonical
+        # identities and `[88.4] NO SCHEMA DRIFT` with the allowlist EMPTY. Arming a gate that
+        # is already red is the one thing the SPEC forbids.
+        #
+        # ---- IF THIS STEP IS FAILING YOUR PR, READ THIS BEFORE YOU EDIT THIS FILE ----
+        # The ONLY sanctioned way to accept a difference is an entry in
+        # scripts/ci/schema-drift-allowlist.js that pins the FULL normalized identity of the
+        # object and carries an owner-signed `// DECISION Phase 88.4` marker immediately above
+        # it — which the `quality` job's marker gate (scripts/ci/verify-allowlist-markers.js)
+        # structurally enforces, per entry, so an unmarked entry cannot merge.
+        #
+        # RE-ADDING `SCHEMA_DRIFT_REPORT_ONLY: "1"` IS NOT AN OPTION. It is named here because
+        # it is the obvious shortcut a developer under CI pressure will reach for, it is a
+        # one-line edit, and it silently converts this gate into a job that gates NOTHING while
+        # still reporting green — which is strictly worse than never having built it, because
+        # everyone downstream believes drift is being caught. The differ still reads the flag
+        # (that is deliberate: the mechanism stays testable, and see the D-08 marker in
+        # scripts/ci/schema-drift-diff.js), so nothing but this comment stops you. If the drift
+        # is genuine, reconcile it or allowlist it with a signature; if the gate is wrong, fix
+        # the gate. Disarming it is a decision that belongs to the owner, not to a red PR.
+        #
+        # Report-only was always an env flag the differ reads rather than a step-level
+        # `continue-on-error`, precisely so that arming would be this reviewable one-line
+        # deletion AND so that a differ CRASH would fail the step in both modes.
+        # `continue-on-error` would have swallowed a genuine crash and made it look identical
+        # to a clean pass — do not substitute it for the flag either.
         run: node scripts/ci/schema-drift-diff.js
 
       - name: Baseline no-op proof — baseline migration only, against the sync-built DB
