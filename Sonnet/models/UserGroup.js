@@ -17,10 +17,31 @@ const UserGroup = sequelize.define('UserGroup', {
     // the physical DB column is retained as the D-07 rollback net and dropped in the
     // D-08 follow-up PR). allowNull is now `false` — all writers key user_uuid, so the
     // sync()-built test DB enforces NOT NULL to match the prod migration's SET NOT NULL.
+    //
+    // DECISION Phase 88.4 F-23 (D1a): `onUpdate: 'NO ACTION'` is declared HERE, on the ATTRIBUTE,
+    // OVER declaring it on the `UserGroup.belongsTo(User)` / `User.hasMany(UserGroup)` pair in
+    // models/index.js where the other 22 RC-1 findings are fixed. Prod's FK
+    // (migration 20260703000001:36) specifies only `onDelete`, so Postgres gives it `NO ACTION`,
+    // while Sequelize's unconditional `onUpdate = onUpdate || 'CASCADE'` default gave every
+    // sync()-built database `ON UPDATE CASCADE` — census finding F-23.
+    //
+    // WHY NOT ON THE ASSOCIATION, like its 22 siblings: this column is ALSO written by the two
+    // `belongsToMany` calls at the top of models/index.js, which run FIRST. FK actions are
+    // first-writer-wins (`_injectAttributes` merges via `Utils.mergeDefaults`, which does not
+    // overwrite an existing field), so an association-level `onUpdate` here is a silent no-op and
+    // the FK still emitted CASCADE. Measured, not assumed: tracing every write to this attribute's
+    // `onUpdate` shows three, all from `belongsToMany`'s `Object.assign`. An attribute-level value
+    // works because `belongs-to-many.js:233,243` explicitly READ THROUGH to it
+    // (`this.options.onUpdate || through.rawAttributes[fk].onUpdate`).
+    //
+    // Do NOT "restore consistency" by moving this onto the association — that reverts F-23. And do
+    // NOT add `onUpdate` to the `belongsToMany` options instead: those also govern
+    // `UserGroups.group_id`, which AGREES with prod today and would start drifting.
     type: DataTypes.UUID,
     allowNull: false,
     references: { model: 'Users', key: 'id' },
     onDelete: 'CASCADE',
+    onUpdate: 'NO ACTION',
   },
   group_id: {
     type: DataTypes.UUID,
@@ -88,10 +109,25 @@ const UserGroup = sequelize.define('UserGroup', {
       // migration identical.
       fields: ['group_id', 'user_uuid'],
       name: 'usergroups_group_id_user_uuid'
-    },
-    {
-      fields: ['status']
     }
+    // DECISION Phase 88.4 F-28 (D2b): the `{ fields: ['status'] }` entry that used to sit here is
+    // DELETED, OVER adding a `CREATE INDEX CONCURRENTLY` migration to give prod the matching index.
+    // It existed only in the models, so only sync()-built databases ever had it (census finding
+    // F-28 / cross-check C-3); no migration has ever created it.
+    //
+    // Deciding evidence (gathered for the Plan 07 sign-off, 13 call sites): EVERY UserGroup query
+    // that filters on `status` also filters on `user_uuid` and/or `group_id` — routes/games.js:83,
+    // routes/events.js:291, routes/groups.js:199, :487-490, :605, :1143-1145, :1183-1186,
+    // :1225-1228, :1260-1263, :1321, :1342, :1411-1414 — and NOT ONE filters on `status` alone.
+    // Both of those columns already LEAD an existing index (the two entries above), so a standalone
+    // low-cardinality `(status)` index would essentially never be chosen by the planner while
+    // costing write throughput on every membership insert and update.
+    //
+    // Corroborating: it was the ONLY entry in this array with no explicit `name`, while both
+    // siblings carry a comment saying the explicit name exists precisely to keep sync() and the
+    // migration identical. That is the signature of an oversight, which is what makes deleting it
+    // safe rather than a loss. Re-adding it means adding the migration too — otherwise the drift
+    // gate goes red.
   ]
 });
 

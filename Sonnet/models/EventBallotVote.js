@@ -42,6 +42,16 @@ const EventBallotVote = sequelize.define('EventBallotVote', {
       fields: ['option_id', 'user_uuid'],
       unique: true,
     },
+    {
+      // DECISION Phase 88.4 F-29 (D2a): declared model-side to match migration
+      // 20260703000006:109, which prod already has. NOT redundant with the composite above: that
+      // one LEADS on option_id, so it cannot serve a `user_uuid`-only lookup. These per-user
+      // indexes exist so account-deletion sweeps do not table-scan, and without this entry the
+      // sync()-built test DB exercised a DIFFERENT query plan from prod. Dual-declared; the
+      // explicit name keeps sync() and the migration byte-identical.
+      fields: ['user_uuid'],
+      name: 'eventballotvotes_user_uuid_idx',
+    },
   ],
 });
 

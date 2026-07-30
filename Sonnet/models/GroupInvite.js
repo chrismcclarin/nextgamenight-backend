@@ -1,6 +1,7 @@
 // models/GroupInvite.js
 // Stores group membership invitations with token-based acceptance flow
-const { DataTypes } = require('sequelize');
+const Sequelize = require('sequelize');
+const { DataTypes, Op } = Sequelize;
 const sequelize = require('../config/database');
 
 const GroupInvite = sequelize.define('GroupInvite', {
@@ -69,8 +70,51 @@ const GroupInvite = sequelize.define('GroupInvite', {
       fields: ['group_id'],
       name: 'group_invites_group_id',
     },
-    // Partial unique index on (group_id, LOWER(invited_email)) WHERE status='pending'
-    // is handled in the migration via raw SQL since Sequelize doesn't support partial indexes
+    {
+      // DECISION Phase 88.4 F-32 (D2a): declared model-side to match migration
+      // 20260703000003:95, which prod already has. The partial-unique index below cannot serve a
+      // plain `invited_by_uuid` lookup (different key, and it is predicated on status='pending'),
+      // so this is not redundant with it. Dual-declared; explicit name keeps both sides identical.
+      fields: ['invited_by_uuid'],
+      name: 'groupinvites_invited_by_uuid_idx',
+    },
+    {
+      // DECISION Phase 88.4 F-43 (D2c): the partial unique index prod already has (migration
+      // 20260228000001:125) is DECLARED HERE, over leaving it migration-only with an allowlist
+      // entry. The owner was shown the allowlist option WITH its honest argument in favour — a
+      // functional index written as `Sequelize.fn('LOWER', ...)` is genuinely less readable than
+      // the raw SQL — and declined it, because the cost is that every sync()-built database (the BE
+      // Jest DB, the FE e2e DB) permanently LACKS a uniqueness constraint prod enforces, so a test
+      // could insert a duplicate pending invite, pass, and ship.
+      //
+      // THE COMMENT THAT USED TO SIT HERE WAS FALSE, ON BOTH COUNTS, AND IT IS WORTH RECORDING
+      // WHY SO THE WRONG REASON STOPS PROPAGATING. It said the index "is handled in the migration
+      // via raw SQL since Sequelize doesn't support partial indexes".
+      //   1. PARTIAL is supported. models/UserGroup.js:76-80 declares a partial unique index
+      //      successfully and its Phase 88.2 comment documents the same discovery, citing THIS
+      //      comment as the claim it was disproving.
+      //   2. The `LOWER()` key was then proposed as "the real blocker" instead. That is ALSO false.
+      // Both were tested against the installed 6.37.7 with a real `sync()` against Postgres — not
+      // with the query generator alone, because sync() also has to ACCEPT the declaration and its
+      // index-existence check has to tolerate a functional field on a second run. Both passed, and
+      // the readback was byte-identical to the migration:
+      //   CREATE UNIQUE INDEX group_invites_pending_unique ON public."GroupInvites"
+      //     USING btree (group_id, lower((invited_email)::text))
+      //     WHERE (status = 'pending'::"enum_GroupInvites_status")
+      //
+      // THE ENUM PREDICATE WAS THE ONE OPEN QUESTION AND IT IS NOW SETTLED. The census left F-43
+      // contingent: its probe had declared `status` as STRING, which renders
+      // `((status)::text = 'pending'::text)` — a varchar artifact, since varchar comparison goes
+      // through text — while the migration side has `(status = 'pending'::"enum_...")`. Re-run in
+      // Plan 08 against a REAL ENUM column, the predicate rendered identically to the migration's.
+      // That is why F-43 stayed `reconcile` and did NOT return to the owner as an allowlist
+      // candidate. If `status` is ever changed away from ENUM, this predicate's rendering changes
+      // and the drift gate will go red — that is the gate working, not a bug here.
+      fields: ['group_id', Sequelize.fn('LOWER', Sequelize.col('invited_email'))],
+      unique: true,
+      where: { status: 'pending' },
+      name: 'group_invites_pending_unique',
+    },
   ],
 });
 

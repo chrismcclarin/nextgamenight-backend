@@ -47,7 +47,19 @@ const SchedulerRun = sequelize.define('SchedulerRun', {
   indexes: [
     {
       // Anomaly query: SELECT last N runs of job ordered by ran_at DESC
-      fields: ['job_name', 'ran_at'],
+      //
+      // DECISION Phase 88.4 F-26 / F-27 (D2a): `order: 'DESC'` on ran_at. Migration
+      // 20260501000001:69 creates `(job_name, ran_at DESC)` and the model declared no `order`, so
+      // sync() emitted ASC — two objects under the name-free identity, hence the MIGRATION-ONLY
+      // (F-26) and SYNC-ONLY (F-27) pair. The comment directly above already said DESC; the
+      // ordering was dropped, not chosen.
+      //
+      // WORTH READING TWICE: both sides ALREADY USE THE IDENTICAL INDEX NAME
+      // (`scheduler_runs_job_name_ran_at`), so the two databases differed in BEHAVIOUR while
+      // looking identical to any name-based check. A name-keyed differ would have called them
+      // equal. This pair is the in-repo proof of why D-04 excludes names from the identity.
+      fields: ['job_name', { name: 'ran_at', order: 'DESC' }],
+      name: 'scheduler_runs_job_name_ran_at',
     },
   ],
 });

@@ -72,7 +72,20 @@ const EventAuditLog = sequelize.define('EventAuditLog', {
   indexes: [
     {
       // Support: list recent deletes for a group
-      fields: ['group_id', 'created_at'],
+      //
+      // DECISION Phase 88.4 F-24 / F-25 (D2a): `order: 'DESC'` on created_at, plus the EXPLICIT
+      // name the migration uses. Migration 20260501000002:80 creates this index as
+      // `(group_id, created_at DESC)`; the model declared it with no `order`, so sync() emitted
+      // ASC. Under the differ's name-free identity those are TWO objects, which is why one census
+      // finding (F-24, MIGRATION-ONLY on the DESC form) and a second (F-25, SYNC-ONLY on the ASC
+      // form) both appear — one fix closes both rows.
+      //
+      // DESC is what this index is FOR: the comment on this very entry says "list recent deletes",
+      // which is an ORDER BY created_at DESC scan. The ordering was DROPPED when the model was
+      // written, not chosen — so this converges the model onto prod rather than the reverse, and no
+      // production DDL changes. Removing `order` again silently re-splits the two sides.
+      fields: ['group_id', { name: 'created_at', order: 'DESC' }],
+      name: 'event_audit_logs_group_created',
     },
     {
       // Support: look up audit row by event_id

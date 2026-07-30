@@ -54,6 +54,14 @@ const EventRsvp = sequelize.define('EventRsvp', {
       fields: ['event_id', 'user_uuid'],
       unique: true,
     },
+    {
+      // DECISION Phase 88.4 F-31 (D2a): declared model-side to match migration
+      // 20260703000004:110, which prod already has. NOT redundant with the composite above, which
+      // leads on event_id and so cannot serve a `user_uuid`-only lookup (the account-deletion
+      // sweep's access pattern). Dual-declared; explicit name keeps both sides identical.
+      fields: ['user_uuid'],
+      name: 'eventrsvps_user_uuid_idx',
+    },
   ],
 });
 
