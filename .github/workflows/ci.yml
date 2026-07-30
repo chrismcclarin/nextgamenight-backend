@@ -13,8 +13,10 @@
 #              the two 83.1 test-hygiene gates, and the 88.2 F-02 paranoid-destroy gate),
 #              TWO presence gates that fail on an ABSENT string rather than a present one
 #              (88.2 SPEC-REQ-10, the purge sweep's explicit child deletes; and 88.4
-#              SPEC R6, a DECISION marker on every schema-drift allowlist entry), plus the
-#              D-04 skip-count ratchet
+#              SPEC R6, a DECISION marker on every schema-drift allowlist entry), ONE
+#              STRUCTURAL gate that parses THIS FILE and asserts the migrate-cli-replay
+#              drift gate is still armed (88.4 D-88.4-05 — deliberately not a grep; see
+#              its own comment), plus the D-04 skip-count ratchet
 #   test     — slow gate (needs: quality): Jest/supertest against a Postgres service container
 #   migrate-cli-replay — slow gate (needs: quality): the real sequelize-cli migration path
 #              replayed from an EMPTY database, diffed against a sequelize.sync() build of
@@ -257,6 +259,40 @@ jobs:
             exit 1
           fi
           node scripts/ci/verify-allowlist-markers.js "$FILE"
+
+      - name: "Armed gate — the migrate-cli-replay schema drift gate must stay ARMED (88.4 / D-88.4-05)"
+        working-directory: Sonnet
+        # NOT A GREP GATE, and that distinction is the whole point of this step. It PARSES this
+        # file and reads effective env KEYS.
+        #
+        # WHAT IT PROTECTS. Plan 88.4-09 armed the drift gate by DELETING one line —
+        # `SCHEMA_DRIFT_REPORT_ONLY: "1"` — from the `Schema drift diff` step further down. The
+        # differ still READS that flag (deliberately: the mechanism stays testable, and a differ
+        # CRASH must fail the step in both modes). So re-adding one line silently turns
+        # `migrate-cli-replay` back into a job that reports GREEN while gating NOTHING — and as of
+        # Plan 88.4-10 that job is a REQUIRED status check on `main`, so the result would be a
+        # required check that is green and vacuous, with everyone downstream believing drift is
+        # being caught. Until this step existed the only thing preventing that was the ARMED
+        # comment below plus code review: behavioural mitigations, neither failing independently of
+        # a human reading them (deferred-items.md D-88.4-05, owner-approved 2026-07-30).
+        #
+        # WHY IT CANNOT BE `grep SCHEMA_DRIFT_REPORT_ONLY .github/workflows/ci.yml`. The ARMED
+        # block below deliberately NAMES the forbidden string so a developer under CI pressure
+        # reads the warning before reaching for the shortcut. That warning is worth more than
+        # grepability — but it means grep now hits on a HEALTHY file, so a text check cannot tell
+        # "the flag is set" from "the flag is forbidden in prose". Plan 09's plan-supplied arming
+        # check was two such regexes and both false-positived on that very comment; it reported the
+        # gate DISARMED against a correctly armed file, and by symmetry could have reported ARMED
+        # against a disarmed one. Same defect class as 88.4-CODE-REVIEW.md #3/#10, which this phase
+        # already rejected twice: a gate that reads text where it should read structure.
+        #
+        # It lives in `quality` (not in migrate-cli-replay) so the failure is 30 seconds in and
+        # needs no database, and in a committed UNIT-TESTED script rather than inline here —
+        # tests/unit/verify-gate-armed.test.js drives it over the seven ci.yml-scoped disarm
+        # scenarios Plan 09 negative-controlled, plus the job deleted, the differ step deleted, and
+        # the D-06 URL-chain keys. A gate whose whole purpose is catching a one-line disarm must
+        # not itself be an unverifiable one-liner.
+        run: node scripts/ci/verify-gate-armed.js
 
       - name: "Grep gate — stray sequelize.close() in tests (D-01 / BTEST-02)"
         working-directory: Sonnet
@@ -608,9 +644,16 @@ jobs:
         # still reporting green — which is strictly worse than never having built it, because
         # everyone downstream believes drift is being caught. The differ still reads the flag
         # (that is deliberate: the mechanism stays testable, and see the D-08 marker in
-        # scripts/ci/schema-drift-diff.js), so nothing but this comment stops you. If the drift
-        # is genuine, reconcile it or allowlist it with a signature; if the gate is wrong, fix
-        # the gate. Disarming it is a decision that belongs to the owner, not to a red PR.
+        # scripts/ci/schema-drift-diff.js). AND AS OF PLAN 88.4-10 A COMMENT IS NO LONGER THE ONLY
+        # THING STOPPING YOU: the `quality` job runs scripts/ci/verify-gate-armed.js, which parses
+        # this file and FAILS if `SCHEMA_DRIFT_REPORT_ONLY` is an env key at workflow, job or step
+        # level, if `continue-on-error` appears on this job or any of its steps, if this job or its
+        # differ / from-empty steps are missing, or if the step order is wrong. Re-adding the flag
+        # now reds the fast job in 30 seconds — which is the point, because this job became a
+        # REQUIRED check in the same plan (D-88.4-05). If the drift is genuine, reconcile it or
+        # allowlist it with a signature; if the gate is wrong, fix the gate. Disarming it means
+        # deleting that guard in the same commit, deliberately and visibly — a decision that
+        # belongs to the owner, not to a red PR.
         #
         # Report-only was always an env flag the differ reads rather than a step-level
         # `continue-on-error`, precisely so that arming would be this reviewable one-line
