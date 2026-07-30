@@ -11,13 +11,24 @@
 // sign-off edit and a logic edit would be indistinguishable in review).
 //
 // ---------------------------------------------------------------------------------------
-// AN EMPTY ARRAY IS THE CORRECT STATE TODAY — IT IS NOT AN OVERSIGHT.
+// AN EMPTY ARRAY IS THE CORRECT STATE — IT IS NOT AN OVERSIGHT, AND IT IS NO LONGER
+// PROVISIONAL. Updated by Plan 10 (D-88.4-06): this block used to say "Plan 08 adds the
+// signed-off entries. Until then: `[]`", which described a pending step. That step has
+// HAPPENED and its outcome was zero entries. Corrected in place rather than deleted, so the
+// overtaken reason stops propagating instead of being quietly forgotten.
 //
-// D-08 locks the order: report-only CI -> day-one census read off a real CI run -> owner
-// signs off every finding's disposition -> THEN reconciling migrations and allowlist entries.
-// Adding an entry here before that sign-off would pre-decide a disposition the SPEC
-// explicitly defers (88.4-SPEC.md Boundaries: "Pre-deciding per-instance drift dispositions
-// in this SPEC" is out of scope). Plan 08 adds the signed-off entries. Until then: `[]`.
+// D-08 locked the order and the order RAN: report-only CI -> day-one census read off a real
+// CI run -> owner signs off every finding's disposition -> then reconciling migrations and
+// allowlist entries. The census (88.4-DRIFT-CENSUS.md in the parent planning repo) recorded
+// 43 day-one findings and the owner signed its § 7 on 2026-07-30 dispositioning ALL 43
+// `reconcile` and NONE `allowlist`. Plan 08 executed all 43, and CI then measured 164 vs 164
+// canonical identities with zero findings — which is what authorized Plan 09 to arm the gate.
+//
+// So `[]` is now correct BECAUSE the sign-off resolved every instance the other way, not
+// while waiting for a sign-off. An entry added from here on is NEW accepted drift and needs
+// its own owner-signed `DECISION Phase 88.4` marker block (the `quality` job's
+// scripts/ci/verify-allowlist-markers.js enforces that per entry, so an unmarked one cannot
+// merge). Reconciling the two sides remains strictly preferred over accepting a difference.
 // ---------------------------------------------------------------------------------------
 //
 // ENTRY CONTRACT — these SEVEN base fields on EVERY entry, plus the kind's own PIN fields
@@ -171,7 +182,9 @@ function deepFreezeEntries(entries) {
 }
 
 // ---------------------------------------------------------------------------------------
-// THE ALLOWLIST. Empty by design until the owner signs off the day-one census (D-08).
+// THE ALLOWLIST. Empty by design BECAUSE the owner's day-one census sign-off (2026-07-30, § 7)
+// dispositioned all 43 findings `reconcile` and accepted none — not while awaiting that
+// sign-off, which is what this line used to say (D-88.4-06). See the header block above.
 // Add entries here in the multi-line, single-quoted, marker-preceded form documented above.
 // ---------------------------------------------------------------------------------------
 const ENTRIES = deepFreezeEntries([]);

@@ -1147,8 +1147,14 @@ function formatSuppressionSummary(total, suppressed, entries = ALLOWLIST_ENTRIES
   const list = Array.isArray(entries) ? entries : [];
   if (list.length === 0) {
     return (
-      `[88.4] allowlist: EMPTY (0 entries) — nothing suppressed of ${total} finding(s). An empty ` +
-      `allowlist is the correct state until the day-one census is signed off (D-08).`
+      // D-88.4-06: this line used to end "...is the correct state UNTIL the day-one census is
+      // signed off", which prints on every CI run and told its reader the census was still
+      // pending — the opposite of the state that authorized arming the gate. The census was
+      // signed off on 2026-07-30 with all 43 findings dispositioned `reconcile` and none
+      // accepted, so empty is correct BECAUSE of the sign-off, not while awaiting it.
+      `[88.4] allowlist: EMPTY (0 entries) — nothing suppressed of ${total} finding(s). Empty is ` +
+      `the correct state: the day-one census was signed off 2026-07-30 with all 43 findings ` +
+      `reconciled and none accepted (D-08). A new entry needs an owner-signed DECISION marker.`
     );
   }
 
@@ -1233,13 +1239,23 @@ const ARMED_ERROR = (n) =>
   `production unnoticed. If you are deliberately accepting one of these, allowlist it with a ` +
   `signed-off marker in the same commit — do not weaken the differ.`;
 
+// UNREACHABLE FROM CI as of Plan 88.4-09, and deliberately kept (D-88.4-06). The gate is ARMED:
+// `SCHEMA_DRIFT_REPORT_ONLY` is set nowhere in .github/workflows/ci.yml, and the `quality` job's
+// scripts/ci/verify-gate-armed.js now FAILS the build if it reappears as an env key at any scope.
+// This message therefore only ever prints for a LOCAL run that opts in explicitly — which is a
+// legitimate use (reading a full finding list without a non-zero exit while iterating on the
+// differ), so the branch stays. Its D-08 framing was rewritten because it described the day-one
+// census as still ahead: it is not, it was signed off 2026-07-30 with all 43 findings reconciled.
 const REPORT_ONLY_WARNING = (n) =>
-  `::warning::[88.4] REPORT-ONLY MODE — ${n} schema-drift finding(s) found; this job is PASSING ` +
-  `anyway by design (D-08: the day-one census is read off this output and every finding gets an ` +
-  `owner-signed disposition before the gate arms). To ARM the gate, delete the ` +
-  `SCHEMA_DRIFT_REPORT_ONLY line from the migrate-cli-replay job in .github/workflows/ci.yml. ` +
-  `Note that a CRASH in this differ already fails the job in this mode — only findings are ` +
-  `suppressed.`;
+  `::warning::[88.4] REPORT-ONLY MODE — ${n} schema-drift finding(s) found; this run is PASSING ` +
+  `anyway because SCHEMA_DRIFT_REPORT_ONLY=1 is set in THIS environment. Backend CI does NOT ` +
+  `set it: the gate was armed in Plan 88.4-09 once the day-one census had been signed off ` +
+  `(2026-07-30, all 43 findings reconciled, none accepted) and CI measured zero drift, and the ` +
+  `quality job's scripts/ci/verify-gate-armed.js fails the build if the flag is re-added at any ` +
+  `scope. So if you are seeing this in CI, something has disarmed the gate — investigate that ` +
+  `before the findings. Locally, this mode is a convenience for reading a full finding list; ` +
+  `unset the variable to get the real exit code. A CRASH in this differ fails in both modes — ` +
+  `only findings are suppressed.`;
 
 module.exports = {
   dumpSchema,

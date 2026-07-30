@@ -254,8 +254,9 @@ if (require.main === module) {
     console.error(
       `::error::[88.4-markers] ${rel} is missing. scripts/ci/schema-drift-diff.js require()s it, ` +
         `so its absence fails the migrate-cli-replay job in a far less obvious place. Restore it ` +
-        `— an EMPTY ENTRIES array is the correct day-one state (D-08), so there is no reason to ` +
-        `delete the file.`
+        `— an EMPTY ENTRIES array is the correct state (the day-one census was signed off ` +
+        `2026-07-30 with all 43 findings reconciled and none accepted, D-08), so there is no ` +
+        `reason to delete the file.`
     );
     process.exitCode = 1;
   } else {
@@ -285,9 +286,13 @@ if (require.main === module) {
         }
         process.exitCode = 1;
       } else if (result.entries.length === 0) {
+        // D-88.4-06: this used to say the empty allowlist was correct "until the day-one drift
+        // census is signed off", and it prints on every `quality` run — telling its reader the
+        // census was still pending long after the sign-off that authorized arming the gate.
         console.log(
           '[88.4-markers] PASS — 0 entries need 0 markers. An EMPTY allowlist is the CORRECT ' +
-            'state until the day-one drift census is signed off (D-08); this is not a broken or ' +
+            'state: the day-one drift census was signed off 2026-07-30 with all 43 findings ' +
+            'dispositioned `reconcile` and none accepted (D-08), so this is not a broken or ' +
             'vacuous gate. It also verified that the `const ENTRIES` array was actually FOUND, ' +
             'so an empty pass cannot come from a parser that lost its way.'
         );
