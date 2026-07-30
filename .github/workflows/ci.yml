@@ -223,51 +223,40 @@ jobs:
         # looking. This gate lives in `quality` (not in migrate-cli-replay) so the failure is
         # 30 seconds into the run and needs no database.
         #
-        # TWO counts, obtained by two DIFFERENT mechanisms on purpose:
-        #   entries — asked of the MODULE (`ENTRIES.length`). Counting `side:` lines instead
-        #             would be formatting-dependent in the worst possible direction: a
-        #             single-line entry, or one written with double quotes, counts as ZERO,
-        #             which drops this gate straight into its "allowlist is empty, pass"
-        #             branch while real unexplained entries sit in the file. Safe in this fast
-        #             job: the module opens no DB connection and pulls in no models (88.4-04).
-        #             The same node call ALSO invokes validateAllowlist(ENTRIES) explicitly.
-        #             That is not belt-and-braces: the allowlist module does NOT validate
-        #             itself at load — schema-drift-diff.js:73-74 is what calls the validator,
-        #             so without this line a malformed policy file sails through the fast job
-        #             and only throws minutes later inside migrate-cli-replay, where it reads
-        #             as a differ crash rather than as the policy typo it is.
-        #   markers — a grep, because it counts COMMENT lines and no module export can report
-        #             those. It is sliced from the `const ENTRIES` line onward with awk and
-        #             ANCHORED to `^ *// DECISION Phase 88.4`: the module HEADER quotes the
-        #             required marker form once, as a nested comment, specifically so an
-        #             anchored count scores it zero. A bare `grep -c 'DECISION Phase 88.4'`
-        #             on the whole file returns 1 with ZERO real markers and would let one
-        #             unjustified entry through forever.
+        # PER-ENTRY PAIRING IS NOW ENFORCED STRUCTURALLY, not implied by a total
+        # (88.4-CODE-REVIEW.md #3 + #10). This step used to compare ENTRIES.length against an
+        # anchored `grep -c` of marker lines and fail only when markers < entries, conceding in
+        # its own comment that pairing was "enforced upstream by the allowlist module's own
+        # header" — i.e. by a comment. Three malformed files passed it: an unmarked entry masked
+        # by a duplicated token on a sibling's block; an orphaned block left behind when an entry
+        # was deleted (markers > entries passed silently); and markers stacked against the wrong
+        # entries. SPEC R6's acceptance is a PER-ENTRY property and two totals cannot express one.
         #
-        # The per-entry pairing this comparison implies (one marker block immediately above
-        # each entry) is enforced upstream by the allowlist module's own header, which
-        # declares one-entry-per-multi-line-literal as a contract and names this gate as why.
+        # scripts/ci/verify-allowlist-markers.js walks the ENTRIES array with a bracket+brace
+        # scanner and asserts three things independently — every entry is immediately preceded by
+        # its own marker run, no marker is orphaned, and the counts agree. It lives in a committed
+        # script rather than inline here so it is UNIT-TESTED
+        # (tests/unit/verify-allowlist-markers.test.js, 16 cases incl. all three files that used
+        # to slip through): a gate whose job is catching sloppy edits to a security-relevant
+        # policy file must not itself be an unverifiable one-liner.
+        #
+        # It also runs validateAllowlist separately below. That is NOT belt-and-braces: the
+        # allowlist module does NOT validate itself at load — schema-drift-diff.js:73-80 is what
+        # calls the validator — so without that line a malformed policy file sails through the
+        # fast job and only throws minutes later inside migrate-cli-replay, where it reads as a
+        # differ crash rather than as the policy typo it is. Safe in this fast job: the module
+        # opens no DB connection and pulls in no models (88.4-04).
         run: |
           FILE=scripts/ci/schema-drift-allowlist.js
           if [ ! -f "$FILE" ]; then
             echo "::error::$FILE is missing. scripts/ci/schema-drift-diff.js require()s it, so its absence fails the migrate-cli-replay job in a far less obvious place. Restore it — an EMPTY ENTRIES array is the correct day-one state (D-08), so there is no reason to delete the file."
             exit 1
           fi
-          if ! ENTRY_COUNT=$(node -e "const m = require('./scripts/ci/schema-drift-allowlist.js'); m.validateAllowlist(m.ENTRIES); console.log(m.ENTRIES.length)"); then
-            echo "::error::$FILE failed to load or failed its own validator (see the thrown message above). validateAllowlist THROWS on any entry shape it does not fully understand (T-88.4-13) — a malformed accepted-drift policy is a crash, not a finding. Fix the entry it names; scripts/ci/schema-drift-diff.js calls the same validator at require time, so migrate-cli-replay cannot run until this loads clean."
+          if ! node -e "const m = require('./scripts/ci/schema-drift-allowlist.js'); m.validateAllowlist(m.ENTRIES); console.log('validateAllowlist OK — ' + m.ENTRIES.length + ' entr(y/ies)')"; then
+            echo "::error::$FILE failed to load or failed its own validator (see the thrown message above). validateAllowlist THROWS on any entry shape it does not fully understand (T-88.4-13) — a malformed accepted-drift policy is a crash, not a finding. Every entry must also pin the FULL normalized identity for its kind (PIN_FIELDS), not just keySpec + predicate: a partial pin suppresses objects nobody reviewed. Fix the entry it names; scripts/ci/schema-drift-diff.js calls the same validator at require time, so migrate-cli-replay cannot run until this loads clean."
             exit 1
           fi
-          MARKER_COUNT=$(awk '/^const ENTRIES/{f=1} f' "$FILE" | grep -cE '^[[:space:]]*// DECISION Phase 88\.4' || true)
-          echo "allowlist DECISION markers: entries=$ENTRY_COUNT markers=$MARKER_COUNT"
-          if [ "$ENTRY_COUNT" -eq 0 ]; then
-            echo "Allowlist marker gate passed — $FILE holds 0 entries and needs 0 markers. An EMPTY allowlist is the CORRECT state until the day-one drift census is signed off (D-08); this is not a broken or vacuous gate."
-            exit 0
-          fi
-          if [ "$MARKER_COUNT" -lt "$ENTRY_COUNT" ]; then
-            echo "::error::$FILE has $ENTRY_COUNT allowlist entr(y/ies) but only $MARKER_COUNT anchored DECISION marker(s). D-07 and SPEC R6 require a full 'DECISION Phase 88.4 <accepted> OVER <rejected> — <why>' block on EVERY entry, as a // comment on the line(s) immediately above it. An entry without one is accepted schema drift with no recorded rationale: it silently suppresses a migrate-cli-replay finding forever while reading in review as though somebody weighed it, so the next reader stops looking. Note this count is ANCHORED and sliced from 'const ENTRIES' — the module header's own example marker deliberately does not count. If you are deliberately removing this, change the gate and say why in the same commit."
-            exit 1
-          fi
-          echo "Allowlist marker gate passed — $ENTRY_COUNT entr(y/ies), $MARKER_COUNT DECISION marker(s)."
+          node scripts/ci/verify-allowlist-markers.js "$FILE"
 
       - name: "Grep gate — stray sequelize.close() in tests (D-01 / BTEST-02)"
         working-directory: Sonnet
@@ -373,9 +362,24 @@ jobs:
         working-directory: Sonnet
         run: npm ci
 
-      # NO migrate step (A5): the earliest migration assumes the "Users" table already
-      # exists and cannot run from an empty DB. Schema is built from the models instead:
-      # db:create provisions the database, seed runs sequelize.sync({ alter: true }).
+      # NO migrate step — and as of Phase 88.4 the reason is NOT that it cannot run.
+      #
+      # The original A5 rationale said "the earliest migration assumes the Users table already
+      # exists and cannot run from an empty DB". That premise was REMOVED by Phase 88.4's guarded
+      # baseline migration (migrations/00000000000000-baseline-pre-migration-schema.js): the chain
+      # now replays from a genuinely empty database, and the migrate-cli-replay job further down
+      # THIS FILE proves it on every run. Leaving the old wording in place would invite a future
+      # reader to "fix" this job by adding a migrate step — undoing a deliberate boundary — or to
+      # stop trusting this file's comments, which this codebase leans on heavily as decision records.
+      #
+      # DECISION Phase 88.4: this job stays SYNC-BUILT (db:create, then seed running
+      # sequelize.sync({ alter: true })) OVER migrating it now that migrating is possible. That is
+      # the 88.4 SPEC boundary, not inertia — "sync-built test DBs are exactly what this gate makes
+      # safe". The suite's job is to test application behaviour against the models; the
+      # migrate-cli-replay drift gate is what makes a sync-built schema trustworthy by proving it
+      # is structurally equivalent to the migration-built one prod runs. Migrating here would
+      # remove the very divergence the gate exists to observe. Switching this to migrate is a
+      # decision, not a cleanup.
       - name: Create database
         working-directory: Sonnet
         run: npm run db:create

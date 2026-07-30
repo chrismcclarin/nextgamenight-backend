@@ -22,8 +22,8 @@
 // dropped and recreated is the module-level const SYNC_DB_NAME below. There is no
 // process.env.SYNC_DB_NAME, and the name is NOT derived from ADMIN_DB_URL's path
 // component. A mis-set environment variable can change WHICH SERVER this connects to
-// (which is why the NODE_ENV refusal below exists), but it cannot redirect the DROP onto a
-// different database name.
+// (which is why the NODE_ENV refusal AND the production-host deny list below both exist), but
+// it cannot redirect the DROP onto a different database name.
 //
 // DECISION Phase 88.4 D-06: raw `pg` Client OVER Sequelize. `scripts/create-database.js`
 // does the same job through a Sequelize admin connection; this script does not, because
@@ -44,13 +44,64 @@ const { Client } = require('pg');
 // (T-88.4-10) -- see the header. Never read from env.
 const SYNC_DB_NAME = 'schema_sync';
 
-// Verbatim from scripts/log-db-resolution.js:19-27. Credential masking is a security
-// control (T-88.4-11), not cosmetics -- never log an unmasked connection string.
+// PRODUCTION-HOST DENY LIST. Transcribed from tests/globalSetup.js:48, which carries the
+// reasoning in full: `railway.internal` is REQUIRED because prod connects primarily via
+// POSTGRES_PRIVATE_URL (config/database.js:14-19), and omitting it would leave the host arm
+// silently missing the documented prod target; `rlwy.net` / `railway.app` are the public proxy
+// hosts. `PROD_DB_HOST_DENY` is the escape hatch for a host this list does not know.
+//
+// DECISION Phase 88.4 (88.4-CODE-REVIEW.md #5): this list is added ALONGSIDE the NODE_ENV
+// refusal below, not instead of it. Deliberately DIVERGING from the sibling
+// scripts/ci/sync-build-schema.js, whose own DECISION marker rejects this list for ITS failure
+// mode -- correctly, because that script's sync-target assert pins the exact database and is
+// strictly stronger than a known-bad-host set. THIS script carries `DROP DATABASE`, the most
+// destructive verb in the phase, and has no equivalent stronger check available: the hardcoded
+// SYNC_DB_NAME bounds WHICH database is dropped but says nothing about WHICH SERVER, and the
+// header already concedes that a mis-set ADMIN_DB_URL can point it at a different server. With
+// NODE_ENV unset (which CI itself does), a developer shell pointing ADMIN_DB_URL at a remote
+// server previously sailed straight through. That sibling marker ends "add the host list
+// alongside it if anything" -- this is that. Do not "restore consistency" by deleting it.
+const PROD_HOST_PATTERNS = ['railway.internal', 'rlwy.net', 'railway.app'];
+
+/**
+ * @param {string} url the admin connection string
+ * @returns {string|null} a human-readable refusal reason, or null when the target is acceptable
+ */
+function prodHostRefusal(url) {
+  let host;
+  try {
+    host = new URL(url).hostname.toLowerCase();
+  } catch {
+    // An unparseable URL is NOT waved through here: `pg` accepts key=value DSNs that `URL`
+    // cannot parse, so a prod DSN in that form would bypass a URL-only check. Refuse and make
+    // the operator supply a parseable URL -- a loud stop on a legitimate-but-exotic string beats
+    // a silent pass on a production one.
+    return `ADMIN_DB_URL is not a parseable URL, so its host cannot be checked against the production-host deny list`;
+  }
+  const denyHost = (process.env.PROD_DB_HOST_DENY || '').toLowerCase();
+  const matched =
+    PROD_HOST_PATTERNS.find((p) => host.includes(p)) || (denyHost && host.includes(denyHost) ? denyHost : null);
+  return matched
+    ? `ADMIN_DB_URL host "${host}" matches the production-host deny list ("${matched}")`
+    : null;
+}
+
+// Verbatim from scripts/log-db-resolution.js:19-33. Credential masking is a security
+// control (T-88.4-11), not cosmetics -- never log an unmasked connection string. The
+// "verbatim" claim is load-bearing: review #6's username fix was applied to all FOUR copies
+// (that source, this file, verify-migration-chain.js, schema-drift-diff.js) in ONE commit so
+// it stays true. If you change one, change all four.
 const mask = (url) => {
   if (!url) return 'unset';
   try {
     const u = new URL(url);
-    return `${u.protocol}//${u.username}:***@${u.hostname}:${u.port || '5432'}/${u.pathname.slice(1)}`;
+    // DECISION Phase 88.4 (88.4-CODE-REVIEW.md #6): the USERNAME is redacted too, over the
+    // long-standing `${u.username}:***@` form. The username is not a credential, but these
+    // scripts document a LOCAL PROOF mode in which a developer's own connection string is
+    // logged, and a real username is identifying (and often environment-revealing) in a public
+    // repo's CI log. Nothing needs it: every log line here already prefers the side LABEL
+    // ("migration side" / "sync side") and the host+database are what a reader diagnoses from.
+    return `${u.protocol}//***:***@${u.hostname}:${u.port || '5432'}/${u.pathname.slice(1)}`;
   } catch {
     return '<unparseable>';
   }
@@ -77,6 +128,21 @@ const mask = (url) => {
     console.error(
       '[88.4-createdb] ADMIN_DB_URL is not set. It must point at an admin/maintenance ' +
         'database (e.g. postgres://user:pw@host:5432/postgres) on the throwaway CI server.'
+    );
+    process.exitCode = 1;
+    return;
+  }
+
+  // SECOND destructive-op guard, and it fires where the NODE_ENV one cannot: NODE_ENV is unset
+  // in CI and is routinely unset in a developer shell, so it protects nothing against an
+  // ADMIN_DB_URL that has been pointed at a real server. Checked BEFORE the client is opened,
+  // so a refused run makes no connection at all.
+  const refusal = prodHostRefusal(adminUrl);
+  if (refusal) {
+    console.error(
+      `[88.4-createdb] refusing to run: ${refusal}. This script issues ` +
+        `DROP DATABASE "${SYNC_DB_NAME}" and must only ever target a throwaway server. ` +
+        `Point ADMIN_DB_URL at the CI service container or a local Postgres.`
     );
     process.exitCode = 1;
     return;

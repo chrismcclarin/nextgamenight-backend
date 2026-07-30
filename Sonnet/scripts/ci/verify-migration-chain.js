@@ -49,12 +49,19 @@ const { Client } = require('pg');
 
 const MIGRATIONS_DIR = path.resolve(__dirname, '..', '..', 'migrations');
 
-// Verbatim from scripts/log-db-resolution.js:19-27. Never log an unmasked connection string.
+// Verbatim from scripts/log-db-resolution.js:19-33 (all four copies changed together — see the
+// note in create-sync-db.js). Never log an unmasked connection string.
 const mask = (url) => {
   if (!url) return 'unset';
   try {
     const u = new URL(url);
-    return `${u.protocol}//${u.username}:***@${u.hostname}:${u.port || '5432'}/${u.pathname.slice(1)}`;
+    // DECISION Phase 88.4 (88.4-CODE-REVIEW.md #6): the USERNAME is redacted too, over the
+    // long-standing `${u.username}:***@` form. The username is not a credential, but these
+    // scripts document a LOCAL PROOF mode in which a developer's own connection string is
+    // logged, and a real username is identifying (and often environment-revealing) in a public
+    // repo's CI log. Nothing needs it: every log line here already prefers the side LABEL
+    // ("migration side" / "sync side") and the host+database are what a reader diagnoses from.
+    return `${u.protocol}//***:***@${u.hostname}:${u.port || '5432'}/${u.pathname.slice(1)}`;
   } catch {
     return '<unparseable>';
   }
