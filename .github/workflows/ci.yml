@@ -417,17 +417,20 @@ jobs:
   #
   # What the job does:
   #   1. create a second, throwaway `schema_sync` database on the same service container;
-  #   2. MIGRATION SIDE — `npx sequelize-cli db:migrate` into `boardgame_db` from EMPTY:
+  #   2. PROVE the migration side is empty — zero user relations, zero user enums — BEFORE
+  #      anything is replayed into it (88.4-CODE-REVIEW.md #11). Every claim below about
+  #      "from EMPTY" rests on this step and no longer on service-container freshness;
+  #   3. MIGRATION SIDE — `npx sequelize-cli db:migrate` into `boardgame_db` from EMPTY:
   #      the guarded baseline (migrations/00000000000000-baseline-pre-migration-schema.js)
   #      plus every migration after it. No sync() ever touches this database and
   #      SequelizeMeta is never pre-seeded, so a defect on ANY migration's
   #      table-creation branch surfaces here instead of on Railway;
-  #   3. assert every migration filename is booked in SequelizeMeta (no silent skips —
-  #      a short replay would otherwise be reported by step 5 as model drift);
-  #   4. SYNC SIDE — sequelize.sync() from THIS commit's models into `schema_sync`;
-  #   5. diff the two schemas (tables / FKs / PKs / uniques / indexes) minus the
+  #   4. assert every migration filename is booked in SequelizeMeta (no silent skips —
+  #      a short replay would otherwise be reported by step 6 as model drift);
+  #   5. SYNC SIDE — sequelize.sync() from THIS commit's models into `schema_sync`;
+  #   6. diff the two schemas (tables / FKs / PKs / uniques / indexes) minus the
   #      signed-off allowlist. REPORT-ONLY until Plan 09 arms it (D-08);
-  #   6. baseline no-op proof — run the baseline migration ALONE against the sync-built
+  #   7. baseline no-op proof — run the baseline migration ALONE against the sync-built
   #      database: the exact shape prod sees on the first deploy after this merges.
   migrate-cli-replay:
     # DECISION Phase 88.4 D-05: a REAL from-empty replay of all 77 migration files OVER
@@ -534,6 +537,22 @@ jobs:
         # holds a connection to that database. Do not move it after a step that connects
         # to `schema_sync`.
         run: node scripts/ci/create-sync-db.js
+
+      # RUNS IMMEDIATELY BEFORE THE REPLAY, and the adjacency is the point: this step is what
+      # makes the words "from EMPTY" in the next step's name true. Before it existed, the
+      # from-empty property — the property the entire job is built on — rested on nothing but
+      # the freshness of the service container. See the script header for the false-green it
+      # closes: a pre-seeded SequelizeMeta makes db:migrate skip, makes
+      # verify-migration-chain.js pass anyway, and makes the drift diff compare a schema the
+      # migration chain never built. Do not reorder this after the replay; a post-hoc check
+      # cannot fire before the database has already been written to.
+      - name: Assert the migration side started EMPTY (before any replay)
+        working-directory: Sonnet
+        env:
+          # Purpose-named, NOT DATABASE_URL (D-06): this assert must be impossible to steer
+          # onto the sync database, where a pass would be meaningless.
+          MIGRATE_DB_URL: ${{ env.MIGRATE_DB_URL }}
+        run: node scripts/ci/assert-migrate-db-empty.js
 
       - name: Migration-side build — baseline + every migration from EMPTY
         working-directory: Sonnet
