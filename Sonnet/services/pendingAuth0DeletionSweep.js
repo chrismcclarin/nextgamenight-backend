@@ -181,8 +181,24 @@ async function runPendingAuth0DeletionSweep() {
           await ghost.destroy();
           counters.ghosts_destroyed++;
         }
-        // Sub-keyed no-FK rows a ghost session may have minted — a bare User.destroy
-        // fires only the FK graph and would leave these.
+        // Sub-keyed rows a ghost session may have minted, deleted EXPLICITLY rather than relied on
+        // to cascade.
+        //
+        // DECISION Phase 88.4 F-41: these two lines are KEPT, over deleting them as redundant now
+        // that both tables carry a `user_id -> Users(user_id) ON DELETE CASCADE` foreign key
+        // (MagicTokens has had one all along; single_use_tokens gains one in migration
+        // 20260730000003-reconcile-single-use-tokens-user-fk.js). On any database that has the FKs
+        // the `ghost.destroy()` above already cascades these rows away and both calls are no-ops —
+        // harmless, and the sweep still succeeds. They stay because this ordering is PARENT-FIRST:
+        // if either FK's action were ever changed to RESTRICT / NO ACTION the destroy above would
+        // FAIL, and if an FK is ever dropped these become load-bearing again. Cheap insurance on a
+        // path whose whole job is to be a backstop.
+        //
+        // The comment that used to sit here called these "sub-keyed NO-FK rows" and said "a bare
+        // User.destroy fires only the FK graph and would leave these". That was already inaccurate
+        // for MagicToken and is now inaccurate for SingleUseToken too — corrected in the same commit
+        // as the migration that made it false, because a stale comment claiming an absent constraint
+        // is exactly what sends the next reader down the wrong path.
         await MagicToken.destroy({ where: { user_id: sub } });
         await SingleUseToken.destroy({ where: { user_id: sub } });
       } catch (ghostErr) {

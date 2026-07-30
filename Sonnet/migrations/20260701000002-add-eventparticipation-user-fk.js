@@ -16,10 +16,12 @@
 //      existing orphans. DELETE (not null-out/reassign) is faithful to the
 //      ON DELETE CASCADE semantics we are enshrining (D-06). Logs the count.
 //      Precedent: migrations/20260227000005-data-audit-and-cleanup.js:60-70.
-//   2. GUARDED FK ADD (DDL): only ADD CONSTRAINT if pg_constraint has no
-//      `eventparticipations_user_id_fkey` yet — so a re-run (or a constraint
-//      already built by an earlier partial apply / by sync on a shared DB) is a
-//      no-op. `Users.id` is the PK → already UNIQUE, so no extra unique step.
+//   2. GUARDED FK ADD (DDL): only ADD CONSTRAINT if no equivalent FK already exists
+//      on (user_id -> Users) under ANY NAME — so a re-run, an earlier partial apply,
+//      or a constraint built by sync() on a shared DB is all a no-op. `Users.id` is
+//      the PK → already UNIQUE, so no extra unique step.
+//      HARDENED IN PHASE 88.4: this was a `conname`-only probe, which is exactly why
+//      census findings F-37/F-38/F-39 exist. See the DECISION marker at the guard.
 //
 // DML + DDL run in ONE transaction: a mid-op failure rolls back cleanly and
 // leaves no half-cleaned / half-constrained state.
@@ -45,9 +47,40 @@ module.exports = {
       const deleted = Array.isArray(orphans) ? orphans.length : 0;
       console.log(`[EP-FK] orphaned rows deleted: ${deleted}`);
 
-      // (2) GUARDED FK ADD — idempotent via pg_constraint existence check.
+      // (2) GUARDED FK ADD.
+      //
+      // DECISION Phase 88.4 RC-2 (88.4-DRIFT-CENSUS.md § 4.2, findings F-37/F-38/F-39): the guard
+      // probes STRUCTURE — an existing `contype='f'` on (this column -> the same parent table) under
+      // ANY NAME — over the `conname = :name` check it used to be. The name check is kept as a
+      // second arm so the intent is still explicit.
+      //
+      // WHY: this migration's original `conname`-only guard IS the root cause of three of the
+      // day-one census's findings. The constraint that already existed on these tables was created
+      // by `sync()` in the pre-migration era and is CamelCase
+      // (`EventParticipations_user_id_fkey`, `Events_winner_id_fkey`, `Events_picked_by_id_fkey`);
+      // this file probes for a LOWERCASE name, found nothing, and added a SECOND, functionally
+      // redundant foreign key on the same column — with no error, on every database where the
+      // CamelCase one was present. The from-empty replay reproduces it exactly: 9 FKs across the two
+      // tables where there should be 6.
+      //
+      // Editing this file does NOT fix prod (the filename is already booked in prod's
+      // SequelizeMeta, so it will never run there again) — migration
+      // 20260730000001-reconcile-duplicate-constraints.js drops the duplicates prod is carrying.
+      // This change fixes the FROM-EMPTY REPLAY and every future dev/CI database, which is what the
+      // drift gate actually compares. Both halves are needed; neither substitutes for the other.
+      // Reverting this to a name-only probe re-creates the duplicates and reds the gate.
       const existing = await sequelize.query(
-        `SELECT 1 FROM pg_constraint WHERE conname = :name`,
+        `SELECT 1
+           FROM pg_constraint c
+           JOIN pg_attribute a
+             ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1]
+          WHERE c.contype = 'f'
+            AND c.conrelid  = to_regclass('"EventParticipations"')
+            AND c.confrelid = to_regclass('"Users"')
+            AND array_length(c.conkey, 1) = 1
+            AND a.attname = 'user_id'
+          UNION ALL
+         SELECT 1 FROM pg_constraint WHERE conname = :name`,
         { replacements: { name: FK_NAME }, type: QueryTypes.SELECT, transaction: t }
       );
 
@@ -60,7 +93,10 @@ module.exports = {
         );
         console.log(`[EP-FK] constraint ${FK_NAME} added (ON DELETE CASCADE).`);
       } else {
-        console.log(`[EP-FK] constraint ${FK_NAME} already present, skipping.`);
+        console.log(
+          `[EP-FK] an equivalent FK on EventParticipations.user_id -> Users already exists ` +
+            `(any name); skipping ${FK_NAME}.`
+        );
       }
     });
   },

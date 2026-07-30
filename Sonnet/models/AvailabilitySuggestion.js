@@ -98,6 +98,23 @@ const AvailabilitySuggestion = sequelize.define('AvailabilitySuggestion', {
     },
     {
       fields: ['suggested_start', 'suggested_end']
+    },
+    {
+      // DECISION Phase 88.4 F-33 (D2a): the GIN index prod already has (migration
+      // 20260208000001:19) is declared model-side, OVER allowlisting it as inexpressible.
+      // VERIFIED against the installed Sequelize 6.37.7 rather than assumed: this declaration
+      // emits
+      //   CREATE INDEX "idx_suggestion_participant_ids_gin"
+      //     ON "AvailabilitySuggestions" USING gin ("participant_user_ids" jsonb_path_ops)
+      // which is byte-identical to the migration's definition. `using` + a per-field `operator`
+      // (the opclass) are both supported — see query-generator.js:445-448 and :486.
+      //
+      // The access method IS part of a non-unique index's identity (D-04), so a btree here would
+      // NOT match: if you change `using`, change the migration in the same commit or the drift gate
+      // goes red. Dual-declared; explicit name keeps sync() and the migration identical.
+      fields: [{ name: 'participant_user_ids', operator: 'jsonb_path_ops' }],
+      using: 'gin',
+      name: 'idx_suggestion_participant_ids_gin'
     }
   ]
 });

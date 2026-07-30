@@ -8,13 +8,19 @@
 # branch protection). Therefore this file lives at the repo root, and every app-touching
 # step sets `working-directory: Sonnet` with `cache-dependency-path: Sonnet/package-lock.json`.
 #
-# Two jobs (D-06 / BSEC-02):
+# Three jobs (D-06 / BSEC-02):
 #   quality  — fast gate: install + six inverted grep backstops (D-01 / D-05 / BE-043,
 #              the two 83.1 test-hygiene gates, and the 88.2 F-02 paranoid-destroy gate),
-#              ONE presence gate that fails on an ABSENT string rather than a present one
-#              (88.2 SPEC-REQ-10, the purge sweep's explicit child deletes), plus the
-#              D-04 skip-count ratchet
+#              TWO presence gates that fail on an ABSENT string rather than a present one
+#              (88.2 SPEC-REQ-10, the purge sweep's explicit child deletes; and 88.4
+#              SPEC R6, a DECISION marker on every schema-drift allowlist entry), ONE
+#              STRUCTURAL gate that parses THIS FILE and asserts the migrate-cli-replay
+#              drift gate is still armed (88.4 D-88.4-05 — deliberately not a grep; see
+#              its own comment), plus the D-04 skip-count ratchet
 #   test     — slow gate (needs: quality): Jest/supertest against a Postgres service container
+#   migrate-cli-replay — slow gate (needs: quality): the real sequelize-cli migration path
+#              replayed from an EMPTY database, diffed against a sequelize.sync() build of
+#              the same commit's models (88.4). See its own header comment below.
 name: CI
 
 on:
@@ -206,6 +212,88 @@ jobs:
           fi
           echo "SPEC-REQ-10 purge-delete gate passed — both explicit deletes present."
 
+      - name: "Grep gate — every schema-drift allowlist entry carries a DECISION Phase 88.4 marker (88.4 / SPEC R6)"
+        working-directory: Sonnet
+        # PRESENCE gate, like the SPEC-REQ-10 one above (and unlike the six inverted
+        # backstops): it fails when a REQUIRED string is ABSENT.
+        #
+        # scripts/ci/schema-drift-allowlist.js is the ONLY way a migrate-cli-replay drift
+        # finding gets suppressed. D-07 / SPEC R6 therefore require a full
+        # `DECISION Phase 88.4 <accepted> OVER <rejected> — <why>` block on EVERY entry: an
+        # entry with no rationale is accepted schema drift with nobody's reasoning attached,
+        # and it reads in review as though the drift WAS reviewed, so the next reader stops
+        # looking. This gate lives in `quality` (not in migrate-cli-replay) so the failure is
+        # 30 seconds into the run and needs no database.
+        #
+        # PER-ENTRY PAIRING IS NOW ENFORCED STRUCTURALLY, not implied by a total
+        # (88.4-CODE-REVIEW.md #3 + #10). This step used to compare ENTRIES.length against an
+        # anchored `grep -c` of marker lines and fail only when markers < entries, conceding in
+        # its own comment that pairing was "enforced upstream by the allowlist module's own
+        # header" — i.e. by a comment. Three malformed files passed it: an unmarked entry masked
+        # by a duplicated token on a sibling's block; an orphaned block left behind when an entry
+        # was deleted (markers > entries passed silently); and markers stacked against the wrong
+        # entries. SPEC R6's acceptance is a PER-ENTRY property and two totals cannot express one.
+        #
+        # scripts/ci/verify-allowlist-markers.js walks the ENTRIES array with a bracket+brace
+        # scanner and asserts three things independently — every entry is immediately preceded by
+        # its own marker run, no marker is orphaned, and the counts agree. It lives in a committed
+        # script rather than inline here so it is UNIT-TESTED
+        # (tests/unit/verify-allowlist-markers.test.js, 16 cases incl. all three files that used
+        # to slip through): a gate whose job is catching sloppy edits to a security-relevant
+        # policy file must not itself be an unverifiable one-liner.
+        #
+        # It also runs validateAllowlist separately below. That is NOT belt-and-braces: the
+        # allowlist module does NOT validate itself at load — schema-drift-diff.js:73-80 is what
+        # calls the validator — so without that line a malformed policy file sails through the
+        # fast job and only throws minutes later inside migrate-cli-replay, where it reads as a
+        # differ crash rather than as the policy typo it is. Safe in this fast job: the module
+        # opens no DB connection and pulls in no models (88.4-04).
+        run: |
+          FILE=scripts/ci/schema-drift-allowlist.js
+          if [ ! -f "$FILE" ]; then
+            echo "::error::$FILE is missing. scripts/ci/schema-drift-diff.js require()s it, so its absence fails the migrate-cli-replay job in a far less obvious place. Restore it — an EMPTY ENTRIES array is the correct day-one state (D-08), so there is no reason to delete the file."
+            exit 1
+          fi
+          if ! node -e "const m = require('./scripts/ci/schema-drift-allowlist.js'); m.validateAllowlist(m.ENTRIES); console.log('validateAllowlist OK — ' + m.ENTRIES.length + ' entr(y/ies)')"; then
+            echo "::error::$FILE failed to load or failed its own validator (see the thrown message above). validateAllowlist THROWS on any entry shape it does not fully understand (T-88.4-13) — a malformed accepted-drift policy is a crash, not a finding. Every entry must also pin the FULL normalized identity for its kind (PIN_FIELDS), not just keySpec + predicate: a partial pin suppresses objects nobody reviewed. Fix the entry it names; scripts/ci/schema-drift-diff.js calls the same validator at require time, so migrate-cli-replay cannot run until this loads clean."
+            exit 1
+          fi
+          node scripts/ci/verify-allowlist-markers.js "$FILE"
+
+      - name: "Armed gate — the migrate-cli-replay schema drift gate must stay ARMED (88.4 / D-88.4-05)"
+        working-directory: Sonnet
+        # NOT A GREP GATE, and that distinction is the whole point of this step. It PARSES this
+        # file and reads effective env KEYS.
+        #
+        # WHAT IT PROTECTS. Plan 88.4-09 armed the drift gate by DELETING one line —
+        # `SCHEMA_DRIFT_REPORT_ONLY: "1"` — from the `Schema drift diff` step further down. The
+        # differ still READS that flag (deliberately: the mechanism stays testable, and a differ
+        # CRASH must fail the step in both modes). So re-adding one line silently turns
+        # `migrate-cli-replay` back into a job that reports GREEN while gating NOTHING — and as of
+        # Plan 88.4-10 that job is a REQUIRED status check on `main`, so the result would be a
+        # required check that is green and vacuous, with everyone downstream believing drift is
+        # being caught. Until this step existed the only thing preventing that was the ARMED
+        # comment below plus code review: behavioural mitigations, neither failing independently of
+        # a human reading them (deferred-items.md D-88.4-05, owner-approved 2026-07-30).
+        #
+        # WHY IT CANNOT BE `grep SCHEMA_DRIFT_REPORT_ONLY .github/workflows/ci.yml`. The ARMED
+        # block below deliberately NAMES the forbidden string so a developer under CI pressure
+        # reads the warning before reaching for the shortcut. That warning is worth more than
+        # grepability — but it means grep now hits on a HEALTHY file, so a text check cannot tell
+        # "the flag is set" from "the flag is forbidden in prose". Plan 09's plan-supplied arming
+        # check was two such regexes and both false-positived on that very comment; it reported the
+        # gate DISARMED against a correctly armed file, and by symmetry could have reported ARMED
+        # against a disarmed one. Same defect class as 88.4-CODE-REVIEW.md #3/#10, which this phase
+        # already rejected twice: a gate that reads text where it should read structure.
+        #
+        # It lives in `quality` (not in migrate-cli-replay) so the failure is 30 seconds in and
+        # needs no database, and in a committed UNIT-TESTED script rather than inline here —
+        # tests/unit/verify-gate-armed.test.js drives it over the seven ci.yml-scoped disarm
+        # scenarios Plan 09 negative-controlled, plus the job deleted, the differ step deleted, and
+        # the D-06 URL-chain keys. A gate whose whole purpose is catching a one-line disarm must
+        # not itself be an unverifiable one-liner.
+        run: node scripts/ci/verify-gate-armed.js
+
       - name: "Grep gate — stray sequelize.close() in tests (D-01 / BTEST-02)"
         working-directory: Sonnet
         # Fail if any tests/ file OTHER THAN the two harness files contains an
@@ -310,9 +398,24 @@ jobs:
         working-directory: Sonnet
         run: npm ci
 
-      # NO migrate step (A5): the earliest migration assumes the "Users" table already
-      # exists and cannot run from an empty DB. Schema is built from the models instead:
-      # db:create provisions the database, seed runs sequelize.sync({ alter: true }).
+      # NO migrate step — and as of Phase 88.4 the reason is NOT that it cannot run.
+      #
+      # The original A5 rationale said "the earliest migration assumes the Users table already
+      # exists and cannot run from an empty DB". That premise was REMOVED by Phase 88.4's guarded
+      # baseline migration (migrations/00000000000000-baseline-pre-migration-schema.js): the chain
+      # now replays from a genuinely empty database, and the migrate-cli-replay job further down
+      # THIS FILE proves it on every run. Leaving the old wording in place would invite a future
+      # reader to "fix" this job by adding a migrate step — undoing a deliberate boundary — or to
+      # stop trusting this file's comments, which this codebase leans on heavily as decision records.
+      #
+      # DECISION Phase 88.4: this job stays SYNC-BUILT (db:create, then seed running
+      # sequelize.sync({ alter: true })) OVER migrating it now that migrating is possible. That is
+      # the 88.4 SPEC boundary, not inertia — "sync-built test DBs are exactly what this gate makes
+      # safe". The suite's job is to test application behaviour against the models; the
+      # migrate-cli-replay drift gate is what makes a sync-built schema trustworthy by proving it
+      # is structurally equivalent to the migration-built one prod runs. Migrating here would
+      # remove the very divergence the gate exists to observe. Switching this to migrate is a
+      # decision, not a cleanup.
       - name: Create database
         working-directory: Sonnet
         run: npm run db:create
@@ -334,23 +437,63 @@ jobs:
         working-directory: Sonnet
         run: npm run test:integration
 
-  # ---- migrate-cli-replay (Phase 87.1 review, F8 / HIGH-2 opt-3) --------------
-  # ADDITIVE job (does not alter `quality` or `test`). It exercises the REAL
-  # sequelize-cli migration path for the 7 UUID re-key migrations (20260703000001..07),
-  # which backend CI otherwise NEVER runs (see the "NO migrate step (A5)" note in the
-  # `test` job — the schema is sync()-built, not migrated). Because of the known local
-  # cli-migrations gap (URL-only CLI config + a full-chain replay that collides on
-  # already-built tables), Railway pre-deploy would otherwise be the FIRST-EVER real
-  # sequelize-cli run of these migrations. This job moves that first run into CI:
-  #   1. provision a TRUE pre-migration schema (sync from models, then per re-keyed
-  #      table drop *_uuid + re-add the legacy Auth0-string column(s), and seed
-  #      SequelizeMeta with every migration EXCEPT the 7 new ones);
-  #   2. run `npx sequelize-cli db:migrate` — the real CLI config + SequelizeMeta path;
-  #   3. verify all 7 re-key files are now recorded in SequelizeMeta.
+  # ---- migrate-cli-replay (Phase 88.4 D-05; extends Phase 87.1 review F8) -----
+  # ADDITIVE job (does not alter `quality` or `test`). It is the ONLY place backend CI
+  # runs the REAL sequelize-cli migration path: the `test` job builds its schema with
+  # sequelize.sync() (see its "NO migrate step (A5)" note), so without this job the
+  # Railway pre-deploy step would be the FIRST-EVER real CLI run of every migration.
+  # Phase 88.4 additionally makes migration-vs-model DRIFT visible, which requires two
+  # independently-built schemas on one service container — a from-empty replay cannot
+  # detect drift against anything if the only database in the job is the one it built.
+  # (Provenance, HISTORICAL — do not go looking for this file, it is gone: this job
+  # replaces the earlier design that leaned on the since-DELETED
+  # `Sonnet/scripts/ci/provision-premigration-schema.js` to SIMULATE a pre-migration schema
+  # and replay only the 17 newest migrations. Recoverable from git history if ever needed;
+  # see the DECISION marker inside the job below for the full lineage.)
+  #
+  # What the job does:
+  #   1. create a second, throwaway `schema_sync` database on the same service container;
+  #   2. PROVE the migration side is empty — zero user relations, zero user enums — BEFORE
+  #      anything is replayed into it (88.4-CODE-REVIEW.md #11). Every claim below about
+  #      "from EMPTY" rests on this step and no longer on service-container freshness;
+  #   3. MIGRATION SIDE — `npx sequelize-cli db:migrate` into `boardgame_db` from EMPTY:
+  #      the guarded baseline (migrations/00000000000000-baseline-pre-migration-schema.js)
+  #      plus every migration after it. No sync() ever touches this database and
+  #      SequelizeMeta is never pre-seeded, so a defect on ANY migration's
+  #      table-creation branch surfaces here instead of on Railway;
+  #   4. assert every migration filename is booked in SequelizeMeta (no silent skips —
+  #      a short replay would otherwise be reported by step 6 as model drift);
+  #   5. SYNC SIDE — sequelize.sync() from THIS commit's models into `schema_sync`;
+  #   6. diff the two schemas (tables / FKs / PKs / uniques / indexes) minus the
+  #      signed-off allowlist. ARMED as of Plan 88.4-09 (D-08) — a finding FAILS this job;
+  #   7. baseline no-op proof — run the baseline migration ALONE against the sync-built
+  #      database: the exact shape prod sees on the first deploy after this merges.
   migrate-cli-replay:
+    # DECISION Phase 88.4 D-05: a REAL from-empty replay of all 77 migration files OVER
+    # the retired provision script's SIMULATION of a pre-migration schema (sync-build a
+    # base, rewind ~16 migrations, hand-seed SequelizeMeta with the ~53 older filenames,
+    # then replay only the 17 newest). This EXTENDS the Phase 87.1 review F8 decision, it
+    # does not reverse it: F8 wanted the real CLI + SequelizeMeta path exercised in CI
+    # rather than first on Railway, and a from-empty replay covers all 77 files where the
+    # simulation covered 17 — strictly more of what F8 asked for. The script existed only
+    # because the chain could not book from an empty database, which is exactly the
+    # constraint Plan 01's guarded baseline removed (the script's own header said so), so
+    # what is retired is the compensating MECHANISM, not the decision. The rekey `down()`
+    # replays and populated-row backfills that script also exercised are independently
+    # covered by tests/migrations/rekey.test.js in the `test` job, which this design does
+    # not touch.
+    # ALSO REJECTED: keeping a second, sibling job alongside this one for a soak period.
+    # It would rebuild the identical scaffold on every PR and leave TWO required checks
+    # asserting the same property, the weaker of which can still green a broken chain.
+    # Widening this back to a simulated pre-migration base is a decision, not a cleanup.
     name: migrate-cli-replay
     needs: quality # gate behind the fast grep gate (like `test`); independent of `test`
     runs-on: ubuntu-latest
+    # RESEARCH R-10: 32 migrations open their OWN connection via
+    # require('../config/database') and none of them calls sequelize.close(), so a hang at
+    # the end of db:migrate is a low-probability but real failure mode. A hung job is worse
+    # than a failed one — cap it.
+    timeout-minutes: 20
 
     services:
       postgres:
@@ -368,16 +511,39 @@ jobs:
           --health-retries 5
 
     env:
-      # The provision script (models) prefers DATABASE_URL; the sequelize-cli config
-      # (config/sequelize-cli.config.js) is URL-only and reads the same DATABASE_URL —
-      # so both hit the SAME throwaway service DB (closes the known URL-only CLI gap).
+      # DB_* are the service container's coordinates (kept for any tool that reads the
+      # individual vars rather than a URL).
       DB_HOST: localhost
       DB_PORT: 5432
       DB_USER: postgres
       DB_PASSWORD: password
       DB_NAME: boardgame_db
-      DATABASE_URL: postgres://postgres:password@localhost:5432/boardgame_db
+      # models/index.js reaches models/SingleUseToken.js, which may read this at require
+      # time. Throwaway CI-only value — it must merely exist.
       MAGIC_TOKEN_SECRET: ci-throwaway-magic-token-secret-1f2e3d4c5b6a
+      # Purpose-named URLs. None of these three is read by the app's connection chain, so
+      # they cannot be captured by it (that is the point — see the D-06 note below).
+      ADMIN_DB_URL: postgres://postgres:password@localhost:5432/postgres
+      MIGRATE_DB_URL: postgres://postgres:password@localhost:5432/boardgame_db
+      SYNC_DB_URL: postgres://postgres:password@localhost:5432/schema_sync
+      #
+      # D-06 — READ BEFORE ADDING ANY env KEY TO THIS JOB.
+      # DATABASE_URL is deliberately NOT set at job level. Job-level env is inherited by
+      # EVERY step, and this job deliberately points two different steps at two different
+      # databases. Both config/database.js:16-19 and config/sequelize-cli.config.js:16-20
+      # resolve the SAME chain:
+      #     POSTGRES_PRIVATE_URL || POSTGRES_URL || DATABASE_URL || PGDATABASE_URL
+      # and 32 of the 76 post-baseline migrations open their own connection through the
+      # former. If DATABASE_URL were job-wide and one step overrode it, the CLI would write
+      # to one database while those 32 migrations wrote to another, and step 5 would then
+      # compare a half-built schema against itself and PASS. So DATABASE_URL is scoped
+      # per-step, and the other THREE members of that chain must never be set anywhere in
+      # this job:
+      #   - POSTGRES_PRIVATE_URL and POSTGRES_URL OUTRANK DATABASE_URL, so either one would
+      #     silently redirect the migrate step no matter what the step sets;
+      #   - PGDATABASE_URL is the chain's TAIL, so it would capture every step that does NOT
+      #     set DATABASE_URL — which is most of them.
+      # Setting any of the three is a false-green, not a convenience.
 
     steps:
       - name: Checkout
@@ -394,14 +560,168 @@ jobs:
         working-directory: Sonnet
         run: npm ci
 
-      - name: Provision TRUE pre-migration schema (F8)
-        working-directory: Sonnet
-        run: node scripts/ci/provision-premigration-schema.js provision
+      # Each step below restates the URL(s) it needs even when the job-level value is
+      # identical. That is deliberate: per D-06 the database a step targets has to be
+      # readable from the step itself, not inferred from a job-level default.
 
-      - name: Run the real sequelize-cli migration path (npx sequelize-cli db:migrate)
+      - name: Create the sync-side database
         working-directory: Sonnet
+        env:
+          ADMIN_DB_URL: ${{ env.ADMIN_DB_URL }}
+        # Bare `DROP DATABASE IF EXISTS schema_sync` + `CREATE DATABASE`. It runs FIRST, on
+        # a fresh service container, because Postgres refuses the DROP while any session
+        # holds a connection to that database. Do not move it after a step that connects
+        # to `schema_sync`.
+        run: node scripts/ci/create-sync-db.js
+
+      # RUNS IMMEDIATELY BEFORE THE REPLAY, and the adjacency is the point: this step is what
+      # makes the words "from EMPTY" in the next step's name true. Before it existed, the
+      # from-empty property — the property the entire job is built on — rested on nothing but
+      # the freshness of the service container. See the script header for the false-green it
+      # closes: a pre-seeded SequelizeMeta makes db:migrate skip, makes
+      # verify-migration-chain.js pass anyway, and makes the drift diff compare a schema the
+      # migration chain never built. Do not reorder this after the replay; a post-hoc check
+      # cannot fire before the database has already been written to.
+      - name: Assert the migration side started EMPTY (before any replay)
+        working-directory: Sonnet
+        env:
+          # Purpose-named, NOT DATABASE_URL (D-06): this assert must be impossible to steer
+          # onto the sync database, where a pass would be meaningless.
+          MIGRATE_DB_URL: ${{ env.MIGRATE_DB_URL }}
+        run: node scripts/ci/assert-migrate-db-empty.js
+
+      - name: Migration-side build — baseline + every migration from EMPTY
+        working-directory: Sonnet
+        env:
+          # THE ONLY STEP where DATABASE_URL points at the MIGRATION database, and it must
+          # stay that way: the sequelize-cli config AND the 32 self-connecting migrations
+          # both resolve it, and they have to land on the same database (D-06).
+          DATABASE_URL: ${{ env.MIGRATE_DB_URL }}
         run: npx sequelize-cli db:migrate
 
-      - name: Verify all 7 re-key migrations booked in SequelizeMeta (F8)
+      - name: Verify every migration booked in SequelizeMeta
         working-directory: Sonnet
-        run: node scripts/ci/provision-premigration-schema.js verify
+        env:
+          MIGRATE_DB_URL: ${{ env.MIGRATE_DB_URL }}
+        run: node scripts/ci/verify-migration-chain.js
+
+      - name: Sync-side build — sequelize.sync() from models
+        working-directory: Sonnet
+        env:
+          # Step-scoped to the SYNC database. The script asserts its resolved database name
+          # is `schema_sync` before it syncs, so a missing or mis-indented value here fails
+          # loudly instead of silently overwriting the migration-built schema.
+          DATABASE_URL: ${{ env.SYNC_DB_URL }}
+        run: node scripts/ci/sync-build-schema.js
+
+      - name: Schema drift diff
+        working-directory: Sonnet
+        env:
+          MIGRATE_DB_URL: ${{ env.MIGRATE_DB_URL }}
+          SYNC_DB_URL: ${{ env.SYNC_DB_URL }}
+        # ============================ THE GATE IS ARMED ============================
+        # ARMED by Plan 88.4-09 (D-08 flip, SPEC R7). `SCHEMA_DRIFT_REPORT_ONLY` USED TO SIT
+        # IN THE env BLOCK ABOVE AND HAS BEEN DELETED. A schema-drift finding now FAILS this
+        # job and blocks the PR. There is no report-only mode in backend CI any more.
+        #
+        # It could be armed because the drift was driven to ZERO first and MEASURED, not
+        # predicted: 88.4-DRIFT-CENSUS.md carries all 43 day-one findings, every one of them
+        # dispositioned `reconcile` with an owner sign-off dated 2026-07-30 (its § 7), all 43
+        # were executed in Plan 08, and CI run 30513558890 then reported 164 vs 164 canonical
+        # identities and `[88.4] NO SCHEMA DRIFT` with the allowlist EMPTY. Arming a gate that
+        # is already red is the one thing the SPEC forbids.
+        #
+        # ---- IF THIS STEP IS FAILING YOUR PR, READ THIS BEFORE YOU EDIT THIS FILE ----
+        # The ONLY sanctioned way to accept a difference is an entry in
+        # scripts/ci/schema-drift-allowlist.js that pins the FULL normalized identity of the
+        # object and carries an owner-signed `// DECISION Phase 88.4` marker immediately above
+        # it — which the `quality` job's marker gate (scripts/ci/verify-allowlist-markers.js)
+        # structurally enforces, per entry, so an unmarked entry cannot merge.
+        #
+        # RE-ADDING `SCHEMA_DRIFT_REPORT_ONLY: "1"` IS NOT AN OPTION. It is named here because
+        # it is the obvious shortcut a developer under CI pressure will reach for, it is a
+        # one-line edit, and it silently converts this gate into a job that gates NOTHING while
+        # still reporting green — which is strictly worse than never having built it, because
+        # everyone downstream believes drift is being caught. The differ still reads the flag
+        # (that is deliberate: the mechanism stays testable, and see the D-08 marker in
+        # scripts/ci/schema-drift-diff.js). AND AS OF PLAN 88.4-10 A COMMENT IS NO LONGER THE ONLY
+        # THING STOPPING YOU: the `quality` job runs scripts/ci/verify-gate-armed.js, which parses
+        # this file and FAILS if `SCHEMA_DRIFT_REPORT_ONLY` is an env key at workflow, job or step
+        # level, if `continue-on-error` appears on this job or any of its steps, if this job or its
+        # differ / from-empty steps are missing, or if the step order is wrong. Re-adding the flag
+        # now reds the fast job in 30 seconds — which is the point, because this job became a
+        # REQUIRED check in the same plan (D-88.4-05). If the drift is genuine, reconcile it or
+        # allowlist it with a signature; if the gate is wrong, fix the gate. Disarming it means
+        # deleting that guard in the same commit, deliberately and visibly — a decision that
+        # belongs to the owner, not to a red PR.
+        #
+        # Report-only was always an env flag the differ reads rather than a step-level
+        # `continue-on-error`, precisely so that arming would be this reviewable one-line
+        # deletion AND so that a differ CRASH would fail the step in both modes.
+        # `continue-on-error` would have swallowed a genuine crash and made it look identical
+        # to a clean pass — do not substitute it for the flag either.
+        run: node scripts/ci/schema-drift-diff.js
+
+      - name: Baseline no-op proof — baseline migration only, against the sync-built DB
+        working-directory: Sonnet
+        env:
+          # BOTH point at the SYNC database on purpose: the CLI resolves DATABASE_URL, and
+          # the inline SequelizeMeta assertion below reads MIGRATE_DB_URL — here the
+          # "migrate side" IS the sync-built database, because that is the database under
+          # proof.
+          DATABASE_URL: ${{ env.SYNC_DB_URL }}
+          MIGRATE_DB_URL: ${{ env.SYNC_DB_URL }}
+        # D-02's provisioned-path assertion: the guarded baseline must meet an ALREADY-BUILT
+        # schema, take its no-op branch, and still book its filename. That is exactly what
+        # the first Railway deploy after this merges will do, and a baseline that hard-fails
+        # there blocks the deploy.
+        #
+        # SCOPED TO THE BASELINE ONLY (--to), NEVER the unscoped `db:migrate`. The
+        # sync-built database already contains every modern table, and unguarded historical
+        # migrations are guaranteed to collide with it — e.g.
+        # migrations/20260107-create-user-availability.js:6 does a bare
+        # createTable('UserAvailabilities') that sync() has already created, and
+        # migrations/20260108-fix-usergroup-user-id-type.js:9 changeColumn's a
+        # `UserGroups.user_id` that the models no longer declare (dropped in 87.5 D-08). A
+        # full-chain replay against THIS database can never succeed, so widening this step
+        # back out would permanently red the job, not strengthen it.
+        #
+        # RUNS LAST, AFTER the diff, because it MUTATES the sync side (it books a
+        # SequelizeMeta row). Reordering it ahead of the differ would change the schema the
+        # differ reads. If that ordering constraint ever becomes impossible, the answer is a
+        # THIRD throwaway database, not a reordering.
+        #
+        # The assertion is baseline-SCOPED on purpose: scripts/ci/verify-migration-chain.js
+        # (step 3) expects all 77 filenames booked and would fail here, where exactly one
+        # migration ran.
+        run: |
+          set -o pipefail
+          BASELINE=00000000000000-baseline-pre-migration-schema.js
+          npx sequelize-cli db:migrate --to "$BASELINE" 2>&1 | tee /tmp/baseline-noop.log
+          if ! grep -q 'no-op, booking filename only' /tmp/baseline-noop.log; then
+            echo "::error::[88.4-baseline-proof] the baseline did NOT take its no-op branch against the sync-built database. It must detect the existing \"Users\" table and return without executing DDL — otherwise the first Railway deploy after this merges runs CREATE TABLE against a populated production database. Check the existence guard in migrations/$BASELINE."
+            exit 1
+          fi
+          BASELINE_NAME="$BASELINE" node -e '
+            const { Client } = require("pg");
+            const expected = process.env.BASELINE_NAME;
+            const client = new Client({ connectionString: process.env.MIGRATE_DB_URL, connectionTimeoutMillis: 10000 });
+            (async () => {
+              try {
+                await client.connect();
+                const { rows } = await client.query("SELECT name FROM \"SequelizeMeta\" ORDER BY name");
+                const names = rows.map((r) => r.name);
+                if (names.length !== 1 || names[0] !== expected) {
+                  console.error("::error::[88.4-baseline-proof] expected EXACTLY one booked migration (" + expected + ") on the sync-built database; SequelizeMeta holds: " + (names.join(", ") || "(none)") + ". A no-op that is not booked would re-run on every deploy; anything else booked means this step was not scoped to the baseline.");
+                  process.exitCode = 1;
+                  return;
+                }
+                console.log("[88.4-baseline-proof] OK — baseline no-opped against the already-built schema and booked its filename, nothing else ran.");
+              } catch (err) {
+                console.error("::error::[88.4-baseline-proof] " + (err && err.message ? err.message : err));
+                process.exitCode = 1;
+              } finally {
+                await client.end().catch(() => {});
+              }
+            })();
+          '

@@ -35,6 +35,74 @@ const PendingAuth0Deletion = require('./PendingAuth0Deletion');
 const sequelize = require('../config/database');
 
 
+// ---------------------------------------------------------------------------------------
+// DECISION Phase 88.4 D1a (88.4-DRIFT-CENSUS.md § 4.3, RC-1 — findings F-01…F-23):
+// `onUpdate: 'NO ACTION'` is declared EXPLICITLY on 23 associations below, OVER converging the
+// other way by rebuilding 23 foreign keys on production.
+//
+// THE DRIFT. Before this, `onUpdate` appeared ZERO times anywhere under `models/` — across all 27
+// models and all 84 association calls here. Sequelize 6.37.7 therefore applied its UNCONDITIONAL
+// default (`node_modules/sequelize/lib/associations/has-many.js:106` and `belongs-to.js:80` are
+// both `onUpdate = onUpdate || "CASCADE"`), while the migrations that created the same FKs specify
+// only `onDelete` and so get Postgres's `NO ACTION`. That single omission is 23 of the day-one
+// census's 43 findings: every sync()-built database (the BE Jest DB, the FE e2e DB) carried
+// `ON UPDATE CASCADE` on FKs that prod carries as `NO ACTION`.
+//
+// WHY MODEL-SIDE. Converging migration-side would mean dropping and recreating 23 FKs on prod,
+// taking ACCESS EXCLUSIVE locks across 18 tables plus revalidation scans, to change a clause that
+// only ever fires when a PARENT KEY VALUE IS UPDATED — and every parent here is an immutable UUID
+// primary key or `Users.user_id` (the Auth0 subject), neither of which is rewritten in normal
+// operation. The owner was shown that cost and declined it. Editing these lines changes NOTHING
+// about production: it makes the test databases honest about the shape prod already has.
+//
+// F-20 WAS BROKEN OUT AND THE EXCEPTION WAS DECLINED (D1b). `MagicTokens.user_id -> Users(user_id)`
+// is one of only two rows whose parent key is the Auth0 subject rather than an immutable UUID, so
+// it is one of only two where ON UPDATE could ever fire. The owner was offered `CASCADE` there and
+// chose `NO ACTION` with the rest: an UPDATE that fails loudly beats one that propagates silently,
+// and any future account-linking feature needs a deliberate migration anyway, which can set the
+// action then.
+//
+// ONLY THESE 23 — DO NOT "FINISH THE JOB" BY ADDING `onUpdate` TO THE OTHER ~61 ASSOCIATIONS.
+// This asymmetry is deliberate and load-bearing, and it is the thing a future reader is most likely
+// to mistake for an oversight. Six FK declarations in the migration chain DO specify
+// `onUpdate: 'CASCADE'` (20260310000001:48,58,103; 20260308000001:71; 20260228000001:78;
+// 20260329100001:35), and every FK created by the baseline migration inherits `ON UPDATE CASCADE`
+// too because the baseline was captured from a pg_dump of a sync()-built database. All of those
+// already AGREE with Sequelize's CASCADE default and produce zero findings — census § 4.1 proves it
+// as a controlled experiment: every FK whose migration omits `onUpdate` drifts, every FK whose
+// migration specifies it does not. Adding `NO ACTION` to those would CREATE new drift where there
+// is none today, and Plan 09 arms the gate on this being zero. Each site below names its census
+// finding ID so the mapping is checkable rather than asserted.
+//
+// DECLARED ON BOTH SIDES of each pair, matching how `onDelete` is already declared throughout this
+// file — and the mechanism is FIRST-WRITER-WINS, not last, which is worth stating because it is the
+// opposite of the intuitive reading. `hasMany` and `belongsTo` both build a `newAttributes` object,
+// hand it to `Helpers.addForeignKeyConstraints`, and then merge it with
+// `Utils.mergeDefaults(target.rawAttributes, newAttributes)` (`has-many.js` / `belongs-to.js`,
+// `_injectAttributes`). `mergeDefaults` only fills in fields that are MISSING — it does not
+// overwrite. So whichever of the two association calls runs FIRST sets the FK action, and the second
+// is a silent no-op. Declaring the same value on both sides is therefore what makes the emitted DDL
+// independent of the order of the lines in this file; it is not duplication.
+//
+// THE ONE PLACE THAT RULE BITES, AND WHY F-23 IS DECLARED IN models/UserGroup.js INSTEAD.
+// `UserGroups.user_uuid` is also written by the two `belongsToMany` calls above, which run BEFORE
+// the `UserGroup.belongsTo(User, ...)` / `User.hasMany(UserGroup, ...)` pair below and win under
+// first-writer-wins — so an `onUpdate` set only on that pair is ignored, and the FK still emits
+// `ON UPDATE CASCADE`. Verified empirically, not read off the source: tracing every writer of
+// `UserGroup.rawAttributes.user_uuid.onUpdate` while requiring this barrel shows exactly three
+// writes, all `CASCADE`, all from `belongsToMany`'s `Object.assign`, and none from the pair below.
+// The fix is an ATTRIBUTE-level `onUpdate: 'NO ACTION'` in `models/UserGroup.js`, which
+// `belongsToMany` deliberately reads through (`belongs-to-many.js:233`:
+// `sourceAttribute.onUpdate = this.options.onUpdate || through.rawAttributes[fk].onUpdate`, and
+// `:243` the same for the otherKey). The pair below keeps its declaration anyway, so the intent is
+// visible where `onDelete` is.
+//
+// Every claim above about which associations converge was checked by rebuilding the sync side
+// against a real Postgres and re-running the differ, NOT by reading the library: the first pass
+// took 43 findings to 21, and it was the differ that reported F-23 still drifting and sent us to
+// look for the belongsToMany interaction.
+// ---------------------------------------------------------------------------------------
+
 // Define associations
 // Users ↔ Groups (Many-to-Many)
 // Phase 87.1 (BINT-02, D-01): re-keyed onto the internal UUID surrogate Users.id via
@@ -74,8 +142,12 @@ Group.belongsToMany(User, {
 
 
 // UserGroup → User (direct association for worker include queries)
-UserGroup.belongsTo(User, { foreignKey: 'user_uuid', onDelete: 'CASCADE' });
-User.hasMany(UserGroup, { foreignKey: 'user_uuid', onDelete: 'CASCADE' });
+// 88.4 F-23 (D1a): onUpdate NO ACTION. These two lines run AFTER the belongsToMany pair above,
+// which also writes UserGroups.user_uuid's FK options — so they are what the emitted DDL uses.
+// The belongsToMany is deliberately left alone: it also governs UserGroups.group_id, which agrees
+// with prod today and would start drifting if NO ACTION were added there.
+UserGroup.belongsTo(User, { foreignKey: 'user_uuid', onDelete: 'CASCADE', onUpdate: 'NO ACTION' });
+User.hasMany(UserGroup, { foreignKey: 'user_uuid', onDelete: 'CASCADE', onUpdate: 'NO ACTION' });
 
 // Groups ↔ Events (One-to-Many)
 Group.hasMany(Event, { foreignKey: 'group_id' });
@@ -127,61 +199,80 @@ UserGame.belongsTo(Game, { foreignKey: 'game_id' });
 // User Availability
 // Phase 87.5 (BINT-02, D-01): re-keyed onto Users.id via user_uuid (UUID PK), the
 // protective FK ON DELETE CASCADE. Default UUID key — no STRING sourceKey/targetKey.
-User.hasMany(UserAvailability, { foreignKey: 'user_uuid', sourceKey: 'id' });
-UserAvailability.belongsTo(User, { foreignKey: 'user_uuid', targetKey: 'id' });
+// 88.4 F-22 (D1a): onUpdate NO ACTION.
+User.hasMany(UserAvailability, { foreignKey: 'user_uuid', sourceKey: 'id', onUpdate: 'NO ACTION' });
+UserAvailability.belongsTo(User, { foreignKey: 'user_uuid', targetKey: 'id', onUpdate: 'NO ACTION' });
 
 // Group Prompt Settings (One-to-One)
-Group.hasOne(GroupPromptSettings, { foreignKey: 'group_id' });
-GroupPromptSettings.belongsTo(Group, { foreignKey: 'group_id' });
+// 88.4 F-17 (D1a): onUpdate NO ACTION.
+Group.hasOne(GroupPromptSettings, { foreignKey: 'group_id', onUpdate: 'NO ACTION' });
+GroupPromptSettings.belongsTo(Group, { foreignKey: 'group_id', onUpdate: 'NO ACTION' });
 
 // Availability Prompts (One-to-Many from Group)
-Group.hasMany(AvailabilityPrompt, { foreignKey: 'group_id' });
-AvailabilityPrompt.belongsTo(Group, { foreignKey: 'group_id' });
+// 88.4 F-02 (D1a): onUpdate NO ACTION.
+Group.hasMany(AvailabilityPrompt, { foreignKey: 'group_id', onUpdate: 'NO ACTION' });
+AvailabilityPrompt.belongsTo(Group, { foreignKey: 'group_id', onUpdate: 'NO ACTION' });
 
 // Availability Prompts (Many-to-One from Game, optional)
-Game.hasMany(AvailabilityPrompt, { foreignKey: 'game_id' });
-AvailabilityPrompt.belongsTo(Game, { foreignKey: 'game_id' });
+// 88.4 F-01 (D1a): onUpdate NO ACTION.
+Game.hasMany(AvailabilityPrompt, { foreignKey: 'game_id', onUpdate: 'NO ACTION' });
+AvailabilityPrompt.belongsTo(Game, { foreignKey: 'game_id', onUpdate: 'NO ACTION' });
 
 // Availability Prompts (Many-to-One from GroupPromptSettings, optional)
-GroupPromptSettings.hasMany(AvailabilityPrompt, { foreignKey: 'created_by_settings_id' });
-AvailabilityPrompt.belongsTo(GroupPromptSettings, { foreignKey: 'created_by_settings_id' });
+// 88.4 F-04 (D1a): onUpdate NO ACTION. Prod's copy of this FK is the deferred one appended by
+// migration 20260129-create-group-prompt-settings.js (the Plan 01 R-1c forward-reference repair).
+GroupPromptSettings.hasMany(AvailabilityPrompt, { foreignKey: 'created_by_settings_id', onUpdate: 'NO ACTION' });
+AvailabilityPrompt.belongsTo(GroupPromptSettings, { foreignKey: 'created_by_settings_id', onUpdate: 'NO ACTION' });
 
 // Phase 71.2 / D-SCHEMA-05: AvailabilityPrompt creator (manual polls only).
 // Used by Plan 03's UI to render "Started by [creator name]" via the Creator association.
 // User.id is UUID, so this association uses the default FK (no sourceKey/targetKey override).
-AvailabilityPrompt.belongsTo(User, { as: 'Creator', foreignKey: 'created_by_user_id', onDelete: 'SET NULL' });
+// 88.4 F-03 (D1a): onUpdate NO ACTION. One-sided association — there is no hasMany counterpart,
+// so this single line is the whole declaration.
+AvailabilityPrompt.belongsTo(User, { as: 'Creator', foreignKey: 'created_by_user_id', onDelete: 'SET NULL', onUpdate: 'NO ACTION' });
 
 // Phase 71.2 / D-SCHEMA-06: GroupPromptSettings creator (the user who first set up scheduling).
 // Used by Plan 02's recipient resolution: settings.created_by_user_id || group owner.
-GroupPromptSettings.belongsTo(User, { as: 'Creator', foreignKey: 'created_by_user_id', onDelete: 'SET NULL' });
+// 88.4 F-18 (D1a): onUpdate NO ACTION. One-sided association, as with F-03 above.
+GroupPromptSettings.belongsTo(User, { as: 'Creator', foreignKey: 'created_by_user_id', onDelete: 'SET NULL', onUpdate: 'NO ACTION' });
 
 // Availability Responses (One-to-Many from Prompt)
-AvailabilityPrompt.hasMany(AvailabilityResponse, { foreignKey: 'prompt_id' });
-AvailabilityResponse.belongsTo(AvailabilityPrompt, { foreignKey: 'prompt_id' });
+// 88.4 F-05 (D1a): onUpdate NO ACTION.
+AvailabilityPrompt.hasMany(AvailabilityResponse, { foreignKey: 'prompt_id', onUpdate: 'NO ACTION' });
+AvailabilityResponse.belongsTo(AvailabilityPrompt, { foreignKey: 'prompt_id', onUpdate: 'NO ACTION' });
 
 // Availability Responses (Many-to-One from User)
 // Phase 87.5 (BINT-02, D-01): re-keyed onto Users.id via user_uuid (UUID PK), the
 // protective FK ON DELETE CASCADE. Default UUID key — no STRING sourceKey/targetKey.
-User.hasMany(AvailabilityResponse, { foreignKey: 'user_uuid', sourceKey: 'id' });
-AvailabilityResponse.belongsTo(User, { foreignKey: 'user_uuid', targetKey: 'id' });
+// 88.4 F-06 (D1a): onUpdate NO ACTION.
+User.hasMany(AvailabilityResponse, { foreignKey: 'user_uuid', sourceKey: 'id', onUpdate: 'NO ACTION' });
+AvailabilityResponse.belongsTo(User, { foreignKey: 'user_uuid', targetKey: 'id', onUpdate: 'NO ACTION' });
 
 // Availability Suggestions (One-to-Many from Prompt)
-AvailabilityPrompt.hasMany(AvailabilitySuggestion, { foreignKey: 'prompt_id' });
-AvailabilitySuggestion.belongsTo(AvailabilityPrompt, { foreignKey: 'prompt_id' });
+// 88.4 F-07 (D1a): onUpdate NO ACTION.
+AvailabilityPrompt.hasMany(AvailabilitySuggestion, { foreignKey: 'prompt_id', onUpdate: 'NO ACTION' });
+AvailabilitySuggestion.belongsTo(AvailabilityPrompt, { foreignKey: 'prompt_id', onUpdate: 'NO ACTION' });
 
 // Availability Suggestions (Many-to-One from Event, optional)
 // Note: alias 'ConvertedEvent' to distinguish from other Event associations
-Event.hasMany(AvailabilitySuggestion, { as: 'ConvertedSuggestions', foreignKey: 'converted_to_event_id' });
-AvailabilitySuggestion.belongsTo(Event, { as: 'ConvertedEvent', foreignKey: 'converted_to_event_id' });
+// 88.4 F-08 (D1a): onUpdate NO ACTION.
+Event.hasMany(AvailabilitySuggestion, { as: 'ConvertedSuggestions', foreignKey: 'converted_to_event_id', onUpdate: 'NO ACTION' });
+AvailabilitySuggestion.belongsTo(Event, { as: 'ConvertedEvent', foreignKey: 'converted_to_event_id', onUpdate: 'NO ACTION' });
 
 // Magic Tokens (One-to-Many from User)
 // Note: Uses sourceKey/targetKey because user_id is STRING (Auth0 ID), not UUID
-User.hasMany(MagicToken, { foreignKey: 'user_id', sourceKey: 'user_id' });
-MagicToken.belongsTo(User, { foreignKey: 'user_id', targetKey: 'user_id' });
+// 88.4 F-20 (D1b): onUpdate NO ACTION — the CASCADE exception for this Auth0-subject parent was
+// offered to the owner and DECLINED. This is one of only two FKs in the schema whose parent key is
+// mutable in principle (Users.user_id, not a UUID PK), so it is one of only two where ON UPDATE
+// could ever fire. NO ACTION makes such an UPDATE fail loudly rather than propagate silently; a
+// future account-linking feature needs a deliberate migration anyway and can set the action then.
+User.hasMany(MagicToken, { foreignKey: 'user_id', sourceKey: 'user_id', onUpdate: 'NO ACTION' });
+MagicToken.belongsTo(User, { foreignKey: 'user_id', targetKey: 'user_id', onUpdate: 'NO ACTION' });
 
 // Magic Tokens (One-to-Many from AvailabilityPrompt)
-AvailabilityPrompt.hasMany(MagicToken, { foreignKey: 'prompt_id' });
-MagicToken.belongsTo(AvailabilityPrompt, { foreignKey: 'prompt_id' });
+// 88.4 F-19 (D1a): onUpdate NO ACTION.
+AvailabilityPrompt.hasMany(MagicToken, { foreignKey: 'prompt_id', onUpdate: 'NO ACTION' });
+MagicToken.belongsTo(AvailabilityPrompt, { foreignKey: 'prompt_id', onUpdate: 'NO ACTION' });
 
 // Single-Use Tokens (One-to-Many from User) — OAuth state nonce + RSVP single-use
 // Note: Uses sourceKey/targetKey because user_id is STRING (Auth0 ID), not UUID
@@ -215,10 +306,11 @@ SingleUseToken.belongsTo(User, { foreignKey: 'user_id', targetKey: 'user_id', on
 // Phase 87.1 (BINT-02, D-05): re-keyed onto Users.id via requester_uuid/addressee_uuid,
 // each a protective FK ON DELETE CASCADE (deleting either endpoint removes the pair row).
 // Default source/target key (Users.id) — no override needed.
-User.hasMany(Friendship, { as: 'SentFriendRequests', foreignKey: 'requester_uuid', onDelete: 'CASCADE' });
-User.hasMany(Friendship, { as: 'ReceivedFriendRequests', foreignKey: 'addressee_uuid', onDelete: 'CASCADE' });
-Friendship.belongsTo(User, { as: 'Requester', foreignKey: 'requester_uuid', onDelete: 'CASCADE' });
-Friendship.belongsTo(User, { as: 'Addressee', foreignKey: 'addressee_uuid', onDelete: 'CASCADE' });
+// 88.4 F-14 / F-15 (D1a): onUpdate NO ACTION on BOTH endpoints.
+User.hasMany(Friendship, { as: 'SentFriendRequests', foreignKey: 'requester_uuid', onDelete: 'CASCADE', onUpdate: 'NO ACTION' });
+User.hasMany(Friendship, { as: 'ReceivedFriendRequests', foreignKey: 'addressee_uuid', onDelete: 'CASCADE', onUpdate: 'NO ACTION' });
+Friendship.belongsTo(User, { as: 'Requester', foreignKey: 'requester_uuid', onDelete: 'CASCADE', onUpdate: 'NO ACTION' });
+Friendship.belongsTo(User, { as: 'Addressee', foreignKey: 'addressee_uuid', onDelete: 'CASCADE', onUpdate: 'NO ACTION' });
 
 // Group Invites
 Group.hasMany(GroupInvite, { foreignKey: 'group_id' });
@@ -226,26 +318,34 @@ GroupInvite.belongsTo(Group, { foreignKey: 'group_id' });
 // Phase 87.1 (BINT-02, D-04): re-keyed onto Users.id via invited_by_uuid, a NULLABLE
 // protective FK ON DELETE SET NULL — a pending invite outlives its inviter's account.
 // Default target key (Users.id) — no override needed.
-User.hasMany(GroupInvite, { as: 'SentInvites', foreignKey: 'invited_by_uuid', onDelete: 'SET NULL' });
-GroupInvite.belongsTo(User, { as: 'Inviter', foreignKey: 'invited_by_uuid', onDelete: 'SET NULL' });
+// 88.4 F-16 (D1a): onUpdate NO ACTION. NOTE the contrast with the GroupInvites -> Groups FK
+// declared just above, which is deliberately left alone: migration 20260228000001:78 is one of the
+// SIX in the whole chain that specify `onUpdate: 'CASCADE'`, so that FK already agrees with
+// Sequelize's default and produces no finding (census § 4.1, C-7).
+User.hasMany(GroupInvite, { as: 'SentInvites', foreignKey: 'invited_by_uuid', onDelete: 'SET NULL', onUpdate: 'NO ACTION' });
+GroupInvite.belongsTo(User, { as: 'Inviter', foreignKey: 'invited_by_uuid', onDelete: 'SET NULL', onUpdate: 'NO ACTION' });
 
 // Event RSVPs (yes/no/maybe responses)
 Event.hasMany(EventRsvp, { foreignKey: 'event_id' });
 EventRsvp.belongsTo(Event, { foreignKey: 'event_id' });
 // Phase 87.1 (BINT-02, D-02): re-keyed onto Users.id via user_uuid, protective FK
 // ON DELETE CASCADE. Default source/target key (Users.id) — no override needed.
-User.hasMany(EventRsvp, { foreignKey: 'user_uuid', onDelete: 'CASCADE' });
-EventRsvp.belongsTo(User, { foreignKey: 'user_uuid', onDelete: 'CASCADE' });
+// 88.4 F-13 (D1a): onUpdate NO ACTION.
+User.hasMany(EventRsvp, { foreignKey: 'user_uuid', onDelete: 'CASCADE', onUpdate: 'NO ACTION' });
+EventRsvp.belongsTo(User, { foreignKey: 'user_uuid', onDelete: 'CASCADE', onUpdate: 'NO ACTION' });
 
 // Event Brings (games users commit to bring)
-Event.hasMany(EventBring, { foreignKey: 'event_id' });
-EventBring.belongsTo(Event, { foreignKey: 'event_id' });
+// 88.4 F-10 (D1a): onUpdate NO ACTION.
+Event.hasMany(EventBring, { foreignKey: 'event_id', onUpdate: 'NO ACTION' });
+EventBring.belongsTo(Event, { foreignKey: 'event_id', onUpdate: 'NO ACTION' });
 // Phase 87.1 (BINT-02, D-02): re-keyed onto Users.id via user_uuid, protective FK
 // ON DELETE CASCADE. Default source/target key (Users.id) — no override needed.
-User.hasMany(EventBring, { foreignKey: 'user_uuid', onDelete: 'CASCADE' });
-EventBring.belongsTo(User, { foreignKey: 'user_uuid', onDelete: 'CASCADE' });
-Game.hasMany(EventBring, { foreignKey: 'game_id' });
-EventBring.belongsTo(Game, { foreignKey: 'game_id' });
+// 88.4 F-12 (D1a): onUpdate NO ACTION.
+User.hasMany(EventBring, { foreignKey: 'user_uuid', onDelete: 'CASCADE', onUpdate: 'NO ACTION' });
+EventBring.belongsTo(User, { foreignKey: 'user_uuid', onDelete: 'CASCADE', onUpdate: 'NO ACTION' });
+// 88.4 F-11 (D1a): onUpdate NO ACTION.
+Game.hasMany(EventBring, { foreignKey: 'game_id', onUpdate: 'NO ACTION' });
+EventBring.belongsTo(Game, { foreignKey: 'game_id', onUpdate: 'NO ACTION' });
 
 // Event Ballot Options (game options for voting)
 Event.hasMany(EventBallotOption, { foreignKey: 'event_id' });
@@ -258,16 +358,19 @@ EventBallotOption.hasMany(EventBallotVote, { foreignKey: 'option_id' });
 EventBallotVote.belongsTo(EventBallotOption, { foreignKey: 'option_id' });
 // Phase 87.1 (BINT-02, D-02): re-keyed onto Users.id via user_uuid, protective FK
 // ON DELETE CASCADE. Default source/target key (Users.id) — no override needed.
-User.hasMany(EventBallotVote, { foreignKey: 'user_uuid', onDelete: 'CASCADE' });
-EventBallotVote.belongsTo(User, { foreignKey: 'user_uuid', onDelete: 'CASCADE' });
+// 88.4 F-09 (D1a): onUpdate NO ACTION.
+User.hasMany(EventBallotVote, { foreignKey: 'user_uuid', onDelete: 'CASCADE', onUpdate: 'NO ACTION' });
+EventBallotVote.belongsTo(User, { foreignKey: 'user_uuid', onDelete: 'CASCADE', onUpdate: 'NO ACTION' });
 
 // Sent Notifications (outbound SMS log for inbound reply resolution)
 Event.hasMany(SentNotification, { foreignKey: 'event_id' });
 SentNotification.belongsTo(Event, { foreignKey: 'event_id' });
 // Phase 87.1 (BINT-02, D-03): re-keyed onto Users.id via user_uuid, protective FK
 // ON DELETE CASCADE. Default source/target key (Users.id) — no override needed.
-User.hasMany(SentNotification, { foreignKey: 'user_uuid', onDelete: 'CASCADE' });
-SentNotification.belongsTo(User, { foreignKey: 'user_uuid', onDelete: 'CASCADE' });
+// 88.4 F-21 (D1a): onUpdate NO ACTION. The SentNotifications -> Events FK just above is
+// deliberately untouched: migration 20260329100001:35 specifies onUpdate CASCADE (census § 4.1).
+User.hasMany(SentNotification, { foreignKey: 'user_uuid', onDelete: 'CASCADE', onUpdate: 'NO ACTION' });
+SentNotification.belongsTo(User, { foreignKey: 'user_uuid', onDelete: 'CASCADE', onUpdate: 'NO ACTION' });
 
 
 module.exports = {
