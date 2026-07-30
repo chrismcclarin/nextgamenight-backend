@@ -70,7 +70,14 @@ const { Client } = require('pg');
 // further down — which only ever gates `process.exitCode` on FINDINGS. A malformed policy file
 // is a CRASH, not a finding: an entry the validator half-understood would suppress real drift
 // that nobody signed off, which is the false-green this phase exists to prevent.
-const { ENTRIES: ALLOWLIST_ENTRIES, validateAllowlist } = require('./schema-drift-allowlist');
+const {
+  ENTRIES: ALLOWLIST_ENTRIES,
+  validateAllowlist,
+  // The per-kind identity attributes an entry must pin BEYOND (side, kind, table, keySpec,
+  // predicate). Owned by the allowlist module because it is the ENTRY CONTRACT; consumed here so
+  // `entryMatchesObject` and `validateAllowlist` can never disagree about what an entry pins.
+  PIN_FIELDS,
+} = require('./schema-drift-allowlist');
 validateAllowlist(ALLOWLIST_ENTRIES);
 
 // Verbatim from scripts/log-db-resolution.js:19-27. Credential masking is a security
@@ -158,9 +165,21 @@ ORDER BY t.relname, c.conname
 
 // C — The full index set, including expression and partial indexes.
 // `pg_get_indexdef` / `pg_get_expr` are used instead of a hand-built DDL renderer: they
-// handle opclasses, collations, NULLS NOT DISTINCT, INCLUDE columns, expressions and
-// predicates correctly. A hand-rolled renderer is a false-green factory (RESEARCH
-// "Don't Hand-Roll").
+// handle opclasses, collations, expressions and predicates correctly. A hand-rolled
+// renderer is a false-green factory (RESEARCH "Don't Hand-Roll").
+//
+// `pg_get_indexdef` RENDERS the post-key-list clauses correctly, but the identity derived
+// from it does NOT read them: `keySpecOfIndex` deliberately parses ONLY the `USING <method>
+// (...)` paren group, and both `INCLUDE (...)` and `NULLS NOT DISTINCT` are rendered AFTER
+// that group. So the two columns below carry them explicitly — see the D-04 promotion marker
+// on IDENTITY_FIELDS. Reading them off the catalog rather than re-parsing the rendered tail
+// is deliberate: a boolean column and an attname array cannot be mis-parsed, whereas a tail
+// parser has to distinguish the real clauses from the same text appearing inside a predicate
+// literal. (Historical note, so the fixed comment is not mistaken for the original: this
+// comment used to claim `pg_get_indexdef` "handles NULLS NOT DISTINCT and INCLUDE columns
+// correctly" as though that settled the identity question. It does not — the rendering was
+// always right and the IDENTITY silently dropped both, folding two genuinely different
+// indexes onto one identity. 88.4-CODE-REVIEW.md #1/#13.)
 const Q_INDEXES = `
 SELECT
   t.relname                                  AS table_name,
@@ -169,6 +188,7 @@ SELECT
   ix.indisunique                             AS indisunique,
   ix.indisprimary                            AS indisprimary,
   ix.indnkeyatts                             AS indnkeyatts,
+  ix.indnullsnotdistinct                     AS nulls_not_distinct,
   am.amname                                  AS method,
   pg_get_indexdef(ix.indexrelid)             AS full_def,
   pg_get_expr(ix.indpred,  ix.indrelid)      AS predicate,
@@ -178,7 +198,14 @@ SELECT
      FROM unnest(ix.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord)
      LEFT JOIN pg_attribute a
        ON a.attrelid = ix.indrelid AND a.attnum = k.attnum
-    WHERE k.ord <= ix.indnkeyatts)           AS key_columns
+    WHERE k.ord <= ix.indnkeyatts)           AS key_columns,
+  -- INCLUDE columns: the indkey slots PAST the key attributes. Postgres requires INCLUDE
+  -- payloads to be plain columns (no expressions), so no NULL slot can appear here.
+  (SELECT array_agg(a.attname ORDER BY k.ord)
+     FROM unnest(ix.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord)
+     LEFT JOIN pg_attribute a
+       ON a.attrelid = ix.indrelid AND a.attnum = k.attnum
+    WHERE k.ord > ix.indnkeyatts)            AS included_columns
 FROM pg_index ix
 JOIN pg_class     i  ON i.oid  = ix.indexrelid
 JOIN pg_class     t  ON t.oid  = ix.indrelid
@@ -260,11 +287,26 @@ async function dumpSchema(url, label) {
 // later phase can promote them by adding one entry to this row — not by re-plumbing. Same
 // reasoning for `method` on `unique`: a UNIQUE enforced by a btree is the same CONSTRAINT
 // whatever index method backs it, so `method` is identity-bearing for `index` only.
+//
+// DECISION Phase 88.4 D-04 (PROMOTED 2026-07-30, 88.4-CODE-REVIEW.md #1/#13): `includeSpec`
+// and `nullsNotDistinct` ARE identity-bearing on `unique` and `index`, over leaving them off
+// the identity with a comment saying so. Both are rendered by `pg_get_indexdef` AFTER the
+// `USING <method> (...)` paren group that `keySpecOfIndex` parses, so before this promotion two
+// indexes differing ONLY in nulls-distinctness or in their INCLUDE payload canonicalized to the
+// SAME identity and the divergence was never reported — a silent under-report, which is the one
+// failure class this whole file is built to prevent (a differ that under-reports is
+// indistinguishable from a healthy schema). Latent when promoted (nothing under `migrations/`
+// emits either clause, and Sequelize 6 cannot express either), which is why this is the D-04
+// promotion path working as designed — one row edit plus an emitter — rather than a rewrite.
+// `nullsNotDistinct` is carried on `index` as well as `unique` even though only a UNIQUE index
+// can be NULLS NOT DISTINCT: the field is always '' for a non-unique index, and a kind-specific
+// omission would be one more asymmetry for a future reader to re-derive. Demoting either field
+// is a decision, not a cleanup.
 const IDENTITY_FIELDS = {
   fk: ['kind', 'table', 'keySpec', 'parentTable', 'parentColumns', 'onDelete', 'onUpdate', 'matchType'],
   pk: ['kind', 'table', 'keySpec'],
-  unique: ['kind', 'table', 'keySpec', 'predicate'],
-  index: ['kind', 'table', 'keySpec', 'predicate', 'method'],
+  unique: ['kind', 'table', 'keySpec', 'predicate', 'includeSpec', 'nullsNotDistinct'],
+  index: ['kind', 'table', 'keySpec', 'predicate', 'method', 'includeSpec', 'nullsNotDistinct'],
 };
 
 /**
@@ -300,6 +342,8 @@ function makeRecord(fields) {
     onUpdate: '',
     matchType: '',
     method: '',
+    includeSpec: '',
+    nullsNotDistinct: '',
     // Human-output only — never identity-bearing (see IDENTITY_FIELDS).
     deferrable: false,
     deferred: false,
@@ -323,6 +367,22 @@ const joinCols = (arr) =>
 // Postgres deparser and therefore render identically by construction. Hand-normalizing
 // whitespace or parens here could only introduce FALSE equivalences.
 const predicateOf = (idx) => (idx.predicate === null || idx.predicate === undefined ? '' : String(idx.predicate));
+
+// Normalization rule 6 (88.4-CODE-REVIEW.md #1/#13): the two post-key-list clauses
+// `pg_get_indexdef` renders OUTSIDE the paren group `keySpecOfIndex` parses. Both come from the
+// CATALOG (Q_INDEXES `included_columns` / `nulls_not_distinct`), never from re-parsing the
+// rendered tail — a boolean column and an attname array cannot be mis-parsed.
+const includeSpecOf = (idx) => joinCols(idx.included_columns);
+
+// DECISION Phase 88.4: `nullsNotDistinct` renders as the literal SQL phrase when set and '' when
+// not, OVER a boolean or the string 'true'. The phrase is what `pg_get_indexdef` prints and what a
+// human writes in an allowlist pin, so log output and entry text stay the same string (the same
+// rule `renderAttrValue` follows for onDelete/onUpdate). Only an explicit `true` counts: `false`,
+// NULL and a fixture that omits the field all yield ''. That is NOT a silent default for a real
+// run — `ix.indnullsnotdistinct` is a PG 15+ column, so a server without it fails the QUERY
+// loudly (CI is postgres:16, prod is 17); the tolerant read exists only so a hand-written unit
+// fixture degrades instead of crashing, matching the `columns` fallback in the unique-fold below.
+const nullsNotDistinctOf = (idx) => (idx.nulls_not_distinct === true ? 'NULLS NOT DISTINCT' : '');
 
 /**
  * Pull the top-level key-list terms out of a `pg_get_indexdef` string.
@@ -532,6 +592,11 @@ function canonicalize({ fks = [], cons = [], idxs = [], tables = [] } = {}) {
           keySpec: backing ? keySpecOfIndex(backing) : joinCols(con.columns),
           predicate: backing ? predicateOf(backing) : '',
           method: backing ? backing.method || '' : '',
+          // A table-level UNIQUE can carry both clauses too (`UNIQUE NULLS NOT DISTINCT (...)`
+          // and `UNIQUE (...) INCLUDE (...)`), and Postgres records them on the BACKING index —
+          // so they are read from `backing`, exactly like keySpec/predicate/method above.
+          includeSpec: backing ? includeSpecOf(backing) : '',
+          nullsNotDistinct: backing ? nullsNotDistinctOf(backing) : '',
           displayName: con.constraint_name || '',
           definition: con.definition || (backing && backing.full_def) || '',
         })
@@ -559,6 +624,8 @@ function canonicalize({ fks = [], cons = [], idxs = [], tables = [] } = {}) {
         keySpec: keySpecOfIndex(idx),
         predicate: predicateOf(idx),
         method: idx.method || '',
+        includeSpec: includeSpecOf(idx),
+        nullsNotDistinct: nullsNotDistinctOf(idx),
         displayName: idx.index_name || '',
         definition: idx.full_def || '',
       })
@@ -847,14 +914,49 @@ function diffSchemas(migrationSide, syncSide) {
 // Allowlist subtraction (SPEC R6, D-07).
 // ---------------------------------------------------------------------------------------
 
-// The object-level key. A `kind: 'table'` entry matches on (side, table) alone — there is no
-// per-object key for a whole-table difference.
+/**
+ * The record whose identity an entry pins. The MIGRATION-side object whenever one exists —
+ * including for a DIFFERS finding, which is the same choice `differsFinding` already makes for
+ * `predicate` and for the same reason: a finding with two records cannot have two keys, and
+ * picking a side per-finding would make an allowlist entry unwritable. `kind: 'table'` findings
+ * carry neither record and return before this is called.
+ */
+const pinRefOf = (finding) => finding.migration || finding.sync;
+
+/**
+ * Compute the pin values a would-be allowlist entry for this finding must carry, rendered exactly
+ * as the human output prints them. Exported and reused by `formatFinding` so the log line and the
+ * matcher read from ONE source — the "copy it off the CI log" instruction in the allowlist header
+ * is only true if these cannot drift apart.
+ *
+ * @returns {Array<[string, string]>} [field, rendered value] pairs, in identity order
+ */
+function pinsOf(finding) {
+  if (!finding || finding.kind === 'table') return [];
+  const ref = pinRefOf(finding);
+  return (PIN_FIELDS[finding.kind] || []).map((f) => [f, renderAttrValue(f, ref ? ref[f] : '')]);
+}
+
+// The object-level key: the FULL normalized identity, not a subset of it (88.4-CODE-REVIEW.md #9).
+// A `kind: 'table'` entry matches on (side, table) alone — there is no per-object key for a
+// whole-table difference.
+//
+// DECISION Phase 88.4: the pin fields are compared against `renderAttrValue`'s output, OVER the
+// raw record values. `onDelete` lives in the record as the catalog letter 'c'; the differ PRINTS
+// 'CASCADE' and the allowlist header instructs the owner to copy what was printed. Comparing raw
+// values would silently reject every correctly-written entry (and, worse, an entry written with
+// the raw letter would validate and match while contradicting the documented convention).
 function entryMatchesObject(entry, finding) {
   if (entry.side !== finding.side) return false;
   if (entry.kind !== finding.kind) return false;
   if (entry.table !== finding.table) return false;
   if (entry.kind === 'table') return true;
-  return entry.keySpec === finding.keySpec && entry.predicate === finding.predicate;
+  if (entry.keySpec !== finding.keySpec) return false;
+  if (entry.predicate !== finding.predicate) return false;
+  for (const [field, value] of pinsOf(finding)) {
+    if (entry[field] !== value) return false;
+  }
+  return true;
 }
 
 // A `differs` entry additionally has to pin THE divergence that was found. Anything else on the
@@ -954,6 +1056,17 @@ function formatFinding(finding) {
     lines.push(`      ${label(`${side} name`)}: ${show(rec.displayName)}`);
     lines.push(`      ${label(`${side} def`)}: ${show(rec.definition)}`);
   }
+
+  // The remaining identity attributes, printed so an allowlist entry for this finding can be
+  // written by COPYING rather than by re-deriving anything from `pg_catalog`. An entry must pin
+  // the FULL normalized identity (88.4-CODE-REVIEW.md #9), and (side, kind, table, keySpec,
+  // predicate) are already on the head line above — these are the rest. Suppressed for
+  // `kind: 'table'`, which has no per-object key, and for `pk`, whose identity IS its prefix.
+  const pins = pinsOf(finding);
+  if (pins.length) {
+    lines.push(`      identity pins : ${pins.map(([f, v]) => `${f}: '${v}'`).join(', ')}`);
+  }
+
   for (const note of finding.notCovered || []) lines.push(`      NOTE: ${note}`);
   return lines;
 }
@@ -1094,8 +1207,14 @@ module.exports = {
   formatFinding,
   formatSuppressionSummary,
   renderAttrValue,
+  pinsOf,
   decideExitCode,
   isReportOnly,
+  // Exported so tests/unit/schema-drift-diff.test.js can assert the allowlist module's
+  // PIN_FIELDS covers exactly the non-prefix identity fields — the structural guard against a
+  // future IDENTITY_FIELDS promotion silently reopening subset matching (88.4-CODE-REVIEW.md #9).
+  IDENTITY_FIELDS,
+  PREFIX_FIELDS,
   Q_FOREIGN_KEYS,
   Q_CONSTRAINTS,
   Q_INDEXES,

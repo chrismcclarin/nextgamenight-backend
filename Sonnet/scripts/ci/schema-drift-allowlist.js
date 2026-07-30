@@ -20,7 +20,8 @@
 // in this SPEC" is out of scope). Plan 08 adds the signed-off entries. Until then: `[]`.
 // ---------------------------------------------------------------------------------------
 //
-// ENTRY CONTRACT — exactly these SEVEN base fields, no more and no less:
+// ENTRY CONTRACT — these SEVEN base fields on EVERY entry, plus the kind's own PIN fields
+// (see PIN_FIELDS below), plus `accepted` on a `differs` entry. No more and no less:
 //
 //   side          'migration-only' | 'sync-only' | 'differs'
 //   kind          'fk' | 'pk' | 'unique' | 'index' | 'table'
@@ -64,7 +65,20 @@
 // is the very noise the canonicalizer exists to discard, and it is itself a drift axis. An
 // entry that named `friendships_pair_unique_uuid` would stop suppressing the moment sync()
 // auto-named the same object differently, or would suppress a genuinely different object that
-// happened to inherit the name. Pin `keySpec` + `predicate`.
+// happened to inherit the name.
+//
+// "NORMALIZED IDENTITY" MEANS THE **WHOLE** IDENTITY, NOT (side, kind, table, keySpec,
+// predicate) — see PIN_FIELDS. That was a real gap, not a hypothetical one: until 2026-07-30
+// this header asserted the full-identity contract while `entryMatchesObject` in the differ
+// compared only those five fields, so an owner-signed "sync-only FK on user_id -> Users(id)
+// SET NULL" entry would ALSO have silently suppressed a later, never-reviewed "sync-only FK on
+// user_id -> SomeOtherTable(id) CASCADE" on the same table and column. That is the same
+// un-reviewed-drift corridor `accepted` (below) closes for `differs` entries, and it was open
+// for presence entries. Closed by requiring the kind's PIN fields on every entry
+// (88.4-CODE-REVIEW.md #9). Every pinned value is written EXACTLY as the differ PRINTS it —
+// decoded English for onDelete / onUpdate / matchType, `(none)` for an absent value — so the
+// `identity pins:` block on a CI finding line is copy-pasteable and nothing has to be
+// re-derived. Same rule as `accepted`; do not re-derive from catalog letters.
 //
 // EVERY ENTRY REQUIRES A FULL MARKER COMMENT BLOCK immediately above it, in this form:
 //
@@ -107,9 +121,39 @@
 const SIDES = ['migration-only', 'sync-only', 'differs'];
 const KINDS = ['fk', 'pk', 'unique', 'index', 'table'];
 
-// Exactly the fields an entry may carry. `accepted` is conditional and handled separately.
+// The fields EVERY entry carries. `accepted` is conditional and handled separately; the
+// per-kind PIN fields are below.
 const BASE_FIELDS = ['side', 'kind', 'table', 'keySpec', 'predicate', 'signedOffBy', 'signedOffOn'];
 const ACCEPTED_FIELDS = ['attribute', 'migration', 'sync'];
+
+// The identity attributes an entry must pin BEYOND the base five (side, kind, table, keySpec,
+// predicate) — i.e. every remaining field of the differ's IDENTITY_FIELDS row for that kind.
+//
+// DECISION Phase 88.4 (88.4-CODE-REVIEW.md #9): named per-kind fields OVER having each entry pin
+// the raw `identityOf()` STRING and comparing it exactly. The identity string is the mechanically
+// simpler pin, and it was rejected because it is unreviewable: it renders as
+// `fk|Events|game_id|Games|id|c|c|s` — RAW catalog letters, positional, with no field names — so
+// the one artifact whose entire purpose is to make accepted drift legible to a human reviewer
+// would become the least legible thing in the repo, and `accepted`'s documented decoded-English
+// convention would contradict it two fields away. Named fields cost more validation code and are
+// worth it. Switching to an identity-string pin is a decision, not a cleanup.
+//
+// KEPT IN THIS MODULE, NOT IN THE DIFFER, because this is the ENTRY CONTRACT and this module owns
+// that. The risk that follows — a future phase promoting a field in the differ's IDENTITY_FIELDS
+// (as 88.4 itself just did with includeSpec / nullsNotDistinct) and forgetting to add it here,
+// silently reopening the subset-matching corridor — is closed STRUCTURALLY rather than by this
+// comment: `tests/unit/schema-drift-diff.test.js` asserts PIN_FIELDS[kind] is exactly
+// IDENTITY_FIELDS[kind] minus the DIFFERS prefix minus `predicate`, for every kind. Adding a
+// field there without adding it here fails that test.
+const PIN_FIELDS = {
+  fk: ['parentTable', 'parentColumns', 'onDelete', 'onUpdate', 'matchType'],
+  // A pk's identity IS the DIFFERS prefix (kind, table, keySpec), so it has nothing left to pin.
+  pk: [],
+  unique: ['includeSpec', 'nullsNotDistinct'],
+  index: ['method', 'includeSpec', 'nullsNotDistinct'],
+  // A whole-table entry is identified by (side, table) alone — see the `kind: 'table'` note above.
+  table: [],
+};
 
 // Kinds whose canonical record NEVER carries a predicate (see IDENTITY_FIELDS in the differ).
 const PREDICATE_FREE_KINDS = ['fk', 'pk', 'table'];
@@ -155,33 +199,54 @@ function validateAllowlist(entries) {
       fail(`${at} is not a plain object.`);
     }
 
+    // `side` and `kind` are validated FIRST, because the set of fields the entry is allowed to
+    // carry is KIND-DEPENDENT (PIN_FIELDS) — an `onDelete` on an index entry has to be rejected
+    // as unknown, not accepted as decoration.
+    if (!SIDES.includes(entry.side)) {
+      fail(`${at}.side is ${JSON.stringify(entry.side)}; must be one of ${SIDES.map((s) => `'${s}'`).join(', ')}.`);
+    }
+    if (!KINDS.includes(entry.kind)) {
+      fail(`${at}.kind is ${JSON.stringify(entry.kind)}; must be one of ${KINDS.map((k) => `'${k}'`).join(', ')}.`);
+    }
+
+    const pins = PIN_FIELDS[entry.kind];
+    const required = [...BASE_FIELDS, ...pins];
     const keys = Object.keys(entry);
-    const allowed = new Set([...BASE_FIELDS, 'accepted']);
+    const allowed = new Set([...required, 'accepted']);
     for (const k of keys) {
       if (!allowed.has(k)) {
         fail(
-          `${at} carries unknown field "${k}". Allowed: ${BASE_FIELDS.join(', ')} (+ "accepted" ` +
-            `on a differs entry). An unknown field is REJECTED rather than ignored: a typo'd ` +
-            `field name would still match on the fields that did parse and would silently widen ` +
-            `accepted drift.`
+          `${at} (kind '${entry.kind}') carries unknown field "${k}". Allowed: ` +
+            `${required.join(', ')} (+ "accepted" on a differs entry). An unknown field is ` +
+            `REJECTED rather than ignored: a typo'd field name would still match on the fields ` +
+            `that did parse and would silently widen accepted drift.`
         );
       }
     }
-    for (const f of BASE_FIELDS) {
+    for (const f of required) {
       if (!Object.prototype.hasOwnProperty.call(entry, f)) {
-        fail(`${at} is missing required field "${f}".`);
+        fail(
+          `${at} (kind '${entry.kind}') is missing required field "${f}".` +
+            (pins.includes(f)
+              ? ` Every entry pins the FULL normalized identity, not just (side, kind, table, ` +
+                `keySpec, predicate) — a partial pin suppresses objects nobody reviewed. Copy the ` +
+                `value from the finding's "identity pins:" line in the CI log; use '(none)' for ` +
+                `an absent value.`
+              : '')
+        );
       }
       if (typeof entry[f] !== 'string') {
         fail(`${at}.${f} must be a string, got ${entry[f] === null ? 'null' : typeof entry[f]}.`);
       }
+      if (pins.includes(f) && entry[f].length === 0) {
+        fail(
+          `${at}.${f} is an empty string. Pin fields are written exactly as the differ PRINTS ` +
+            `them, and the differ prints '(none)' for an absent value — an empty string matches ` +
+            `nothing and would leave a DEAD entry that reads as though it suppresses something.`
+        );
+      }
     }
 
-    if (!SIDES.includes(entry.side)) {
-      fail(`${at}.side is "${entry.side}"; must be one of ${SIDES.map((s) => `'${s}'`).join(', ')}.`);
-    }
-    if (!KINDS.includes(entry.kind)) {
-      fail(`${at}.kind is "${entry.kind}"; must be one of ${KINDS.map((k) => `'${k}'`).join(', ')}.`);
-    }
     if (entry.table.length === 0) {
       fail(`${at}.table is empty; name the table as pg_class.relname renders it (unquoted).`);
     }
@@ -266,6 +331,22 @@ function validateAllowlist(entries) {
             `not a divergence; the entry would match nothing.`
         );
       }
+      // CONSISTENCY between the object pin and the accepted divergence. When the diverging
+      // attribute is itself a PIN field, the entry now states its value TWICE — once as the pin
+      // and once as `accepted.migration`. The differ keys a DIFFERS finding on the MIGRATION-side
+      // object (see the `predicate: mRec.predicate` marker in differsFinding), so the pin must
+      // carry the MIGRATION value. Disagreeing values would produce an entry that validates,
+      // reads as reviewed, and matches nothing — the DEAD-entry failure mode, which the differ
+      // only reports as an "UNUSED entry" line a reader has to notice.
+      if (pins.includes(acc.attribute) && entry[acc.attribute] !== acc.migration) {
+        fail(
+          `${at} pins ${acc.attribute}: '${entry[acc.attribute]}' but accepted.migration is ` +
+            `'${acc.migration}'. A DIFFERS finding is keyed on the MIGRATION-side object, so when ` +
+            `the diverging attribute is also a pin field the two MUST agree. Set ` +
+            `${acc.attribute} to the migration-side value ('${acc.migration}'); the sync-side ` +
+            `value lives only in accepted.sync.`
+        );
+      }
     } else if (hasAccepted) {
       fail(
         `${at} has side '${entry.side}' but carries an "accepted" field. A presence/absence entry ` +
@@ -278,4 +359,4 @@ function validateAllowlist(entries) {
   return entries;
 }
 
-module.exports = { ENTRIES, validateAllowlist };
+module.exports = { ENTRIES, validateAllowlist, PIN_FIELDS };

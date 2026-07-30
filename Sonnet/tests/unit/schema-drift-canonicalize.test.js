@@ -52,6 +52,11 @@ const idxRow = (o) => ({
   expressions: null, // pg_get_expr(indexprs, indrelid) — NULL when all simple columns
   key_attnums: [],
   key_columns: [], // NULL element = expression slot (indkey entry 0)
+  // The two post-key-list clauses pg_get_indexdef renders OUTSIDE the paren group keySpecOfIndex
+  // parses, promoted into the identity by 88.4-CODE-REVIEW.md #1/#13. Defaults are the
+  // no-clause case, which is what every real index in this repo is today.
+  included_columns: [], // indkey slots past indnkeyatts — the INCLUDE payload
+  nulls_not_distinct: false, // pg_index.indnullsnotdistinct (PG 15+)
   ...o,
 });
 
@@ -104,7 +109,7 @@ const UG_PARTIAL_MIGRATION = idxRow({
 // Same object in a separately-built database: only the catalog OID differs.
 const UG_PARTIAL_SYNC = idxRow({ ...UG_PARTIAL_MIGRATION, indexrelid: 2001 });
 
-const UG_PARTIAL_IDENTITY = 'unique|UserGroups|user_uuid,group_id|("deletedAt" IS NULL)';
+const UG_PARTIAL_IDENTITY = 'unique|UserGroups|user_uuid,group_id|("deletedAt" IS NULL)||';
 
 // --- shape 2: the same index under its two historical names ------------------------------
 // 20260725000001:99-105 drops BOTH names; they were observed coexisting on one table
@@ -138,7 +143,7 @@ const FRIENDSHIPS_PAIR_UNIQUE = idxRow({
 });
 
 const FRIENDSHIPS_PAIR_IDENTITY =
-  'unique|Friendships|LEAST(requester_uuid, addressee_uuid),GREATEST(requester_uuid, addressee_uuid)|';
+  'unique|Friendships|LEAST(requester_uuid, addressee_uuid),GREATEST(requester_uuid, addressee_uuid)|||';
 
 // --- shape 4: table-level UNIQUE from belongsToMany.through.unique -----------------------
 // What models/index.js:66,70 would produce if `unique: false` were lifted (DECISION Phase
@@ -165,7 +170,7 @@ const UG_FULL_UNIQUE_IDX = idxRow({
   key_columns: ['user_uuid', 'group_id'],
 });
 
-const UG_FULL_UNIQUE_IDENTITY = 'unique|UserGroups|user_uuid,group_id|';
+const UG_FULL_UNIQUE_IDENTITY = 'unique|UserGroups|user_uuid,group_id|||';
 
 // --- shape 5: auto-name divergence, identical semantics ----------------------------------
 // 20260507000002 creates `availability_prompts_created_by_user_idx`; models/AvailabilityPrompt.js
@@ -184,7 +189,7 @@ const prompsIdx = (name, oid) =>
 
 const PROMPTS_MIGRATION = prompsIdx('availability_prompts_created_by_user_idx', 1003);
 const PROMPTS_SYNC = prompsIdx('availability_prompts_created_by_user_id', 2003);
-const PROMPTS_IDENTITY = 'index|AvailabilityPrompts|created_by_user_id||btree';
+const PROMPTS_IDENTITY = 'index|AvailabilityPrompts|created_by_user_id||btree||';
 
 // --- shape 6: GIN vs btree ---------------------------------------------------------------
 // 20260208000001-add-suggestion-gin-index.js; absent from models/AvailabilitySuggestion.js
@@ -213,8 +218,8 @@ const SUGGESTION_BTREE = idxRow({
     .replace('USING gin', 'USING btree'),
 });
 
-const SUGGESTION_GIN_IDENTITY = 'index|AvailabilitySuggestions|participant_user_ids||gin';
-const SUGGESTION_BTREE_IDENTITY = 'index|AvailabilitySuggestions|participant_user_ids||btree';
+const SUGGESTION_GIN_IDENTITY = 'index|AvailabilitySuggestions|participant_user_ids||gin||';
+const SUGGESTION_BTREE_IDENTITY = 'index|AvailabilitySuggestions|participant_user_ids||btree||';
 
 // --- shape 7: partial unique with a function in the key ----------------------------------
 // 20260228000001-create-group-invites-table.js:84-87. `LOWER()` in the key is genuinely
@@ -236,7 +241,7 @@ const GROUP_INVITES_PENDING_UNIQUE = idxRow({
 });
 
 const GROUP_INVITES_IDENTITY =
-  "unique|GroupInvites|group_id,lower((invited_email)::text)|((status)::text = 'pending'::text)";
+  "unique|GroupInvites|group_id,lower((invited_email)::text)|((status)::text = 'pending'::text)||";
 
 // --- shape 8 fixtures: PK + its backing index -------------------------------------------
 const USERS_PK_CON = conRow({
@@ -440,7 +445,7 @@ describe('shape 6 — GIN index (pg_am.amname is part of a non-unique index iden
   test('the access method is carried on the record and lands in the identity', () => {
     const gin = canonicalize({ idxs: [SUGGESTION_GIN] }).identities[0];
     expect(gin.method).toBe('gin');
-    expect(gin.identity.endsWith('|gin')).toBe(true);
+    expect(gin.identity).toContain('|gin|');
   });
 });
 
@@ -457,6 +462,130 @@ describe('shape 7 — partial unique with a function in the key (expression AND 
   test('the plain column keeps its position ahead of the expression slot', () => {
     const [rec] = canonicalize({ idxs: [GROUP_INVITES_PENDING_UNIQUE] }).identities;
     expect(rec.keySpec.startsWith('group_id,')).toBe(true);
+  });
+});
+
+// =======================================================================================
+// The post-key-list clauses: INCLUDE (...) and NULLS NOT DISTINCT.
+//
+// DELIBERATELY OUTSIDE the SHAPES table above, whose documented contract is that every shape is
+// transcribed from a real in-repo migration/model pair. These two are NOT in-repo — nothing under
+// `migrations/` emits either clause and Sequelize 6 cannot express either, which is exactly why
+// the gap was latent and survived to a code review (88.4-CODE-REVIEW.md #1/#13).
+//
+// Provenance, so these fixtures are evidence rather than invention: the `full_def` strings and the
+// catalog values below are TRANSCRIBED from a live probe run against a throwaway local database
+// (PostgreSQL 18.3) during 88.4-08. The rendering was verified for all four combinations —
+// INCLUDE alone, NULLS NOT DISTINCT alone, both together, and both together WITH a WHERE
+// predicate — confirming that the tail order is `INCLUDE (...)` then `NULLS NOT DISTINCT` then
+// `WHERE (...)`, i.e. entirely outside the `USING btree (...)` group parseKeyTerms scans.
+//
+// WHY THIS IS THE HIGH-VALUE PART: before the promotion, EVERY assertion in this block passed
+// while returning the WRONG answer — the two indexes folded onto one identity and the differ
+// reported nothing. A silent fold is indistinguishable from a matching schema, so a regression
+// here would be invisible in CI output.
+describe('post-key-list clauses are identity-bearing (NULLS NOT DISTINCT, INCLUDE)', () => {
+  const TAIL_BASE = {
+    table_name: 'Tails',
+    indisunique: true,
+    indnkeyatts: 2,
+    key_attnums: [1, 2],
+    key_columns: ['a', 'b'],
+  };
+
+  const PLAIN = idxRow({
+    ...TAIL_BASE,
+    index_name: 'i_plain',
+    indexrelid: 6001,
+    full_def: 'CREATE UNIQUE INDEX i_plain ON public."Tails" USING btree (a, b)',
+  });
+
+  const NULLS_NOT_DISTINCT = idxRow({
+    ...TAIL_BASE,
+    index_name: 'i_nnd',
+    indexrelid: 6002,
+    nulls_not_distinct: true,
+    full_def: 'CREATE UNIQUE INDEX i_nnd ON public."Tails" USING btree (a, b) NULLS NOT DISTINCT',
+  });
+
+  const WITH_INCLUDE = idxRow({
+    ...TAIL_BASE,
+    index_name: 'i_incl',
+    indexrelid: 6003,
+    included_columns: ['c', 'd'],
+    full_def: 'CREATE UNIQUE INDEX i_incl ON public."Tails" USING btree (a, b) INCLUDE (c, d)',
+  });
+
+  const OTHER_INCLUDE = idxRow({
+    ...WITH_INCLUDE,
+    index_name: 'i_incl_c',
+    indexrelid: 6004,
+    included_columns: ['c'],
+    full_def: 'CREATE UNIQUE INDEX i_incl_c ON public."Tails" USING btree (a, b) INCLUDE (c)',
+  });
+
+  const one = (idx) => canonicalize({ idxs: [idx] }).identities[0];
+
+  test('all four share the SAME keySpec and predicate — the fold hazard is real, not contrived', () => {
+    for (const idx of [PLAIN, NULLS_NOT_DISTINCT, WITH_INCLUDE, OTHER_INCLUDE]) {
+      expect(one(idx).keySpec).toBe('a,b');
+      expect(one(idx).predicate).toBe('');
+    }
+  });
+
+  test('a NULLS NOT DISTINCT flip yields a DIFFERENT identity', () => {
+    expect(one(NULLS_NOT_DISTINCT).nullsNotDistinct).toBe('NULLS NOT DISTINCT');
+    expect(one(PLAIN).nullsNotDistinct).toBe('');
+    expect(one(NULLS_NOT_DISTINCT).identity).not.toBe(one(PLAIN).identity);
+  });
+
+  test('an INCLUDE payload yields a DIFFERENT identity', () => {
+    expect(one(WITH_INCLUDE).includeSpec).toBe('c,d');
+    expect(one(PLAIN).includeSpec).toBe('');
+    expect(one(WITH_INCLUDE).identity).not.toBe(one(PLAIN).identity);
+  });
+
+  test('two DIFFERENT INCLUDE payloads are two identities, not one', () => {
+    expect(one(WITH_INCLUDE).identity).not.toBe(one(OTHER_INCLUDE).identity);
+  });
+
+  test('the INCLUDE payload does NOT leak into keySpec (indnkeyatts still governs the key list)', () => {
+    // If included columns were counted as key terms, keySpecOfIndex's indnkeyatts cross-check
+    // would throw instead — so this also pins that the two mechanisms agree.
+    expect(() => canonicalize({ idxs: [WITH_INCLUDE] })).not.toThrow();
+    expect(one(WITH_INCLUDE).keySpec).not.toContain('c');
+  });
+
+  test('a NULLS NOT DISTINCT flip on a table-level UNIQUE also differs (the fold reads the backing index)', () => {
+    const con = (oid) =>
+      conRow({
+        table_name: 'Tails',
+        kind: 'u',
+        constraint_name: 'Tails_a_b_key',
+        backing_index_oid: oid,
+        columns: ['a', 'b'],
+        definition: 'UNIQUE NULLS NOT DISTINCT (a, b)',
+      });
+    const distinct = canonicalize({ cons: [con(6001)], idxs: [PLAIN] }).identities[0];
+    const notDistinct = canonicalize({ cons: [con(6002)], idxs: [NULLS_NOT_DISTINCT] }).identities[0];
+    expect(distinct.kind).toBe('unique');
+    expect(notDistinct.nullsNotDistinct).toBe('NULLS NOT DISTINCT');
+    expect(distinct.identity).not.toBe(notDistinct.identity);
+  });
+
+  test('a non-unique index carries includeSpec too (INCLUDE is not unique-only)', () => {
+    const nonUnique = idxRow({
+      table_name: 'Tails',
+      index_name: 'i_nonu_incl',
+      indexrelid: 6005,
+      indnkeyatts: 1,
+      key_attnums: [1],
+      key_columns: ['a'],
+      included_columns: ['b'],
+      full_def: 'CREATE INDEX i_nonu_incl ON public."Tails" USING btree (a) INCLUDE (b)',
+    });
+    expect(one(nonUnique).kind).toBe('index');
+    expect(one(nonUnique).includeSpec).toBe('b');
   });
 });
 

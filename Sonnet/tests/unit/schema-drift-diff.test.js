@@ -28,7 +28,11 @@
 //   4. Plain index            — presence, and a btree-vs-gin method flip, both yield findings
 //   5. Missing table collapse — one TABLE-MISSING finding, zero per-object findings
 //   6. Allowlist subtraction  — suppressed WITH the entry, reappears WITHOUT it (SPEC R6),
-//                               and `accepted` narrows suppression to the reviewed divergence
+//                               `accepted` narrows suppression to the reviewed divergence, a
+//                               PRESENCE entry pins the FULL identity rather than a subset of it
+//                               (88.4-CODE-REVIEW.md #9), and PIN_FIELDS is asserted to cover
+//                               IDENTITY_FIELDS kind-for-kind so a future promotion cannot
+//                               silently reopen subset matching
 //   7. Malformed allowlist    — validateAllowlist throws; ENTRIES is frozen
 //   8. Report-only exit gating— 0 under SCHEMA_DRIFT_REPORT_ONLY=1, 1 armed, 1 on a throw in both
 //   9. Deterministic output   — same findings, and a shuffled array, format byte-identically
@@ -40,9 +44,11 @@ const {
   formatFindings,
   formatSuppressionSummary,
   decideExitCode,
+  IDENTITY_FIELDS,
+  PREFIX_FIELDS,
 } = require('../../scripts/ci/schema-drift-diff');
 
-const { ENTRIES, validateAllowlist } = require('../../scripts/ci/schema-drift-allowlist');
+const { ENTRIES, validateAllowlist, PIN_FIELDS } = require('../../scripts/ci/schema-drift-allowlist');
 
 // --- fixture builders (mirror the SELECT lists in Q_INDEXES / Q_CONSTRAINTS / Q_FOREIGN_KEYS)
 
@@ -59,6 +65,10 @@ const idxRow = (o) => ({
   expressions: null,
   key_attnums: [],
   key_columns: [],
+  // Post-key-list clauses promoted into the identity by 88.4-CODE-REVIEW.md #1/#13; defaults
+  // are the no-clause case. Pinned in detail in tests/unit/schema-drift-canonicalize.test.js.
+  included_columns: [],
+  nulls_not_distinct: false,
   ...o,
 });
 
@@ -176,16 +186,38 @@ const SUGGESTION_BTREE = idxRow({
 
 // A conforming allowlist entry, so every test's entry starts from a shape the validator accepts
 // and each test varies exactly the one field it is about.
-const ENTRY = (o) => ({
-  side: 'migration-only',
-  kind: 'unique',
-  table: 'Friendships',
-  keySpec: FRIENDSHIPS_PAIR_KEYSPEC,
-  predicate: '',
-  signedOffBy: 'test-owner',
-  signedOffOn: '2026-07-29',
-  ...o,
-});
+// Default values for the per-kind PIN fields an entry must carry (88.4-CODE-REVIEW.md #9), each
+// written in the RENDERED form the differ prints — decoded English for the FK actions, '(none)'
+// for an absent value. These match the `ugFk` / `FRIENDSHIPS_PAIR_UNIQUE` fixtures below, which is
+// what makes the default ENTRY() a MATCHING entry.
+const PIN_DEFAULT = {
+  parentTable: 'Users',
+  parentColumns: 'id',
+  onDelete: 'CASCADE',
+  onUpdate: 'NO ACTION', // fkRow's on_update: 'a'
+  matchType: 'SIMPLE', // fkRow's match_type: 's'
+  method: 'btree',
+  includeSpec: '(none)',
+  nullsNotDistinct: '(none)',
+};
+
+// Kind-aware, because the field set an entry may carry IS kind-dependent: validateAllowlist
+// rejects an `onDelete` on an index entry as an unknown field and a missing `method` on one as a
+// partial pin. Overrides win, so a test can deliberately mis-pin one field.
+const ENTRY = (o = {}) => {
+  const kind = o.kind || 'unique';
+  const base = {
+    side: 'migration-only',
+    kind,
+    table: 'Friendships',
+    keySpec: FRIENDSHIPS_PAIR_KEYSPEC,
+    predicate: '',
+    signedOffBy: 'test-owner',
+    signedOffOn: '2026-07-29',
+  };
+  for (const f of PIN_FIELDS[kind] || []) base[f] = PIN_DEFAULT[f];
+  return { ...base, ...o };
+};
 
 // =======================================================================================
 
@@ -524,6 +556,133 @@ describe('6 — allowlist subtraction (SPEC R6, both directions)', () => {
       expect(subtractAllowlist(onUpdateOnly, [DIFFERS_ENTRY]).kept).toHaveLength(1);
     });
   });
+
+  // ------------------------------------------------------------------------------------
+  // 88.4-CODE-REVIEW.md #9: a PRESENCE entry pins the FULL normalized identity.
+  //
+  // The corridor these close: before this, `entryMatchesObject` compared only
+  // (side, kind, table, keySpec, predicate). For an `fk` the identity ALSO carries
+  // parentTable / parentColumns / onDelete / onUpdate / matchType, and for an `index` it carries
+  // method (plus, since #1/#13, includeSpec / nullsNotDistinct). So one owner-signed entry
+  // suppressed every object sharing the partial key — including objects nobody had reviewed.
+  // Day-one impact was zero (the census concluded 0 allowlist entries), which is exactly why it
+  // had to be closed BEFORE the first entry can exist rather than after.
+  describe('a presence entry pins the FULL identity, not a subset of it', () => {
+    const SYNC_ONLY_FK = (parentTable, parentColumns, onDelete) =>
+      diffSchemas(
+        side({ fks: [] }),
+        side({
+          fks: [
+            fkRow({
+              child_table: 'UserGroups',
+              parent_table: parentTable,
+              parent_columns: parentColumns,
+              constraint_name: 'UserGroups_user_uuid_fkey',
+              on_delete: onDelete,
+              child_columns: ['user_uuid'],
+              definition: `FOREIGN KEY (user_uuid) REFERENCES "${parentTable}"(${parentColumns[0]})`,
+            }),
+          ],
+        })
+      );
+
+    const REVIEWED = ENTRY({
+      side: 'sync-only',
+      kind: 'fk',
+      table: 'UserGroups',
+      keySpec: 'user_uuid',
+      parentTable: 'Users',
+      parentColumns: 'id',
+      onDelete: 'SET NULL',
+    });
+
+    test('the entry is conforming and DOES suppress the object it was signed off for', () => {
+      expect(() => validateAllowlist([REVIEWED])).not.toThrow();
+      const reviewed = SYNC_ONLY_FK('Users', ['id'], 'n');
+      expect(reviewed).toHaveLength(1);
+      expect(subtractAllowlist(reviewed, [REVIEWED]).suppressed).toHaveLength(1);
+    });
+
+    test('it does NOT suppress the same column pointing at a DIFFERENT PARENT TABLE', () => {
+      const other = SYNC_ONLY_FK('Groups', ['id'], 'n');
+      expect(other[0].keySpec).toBe(REVIEWED.keySpec); // same partial key — the old matcher's blind spot
+      expect(subtractAllowlist(other, [REVIEWED]).kept).toHaveLength(1);
+    });
+
+    test('it does NOT suppress the same FK with a different PARENT COLUMN', () => {
+      const other = SYNC_ONLY_FK('Users', ['user_id'], 'n');
+      expect(subtractAllowlist(other, [REVIEWED]).kept).toHaveLength(1);
+    });
+
+    test('it does NOT suppress the same FK with a different ON DELETE action', () => {
+      const other = SYNC_ONLY_FK('Users', ['id'], 'c');
+      expect(subtractAllowlist(other, [REVIEWED]).kept).toHaveLength(1);
+    });
+
+    test('an index entry must pin `method` — a btree entry does not suppress a gin object', () => {
+      const ginFinding = diffSchemas(side({ idxs: [SUGGESTION_GIN] }), side({ idxs: [] }));
+      const btreeEntry = ENTRY({
+        kind: 'index',
+        table: 'AvailabilitySuggestions',
+        keySpec: 'participant_user_ids',
+        method: 'btree',
+      });
+      expect(() => validateAllowlist([btreeEntry])).not.toThrow();
+      expect(subtractAllowlist(ginFinding, [btreeEntry]).kept).toHaveLength(1);
+      expect(subtractAllowlist(ginFinding, [ENTRY({ ...btreeEntry, method: 'gin' })]).kept).toHaveLength(0);
+    });
+
+    test('the finding PRINTS its pins, so an entry can be written by copying rather than deriving', () => {
+      const out = formatFindings(SYNC_ONLY_FK('Users', ['id'], 'n'));
+      expect(out).toContain('identity pins :');
+      expect(out).toContain("parentTable: 'Users'");
+      expect(out).toContain("onDelete: 'SET NULL'"); // decoded, NOT the catalog letter 'n'
+      expect(out).toContain("matchType: 'SIMPLE'");
+      expect(out).not.toContain("onDelete: 'n'");
+    });
+
+    test('a pin field is REQUIRED — an entry omitting one is rejected, not treated as a wildcard', () => {
+      const partial = { ...REVIEWED };
+      delete partial.matchType;
+      expect(() => validateAllowlist([partial])).toThrow(/matchType/);
+    });
+
+    test('a pin field written as a raw catalog letter is a MISS, not a silent match', () => {
+      // The whole convention is "copy what the differ printed". An entry with 'n' instead of
+      // 'SET NULL' validates (both are non-empty strings) and must then suppress NOTHING —
+      // surfacing as an UNUSED entry rather than as accidentally-correct behaviour.
+      const raw = ENTRY({ ...REVIEWED, onDelete: 'n' });
+      expect(() => validateAllowlist([raw])).not.toThrow();
+      expect(subtractAllowlist(SYNC_ONLY_FK('Users', ['id'], 'n'), [raw]).kept).toHaveLength(1);
+    });
+  });
+
+  // The STRUCTURAL guard the PIN_FIELDS marker in schema-drift-allowlist.js promises. Two tables
+  // in two modules have to agree; a comment saying so is not enforcement. A future phase promoting
+  // an IDENTITY_FIELDS field (as 88.4 did with includeSpec / nullsNotDistinct) without adding it
+  // here would silently reopen subset matching, and nothing else in CI would notice.
+  describe('PIN_FIELDS covers exactly the non-prefix identity fields, for every kind', () => {
+    test('the two modules agree kind-for-kind', () => {
+      for (const kind of Object.keys(IDENTITY_FIELDS)) {
+        const expected = IDENTITY_FIELDS[kind].filter(
+          (f) => !PREFIX_FIELDS.includes(f) && f !== 'predicate'
+        );
+        expect(PIN_FIELDS[kind]).toEqual(expected);
+      }
+    });
+
+    test("kind 'table' is pin-free, and every allowlist kind has an entry (no undefined lookups)", () => {
+      expect(PIN_FIELDS.table).toEqual([]);
+      for (const kind of ['fk', 'pk', 'unique', 'index', 'table']) {
+        expect(Array.isArray(PIN_FIELDS[kind])).toBe(true);
+      }
+    });
+
+    test('pk has nothing to pin because its identity IS the DIFFERS prefix', () => {
+      expect(IDENTITY_FIELDS.pk).toEqual(PREFIX_FIELDS);
+      expect(PIN_FIELDS.pk).toEqual([]);
+    });
+  });
 });
 
 describe('7 — a malformed allowlist THROWS rather than widening accepted drift', () => {
@@ -543,6 +702,30 @@ describe('7 — a malformed allowlist THROWS rather than widening accepted drift
     ['an unknown field', ENTRY({ typo: 1 })],
     ['a missing required field', (() => { const e = ENTRY(); delete e.predicate; return e; })()],
     ['a non-string field value', ENTRY({ table: 42 })],
+    // 88.4-CODE-REVIEW.md #9 — the full-identity pin is validated, not merely documented.
+    [
+      'a missing PIN field (a partial pin is not a wildcard)',
+      (() => { const e = ENTRY({ kind: 'index', method: 'btree' }); delete e.method; return e; })(),
+    ],
+    [
+      'an empty-string PIN field (the differ prints \'(none)\', never \'\')',
+      ENTRY({ includeSpec: '' }),
+    ],
+    [
+      'a PIN field belonging to a DIFFERENT kind (onDelete on a unique entry)',
+      ENTRY({ onDelete: 'CASCADE' }),
+    ],
+    [
+      'a differs entry whose pin contradicts accepted.migration',
+      ENTRY({
+        side: 'differs',
+        kind: 'fk',
+        table: 'UserGroups',
+        keySpec: 'user_uuid',
+        onDelete: 'SET NULL',
+        accepted: { attribute: 'onDelete', migration: 'CASCADE', sync: 'SET NULL' },
+      }),
+    ],
     ['a side outside its enum', ENTRY({ side: 'bogus' })],
     ['a kind outside its enum', ENTRY({ kind: 'trigger' })],
     ['a differs entry with no accepted', ENTRY({ side: 'differs' })],
