@@ -589,6 +589,104 @@ describe('post-key-list clauses are identity-bearing (NULLS NOT DISTINCT, INCLUD
   });
 });
 
+// =======================================================================================
+// REGRESSION GUARD: a raw Postgres array-literal STRING must THROW, never degrade to ''.
+//
+// This one shipped, and it is the sharpest illustration in the phase of why hand-written
+// fixtures are necessary but NOT sufficient. `array_agg(att.attname)` aggregates a column of type
+// `name`, so its result type is `name[]` (OID 1003) — for which node-postgres has NO type parser.
+// The driver therefore handed back the literal string `'{game_id}'`, and `joinCols`'s old
+// `Array.isArray(arr) ? ... : ''` ternary turned that into an EMPTY STRING. Every foreign key's
+// keySpec and parentColumns were blank, so the FK identity carried no column list at all.
+//
+// Measured against the real 77-migration replay (28 tables, 45 FKs), three identity groups each
+// folded TWO different foreign keys together:
+//   fk|Events||Users||n|a|s      <= events_picked_by_id_fkey  + events_winner_id_fkey
+//   fk|Events||Users||n|c|s      <= Events_picked_by_id_fkey  + Events_winner_id_fkey
+//   fk|Friendships||Users||c|a|s <= friendships_addressee_uuid_fkey + friendships_requester_uuid_fkey
+//
+// EVERY test in this file passed throughout, because every fixture passes a JS array — which is
+// what the queries return only AFTER the `::text[]` cast they now carry. The fixtures were right
+// about the intent and wrong about the driver. So the guard has to live in the code, not here;
+// these tests only pin that it fires.
+describe('a raw Postgres array literal is REFUSED, not silently read as no columns', () => {
+  // Exactly what node-postgres returns for an UNCAST array_agg(attname).
+  const RAW = '{game_id}';
+
+  test('an FK whose child_columns arrived as a string throws', () => {
+    expect(() =>
+      canonicalize({
+        fks: [fkRow({ child_table: 'Events', parent_table: 'Games', child_columns: RAW, parent_columns: ['id'] })],
+      })
+    ).toThrow(/name\[\]-not-parsed/);
+  });
+
+  test('an FK whose parent_columns arrived as a string throws', () => {
+    expect(() =>
+      canonicalize({
+        fks: [fkRow({ child_table: 'Events', parent_table: 'Games', child_columns: ['game_id'], parent_columns: RAW })],
+      })
+    ).toThrow(/name\[\]-not-parsed/);
+  });
+
+  test('the message names the remedy (cast to ::text[]) rather than just the symptom', () => {
+    let msg = '';
+    try {
+      canonicalize({ fks: [fkRow({ child_table: 'T', parent_table: 'P', child_columns: RAW })] });
+    } catch (e) {
+      msg = e.message;
+    }
+    expect(msg).toContain('::text[]');
+    expect(msg).toContain('{game_id}');
+  });
+
+  test('NULL is still tolerated (an FK with no resolvable columns is not a crash)', () => {
+    // Distinct from the bug: NULL means the catalog genuinely returned nothing, which the
+    // aggregate can do for an empty conkey. '' is the right answer there.
+    expect(() =>
+      canonicalize({ fks: [fkRow({ child_table: 'T', parent_table: 'P', child_columns: null })] })
+    ).not.toThrow();
+  });
+
+  test('an included_columns string also throws (the new post-paren fields use the same helper)', () => {
+    expect(() =>
+      canonicalize({
+        idxs: [
+          idxRow({
+            table_name: 'T',
+            index_name: 'i',
+            indexrelid: 7001,
+            indnkeyatts: 1,
+            key_columns: ['a'],
+            key_attnums: [1],
+            included_columns: '{b,c}',
+            full_def: 'CREATE INDEX i ON public."T" USING btree (a) INCLUDE (b, c)',
+          }),
+        ],
+      })
+    ).toThrow(/name\[\]-not-parsed/);
+  });
+});
+
+describe('every attname aggregate in the four queries is cast to ::text[]', () => {
+  // A TEXT assertion on the SQL, deliberately: the runtime guard above turns the bug into a loud
+  // crash, but only when a database is present. `npm run test:unit` has no Postgres, so without
+  // this the cast could be dropped from a query and nothing in the fast lane would notice until
+  // migrate-cli-replay crashed minutes later.
+  const { Q_FOREIGN_KEYS, Q_CONSTRAINTS, Q_INDEXES } = require('../../scripts/ci/schema-drift-diff');
+
+  test.each([
+    ['Q_FOREIGN_KEYS', Q_FOREIGN_KEYS, 2],
+    ['Q_CONSTRAINTS', Q_CONSTRAINTS, 1],
+    ['Q_INDEXES', Q_INDEXES, 2],
+  ])('%s casts all %i of its attname aggregates', (_name, sql, expected) => {
+    const cast = (sql.match(/array_agg\(\s*\w+\.attname::text/g) || []).length;
+    const uncast = (sql.match(/array_agg\(\s*\w+\.attname(?!::text)/g) || []).length;
+    expect(cast).toBe(expected);
+    expect(uncast).toBe(0);
+  });
+});
+
 describe('PK-backing indexes are skipped', () => {
   test('a PK constraint plus its backing index yields exactly one `pk` identity', () => {
     const { identities } = canonicalize({ cons: [USERS_PK_CON], idxs: [USERS_PK_IDX] });

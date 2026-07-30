@@ -128,11 +128,11 @@ SELECT
   c.confmatchtype              AS match_type,
   c.condeferrable,
   c.condeferred,
-  (SELECT array_agg(att.attname ORDER BY k.ord)
+  (SELECT array_agg(att.attname::text ORDER BY k.ord)
      FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord)
      JOIN pg_attribute att
        ON att.attrelid = c.conrelid AND att.attnum = k.attnum) AS child_columns,
-  (SELECT array_agg(att.attname ORDER BY k.ord)
+  (SELECT array_agg(att.attname::text ORDER BY k.ord)
      FROM unnest(c.confkey) WITH ORDINALITY AS k(attnum, ord)
      JOIN pg_attribute att
        ON att.attrelid = c.confrelid AND att.attnum = k.attnum) AS parent_columns,
@@ -156,7 +156,7 @@ SELECT
   c.contype                    AS kind,
   c.conname                    AS constraint_name,
   c.conindid                   AS backing_index_oid,
-  (SELECT array_agg(att.attname ORDER BY k.ord)
+  (SELECT array_agg(att.attname::text ORDER BY k.ord)
      FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord)
      JOIN pg_attribute att
        ON att.attrelid = c.conrelid AND att.attnum = k.attnum) AS columns,
@@ -201,14 +201,14 @@ SELECT
   pg_get_expr(ix.indpred,  ix.indrelid)      AS predicate,
   pg_get_expr(ix.indexprs, ix.indrelid)      AS expressions,
   ix.indkey::int2[]                          AS key_attnums,
-  (SELECT array_agg(a.attname ORDER BY k.ord)
+  (SELECT array_agg(a.attname::text ORDER BY k.ord)
      FROM unnest(ix.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord)
      LEFT JOIN pg_attribute a
        ON a.attrelid = ix.indrelid AND a.attnum = k.attnum
     WHERE k.ord <= ix.indnkeyatts)           AS key_columns,
   -- INCLUDE columns: the indkey slots PAST the key attributes. Postgres requires INCLUDE
   -- payloads to be plain columns (no expressions), so no NULL slot can appear here.
-  (SELECT array_agg(a.attname ORDER BY k.ord)
+  (SELECT array_agg(a.attname::text ORDER BY k.ord)
      FROM unnest(ix.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord)
      LEFT JOIN pg_attribute a
        ON a.attrelid = ix.indrelid AND a.attnum = k.attnum
@@ -365,8 +365,45 @@ function makeRecord(fields) {
 // unique-fold silently never fires and every UNIQUE constraint shows up twice.
 const oidKey = (v) => (v === null || v === undefined ? '' : String(v));
 
-const joinCols = (arr) =>
-  Array.isArray(arr) ? arr.map((c) => (c === null || c === undefined ? '' : String(c))).join(',') : '';
+/**
+ * Join a catalog column array into a keySpec fragment.
+ *
+ * REFUSES a non-array rather than degrading to '' (Plan 08, and this is not a hypothetical
+ * hardening — it is a regression guard for a bug that shipped):
+ *
+ * `array_agg(att.attname)` aggregates a column of type `name`, so the result type is `name[]`
+ * (OID 1003). node-postgres has NO type parser for `name[]` and hands the value back as the RAW
+ * POSTGRES ARRAY LITERAL STRING — `'{game_id}'` — not a JS array. The previous
+ * `Array.isArray(arr) ? ... : ''` ternary turned that into an EMPTY STRING, so EVERY foreign key's
+ * `keySpec` and `parentColumns` were blank and the FK identity silently dropped both column lists.
+ * Measured consequence against the real 77-migration replay: three identity groups each collapsed
+ * TWO genuinely different foreign keys into one identity —
+ *   fk|Events||Users||n|a|s   <= events_picked_by_id_fkey  + events_winner_id_fkey
+ *   fk|Events||Users||n|c|s   <= Events_picked_by_id_fkey  + Events_winner_id_fkey
+ *   fk|Friendships||Users||c|a|s <= friendships_addressee_uuid_fkey + friendships_requester_uuid_fkey
+ * so a migration-side FK on `winner_id` and a sync-side FK on `picked_by_id` would have CANCELLED
+ * OUT and the gate would have reported nothing. `Users(user_id)` versus `Users(id)` — the very
+ * distinction F-20 and F-41 of the census turn on — was likewise invisible.
+ *
+ * FIXED AT BOTH LAYERS, deliberately: the four queries now cast `attname::text` so the driver
+ * parses a real array, AND this function throws if it ever receives a non-array again. The cast
+ * alone would have been enough today; the throw is what makes the NEXT such regression loud
+ * instead of silent. Unit fixtures pass JS arrays and so could never have caught the driver-level
+ * shape — which is exactly why the throw belongs here rather than in a test.
+ */
+const joinCols = (arr) => {
+  if (arr === null || arr === undefined) return '';
+  if (!Array.isArray(arr)) {
+    throw new Error(
+      `[88.4] expected a column ARRAY from pg_catalog, got ${typeof arr} ${JSON.stringify(arr)}. ` +
+        `This is the name[]-not-parsed bug: node-postgres has no parser for name[], so an ` +
+        `uncast array_agg(attname) arrives as a raw '{a,b}' STRING. Refusing to degrade to an ` +
+        `empty keySpec — that silently drops the column list out of the identity and folds ` +
+        `different objects together. Cast the aggregate to ::text[] in the query.`
+    );
+  }
+  return arr.map((c) => (c === null || c === undefined ? '' : String(c))).join(',');
+};
 
 // Normalization rule 3: the predicate is `pg_get_expr(indpred, indrelid)` VERBATIM. Both
 // `WHERE "deletedAt" IS NULL` written in a migration (20260725000001:113-116) and
