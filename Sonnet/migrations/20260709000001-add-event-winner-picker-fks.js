@@ -63,11 +63,42 @@ module.exports = {
       const pickerCleaned = Array.isArray(pickerOrphans) ? pickerOrphans.length : 0;
       console.log(`[EVENT-FK] picked_by_id orphans nulled: ${pickerCleaned}`);
 
-      // (2) GUARDED FK ADD — idempotent via pg_constraint existence check.
+      // (2) GUARDED FK ADD.
+      //
+      // DECISION Phase 88.4 RC-2 (88.4-DRIFT-CENSUS.md § 4.2, findings F-37/F-38/F-39): the guard
+      // probes STRUCTURE — an existing `contype='f'` on (this column -> the same parent table) under
+      // ANY NAME — over the `conname = :name` check it used to be. The name check is kept as a
+      // second arm so the intent is still explicit.
+      //
+      // WHY: this migration's original `conname`-only guard IS the root cause of three of the
+      // day-one census's findings. The constraint that already existed on these tables was created
+      // by `sync()` in the pre-migration era and is CamelCase
+      // (`EventParticipations_user_id_fkey`, `Events_winner_id_fkey`, `Events_picked_by_id_fkey`);
+      // this file probes for a LOWERCASE name, found nothing, and added a SECOND, functionally
+      // redundant foreign key on the same column — with no error, on every database where the
+      // CamelCase one was present. The from-empty replay reproduces it exactly: 9 FKs across the two
+      // tables where there should be 6.
+      //
+      // Editing this file does NOT fix prod (the filename is already booked in prod's
+      // SequelizeMeta, so it will never run there again) — migration
+      // 20260730000001-reconcile-duplicate-constraints.js drops the duplicates prod is carrying.
+      // This change fixes the FROM-EMPTY REPLAY and every future dev/CI database, which is what the
+      // drift gate actually compares. Both halves are needed; neither substitutes for the other.
+      // Reverting this to a name-only probe re-creates the duplicates and reds the gate.
       const addFk = async (fkName, column) => {
         const existing = await sequelize.query(
-          `SELECT 1 FROM pg_constraint WHERE conname = :name`,
-          { replacements: { name: fkName }, type: QueryTypes.SELECT, transaction: t }
+          `SELECT 1
+             FROM pg_constraint c
+             JOIN pg_attribute a
+               ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1]
+            WHERE c.contype = 'f'
+              AND c.conrelid  = to_regclass('"Events"')
+              AND c.confrelid = to_regclass('"Users"')
+              AND array_length(c.conkey, 1) = 1
+              AND a.attname = :column
+            UNION ALL
+           SELECT 1 FROM pg_constraint WHERE conname = :name`,
+          { replacements: { name: fkName, column }, type: QueryTypes.SELECT, transaction: t }
         );
         if (existing.length === 0) {
           await sequelize.query(
@@ -78,7 +109,10 @@ module.exports = {
           );
           console.log(`[EVENT-FK] constraint ${fkName} added (ON DELETE SET NULL).`);
         } else {
-          console.log(`[EVENT-FK] constraint ${fkName} already present, skipping.`);
+          console.log(
+            `[EVENT-FK] an equivalent FK on Events.${column} -> Users already exists ` +
+              `(any name); skipping ${fkName}.`
+          );
         }
       };
 
