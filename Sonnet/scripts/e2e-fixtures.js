@@ -22,6 +22,13 @@ const { generateToken } = require('../services/magicTokenService');
 // RSVP single-use link lifetime — mirrors routes/rsvp.js RSVP_TOKEN_TTL_MS (30d).
 const RSVP_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
+// Group-restore fixture lifetimes — mirror services/groupRecoveryService.js:
+// RECOVERY_WINDOW_DAYS = 30 (:119) stamps purge_after, and the token's expires_at
+// deliberately outlives purge_after by a 2-day margin (:122-135) so the window
+// check, not token expiry, is what a near-deadline preview reports.
+const RESTORE_RECOVERY_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
+const RESTORE_TOKEN_MARGIN_MS = 2 * 24 * 60 * 60 * 1000;
+
 // Mirrors routes/rsvp.js generateRsvpToken EXACTLY (same payload + HMAC).
 // Inlined rather than required: pulling in the route module drags rate
 // limiters / services whose timers keep the event loop alive forever —
@@ -150,12 +157,82 @@ async function main() {
   // the fixture's point of view on the next run, so the teardown must really remove it.
   await UserGroup.destroy({ where: { user_uuid: friend.id, group_id: inviteGroup.id }, force: true });
 
+  // ── Restore-preview fixture (SPEC R7): a soft-deleted-but-restorable group plus
+  // its active group_restore nonce, so the restore-preview spec has a route to visit.
+  //
+  // Group is PARANOID (models/Group.js): findOrCreate's internal SELECT is scoped to
+  // non-deleted rows, so on a second run it would MISS the row this fixture itself
+  // soft-deleted, then crash INSERTing a duplicate group_id. The lookup must be
+  // explicitly paranoid-aware — do NOT convert this to findOrCreate.
+  let restoreGroup = await Group.findOne({
+    where: { group_id: 'e2e-restore-group' },
+    paranoid: false,
+  });
+  if (!restoreGroup) {
+    restoreGroup = await Group.create({ group_id: 'e2e-restore-group', name: 'E2E Restore Group' });
+  }
+  // ZERO UserGroup rows for this group — deliberate and load-bearing:
+  // accountDeletionService.getDeletionBlockers (the 87.2 account-deletion gate)
+  // treats a group the user OWNS with >= 1 OTHER membership row of ANY status as a
+  // hard blocker, and routes/groups.js's restore-preview validates only the token,
+  // never membership — so a memberless group satisfies the spec and can never trip
+  // the gate. Do not add Alice (or anyone) as a member here.
+  //
+  // Converge on the same soft-deleted, future-purge state on EVERY run, regardless
+  // of what the database already held (this only works because the lookup above is
+  // paranoid-aware): re-set purge_after, then paranoid-destroy if deletedAt is null
+  // so Sequelize stamps deletedAt itself rather than it being written by hand.
+  await Group.update(
+    { purge_after: new Date(Date.now() + RESTORE_RECOVERY_WINDOW_MS) },
+    { where: { id: restoreGroup.id }, paranoid: false }
+  );
+  await restoreGroup.reload({ paranoid: false });
+  if (!restoreGroup.deletedAt) {
+    await restoreGroup.destroy(); // paranoid soft delete
+  }
+
+  // DECISION Phase 87.8 (R7): the group_restore SingleUseToken uses LOOKUP-FIRST
+  // idempotency — find any existing row for this group (no status filter, so a
+  // revoked row is reactivated rather than duplicated), REUSE its nonce, and mint
+  // via crypto.randomBytes only when none exists — chosen OVER the deterministic
+  // HMAC idiom the RSVP nonces above use (:29-35). group_restore grants restore
+  // access to a whole group and must NOT be computable from MAGIC_TOKEN_SECRET, a
+  // value this repo already treats as a published CI throwaway (round-3 ML#15+#24):
+  // a secret-derived nonce would be a live restore credential re-derivable by
+  // anyone holding that secret. The RSVP pattern stays acceptable for its
+  // lower-stakes per-event/user/status links; a group-restore credential is not.
+  // Task 0's assert-not-production-db guard is defence-in-depth against
+  // wrong-database runs — it is NOT a substitute for this.
+  const restoreTokenKey = { purpose: 'group_restore', group_id: restoreGroup.id };
+  let restoreToken = await SingleUseToken.findOne({ where: restoreTokenKey });
+  const restoreExpiresAt = new Date(Date.now() + RESTORE_RECOVERY_WINDOW_MS + RESTORE_TOKEN_MARGIN_MS);
+  if (restoreToken) {
+    await restoreToken.update({ status: 'active', expires_at: restoreExpiresAt });
+  } else {
+    restoreToken = await SingleUseToken.create({
+      // Same nonce shape prod mints (services/groupRecoveryService.js:175).
+      nonce: crypto.randomBytes(32).toString('hex'),
+      ...restoreTokenKey,
+      // user_id DELIBERATELY null — DECISION Phase 88.2 D-02
+      // (models/SingleUseToken.js:38-50): a populated sub would let
+      // accountDeletionService's sub-keyed destroy silently kill the restore token.
+      // group_restore rows identify the GROUP, not a user.
+      user_id: null,
+      status: 'active',
+      expires_at: restoreExpiresAt,
+      // event_id, email_batch_id, rsvp_status left null — group_restore carries none.
+    });
+  }
+  // Exact emailed-link path shape routes/groups.js:1039 builds.
+  const restorePath = `/restore/group/${restoreToken.nonce}`;
+
   console.log(`E2E_FIXTURES_JSON=${JSON.stringify({
     group_id: group.id,
     availability_token: availabilityToken,
     rsvp_path: rsvpPath,
     invite_group_name: inviteGroup.name,
     invite_friend_name: friend.username,
+    restore_path: restorePath,
   })}`);
 
   await sequelize.close();
