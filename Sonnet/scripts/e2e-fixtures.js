@@ -55,13 +55,31 @@ async function main() {
     comments: 'E2E fixture event (created by scripts/e2e-fixtures.js)',
   });
 
-  // Active prompt for the availability magic link.
-  const prompt = await AvailabilityPrompt.create({
-    group_id: group.id,
-    prompt_date: new Date(),
-    deadline: new Date(Date.now() + 72 * 60 * 60 * 1000),
+  // Active prompt for the availability magic link — CI-only token minting (DEC-4,
+  // owner-ruled 2026-08-02): this prompt exists SOLELY so generateToken(alice, prompt)
+  // below has something to mint against for the availability-submit journey. It
+  // carries NO response data — R8's populated heatmap lives entirely in
+  // scripts/seed-sample-data.js. Idempotent on re-run: findOrCreate on a stable
+  // business key (group + fixed literal week identifier, distinct from any real ISO
+  // week and from anything the R8 seed uses), then an explicit reactivating update so
+  // a re-run refreshes status/deadline/prompt_date instead of accumulating one row
+  // per run (the old `e2e-fixture-${Date.now()}` key was unique per run).
+  // AvailabilityPrompt is not paranoid, so findOrCreate is safe here (a paranoid
+  // model's findOrCreate would miss soft-deleted rows and collide on re-create).
+  const [prompt] = await AvailabilityPrompt.findOrCreate({
+    where: { group_id: group.id, week_identifier: 'e2e-ci-magic-link' },
+    defaults: {
+      group_id: group.id,
+      prompt_date: new Date(),
+      deadline: new Date(Date.now() + 72 * 60 * 60 * 1000),
+      status: 'active',
+      week_identifier: 'e2e-ci-magic-link',
+    },
+  });
+  await prompt.update({
     status: 'active',
-    week_identifier: `e2e-fixture-${Date.now()}`,
+    deadline: new Date(Date.now() + 72 * 60 * 60 * 1000),
+    prompt_date: new Date(),
   });
 
   const availability = await generateToken(alice, prompt);
