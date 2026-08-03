@@ -1,5 +1,6 @@
 // scripts/seed-sample-data.js
 const { User, Group, UserGroup, Game, Event, EventParticipation, GameReview, sequelize } = require('../models');
+const { assertNotProductionDb } = require('./lib/assert-not-production-db');
 
 // Sample data arrays
 // NOTE: user_id should match your Auth0 'sub' claim value
@@ -142,6 +143,13 @@ const sampleGames = [
 
 async function seedDatabase() {
   try {
+    // Phase 87.8 Plan 02 Task 0 (T-87.8-05): default-deny guard BEFORE the first
+    // destructive statement. The sync({ alter: true }) below is itself
+    // schema-destructive, not just the destroy({ where: {} }) block — so the guard
+    // must run before BOTH. Throws on NODE_ENV=production and on any non-local DB
+    // host unless ALLOW_DESTRUCTIVE_SEED=1 is explicitly set.
+    assertNotProductionDb(sequelize);
+
     console.log('🌱 Starting database seeding...\n');
     console.log('📝 Note: Make sure your database exists and is configured in .env\n');
 
