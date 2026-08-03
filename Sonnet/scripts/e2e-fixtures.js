@@ -3,20 +3,27 @@
 // Run AFTER seed-sample-data.js (needs Alice + Weekend Warriors to exist).
 //
 // Emits ONE machine-readable line to stdout:
-//   E2E_FIXTURES_JSON={"group_id":"...","availability_token":"...","rsvp_path":"..."}
+//   E2E_FIXTURES_JSON={"group_id":"...","availability_token":"...","rsvp_path":"...",...}
 // (Sequelize query logging also writes to stdout — consumers must grep the marker.)
 //
-// Produces:
-// - group_id            → E2E_GROUP_ID  (create-event journey's planning surface)
-// - availability_token  → E2E_AVAILABILITY_TOKEN (magic JWT for /availability-form/[token])
-// - rsvp_path           → E2E_RSVP_PATH (/rsvp/<hmac>?e=&u=&s=yes for a FUTURE event —
-//                         routes/rsvp.js rejects past events, and every seeded event is past)
+// Emitted keys — this list MUST enumerate every key in the emit object literal at
+// the bottom of this file, no more and no fewer (round-3 ML#22: this header is
+// documentation, not a contract the code enforces, and it HAD silently drifted):
+// - group_id                 → E2E_GROUP_ID (create-event journey's planning surface)
+// - availability_token       → E2E_AVAILABILITY_TOKEN (magic JWT for /availability-form/[token])
+// - rsvp_path                → E2E_RSVP_PATH (/rsvp/<hmac>?e=&u=&s=yes for a FUTURE event —
+//                              routes/rsvp.js rejects past events, and every seeded event is past)
+// - invite_group_name        → group Alice owns, the invite journey's target group
+// - invite_friend_name       → accepted friend NOT in that group (desktop journeys target)
+// - invite_friend_name_phone → second accepted friend, --project=phone target (D-07)
+// - rsvp_path_phone          → second future event's RSVP link, --project=phone target (D-07)
+// - restore_path             → /restore/group/<nonce> for the restore-preview spec (R7)
 //
 // Requires MAGIC_TOKEN_SECRET in env (same value the booted server uses, or
 // token validation will fail server-side).
 
 const crypto = require('crypto');
-const { User, Group, UserGroup, Friendship, SingleUseToken, Event, AvailabilityPrompt, sequelize } = require('../models');
+const { User, Group, UserGroup, Friendship, SingleUseToken, Event, AvailabilityPrompt, GroupInvite, sequelize } = require('../models');
 const { generateToken } = require('../services/magicTokenService');
 
 // RSVP single-use link lifetime — mirrors routes/rsvp.js RSVP_TOKEN_TTL_MS (30d).
@@ -119,6 +126,55 @@ async function main() {
     { updateOnDuplicate: ['email_batch_id', 'rsvp_status', 'status', 'expires_at', 'used_at', 'updatedAt'] }
   );
 
+  // D-07 (Phase 87.8): arming --project=phone alongside --project=journeys runs
+  // every e2e/*.spec.ts twice per CI job, concurrently, and the RSVP journey is
+  // single-use — GET /rsvp/respond atomically consumes its token. Do NOT relax
+  // the atomic single-use consume in models/SingleUseToken.js to make the second
+  // run pass (that atomicity is a security control pinned by
+  // tests/routes/singleUseToken.test.js, T-87.8-06); minting a SECOND target is
+  // the correct fix. The nonce is an HMAC
+  // over (event id, user id, status), so a distinct event id yields distinct
+  // nonces automatically. Unlike the desktop event above (whose per-run
+  // Event.create behaviour is deliberately unchanged), this one is keyed
+  // idempotently on its comments string — findOrCreate costs nothing here, and
+  // the reactivating start_date refresh keeps a reused row in the future so
+  // routes/rsvp.js never rejects it as past.
+  const PHONE_EVENT_COMMENTS = 'E2E fixture event for --project=phone (created by scripts/e2e-fixtures.js)';
+  const [eventPhone] = await Event.findOrCreate({
+    where: { group_id: group.id, comments: PHONE_EVENT_COMMENTS },
+    defaults: {
+      group_id: group.id,
+      start_date: new Date(Date.now() + 4 * 24 * 60 * 60 * 1000),
+      duration_minutes: 120,
+      status: 'scheduled',
+      comments: PHONE_EVENT_COMMENTS,
+    },
+  });
+  await eventPhone.update({
+    start_date: new Date(Date.now() + 4 * 24 * 60 * 60 * 1000),
+    status: 'scheduled',
+  });
+
+  const rsvpTokenPhone = generateRsvpToken(eventPhone.id, alice.user_id, 'yes');
+  const rsvpPathPhone = `/rsvp/${rsvpTokenPhone}?e=${eventPhone.id}&u=${encodeURIComponent(alice.user_id)}&s=yes`;
+
+  const rsvpBatchIdPhone = crypto.randomUUID();
+  await SingleUseToken.bulkCreate(
+    ['yes', 'maybe', 'no'].map((status) => ({
+      nonce: generateRsvpToken(eventPhone.id, alice.user_id, status),
+      user_id: alice.user_id,
+      purpose: 'rsvp',
+      event_id: eventPhone.id,
+      email_batch_id: rsvpBatchIdPhone,
+      rsvp_status: status,
+      status: 'active',
+      expires_at: rsvpExpiresAt,
+      used_at: null,
+    })),
+    // Same deterministic-nonce UPSERT idempotency as the desktop batch above.
+    { updateOnDuplicate: ['email_batch_id', 'rsvp_status', 'status', 'expires_at', 'used_at', 'updatedAt'] }
+  );
+
   // Invite-to-group journey fixture: Alice must own a group, and have an accepted
   // friend who is NOT in that group (so the friends-screen checkbox is enabled and
   // the invite has a valid target). Seed data creates no friendships, so build one.
@@ -156,6 +212,35 @@ async function main() {
   // F-02: hard delete — a soft-deleted membership row still occupies the roster from
   // the fixture's point of view on the next run, so the teardown must really remove it.
   await UserGroup.destroy({ where: { user_uuid: friend.id, group_id: inviteGroup.id }, force: true });
+
+  // D-07 (Phase 87.8): second, per-project invite target. The invite journey is
+  // also non-re-entrant — routes/invites.js 409s while a pending invite exists for
+  // the same email+group — so running --project=phone concurrently with
+  // --project=journeys needs a DISTINCT friend to invite. Desktop keeps Bob;
+  // phone gets Charlie, a seeded user who is likewise not a member of the invite
+  // group. Same Friendship.findOrCreate shape, same null-email backfill guard,
+  // same hard-delete UserGroup teardown as Bob above, so Charlie's friends-screen
+  // checkbox also stays enabled.
+  const friendPhone = await User.findOne({ where: { username: 'Charlie' } });
+  if (!friendPhone) {
+    throw new Error('Seed data missing (Charlie) — run seed-sample-data.js first');
+  }
+  if (!friendPhone.email) {
+    await friendPhone.update({ email: 'e2e-invite-friend-phone@example.com' });
+  }
+  await Friendship.findOrCreate({
+    where: { requester_uuid: alice.id, addressee_uuid: friendPhone.id },
+    defaults: { requester_uuid: alice.id, addressee_uuid: friendPhone.id, status: 'accepted' },
+  });
+  await UserGroup.destroy({ where: { user_uuid: friendPhone.id, group_id: inviteGroup.id }, force: true });
+
+  // Hard-delete EVERY invite row for the invite group, force: true — mirroring the
+  // F-02 reasoning above (a soft-deleted row still occupies the slot from the
+  // fixture's point of view). This closes a PRE-EXISTING cross-run leak, not only
+  // the new within-run one: invite.spec.ts creates pending invites that were never
+  // cleaned up, so a second run against the same database 409'd on the
+  // pending-invite check before this teardown existed.
+  await GroupInvite.destroy({ where: { group_id: inviteGroup.id }, force: true });
 
   // ── Restore-preview fixture (SPEC R7): a soft-deleted-but-restorable group plus
   // its active group_restore nonce, so the restore-preview spec has a route to visit.
@@ -232,6 +317,8 @@ async function main() {
     rsvp_path: rsvpPath,
     invite_group_name: inviteGroup.name,
     invite_friend_name: friend.username,
+    invite_friend_name_phone: friendPhone.username,
+    rsvp_path_phone: rsvpPathPhone,
     restore_path: restorePath,
   })}`);
 
