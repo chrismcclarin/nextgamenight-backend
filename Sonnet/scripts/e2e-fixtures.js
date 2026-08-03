@@ -18,12 +18,16 @@
 // - invite_friend_name_phone → second accepted friend, --project=phone target (D-07)
 // - rsvp_path_phone          → second future event's RSVP link, --project=phone target (D-07)
 // - restore_path             → /restore/group/<nonce> for the restore-preview spec (R7)
+// - event_detail_path        → /gameDetail?event_id=&group_id= for the touch-target
+//                              add-friend specs (R4/D-13) — the RsvpSection surface;
+//                              rows below make Diana (not-yet-friend) + Bob (friend)
+//                              render there
 //
 // Requires MAGIC_TOKEN_SECRET in env (same value the booted server uses, or
 // token validation will fail server-side).
 
 const crypto = require('crypto');
-const { User, Group, UserGroup, Friendship, SingleUseToken, Event, AvailabilityPrompt, GroupInvite, sequelize } = require('../models');
+const { User, Group, UserGroup, Friendship, SingleUseToken, Event, EventRsvp, AvailabilityPrompt, GroupInvite, sequelize } = require('../models');
 const { generateToken } = require('../services/magicTokenService');
 
 // RSVP single-use link lifetime — mirrors routes/rsvp.js RSVP_TOKEN_TTL_MS (30d).
@@ -125,6 +129,30 @@ async function main() {
     // (reactivate) rather than collide — mirrors routes/rsvp.js mintRsvpBatch.
     { updateOnDuplicate: ['email_batch_id', 'rsvp_status', 'status', 'expires_at', 'used_at', 'updatedAt'] }
   );
+
+  // Touch-target add-friend surface (R4/D-13, plan 87.8-12): gameDetail's
+  // RsvpSection renders a member row ONLY per EventRsvp row (RsvpSection.js
+  // buckets data.rsvps by status — no RSVP, no row, no add-friend "+"). Seed two:
+  // Diana (Weekend Warriors member, NOT Alice's friend — the Friendship rows this
+  // script creates below cover Bob and Charlie only) carries the "+" the specs
+  // measure, and
+  // Bob (already-friend) renders without it, giving the D-13 tap-isolation probe
+  // its vertically adjacent row. Keyed user_uuid → Users.id (87.1 rekey).
+  // Idempotent on re-run: findOrCreate on the natural (event_id, user_uuid) key.
+  const diana = await User.findOne({ where: { username: 'Diana' } });
+  const bob = await User.findOne({ where: { username: 'Bob' } });
+  if (!diana || !bob) {
+    throw new Error('Seed data missing (Diana / Bob) — run seed-sample-data.js first');
+  }
+  for (const member of [diana, bob]) {
+    const [row] = await EventRsvp.findOrCreate({
+      where: { event_id: event.id, user_uuid: member.id },
+      defaults: { event_id: event.id, user_uuid: member.id, status: 'yes' },
+    });
+    if (row.status !== 'yes') await row.update({ status: 'yes' });
+  }
+  // Same URL shape EventCalendar/GroupGamesList build for this surface.
+  const eventDetailPath = `/gameDetail?event_id=${event.id}&group_id=${group.id}`;
 
   // D-07 (Phase 87.8): arming --project=phone alongside --project=journeys runs
   // every e2e/*.spec.ts twice per CI job, concurrently, and the RSVP journey is
@@ -320,6 +348,7 @@ async function main() {
     invite_friend_name_phone: friendPhone.username,
     rsvp_path_phone: rsvpPathPhone,
     restore_path: restorePath,
+    event_detail_path: eventDetailPath,
   })}`);
 
   await sequelize.close();
