@@ -16,6 +16,48 @@ const { requirePlatformAdmin } = require('../middleware/adminAuth');
 const { Feedback } = require('../models');
 const emailService = require('../services/emailService');
 
+// [87.8-05 Task 4, round-3 security] pageUrl credential scrub — BE half,
+// defence-in-depth (the FE scrubs at the source in
+// periodictabletop/src/lib/scrubFeedbackPageUrl.ts, but a stale client can
+// still send window.location.href verbatim). The five routes below embed a
+// LIVE credential in the PATH segment (signed magic JWT, HMAC RSVP token,
+// invite tokens, restore nonce), and the RSVP query string carries an Auth0
+// sub — so the token segment is replaced with the literal placeholder and
+// any query string / fragment is stripped BEFORE the value reaches a GitHub
+// Issue body or the DB page_context column.
+//
+// DEFAULT-DENY RULE: any route whose path embeds a credential gets a
+// placeholder before entering an issue body. The list is the five token
+// routes TODAY — the next token route added to the app belongs here AND in
+// the FE scrub list.
+const TOKEN_ROUTE_PREFIXES = [
+  '/availability-form/',
+  '/rsvp/',
+  '/invite/group/',
+  '/invite/game/',
+  '/restore/group/',
+];
+
+function scrubPageUrl(pageUrl) {
+  if (typeof pageUrl !== 'string' || pageUrl === '') return pageUrl;
+  // Strip query string and fragment unconditionally — the RSVP query carries
+  // an Auth0 sub (?e=&u=&s=), and no legitimate reporting need survives it.
+  const noQuery = pageUrl.split('?')[0].split('#')[0];
+  // A stale client sends an absolute URL; split off the origin so the prefix
+  // match runs against the path alone.
+  const originMatch = noQuery.match(/^[a-z][a-z0-9+.-]*:\/\/[^/]*/i);
+  const origin = originMatch ? originMatch[0] : '';
+  const path = originMatch ? noQuery.slice(origin.length) || '/' : noQuery;
+  for (const prefix of TOKEN_ROUTE_PREFIXES) {
+    if (path.startsWith(prefix)) {
+      // Replace the ENTIRE dynamic remainder — never truncate the token
+      // partially (a prefix of a signed token is still sensitive material).
+      return `${origin}${prefix}[token]`;
+    }
+  }
+  return `${origin}${path}`;
+}
+
 // Submit feedback as a GitHub Issue (with DB fallback)
 router.post('/github', verifyAuth0Token, async (req, res) => {
   try {
@@ -32,6 +74,10 @@ router.post('/github', verifyAuth0Token, async (req, res) => {
       return res.status(400).json({ error: 'Page URL is required' });
     }
 
+    // [87.8-05 Task 4] ONE scrubbed value feeds BOTH sinks (issue body and the
+    // DB fallback below) — never interpolate the raw pageUrl past this point.
+    const safePageUrl = scrubPageUrl(pageUrl);
+
     const title = `[Feedback] ${category}: ${text.substring(0, 50)}${text.length > 50 ? '...' : ''}`;
     const body = [
       '## Feedback',
@@ -39,7 +85,7 @@ router.post('/github', verifyAuth0Token, async (req, res) => {
       text,
       '',
       '---',
-      `**Page:** ${pageUrl}`,
+      `**Page:** ${safePageUrl}`,
       `**User:** ${userName || 'Unknown'}`,
       `**Email:** ${userEmail || 'Not provided'}`,
       `**Category:** ${category}`,
@@ -74,7 +120,7 @@ router.post('/github', verifyAuth0Token, async (req, res) => {
         description: text,
         user_email: userEmail || null,
         user_id: null,
-        page_context: pageUrl,
+        page_context: safePageUrl,
       });
     }
 
@@ -192,3 +238,6 @@ router.get('/', requirePlatformAdmin, async (req, res) => {
 });
 
 module.exports = router;
+// Exported for the unit test (tests/routes/feedback.test.js) — pure helper,
+// no router behaviour attached.
+module.exports.scrubPageUrl = scrubPageUrl;
