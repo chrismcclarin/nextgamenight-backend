@@ -1,5 +1,11 @@
 // scripts/seed-sample-data.js
-const { User, Group, UserGroup, Game, Event, EventParticipation, GameReview, sequelize } = require('../models');
+const { Op } = require('sequelize');
+const {
+  User, Group, UserGroup, Game, Event, EventParticipation, GameReview,
+  AvailabilityPrompt, AvailabilityResponse, AvailabilitySuggestion, sequelize,
+} = require('../models');
+const heatmapService = require('../services/heatmapService');
+const { assertNotProductionDb } = require('./lib/assert-not-production-db');
 
 // Sample data arrays
 // NOTE: user_id should match your Auth0 'sub' claim value
@@ -142,6 +148,13 @@ const sampleGames = [
 
 async function seedDatabase() {
   try {
+    // Phase 87.8 Plan 02 Task 0 (T-87.8-05): default-deny guard BEFORE the first
+    // destructive statement. The sync({ alter: true }) below is itself
+    // schema-destructive, not just the destroy({ where: {} }) block — so the guard
+    // must run before BOTH. Throws on NODE_ENV=production and on any non-local DB
+    // host unless ALLOW_DESTRUCTIVE_SEED=1 is explicitly set.
+    assertNotProductionDb(sequelize);
+
     console.log('🌱 Starting database seeding...\n');
     console.log('📝 Note: Make sure your database exists and is configured in .env\n');
 
@@ -166,6 +179,16 @@ async function seedDatabase() {
     console.log('🗑️  Clearing existing data...');
     // F-02: the three paranoid models are FORCED (Event/UserGroup/Group) — a
     // reseed must WIPE rows, not accumulate soft-deleted ones run after run.
+    //
+    // Phase 87.8 Plan 02 (R8): the availability check-in rows follow the SAME
+    // wipe-then-recreate idempotency convention as the rest of this block (no
+    // upsert idiom needed). FK order: suggestions and responses reference the
+    // prompt, and the prompt references group_id — so all three go before
+    // Group.destroy. None of the three models is paranoid (confirmed against the
+    // model files), so a plain destroy fully removes rows — no force needed.
+    await AvailabilitySuggestion.destroy({ where: {} });
+    await AvailabilityResponse.destroy({ where: {} });
+    await AvailabilityPrompt.destroy({ where: {} });
     await GameReview.destroy({ where: {} });
     await EventParticipation.destroy({ where: {} });
     await Event.destroy({ where: {}, force: true });
@@ -426,6 +449,143 @@ async function seedDatabase() {
       });
     }
     console.log(`✅ Created ${reviews.length} game reviews\n`);
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Phase 87.8 Plan 02 Task 1 — SPEC R8 availability check-in (DEC-4):
+    // `npm run seed` ALONE produces Weekend Warriors' populated heatmap — no
+    // secret, no chained script. CI-only token minting stays in e2e-fixtures.js.
+    // ────────────────────────────────────────────────────────────────────────
+    console.log('🗓️  Seeding availability check-in (R8 heatmap)...');
+
+    // Week derivation — BOTH live heatmap read paths must reach this prompt:
+    //  - services/availabilityService.js getGroupHeatmap (the EventHeatmapBackground
+    //    surface) looks the prompt up by { group_id, status: 'active',
+    //    week_identifier: <ISO week> }, deriving the ISO week from the caller's
+    //    weekStart param (availabilityService.js:674-680, UTC Thursday algorithm).
+    //  - The caller is the frontend: createEvent.js:326-334 derives "today" from the
+    //    user's effective TZ (LOCAL wall clock), snaps to Monday (weekStartsOn: 1),
+    //    and sends that yyyy-MM-dd Monday as weekStart.
+    // So the seeded week_identifier must be the ISO week of LOCAL-today's Monday —
+    // the week the browser will actually request at walkthrough time — NOT the ISO
+    // week of an independently-derived UTC "today". The two diverge in evening
+    // hours west of UTC at week boundaries (Sunday evening local is already Monday
+    // UTC, which would seed NEXT week and leave the walkthrough's request empty).
+    // We reproduce the FE's local-Monday first, then apply the backend's own
+    // ISO-week algorithm to that Monday. Assumption: the machine running the seed
+    // shares its TZ with the walkthrough browser (both the owner's machine).
+    const localNow = new Date();
+    const localNoon = new Date(Date.UTC(localNow.getFullYear(), localNow.getMonth(), localNow.getDate(), 12, 0, 0));
+    const localDow = localNoon.getUTCDay() || 7; // 1=Mon .. 7=Sun (weekStartsOn: 1 semantics)
+    const weekMonday = new Date(localNoon);
+    weekMonday.setUTCDate(weekMonday.getUTCDate() - (localDow - 1));
+    const weekStartStr = weekMonday.toISOString().slice(0, 10); // the string the FE would send
+    // Backend ISO-week derivation, reproduced from services/availabilityService.js:674-680:
+    const weekDate = new Date(weekStartStr + 'T00:00:00Z');
+    const thursday = new Date(weekDate);
+    thursday.setUTCDate(thursday.getUTCDate() + (4 - (thursday.getUTCDay() || 7)));
+    const yearStart = new Date(Date.UTC(thursday.getUTCFullYear(), 0, 1));
+    const weekNum = Math.ceil(((thursday - yearStart) / 86400000 + 1) / 7);
+    const isoWeek = `${thursday.getUTCFullYear()}-W${String(weekNum).padStart(2, '0')}`;
+
+    const availabilityPrompt = await AvailabilityPrompt.create({
+      group_id: weekendGroup.id,
+      prompt_date: now,
+      deadline: new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000),
+      status: 'active',
+      week_identifier: isoWeek,
+      // created_by_user_id stays null (auto-style prompt) — satisfies the
+      // availability_prompts_auto_group_week_unique partial index; the wipe block
+      // above guarantees at most one such row per seed run.
+    });
+
+    // 30-minute sub-slots, because BOTH read paths AND consecutive halves
+    // (HH:00 + HH:30) into one visible hour — a response stored as a single
+    // multi-hour block would aggregate but never RENDER (routes/availabilityPrompt.js
+    // hour bucketing needs both halves; availabilityService.js requires both the
+    // date_HH:00 and date_HH:30 keys per hour).
+    const slotAt = (dayOffset, hourUtc, halfHour, preference) => {
+      const start = new Date(weekDate);
+      start.setUTCDate(start.getUTCDate() + dayOffset);
+      start.setUTCHours(hourUtc, halfHour ? 30 : 0, 0, 0);
+      const end = new Date(start.getTime() + 30 * 60 * 1000);
+      return { start: start.toISOString(), end: end.toISOString(), preference };
+    };
+    const hourSlots = (dayOffset, hourUtc, preference) => [
+      slotAt(dayOffset, hourUtc, false, preference),
+      slotAt(dayOffset, hourUtc, true, preference),
+    ];
+
+    // Three DELIBERATELY DIFFERENT patterns for visible heatmap contrast, with
+    // shared exact {start, end} pairs layered in ON PURPOSE:
+    // heatmapService.aggregateResponses keys suggestions on EXACT {start, end}
+    // matches (round-3 finding ML#25), so merely-different patterns can legally
+    // overlap nowhere. Overlap is guaranteed BY CONSTRUCTION here, not by chance:
+    // Bob and Charlie share the full Friday 18:00-19:00 UTC hour (both 30-min
+    // pairs), and Bob and Diana share Saturday 18:00-19:00 UTC.
+    // Day offsets are from the week's Monday (4 = Friday, 5 = Saturday); UTC hours
+    // 17-21 sit inside the heatmap's local 10:00-23:00 grid for both UTC and
+    // US-Eastern viewers.
+    const bobSlots = [ // broad, mostly preferred
+      ...hourSlots(4, 17, 'preferred'),
+      ...hourSlots(4, 18, 'preferred'), // ← shared exact pairs with Charlie
+      ...hourSlots(4, 19, 'preferred'),
+      ...hourSlots(4, 20, 'if-need-be'),
+      ...hourSlots(5, 18, 'preferred'), // ← shared exact pairs with Diana
+      ...hourSlots(5, 19, 'preferred'),
+    ];
+    const charlieSlots = [ // narrower, mixed preferences
+      ...hourSlots(4, 18, 'preferred'), // ← shared exact pairs with Bob
+      ...hourSlots(4, 19, 'if-need-be'),
+    ];
+    const dianaSlots = [ // available one hour only
+      ...hourSlots(5, 18, 'if-need-be'), // ← shared exact pairs with Bob
+    ];
+
+    // DECISION Phase 87.8 (R8/DEC-4): responses for Bob, Charlie and Diana ONLY —
+    // Alice's response is deliberately WITHHELD, chosen OVER seeding all four
+    // members. promptLifecycleService.checkConsensusAndClose closes a prompt the
+    // instant respondedCount === totalActive, and Weekend Warriors has exactly 4
+    // active members — seeding 3 of 4 keeps the prompt 'active' by construction,
+    // so a real member can still respond during a walkthrough without the seed
+    // having pre-tripped consensus auto-close. Adding Alice here is a decision,
+    // not a completeness fix.
+    const responseRows = [
+      { user: users[1], time_slots: bobSlots },     // Bob
+      { user: users[2], time_slots: charlieSlots }, // Charlie
+      { user: users[3], time_slots: dianaSlots },   // Diana
+    ];
+    for (const { user, time_slots } of responseRows) {
+      await AvailabilityResponse.create({
+        prompt_id: availabilityPrompt.id,
+        // user_uuid MUST come from the User instance's .id (Users.id UUID) — never
+        // .user_id, which is the Auth0 sub string (Phase 87.5 UUID re-key).
+        user_uuid: user.id,
+        time_slots,
+        user_timezone: 'America/New_York',
+        submitted_at: now, // NULL would exclude the row from every responded/consensus query
+      });
+    }
+    console.log(`   ✓ Created 1 active check-in (${isoWeek}) with 3 responses (Bob, Charlie, Diana)`);
+
+    // This single call is what makes the seed reachable by the per-prompt heatmap
+    // route (routes/availabilityPrompt.js GET /prompts/:promptId/heatmap reads
+    // AvailabilitySuggestion rows, never raw responses). The ISO-week
+    // week_identifier above is what makes the prompt independently reachable by
+    // availabilityService.getGroupHeatmap. Both paths are needed — different
+    // frontend surfaces read them and neither substitutes for the other.
+    const aggregation = await heatmapService.aggregateResponses(availabilityPrompt.id);
+    console.log(`   ✓ aggregateResponses: ${aggregation.suggestionCount} suggestion rows (${aggregation.message})`);
+
+    // Consensus sanity line — same query shape promptLifecycleService.js:56-70
+    // uses — so a human running `npm run seed` sees at a glance that consensus
+    // was NOT tripped.
+    const totalActive = await UserGroup.count({
+      where: { group_id: weekendGroup.id, status: 'active' },
+    });
+    const respondedCount = await AvailabilityResponse.count({
+      where: { prompt_id: availabilityPrompt.id, submitted_at: { [Op.ne]: null } },
+    });
+    console.log(`   ✓ Consensus check: respondedCount ${respondedCount} / totalActive ${totalActive} — prompt stays '${availabilityPrompt.status}' (Alice deliberately withheld)\n`);
 
     console.log('🎉 Database seeding completed successfully!\n');
     console.log('📊 Summary:');
