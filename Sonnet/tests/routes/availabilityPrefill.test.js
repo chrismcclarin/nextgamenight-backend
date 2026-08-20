@@ -206,11 +206,15 @@ describe('POST /api/availability-prefill/gcal', () => {
   });
 
   it('excludes slots whose UTC date+startTime is in the busy set (conservative overlap)', async () => {
-    // Mark 02:00 UTC on the start day as busy. The endpoint must not include
-    // a "2026-05-18T02:00:00.000Z" slot in the free list, but should include
-    // "2026-05-18T02:30:00.000Z" (adjacent slot is free).
+    // Phase 88-34 WI-B3 (M6): this fixture used to mark 2026-05-18T02:00Z busy.
+    // That instant is local 2026-05-17 19:00 PDT — the day BEFORE the window's
+    // first local day — so under the old UTC-midnight bounds it was inside the
+    // window only because of the bug M6 fixed (the rollover sliver). Moved to
+    // 2026-05-19T02:00Z = local Mon 2026-05-18 19:00 PDT, genuinely inside the
+    // window. The assertion (busy slot excluded, adjacent slot free) is
+    // unchanged — only the instants were re-anchored to the real local grid.
     googleCalendarService.getBusyTimesForDateRange.mockResolvedValue([
-      { date: '2026-05-18', startTime: '02:00', endTime: '02:30' },
+      { date: '2026-05-19', startTime: '02:00', endTime: '02:30' },
     ]);
 
     const res = await request(app)
@@ -223,8 +227,8 @@ describe('POST /api/availability-prefill/gcal', () => {
       });
 
     expect(res.status).toBe(200);
-    expect(res.body.slot_ids).not.toContain('2026-05-18T02:00:00.000Z');
-    expect(res.body.slot_ids).toContain('2026-05-18T02:30:00.000Z');
+    expect(res.body.slot_ids).not.toContain('2026-05-19T02:00:00.000Z');
+    expect(res.body.slot_ids).toContain('2026-05-19T02:30:00.000Z');
   });
 
   // ------------------------------------------------------------------
@@ -277,9 +281,13 @@ describe('POST /api/availability-prefill/gcal', () => {
   it('returns an empty array (count: 0) when every slot is busy', async () => {
     // Use generateTimeSlots to derive what the endpoint will see, then mark
     // every slot as busy.
+    // Phase 88-34 WI-B3 (M6): these bounds must MIRROR what the endpoint now
+    // computes — one LOCAL day in America/Los_Angeles, i.e. 07:00Z to 07:00Z
+    // during PDT — not the old UTC-midnight pair. Deriving from a stale window
+    // marks the wrong slots busy and leaves real free slots in the response.
     const availabilityService = require('../../services/availabilityService');
-    const startDate = new Date('2026-05-18T00:00:00.000Z');
-    const endDate = new Date('2026-05-19T00:00:00.000Z'); // 1 day only
+    const startDate = new Date('2026-05-18T07:00:00.000Z'); // 00:00 PDT 2026-05-18
+    const endDate = new Date('2026-05-19T07:00:00.000Z');   // 00:00 PDT 2026-05-19 (1 local day)
     const allSlots = availabilityService.generateTimeSlots(startDate, endDate, 'America/Los_Angeles');
     googleCalendarService.getBusyTimesForDateRange.mockResolvedValue(
       allSlots.map(s => ({ date: s.date, startTime: s.startTime, endTime: s.endTime }))
@@ -308,7 +316,10 @@ describe('POST /api/availability-prefill/saved', () => {
   // slotToLocal branch (deterministic) instead of the server-local
   // getDay() fallback (host-TZ-dependent).
   const TZ = 'America/Los_Angeles';
-  const WEEK_START = '2026-05-18'; // Monday in UTC; in LA this is Sun→Sat 2026-05-17→2026-05-23 local
+  // Phase 88-34 WI-B3 (M6): start_date is a LOCAL calendar date. The window is
+  // local Mon 2026-05-18 .. Sun 2026-05-24 (was documented here as Sun 05-17 ..
+  // Sat 05-23, which described the pre-M6 UTC-midnight window, not the grid).
+  const WEEK_START = '2026-05-18';
 
   let recurringUser;       // has a Mon-19:00-22:00 recurring pattern
   let overrideUser;        // has the same pattern + a Mon override that subtracts 20:00-21:00
@@ -708,3 +719,174 @@ describe('routes/availability.js self-CRUD — UUID wire + sub-shaped rollout wi
 // NOTE: no sequelize.close() here — the connection lifecycle is owned solely by
 // tests/globalTeardown.js (BTEST-02). Closing mid-run kills the shared
 // connection for every later serial suite.
+
+// ---------------------------------------------------------------------------
+// Phase 88-34 Task 3 (WI-B3) — walk MAJOR M6: the prefill window is the LOCAL
+// day grid the user actually sees, not a UTC-midnight window laid over it.
+//
+// Old bounds: [start_date T00:00Z, +N UTC days). In PDT (UTC-7) the last local
+// day's 17:00 is already 00:00Z on the day AFTER the end bound, so the whole
+// last evening was silently dropped — and a sliver of the day BEFORE day 1 was
+// silently included.
+//
+// Fork C (owner-ruled 2026-08-20): NO ±1 widening. AvailabilityForm submits
+// every returned slot id verbatim, so out-of-window slots would be PERSISTED as
+// phantom availability. The anti-phantom guard below pins that.
+// ---------------------------------------------------------------------------
+describe('Phase 88-34 WI-B3 — prefill window from local-day bounds (M6, fork C)', () => {
+  const TZ = 'America/Los_Angeles';
+  const WEEK_START = '2026-05-18';          // local Mon; window is local Mon 05-18 .. Sun 05-24
+  const LOCAL_START_UTC = '2026-05-18T07:00:00.000Z'; // 00:00 PDT on day 1
+  const LOCAL_END_UTC = '2026-05-25T07:00:00.000Z';   // 00:00 PDT on the day AFTER day 7
+
+  let lastDayUser;   // Sunday 17:00-22:00 pattern — the clipped evening
+  let group;
+  let prompt;
+  let lastDayToken;
+
+  beforeEach(async () => {
+    googleCalendarService.getBusyTimesForDateRange.mockReset();
+    googleCalendarService.getBusyTimesForDateRange.mockResolvedValue([]);
+
+    lastDayUser = await User.create({
+      user_id: 'auth0|prefill-m6-lastday',
+      username: 'M6 Last Day',
+      email: 'm6-lastday@test.com',
+      google_calendar_enabled: false,
+      google_calendar_token: null,
+      timezone: TZ,
+    });
+
+    group = await Group.create({ name: 'M6 Group', group_id: 'prefill-m6-group' });
+    prompt = await AvailabilityPrompt.create({
+      group_id: group.id,
+      prompt_date: new Date(),
+      deadline: new Date(Date.now() + 72 * 60 * 60 * 1000),
+      status: 'active',
+      week_identifier: '2026-W21-m6',
+    });
+
+    // Sunday (dayOfWeek 0) 17:00-22:00 LA local. 2026-05-24 is the window's
+    // LAST local day. Local 17:00 PDT == 2026-05-25T00:00Z — i.e. exactly the
+    // OLD end bound, so all ten of these slots used to fall outside the window.
+    await UserAvailability.create({
+      user_uuid: lastDayUser.id,
+      type: 'recurring_pattern',
+      pattern_data: { dayOfWeek: 0, startTime: '17:00', endTime: '22:00', timezone: TZ },
+      start_date: '2026-05-01',
+      end_date: null,
+      is_available: null,
+      timezone: TZ,
+    });
+
+    lastDayToken = await generateToken(lastDayUser, prompt);
+  });
+
+  it('(M6 regression) the last local day\'s EVENING is in the saved-prefill response', async () => {
+    const res = await request(app)
+      .post('/api/availability-prefill/saved')
+      .send({ magic_token: lastDayToken, start_date: WEEK_START, num_days: 7, timezone: TZ })
+      .expect(200);
+
+    // 17:00-22:00 local = 10 half-hour slots, all of them on 2026-05-25 in UTC.
+    expect(res.body.count).toBe(10);
+    expect(res.body.slot_ids).toContain('2026-05-25T00:00:00.000Z'); // 17:00 PDT — the first clipped slot
+    expect(res.body.slot_ids).toContain('2026-05-25T04:30:00.000Z'); // 21:30 PDT — the last one
+  });
+
+  it('(anti-phantom guard, fork C) NO returned instant falls outside the requested local window', async () => {
+    const res = await request(app)
+      .post('/api/availability-prefill/saved')
+      .send({ magic_token: lastDayToken, start_date: WEEK_START, num_days: 7, timezone: TZ })
+      .expect(200);
+
+    const startMs = Date.parse(LOCAL_START_UTC);
+    const endMs = Date.parse(LOCAL_END_UTC);
+    expect(res.body.slot_ids.length).toBeGreaterThan(0);
+    for (const id of res.body.slot_ids) {
+      const ms = Date.parse(id);
+      expect(ms).toBeGreaterThanOrEqual(startMs);
+      expect(ms).toBeLessThan(endMs);
+    }
+  });
+
+  it('(anti-phantom guard) the /gcal endpoint spans EXACTLY the local window, no rollover sliver', async () => {
+    const gcalUser = await User.create({
+      user_id: 'auth0|prefill-m6-gcal',
+      username: 'M6 GCal',
+      email: 'm6-gcal@test.com',
+      google_calendar_enabled: true,
+      google_calendar_token: 'fake-access-token',
+      timezone: TZ,
+    });
+    const gcalToken = await generateToken(gcalUser, prompt);
+
+    const res = await request(app)
+      .post('/api/availability-prefill/gcal')
+      .send({ magic_token: gcalToken, start_date: WEEK_START, num_days: 7, timezone: TZ })
+      .expect(200);
+
+    // Zero busy events => every slot in the window is free: 7 local days x 48.
+    expect(res.body.count).toBe(7 * 48);
+    const sorted = [...res.body.slot_ids].sort();
+    expect(sorted[0]).toBe(LOCAL_START_UTC);
+    // Last slot starts 30 minutes before the end bound (half-open window).
+    expect(sorted[sorted.length - 1]).toBe('2026-05-25T06:30:00.000Z');
+    // The old UTC-midnight anchor pulled in local Sunday 05-17 17:00 onward.
+    expect(res.body.slot_ids).not.toContain('2026-05-18T00:00:00.000Z');
+  });
+
+  // The window bound is measured with Intl AT the instant, so a DST transition
+  // inside the window shortens/lengthens it correctly. 2026-03-08 is US
+  // spring-forward: the 7-day window is 167 hours, not 168.
+  it('(DST) a window spanning spring-forward is 167 local hours, with PST and PDT bounds', async () => {
+    const dstUser = await User.create({
+      user_id: 'auth0|prefill-m6-dst',
+      username: 'M6 DST',
+      email: 'm6-dst@test.com',
+      google_calendar_enabled: true,
+      google_calendar_token: 'fake-access-token',
+      timezone: TZ,
+    });
+    const dstToken = await generateToken(dstUser, prompt);
+
+    const res = await request(app)
+      .post('/api/availability-prefill/gcal')
+      .send({ magic_token: dstToken, start_date: '2026-03-06', num_days: 7, timezone: TZ })
+      .expect(200);
+
+    const sorted = [...res.body.slot_ids].sort();
+    expect(sorted[0]).toBe('2026-03-06T08:00:00.000Z');        // 00:00 PST (UTC-8)
+    expect(sorted[sorted.length - 1]).toBe('2026-03-13T06:30:00.000Z'); // end bound 07:00Z = 00:00 PDT (UTC-7)
+    expect(res.body.count).toBe(167 * 2);
+  });
+
+  // Fixed-offset arithmetic silently breaks for zones whose offset is not a
+  // whole number of hours. Asia/Kathmandu is +05:45.
+  it('(sub-hour offset) Asia/Kathmandu bounds land at :15 past the hour, not on the hour', async () => {
+    const kUser = await User.create({
+      user_id: 'auth0|prefill-m6-ktm',
+      username: 'M6 Kathmandu',
+      email: 'm6-ktm@test.com',
+      google_calendar_enabled: true,
+      google_calendar_token: 'fake-access-token',
+      timezone: 'Asia/Kathmandu',
+    });
+    const kToken = await generateToken(kUser, prompt);
+
+    const res = await request(app)
+      .post('/api/availability-prefill/gcal')
+      .send({ magic_token: kToken, start_date: WEEK_START, num_days: 7, timezone: 'Asia/Kathmandu' })
+      .expect(200);
+
+    // 00:00 local on 2026-05-18 == 2026-05-17T18:15Z. generateTimeSlots only
+    // emits :00/:30 marks, so the first slot inside [18:15Z, ...) is 18:30Z.
+    const sorted = [...res.body.slot_ids].sort();
+    expect(sorted[0]).toBe('2026-05-17T18:30:00.000Z');
+    expect(sorted[sorted.length - 1]).toBe('2026-05-24T18:00:00.000Z');
+    for (const id of res.body.slot_ids) {
+      expect(Date.parse(id)).toBeGreaterThanOrEqual(Date.parse('2026-05-17T18:15:00.000Z'));
+      expect(Date.parse(id)).toBeLessThan(Date.parse('2026-05-24T18:15:00.000Z'));
+    }
+  });
+});
