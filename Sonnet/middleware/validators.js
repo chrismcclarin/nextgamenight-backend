@@ -137,6 +137,116 @@ const validateGroupUpdate = [
 ];
 
 // Event validators
+// ---------------------------------------------------------------------------
+// DECISION Phase 88-34 Task 4 (fork 2 BE half + fork E, owner-ruled 2026-08-20):
+// guest names on Events are validated HERE, at the write path, for ALL THREE
+// carriers with ONE shared rule — over validating only the JSONB copy, and over
+// letting the one-time clamp backfill carry the invariant alone.
+//
+// WHY ALL THREE. A guest name lives in three places on an Event:
+// custom_participants[].username (JSONB), winner_name, and picked_by_name. The
+// FE re-links a winner/picked-by back to a guest by EXACT STRING EQUALITY, and
+// it derives winner_name from the RAW guest username in the same request
+// (eventFormUtils.js builds custom_participants[].username and winner_name from
+// the same untrimmed input). Normalizing one carrier and not the others — or
+// normalizing them differently — silently breaks that equality match and ERASES
+// winner/picked-by attribution on the next edit. So the trim and the 50-cap
+// below are deliberately shared, not duplicated per field.
+//
+// WHY NOT A CLAMP. Create and update strict-REJECT over 50; they never truncate.
+// A validator-side clamp would silently produce a different stored value than
+// the client sent, re-creating exactly the byte-divergence the backfill closes,
+// and hiding it until a second edit. The one-time migration clamps LEGACY rows
+// once; these validators are what stop new writes reopening that gap.
+//
+// WHY AN ELEMENT-SHAPE WHITELIST. custom_participants is a raw JSONB column —
+// without a key whitelist an arbitrary object graph rides the array straight
+// into the database (T-88-34-02). Unknown keys and non-string usernames are
+// rejected rather than stripped, so a client sending garbage learns about it.
+//
+// NOT re-added here (VERIFIED 2026-08-17, do not "fix" this): group name max-40
+// is already enforced by validateGroupCreate/Update above, and username max-50
+// by routes/users.js. Duplicating either is a regression risk, not a fix.
+// ---------------------------------------------------------------------------
+const GUEST_NAME_MAX = 50;
+const MAX_CUSTOM_PARTICIPANTS = 50;
+const CUSTOM_PARTICIPANT_KEYS = ['username', 'score', 'faction', 'is_new_player', 'placement'];
+
+// The ONE normalization. Every guest-name carrier runs exactly this.
+const normalizeGuestName = (value) => (typeof value === 'string' ? value.trim() : value);
+
+// Applies normalizeGuestName to each element's username, preserving element
+// order and every sibling field (same element-preserving contract as the
+// backfill migration's JSONB rebuild).
+const normalizeCustomParticipants = (value) => {
+  if (!Array.isArray(value)) return value; // shape validator below rejects it
+  return value.map((el) =>
+    el && typeof el === 'object' && !Array.isArray(el) && typeof el.username === 'string'
+      ? { ...el, username: normalizeGuestName(el.username) }
+      : el
+  );
+};
+
+const validateCustomParticipants = (value) => {
+  if (value === null || value === undefined) return true;
+  if (!Array.isArray(value)) {
+    throw new Error('custom_participants must be an array');
+  }
+  if (value.length > MAX_CUSTOM_PARTICIPANTS) {
+    throw new Error(`custom_participants cannot exceed ${MAX_CUSTOM_PARTICIPANTS} entries`);
+  }
+  for (const el of value) {
+    if (el === null || typeof el !== 'object' || Array.isArray(el)) {
+      throw new Error('Each custom participant must be an object');
+    }
+    for (const key of Object.keys(el)) {
+      if (!CUSTOM_PARTICIPANT_KEYS.includes(key)) {
+        throw new Error(`Unknown custom participant field: ${key}`);
+      }
+    }
+    if (typeof el.username !== 'string') {
+      throw new Error('Custom participant username must be a string');
+    }
+    // Already trimmed by the sanitizer that runs before this validator.
+    if (el.username.length < 1 || el.username.length > GUEST_NAME_MAX) {
+      throw new Error(`Guest name must be between 1 and ${GUEST_NAME_MAX} characters`);
+    }
+  }
+  return true;
+};
+
+// winner_name / picked_by_name are OPTIONAL in a way custom_participants[].username
+// is not: a MEMBER winner is recorded via winner_id and leaves this column blank.
+// So blank-after-trim means "no custom winner" (the routes already coerce it to
+// null), while a NON-blank value gets the identical 50-cap as the JSONB copy —
+// which is what keeps the two byte-identical for the FE's exact-string re-link.
+const makeGuestNameFieldValidator = (label) => (value) => {
+  if (value === null || value === undefined || value === '') return true;
+  if (typeof value !== 'string') {
+    throw new Error(`${label} must be a string`);
+  }
+  if (value.length > GUEST_NAME_MAX) {
+    throw new Error(`${label} must be ${GUEST_NAME_MAX} characters or less`);
+  }
+  return true;
+};
+
+// The shared chain fragment, so create and update cannot drift apart.
+const guestNameCarrierRules = () => [
+  body('custom_participants')
+    .optional({ nullable: true })
+    .customSanitizer(normalizeCustomParticipants)
+    .custom(validateCustomParticipants),
+  body('winner_name')
+    .optional({ nullable: true })
+    .customSanitizer(normalizeGuestName)
+    .custom(makeGuestNameFieldValidator('Winner name')),
+  body('picked_by_name')
+    .optional({ nullable: true })
+    .customSanitizer(normalizeGuestName)
+    .custom(makeGuestNameFieldValidator('Picked-by name')),
+];
+
 const validateEventCreate = [
   body('group_id')
     .isUUID()
@@ -203,6 +313,7 @@ const validateEventCreate = [
     .trim()
     .isLength({ min: 1, max: 255 })
     .withMessage('Ballot option game_name must be between 1 and 255 characters'),
+  ...guestNameCarrierRules(),
   validate
 ];
 
@@ -237,6 +348,10 @@ const validateEventUpdate = [
     .optional()
     .isLength({ max: 2000 })
     .withMessage('Comments must be less than 2000 characters'),
+  // IDENTICAL rules to create — shared fragment, not a copy, so the two can
+  // never drift (a drift here is exactly how one carrier gets normalized and
+  // another does not, which erases winner attribution).
+  ...guestNameCarrierRules(),
   validate
 ];
 

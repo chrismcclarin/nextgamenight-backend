@@ -11,6 +11,14 @@ const Group = sequelize.define('Group', {
   name: {
     type: DataTypes.STRING,
     allowNull: false,
+    // DECISION Phase 88-34 Task 4: app-side `len` backstop, NOT a STRING(40)
+    // column type — a type change needs a migration and tangles with the 88.4
+    // migrate-cli-replay drift gate for zero user-visible gain. The route
+    // (validateGroupCreate / validateGroupUpdate, max 40) is the enforcement;
+    // this catches a future write path that forgets. Unlike User.username there
+    // is no machine-derived writer here — every Group.name comes from a human
+    // typing into a validated form — so no clamp-at-writer is needed.
+    validate: { len: [1, 40] },
   },
   group_id: {
     type: DataTypes.STRING,

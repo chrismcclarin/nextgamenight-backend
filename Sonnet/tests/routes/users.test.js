@@ -157,3 +157,119 @@ describe('User Routes', () => {
   });
 });
 
+
+// ---------------------------------------------------------------------------
+// Phase 88-34 Task 4 (fork D, owner-ruled 2026-08-20) — the provisioning clamp.
+//
+// The JIT provisioning branch derives username from Auth0 and, at :257-262,
+// given_name + family_name OVERRIDES everything. Real people have full names
+// longer than 50 characters. Once User.username carries a len[1,50] backstop, a
+// bare backstop with no clamp 500s their FIRST LOGIN — an outage with no
+// user-side workaround. Ruled: clamp at the writer, keep the backstop.
+// ---------------------------------------------------------------------------
+describe('Phase 88-34 Task 4 — provisioning clamps the Auth0-derived username (fork D)', () => {
+  beforeEach(async () => {
+    await UserGroup.destroy({ where: {} });
+    await User.destroy({ where: {} });
+    await Group.destroy({ where: {} });
+  });
+
+  // Same shape as makeApp above, but with the long-name Auth0 claims attached.
+  const makeAppWithClaims = (claims) => {
+    const a = express();
+    a.use(express.json());
+    a.use(stubAuth(claims));
+    a.use('/api/users', userRoutes);
+    return a;
+  };
+
+  it('(fork D repro) first login with a >50-char Auth0 full name succeeds with a 50-char username', async () => {
+    const sub = 'auth0|very-long-name-user';
+    const givenName = 'Bartholomew Maximilian Fitzgerald';   // 33
+    const familyName = 'Wolfeschlegelsteinhausenbergerdorff'; // 34 => 68 with the space
+
+    const res = await request(makeAppWithClaims({
+      user_id: sub,
+      email: 'long-name@example.com',
+      given_name: givenName,
+      family_name: familyName,
+    }))
+      .get(`/api/users/${sub}`)
+      .expect(200); // NOT 500 — that is the whole point of this test
+
+    const created = await User.findOne({ where: { user_id: sub } });
+    expect(created).not.toBeNull();
+    expect(created.username).toHaveLength(50);
+    expect(created.username).toBe(`${givenName} ${familyName}`.slice(0, 50));
+    expect(res.body.id).toBe(created.id);
+  });
+
+  it('the !created needsUpdate path clamps too (both write paths covered)', async () => {
+    const sub = 'auth0|existing-generic-user';
+    // A pre-existing row whose username is still the generic placeholder — the
+    // condition the needsUpdate branch exists for.
+    await User.create({ user_id: sub, username: 'User', email: 'generic@example.com' });
+
+    // The !created branch is only reachable through the route's RACE window:
+    // the initial self-read misses, so the handler enters the JIT block, but
+    // findOrCreate then finds the row that appeared in between. Simulate that
+    // by making the FIRST scoped lookup miss while the row genuinely exists —
+    // this is the only way to exercise the second write path through the route,
+    // and it is the exact concurrency shape that branch was written for.
+    const scopeSpy = jest.spyOn(User, 'scope').mockImplementationOnce(() => ({
+      findByPk: async () => null,
+      findOne: async () => null,
+    }));
+
+    const givenName = 'Bartholomew Maximilian Fitzgerald';
+    const familyName = 'Wolfeschlegelsteinhausenbergerdorff';
+
+    try {
+      await request(makeAppWithClaims({
+        user_id: sub,
+        email: 'generic-updated@example.com',
+        given_name: givenName,
+        family_name: familyName,
+      }))
+        .get(`/api/users/${sub}`)
+        .expect(200); // NOT 500 — an unclamped update would violate len[1,50]
+    } finally {
+      scopeSpy.mockRestore();
+    }
+
+    const updated = await User.scope('withContactInfo').findOne({ where: { user_id: sub } });
+    expect(updated.username).toHaveLength(50);
+    expect(updated.username).toBe(`${givenName} ${familyName}`.slice(0, 50));
+    // Rule-1 regression (found by this test): the needsUpdate branch used to
+    // throw on `newUser.email.includes(...)` because findOrCreate returned a
+    // DEFAULT-SCOPED instance with no `email`, so the whole repair path was dead
+    // and silently swallowed by the catch. If this assertion regresses, the
+    // findOrCreate lost its withContactInfo scope.
+    expect(updated.email).toBe('generic-updated@example.com');
+  });
+
+  it('a normal-length name is untouched by the clamp', async () => {
+    const sub = 'auth0|short-name-user';
+    await request(makeAppWithClaims({
+      user_id: sub,
+      email: 'short@example.com',
+      given_name: 'Ada',
+      family_name: 'Lovelace',
+    }))
+      .get(`/api/users/${sub}`)
+      .expect(200);
+
+    const created = await User.findOne({ where: { user_id: sub } });
+    expect(created.username).toBe('Ada Lovelace');
+  });
+
+  it('(backstop pin) the model still rejects a >50-char username on a direct write', async () => {
+    await expect(
+      User.create({
+        user_id: 'auth0|direct-write',
+        username: 'Z'.repeat(51),
+        email: 'direct@example.com',
+      })
+    ).rejects.toThrow();
+  });
+});

@@ -1017,3 +1017,294 @@ describe('Phase 88-34 WI-B1 — status derived from start_date (M4)', () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Phase 88-34 Task 4 (fork 2 BE half + fork E) — guest-name cap across ALL
+// THREE Event guest-name carriers, at the WRITE path and in the backfill.
+// ---------------------------------------------------------------------------
+const clampOversizeNames = require('../../migrations/20260820000003-clamp-oversize-names');
+
+describe('Phase 88-34 Task 4 — guest-name cap on all three Event carriers', () => {
+  let owner, group, game;
+  const NAME_50 = 'a'.repeat(50);
+  const NAME_51 = 'a'.repeat(51);
+  const DAY_MS = 24 * 60 * 60 * 1000;
+
+  beforeEach(async () => {
+    owner = await makeUser({ user_id: 'test-user-guestcap', username: 'guestcapowner' });
+    group = await makeGroup({ group_id: 'test-group-guestcap', name: 'Guest Cap Group' });
+    game = await Game.create({ name: 'Guest Cap Game', is_custom: true });
+    await addToGroup(owner, group, 'owner');
+  });
+
+  const baseEvent = (extra = {}) => ({
+    group_id: group.id,
+    game_id: game.id,
+    start_date: new Date(Date.now() - DAY_MS).toISOString(),
+    ...extra,
+  });
+
+  describe('create', () => {
+    it('rejects a 51-char guest name with 400', async () => {
+      await request(makeApp(owner))
+        .post('/api/events')
+        .send(baseEvent({ custom_participants: [{ username: NAME_51 }] }))
+        .expect(400);
+    });
+
+    it('accepts the 50-char boundary', async () => {
+      const res = await request(makeApp(owner))
+        .post('/api/events')
+        .send(baseEvent({ custom_participants: [{ username: NAME_50 }] }))
+        .expect(200);
+      const row = await Event.findByPk(res.body.id);
+      expect(row.custom_participants[0].username).toBe(NAME_50);
+    });
+
+    it('rejects an empty guest name', async () => {
+      await request(makeApp(owner))
+        .post('/api/events')
+        .send(baseEvent({ custom_participants: [{ username: '   ' }] }))
+        .expect(400);
+    });
+
+    it('rejects a 51-char winner_name and picked_by_name', async () => {
+      await request(makeApp(owner))
+        .post('/api/events')
+        .send(baseEvent({ winner_name: NAME_51 }))
+        .expect(400);
+      await request(makeApp(owner))
+        .post('/api/events')
+        .send(baseEvent({ picked_by_name: NAME_51 }))
+        .expect(400);
+    });
+
+    // T-88-34-02: custom_participants is a raw JSONB column.
+    it('rejects an unknown key in a guest object (JSONB shape whitelist)', async () => {
+      const res = await request(makeApp(owner))
+        .post('/api/events')
+        .send(baseEvent({ custom_participants: [{ username: 'Bob', evil_payload: { a: 1 } }] }))
+        .expect(400);
+      expect(JSON.stringify(res.body)).toMatch(/Unknown custom participant field/);
+    });
+
+    it('rejects a non-string username', async () => {
+      await request(makeApp(owner))
+        .post('/api/events')
+        .send(baseEvent({ custom_participants: [{ username: { $ne: null } }] }))
+        .expect(400);
+    });
+
+    it('rejects a guest array over the element cap', async () => {
+      const tooMany = Array.from({ length: 51 }, (_, i) => ({ username: `Guest ${i}` }));
+      await request(makeApp(owner))
+        .post('/api/events')
+        .send(baseEvent({ custom_participants: tooMany }))
+        .expect(400);
+    });
+
+    it('preserves sibling fields and element order', async () => {
+      const res = await request(makeApp(owner))
+        .post('/api/events')
+        .send(baseEvent({
+          custom_participants: [
+            { username: 'Bob', score: 10, faction: 'Red', is_new_player: true, placement: 1 },
+            { username: 'Cara', score: 5, faction: 'Blue', is_new_player: false, placement: 2 },
+          ],
+        }))
+        .expect(200);
+      const row = await Event.findByPk(res.body.id);
+      expect(row.custom_participants.map((p) => p.username)).toEqual(['Bob', 'Cara']);
+      expect(row.custom_participants[0]).toMatchObject({
+        score: 10, faction: 'Red', is_new_player: true, placement: 1,
+      });
+    });
+  });
+
+  describe('update', () => {
+    let event;
+    beforeEach(async () => {
+      event = await Event.create({
+        group_id: group.id,
+        game_id: game.id,
+        start_date: new Date(Date.now() - DAY_MS),
+        status: 'completed',
+        custom_participants: [{ username: 'Bob' }],
+      });
+    });
+
+    it('rejects a 51-char guest name with 400', async () => {
+      await request(makeApp(owner))
+        .put(`/api/events/${event.id}`)
+        .send({
+          start_date: event.start_date.toISOString(),
+          custom_participants: [{ username: NAME_51 }],
+        })
+        .expect(400);
+    });
+
+    it('accepts the 50-char boundary', async () => {
+      await request(makeApp(owner))
+        .put(`/api/events/${event.id}`)
+        .send({
+          start_date: event.start_date.toISOString(),
+          custom_participants: [{ username: NAME_50 }],
+        })
+        .expect(200);
+    });
+
+    it('rejects a 51-char winner_name', async () => {
+      await request(makeApp(owner))
+        .put(`/api/events/${event.id}`)
+        .send({ start_date: event.start_date.toISOString(), winner_name: NAME_51 })
+        .expect(400);
+    });
+  });
+
+  // FORK E — the WRITE-PATH half of the byte-identical invariant. No migration
+  // involved: this proves the validators alone keep the three carriers equal on
+  // every future write, so the backfill's repair cannot be silently reopened.
+  describe('fork E write-path invariant (no migration involved)', () => {
+    const PADDED = '   Bob The Guest   ';
+    const TRIMMED = 'Bob The Guest';
+
+    it('CREATE stores byte-identical JSONB username, winner_name and picked_by_name', async () => {
+      const res = await request(makeApp(owner))
+        .post('/api/events')
+        .send(baseEvent({
+          custom_participants: [{ username: PADDED }],
+          winner_name: PADDED,
+          picked_by_name: PADDED,
+        }))
+        .expect(200);
+
+      const row = await Event.findByPk(res.body.id);
+      expect(row.custom_participants[0].username).toBe(TRIMMED);
+      expect(row.winner_name).toBe(TRIMMED);
+      expect(row.picked_by_name).toBe(TRIMMED);
+      // The FE re-links by EXACT string equality — this is that property.
+      expect(row.winner_name).toBe(row.custom_participants[0].username);
+      expect(row.picked_by_name).toBe(row.custom_participants[0].username);
+    });
+
+    it('UPDATE stores byte-identical JSONB username, winner_name and picked_by_name', async () => {
+      const event = await Event.create({
+        group_id: group.id,
+        game_id: game.id,
+        start_date: new Date(Date.now() - DAY_MS),
+        status: 'completed',
+      });
+
+      await request(makeApp(owner))
+        .put(`/api/events/${event.id}`)
+        .send({
+          start_date: event.start_date.toISOString(),
+          custom_participants: [{ username: PADDED }],
+          winner_name: PADDED,
+          picked_by_name: PADDED,
+        })
+        .expect(200);
+
+      await event.reload();
+      expect(event.custom_participants[0].username).toBe(TRIMMED);
+      expect(event.winner_name).toBe(TRIMMED);
+      expect(event.picked_by_name).toBe(TRIMMED);
+      expect(event.winner_name).toBe(event.custom_participants[0].username);
+    });
+  });
+
+  // FORK E — the BACKFILL half: legacy rows written before the cap existed.
+  describe('fork E backfill migration 20260820000003', () => {
+    const LONG = 'X'.repeat(80);
+    const CLAMPED = 'X'.repeat(50);
+
+    it('clamps all three carriers to the SAME 50 chars, and Edit Event stops 400ing', async () => {
+      // Bypass the validators (this is a row that predates them).
+      const legacy = await Event.create({
+        group_id: group.id,
+        game_id: game.id,
+        start_date: new Date(Date.now() - DAY_MS),
+        status: 'completed',
+        custom_participants: [
+          { username: LONG, score: 7, faction: 'Green', is_new_player: false, placement: 1 },
+          { username: 'Short', score: 3, faction: 'Grey', is_new_player: true, placement: 2 },
+        ],
+        winner_name: LONG,
+        picked_by_name: LONG,
+      });
+
+      // Pre-migration: Edit Event resubmits the whole array and PERMANENTLY 400s.
+      await request(makeApp(owner))
+        .put(`/api/events/${legacy.id}`)
+        .send({
+          start_date: legacy.start_date.toISOString(),
+          custom_participants: legacy.custom_participants,
+          winner_name: legacy.winner_name,
+        })
+        .expect(400);
+
+      await clampOversizeNames.up(sequelize.getQueryInterface());
+      await legacy.reload();
+
+      expect(legacy.custom_participants[0].username).toBe(CLAMPED);
+      expect(legacy.winner_name).toBe(CLAMPED);
+      expect(legacy.picked_by_name).toBe(CLAMPED);
+      // Byte-identical => the FE's exact-string re-link still matches.
+      expect(legacy.winner_name).toBe(legacy.custom_participants[0].username);
+      // Element order + sibling fields preserved; the short name untouched.
+      expect(legacy.custom_participants.map((p) => p.username)).toEqual([CLAMPED, 'Short']);
+      expect(legacy.custom_participants[0]).toMatchObject({
+        score: 7, faction: 'Green', is_new_player: false, placement: 1,
+      });
+
+      // Post-migration: the same Edit Event save now succeeds.
+      await request(makeApp(owner))
+        .put(`/api/events/${legacy.id}`)
+        .send({
+          start_date: legacy.start_date.toISOString(),
+          custom_participants: legacy.custom_participants,
+          winner_name: legacy.winner_name,
+        })
+        .expect(200);
+    });
+
+    it('is idempotent — a second run changes 0 rows', async () => {
+      const legacy = await Event.create({
+        group_id: group.id,
+        game_id: game.id,
+        start_date: new Date(Date.now() - DAY_MS),
+        status: 'completed',
+        custom_participants: [{ username: LONG }],
+        winner_name: LONG,
+      });
+
+      const qi = sequelize.getQueryInterface();
+      await clampOversizeNames.up(qi);
+      await legacy.reload();
+      const after1 = JSON.stringify(legacy.custom_participants);
+
+      await clampOversizeNames.up(qi);
+      await legacy.reload();
+      expect(JSON.stringify(legacy.custom_participants)).toBe(after1);
+      expect(legacy.winner_name).toBe(CLAMPED);
+    });
+
+    it('also clamps Users.username (>50) and Groups.name (>40)', async () => {
+      await sequelize.query(
+        `UPDATE "Users" SET username = :n WHERE id = :id`,
+        { replacements: { n: 'U'.repeat(80), id: owner.id } }
+      );
+      await sequelize.query(
+        `UPDATE "Groups" SET name = :n WHERE id = :id`,
+        { replacements: { n: 'G'.repeat(80), id: group.id } }
+      );
+
+      await clampOversizeNames.up(sequelize.getQueryInterface());
+
+      await owner.reload();
+      await group.reload();
+      expect(owner.username).toBe('U'.repeat(50));
+      expect(group.name).toBe('G'.repeat(40));
+    });
+  });
+});

@@ -261,13 +261,46 @@ router.get('/:user_id', requireParamMatchesToken('user_id'), async (req, res) =>
         }
       }
       
+      // DECISION Phase 88-34 Task 4 (fork D, owner-ruled 2026-08-20): CLAMP the
+      // derived username at this writer, over dropping the User.username
+      // len[1,50] model backstop.
+      //
+      // This is the ONE writer that legitimately receives input it does not
+      // control: the value above comes from Auth0 (token claims, then the
+      // Management API, then given_name + family_name which OVERRIDES
+      // everything at :257-262). Real people have full names longer than 50
+      // characters. With the model backstop and without this clamp, their very
+      // FIRST LOGIN 500s and they can never get an account — an outage with no
+      // user-side workaround.
+      //
+      // Clamp rather than reject, because a human's legal name is not invalid
+      // input; and clamp HERE rather than widening/removing the backstop,
+      // because the backstop is what protects every OTHER (human-entered,
+      // already route-validated) write path. Trim first so the 50 characters
+      // are 50 real characters, not padding.
+      //
+      // Applies to BOTH write paths below — the findOrCreate defaults AND the
+      // !created needsUpdate branch. Test-pinned (a >50-char Auth0 full name
+      // must provision successfully with a 50-char username).
+      const clampedUserName = String(userName).trim().slice(0, 50);
+
       try {
-        const [newUser, created] = await User.findOrCreate({
+        // Phase 88-34 (Rule 1, found by the fork-D !created test): this was a
+        // bare `User.findOrCreate`, so the returned instance came back under the
+        // DEFAULT SCOPE — which EXCLUDES `email` (models/User.js defaultScope,
+        // BSEC-01 D-03). The `!created` repair branch below then evaluated
+        // `newUser.email.includes('@auth0.local')` on `undefined` and THREW
+        // ("Cannot read properties of undefined"), so that entire
+        // fix-a-wrong-email/username path has been dead: every run fell into the
+        // catch, re-fetched, and returned the row unrepaired. Scoping the find
+        // half to withContactInfo loads `email` and makes the branch do what it
+        // has always claimed to do. Test-pinned below.
+        const [newUser, created] = await User.scope('withContactInfo').findOrCreate({
           where: { user_id: req.params.user_id },
           defaults: {
             user_id: req.params.user_id,
             email: userEmail,
-            username: userName,
+            username: clampedUserName,
             // TZ-01: persist browser-detected timezone on first creation if supplied.
             // If detectedTimezone is null we DELIBERATELY omit the key so Sequelize
             // applies the model defaultValue (null per migration 78-01) — sending
@@ -279,19 +312,24 @@ router.get('/:user_id', requireParamMatchesToken('user_id'), async (req, res) =>
         
         // If user already existed but has wrong email/username, update them
         if (!created) {
-          const needsUpdate = 
+          const needsUpdate =
             (newUser.email !== userEmail && !newUser.email.includes('@auth0.local') && !newUser.email.includes('@auth0')) ||
-            (newUser.username === 'User' && userName !== 'User');
-          
+            (newUser.username === 'User' && clampedUserName !== 'User');
+
           if (needsUpdate) {
             await newUser.update({
               email: userEmail,
-              username: userName
+              username: clampedUserName
             });
-            console.log(`Updated user ${newUser.user_id} with email: ${userEmail}, username: ${userName}`);
+            // Phase 88-34 (r3 triage #7): log the row ID, never the identity.
+            // This line used to print the user's EMAIL and USERNAME to stdout,
+            // i.e. into Railway's log retention, on every provisioning update.
+            // Log ids, not identities.
+            console.log(`[users:provision] updated contact fields for user ${newUser.id}`);
           }
         } else {
-          console.log(`Auto-created user: ${newUser.user_id} (${newUser.username}) with email: ${newUser.email}`);
+          // Phase 88-34 (r3 triage #7): same — id only, no email/username.
+          console.log(`[users:provision] auto-created user ${newUser.id}`);
         }
         
         user = newUser;

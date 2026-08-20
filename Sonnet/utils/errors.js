@@ -57,6 +57,19 @@ const ERROR_REGISTRY = Object.freeze({
   // pattern `not_found` / `forbidden` above already occupy — registered, documented
   // as not-emitted-through-the-chokepoint, and explicitly NOT a gap.
   already_restored:        { httpStatus: 409, message: 'This group has already been restored.' },
+  // Phase 88-34 Task 4 (fork F, owner-ruled 2026-08-20) — append-only per D-11.
+  // Group-invite 409s. Same registered-but-hand-rolled shape as the 88.2 MED-1
+  // block above: routes/invites.js keeps its raw { error, code } body and is NOT
+  // converted to sendError, because existing consumers read the raw `error`
+  // string off these two responses. The `message` values below are BYTE-IDENTICAL
+  // to the strings those handlers emit — this registry is the canonical
+  // status/message record the FE contract anchors on, so an unregistered code
+  // emitted outside sendError would be invisible to it. Test-pinned: the
+  // registry message must equal the live route string.
+  // FE side (88-33 Task 2): ApiErrorCode union + NON_RETRYABLE_API_CODES (409 is
+  // TERMINAL — omitting it makes these silently retryable) + MESSAGE_BY_CODE.
+  already_member:          { httpStatus: 409, message: 'This person is already a member of the group' },
+  invite_pending:          { httpStatus: 409, message: 'This person already has a pending invite' },
   invalid_token:           { httpStatus: 410, message: 'This restore link is no longer valid.' },
   already_used:            { httpStatus: 410, message: 'This restore link is no longer valid.' },
   window_expired:          { httpStatus: 410, message: 'This link has expired.' },
