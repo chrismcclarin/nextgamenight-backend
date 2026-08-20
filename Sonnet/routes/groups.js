@@ -239,13 +239,19 @@ router.get('/user/:user_id', async (req, res) => {
           //   2. order was `createdAt DESC` — ROW-INSERTION time, not when the
           //      game was played. Backfilling an old session today made it the
           //      "last game". Ordered by start_date DESC instead.
-          // `required: false` is LOAD-BEARING, not decoration: with limit +
-          // where, Sequelize emits a subquery join, and a required/INNER join
-          // would DROP the whole Group row for any group whose only events are
-          // future or cancelled — the group would vanish from the user's group
-          // list entirely. That is the same include-drops-the-parent class this
-          // plan kills in games.js. A group with no past events must still
-          // return, with an empty Events array. Test-pinned in groups.test.js.
+          // `required: false` is DEFENSIVE and explicit — MEASURED, not assumed
+          // (probed 2026-08-20): with `limit` present Sequelize resolves this
+          // hasMany via a separate/subquery path, so flipping it to `required:
+          // true` today does NOT drop the parent Group. It is written out anyway
+          // because adding a `where` to an include is exactly how the
+          // include-drops-the-parent class (the one this plan kills in games.js,
+          // where an INNER-JOINed Events include 404'd every zero-event game)
+          // gets reintroduced: remove the `limit` and an implicit-required
+          // include would make every group whose only events are future or
+          // cancelled VANISH from the user's group list. The behavior — a group
+          // with no past events still returns, with an empty Events array — is
+          // test-pinned in groups.test.js independently of which mechanism
+          // holds it.
           model: Event,
           required: false,
           limit: 1,
