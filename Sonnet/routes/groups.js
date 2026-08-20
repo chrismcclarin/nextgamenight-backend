@@ -80,6 +80,19 @@ async function cascadeDeleteFutureEventDataOnLeaveGroup({
   //      happened yet, the leaving user's RSVP/brings/vote on it is moot
   //      regardless of whether it's scheduled, in_progress, completed, or
   //      cancelled. Past events stay untouched (history preserved).
+  //
+  // AMENDMENT Phase 88-34 (WI-B1, 2026-08-20) — reason 1's "separate todo" is now
+  // DONE, but the no-status-filter decision STANDS on reason 2 alone.
+  //   - The source is fixed: routes/events.js derives status from start_date on
+  //     create and re-derives it on reschedule; models/Event.js defaults to
+  //     'scheduled' (migration 20260820000001).
+  //   - The historical rows are repaired: migration 20260820000002 re-stamps
+  //     future-dated 'completed' rows as 'scheduled' (idempotent).
+  // Do NOT read that as licence to add a status filter here. Reason 2 was never
+  // about the bug — 'cancelled' and 'in_progress' future events still carry the
+  // leaving user's forward commitments, and those rows must still cascade.
+  // Original decision preserved verbatim above; this note records who reopened
+  // it and why it survived.
   const now = new Date();
   const futureEvents = await Event.findAll({
     where: {

@@ -68,7 +68,15 @@ const Event = sequelize.define('Event', {
   },
   status: {
     type: DataTypes.ENUM('scheduled', 'in_progress', 'completed', 'cancelled'),
-    defaultValue: 'completed',
+    // DECISION Phase 88-34 WI-B1 (walk MAJOR M4): default flipped
+    // 'completed' -> 'scheduled', over leaving the relic default in place.
+    // An Event row that omits status is one nobody has decided the outcome of
+    // yet, so 'scheduled' is the only safe assumption; 'completed' silently
+    // stamped every such row as history and hid it from Upcoming Events.
+    // SCHEMA DUAL-WRITE (Phase 88.4 migrate-cli-replay drift gate): this model
+    // is the sync/CI source, migration 20260820000001 is the prod source. They
+    // shipped in the SAME commit. IF YOU CHANGE ONE SIDE, CHANGE THE OTHER.
+    defaultValue: 'scheduled',
   },
   rsvp_deadline: {
     type: DataTypes.DATE,

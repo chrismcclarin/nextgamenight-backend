@@ -12,6 +12,11 @@ const { QueryTypes } = require('sequelize');
 // Phase 87 (BINT-02): the migration under test — used by the preclean unit test
 // to exercise the real orphan-DELETE + guarded ADD CONSTRAINT on a raw connection.
 const epUserFkMigration = require('../../migrations/20260701000002-add-eventparticipation-user-fk');
+// Phase 88-34 (WI-B1 / walk MAJOR M4): the future-completed data repair. DATA-ONLY —
+// it touches no schema, so replaying its up() cannot leak a stale schema into later
+// suites (the rekey.test.js failure class). Its down() is a deliberate no-op and is
+// never called here.
+const futureCompletedBackfill = require('../../migrations/20260820000002-backfill-future-completed-events');
 
 const EP_FK_NAME = 'eventparticipations_user_id_fkey';
 
@@ -803,5 +808,212 @@ describe('88.2 SPEC-REQ-4a — GET /api/events/user/:user_id hides soft-deleted 
     for (const record of res.body) {
       expect(record.Group === null || record.Group === undefined).toBe(false);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 88-34 Task 1 (WI-B1) — event status is DERIVED from start_date.
+//
+// Walk MAJOR M4: POST /events hardcoded status:'completed', so an event created
+// for next Saturday was born as history and never appeared in Upcoming Events
+// (UpcomingEventsCard filters to scheduled/in_progress).
+// ---------------------------------------------------------------------------
+describe('Phase 88-34 WI-B1 — status derived from start_date (M4)', () => {
+  let owner, group, game;
+
+  const DAY_MS = 24 * 60 * 60 * 1000;
+
+  beforeEach(async () => {
+    owner = await makeUser({ user_id: 'test-user-m4-owner', username: 'm4owner' });
+    group = await makeGroup({ group_id: 'test-group-m4', name: 'M4 Group' });
+    game = await Game.create({ name: 'M4 Game', is_custom: true });
+    await addToGroup(owner, group, 'owner');
+  });
+
+  describe('create path', () => {
+    it('births a FUTURE-dated event as scheduled', async () => {
+      const res = await request(makeApp(owner))
+        .post('/api/events')
+        .send({
+          group_id: group.id,
+          game_id: game.id,
+          start_date: new Date(Date.now() + 3 * DAY_MS).toISOString(),
+        })
+        .expect(200);
+
+      expect(res.body.status).toBe('scheduled');
+      const row = await Event.findByPk(res.body.id);
+      expect(row.status).toBe('scheduled');
+    });
+
+    it('births a PAST-dated event as completed', async () => {
+      const res = await request(makeApp(owner))
+        .post('/api/events')
+        .send({
+          group_id: group.id,
+          game_id: game.id,
+          start_date: new Date(Date.now() - 3 * DAY_MS).toISOString(),
+        })
+        .expect(200);
+
+      expect(res.body.status).toBe('completed');
+    });
+
+    it('IGNORES a client-sent status (T-88-34-01: status stays server-derived)', async () => {
+      const res = await request(makeApp(owner))
+        .post('/api/events')
+        .send({
+          group_id: group.id,
+          game_id: game.id,
+          start_date: new Date(Date.now() + 3 * DAY_MS).toISOString(),
+          status: 'cancelled',
+        })
+        .expect(200);
+
+      // Derived from start_date, NOT taken from the body.
+      expect(res.body.status).toBe('scheduled');
+    });
+
+    it('model default is scheduled when status is omitted entirely', async () => {
+      // The sync-built test schema reads models/Event.js — this pins the model
+      // half of the dual-write (migration 20260820000001 is the prod half).
+      const row = await Event.create({
+        group_id: group.id,
+        game_id: game.id,
+        start_date: new Date(Date.now() + DAY_MS),
+      });
+      expect(row.status).toBe('scheduled');
+    });
+  });
+
+  describe('update path — reschedule re-derives (r3 triage #0)', () => {
+    it('moving a PAST event to a FUTURE date flips completed -> scheduled', async () => {
+      const ev = await Event.create({
+        group_id: group.id,
+        game_id: game.id,
+        start_date: new Date(Date.now() - 5 * DAY_MS),
+        status: 'completed',
+      });
+
+      const res = await request(makeApp(owner))
+        .put(`/api/events/${ev.id}`)
+        .send({ start_date: new Date(Date.now() + 5 * DAY_MS).toISOString() })
+        .expect(200);
+
+      expect(res.body.status).toBe('scheduled');
+    });
+
+    it('moving a FUTURE event to a PAST date flips scheduled -> completed', async () => {
+      const ev = await Event.create({
+        group_id: group.id,
+        game_id: game.id,
+        start_date: new Date(Date.now() + 5 * DAY_MS),
+        status: 'scheduled',
+      });
+
+      const res = await request(makeApp(owner))
+        .put(`/api/events/${ev.id}`)
+        .send({ start_date: new Date(Date.now() - 5 * DAY_MS).toISOString() })
+        .expect(200);
+
+      expect(res.body.status).toBe('completed');
+    });
+
+    it('NEVER overwrites cancelled, even across a reschedule', async () => {
+      const ev = await Event.create({
+        group_id: group.id,
+        game_id: game.id,
+        start_date: new Date(Date.now() - 5 * DAY_MS),
+        status: 'cancelled',
+      });
+
+      const res = await request(makeApp(owner))
+        .put(`/api/events/${ev.id}`)
+        .send({ start_date: new Date(Date.now() + 5 * DAY_MS).toISOString() })
+        .expect(200);
+
+      expect(res.body.status).toBe('cancelled');
+    });
+
+    it('NEVER overwrites in_progress, even across a reschedule', async () => {
+      const ev = await Event.create({
+        group_id: group.id,
+        game_id: game.id,
+        start_date: new Date(Date.now() - 5 * DAY_MS),
+        status: 'in_progress',
+      });
+
+      const res = await request(makeApp(owner))
+        .put(`/api/events/${ev.id}`)
+        .send({ start_date: new Date(Date.now() + 5 * DAY_MS).toISOString() })
+        .expect(200);
+
+      expect(res.body.status).toBe('in_progress');
+    });
+
+    it('leaves status alone when start_date does not change', async () => {
+      const startDate = new Date(Date.now() - 5 * DAY_MS);
+      const ev = await Event.create({
+        group_id: group.id,
+        game_id: game.id,
+        start_date: startDate,
+        status: 'completed',
+      });
+
+      const res = await request(makeApp(owner))
+        .put(`/api/events/${ev.id}`)
+        .send({ start_date: startDate.toISOString(), comments: 'edited copy only' })
+        .expect(200);
+
+      expect(res.body.status).toBe('completed');
+      expect(res.body.comments).toBe('edited copy only');
+    });
+  });
+
+  describe('backfill migration 20260820000002 (T-88-34-03)', () => {
+    it('repairs future-dated completed rows and is IDEMPOTENT on a second run', async () => {
+      const qi = sequelize.getQueryInterface();
+
+      // Bypass the model default to plant the exact prod defect shape.
+      const broken = await Event.create({
+        group_id: group.id,
+        game_id: game.id,
+        start_date: new Date(Date.now() + 7 * DAY_MS),
+        status: 'completed',
+      });
+      const pastHistory = await Event.create({
+        group_id: group.id,
+        game_id: game.id,
+        start_date: new Date(Date.now() - 7 * DAY_MS),
+        status: 'completed',
+      });
+      const futureCancelled = await Event.create({
+        group_id: group.id,
+        game_id: game.id,
+        start_date: new Date(Date.now() + 7 * DAY_MS),
+        status: 'cancelled',
+      });
+
+      await futureCompletedBackfill.up(qi);
+
+      await broken.reload();
+      await pastHistory.reload();
+      await futureCancelled.reload();
+      expect(broken.status).toBe('scheduled');
+      // Narrow scope: past history untouched, cancelled never overwritten.
+      expect(pastHistory.status).toBe('completed');
+      expect(futureCancelled.status).toBe('cancelled');
+
+      // Idempotency: the second run must match ZERO rows (the WHERE clause is
+      // the exact negation of the post-condition).
+      const [, meta] = await sequelize.query(
+        `UPDATE "Events" SET status='scheduled' WHERE start_date > NOW() AND status='completed';`
+      );
+      expect(meta.rowCount).toBe(0);
+
+      await futureCompletedBackfill.up(qi);
+      await broken.reload();
+      expect(broken.status).toBe('scheduled');
+    });
   });
 });

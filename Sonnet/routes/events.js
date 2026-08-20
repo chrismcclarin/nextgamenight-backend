@@ -567,7 +567,20 @@ router.post('/', validateEventCreate, async (req, res) => {
         custom_participants: custom_participants || [],
         is_group_win,
         comments,
-        status: 'completed',
+        // DECISION Phase 88-34 WI-B1 (walk MAJOR M4): status is DERIVED FROM
+        // start_date here, over the previous hardcoded 'completed' AND over
+        // accepting a client-sent status. The hardcode meant every event born
+        // through the create-event modal — including future ones — was stamped
+        // 'completed', so UpcomingEventsCard (which filters to
+        // scheduled/in_progress) never showed them. Accepting status from the
+        // body was rejected because it hands a client control of a field that
+        // gates RSVP/cancellation semantics (T-88-34-01): the body destructure
+        // above deliberately does NOT read status and validateEventCreate
+        // declares no status rule — client-sent status stays silently ignored.
+        // The poll->event path (services/eventCreationService.js) is the
+        // correctness exemplar this converges on. Changing this to a constant
+        // is a decision, not a cleanup.
+        status: new Date(start_date) > new Date() ? 'scheduled' : 'completed',
         rsvp_deadline: rsvp_deadline || null,
         ballot_status: null
       }, { transaction: t });
@@ -900,9 +913,31 @@ router.put('/:id', validateUUID('id'), validateEventUpdate, async (req, res) => 
     // Capture old start_date before update to detect date changes
     const oldStartDate = event.start_date;
 
+    // DECISION Phase 88-34 WI-B1 (r3 triage #0): re-derive status on RESCHEDULE
+    // — over leaving status alone on update. Without this, the one-time M4
+    // backfill repairs history once and then every reschedule regenerates the
+    // symptom per-event: moving a past event forward would leave it
+    // 'completed' and invisible to Upcoming Events forever.
+    // Two deliberate guards, both load-bearing:
+    //   1. Only when start_date actually CHANGES — an unrelated edit (comments,
+    //      winner) must never move status.
+    //   2. Only from within the DERIVED PAIR ('scheduled' | 'completed').
+    //      'cancelled' and 'in_progress' are operator/lifecycle states that
+    //      this derivation has no authority to overwrite — cancelling an event
+    //      and then correcting its date must not un-cancel it.
+    const DERIVED_STATUSES = ['scheduled', 'completed'];
+    const startDateChanged =
+      start_date !== undefined &&
+      new Date(start_date).getTime() !== new Date(oldStartDate).getTime();
+    const rederivedStatus =
+      startDateChanged && DERIVED_STATUSES.includes(event.status)
+        ? (new Date(start_date) > new Date() ? 'scheduled' : 'completed')
+        : event.status;
+
     await event.update({
       game_id: game_id !== undefined ? (game_id || null) : event.game_id,
       start_date,
+      status: rederivedStatus,
       duration_minutes,
       winner_id: winner_id || null,
       picked_by_id: picked_by_id || null,
