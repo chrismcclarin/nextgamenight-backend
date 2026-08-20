@@ -129,13 +129,34 @@ router.get('/games/:group_id/:user_id', async (req, res) => {
     
     // Aggregate unique games with metadata
     const gameMap = new Map();
-    
+
+    // DECISION Phase 88-34 WI-B2: play statistics mean HISTORY — past,
+    // non-cancelled events only. The one contract this sweep applies at every
+    // surface that presents events as history:
+    //     start_date <= NOW() AND status != 'cancelled'
+    // Before this, scheduling next Saturday's game night immediately bumped
+    // that game's play_count and set last_played to a date in the FUTURE, so a
+    // game nobody had played yet sorted to the top of "recently played".
+    //
+    // SCOPE RULING (2026-08-20, r1 triage): this gates the per-event STATS
+    // accumulation ONLY — play_count, first/last_played, and the winner/picker
+    // tallies (all of them are history attributions). It deliberately does NOT
+    // gate list MEMBERSHIP: the gameMap entry is still created for a game whose
+    // only events are future, so the game APPEARS in the group's list with
+    // play_count 0 and last_played null rather than vanishing from it. Moving
+    // this predicate up to the `where` of the Event.findAll above, or above the
+    // gameMap.set, would silently drop those games — that is the rejected
+    // reading, not a simplification.
+    const nowMs = Date.now();
+    const isHistory = (event) =>
+      new Date(event.start_date).getTime() <= nowMs && event.status !== 'cancelled';
+
     events.forEach(event => {
       if (!event.Game) return;
-      
+
       const gameId = event.Game.id;
       const eventDate = new Date(event.start_date);
-      
+
       if (!gameMap.has(gameId)) {
         gameMap.set(gameId, {
           id: gameId,
@@ -158,8 +179,12 @@ router.get('/games/:group_id/:user_id', async (req, res) => {
       }
       
       const game = gameMap.get(gameId);
+
+      // Membership is already recorded above; everything below is history.
+      if (!isHistory(event)) return;
+
       game.play_count++;
-      
+
       // Update last played
       if (!game.last_played || eventDate > new Date(game.last_played)) {
         game.last_played = eventDate.toISOString();

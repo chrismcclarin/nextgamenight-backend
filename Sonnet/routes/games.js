@@ -1,6 +1,8 @@
 // routes/games.js
 const express = require('express');
-const { Game, Event, EventParticipation, GameReview, Group, User, UserGame, UserGroup } = require('../models');
+// Phase 88-34 WI-B2: EventParticipation dropped from this destructure — its only
+// use was the GET /:id Event include deleted below (fork B).
+const { Game, Event, GameReview, Group, User, UserGame, UserGroup } = require('../models');
 const { Op } = require('sequelize');
 const { matchesSelf } = require('../middleware/objectAuth');
 const { optionalAuth } = require('../middleware/auth0');
@@ -214,15 +216,23 @@ router.post('/resolve', async (req, res) => {
 // Get game by ID
 router.get('/:id', async (req, res) => {
   try {
+    // DECISION Phase 88-34 WI-B2 (fork B, owner-ruled 2026-08-20): the Event
+    // include was DELETED here rather than history-filtered. It was DEAD
+    // PAYLOAD — zero consumers. gameDetail is the only caller of this route
+    // (gameDetail/page.js:668 `gamesAPI.getGame`), it does `setGame(gameData)`
+    // and never reads `game.Events`; its Game Sessions list actually consumes
+    // the MIXED route GET /events/group/:group_id (page.js:677 -> :690), which
+    // must keep future events because it also feeds RSVP/Ballot/Bring. So the
+    // sessions history filter belongs on the FE (88-33 Task 7), not here.
+    // Deleting rather than filtering also killed two live defects for free:
+    //   - the include was an INNER JOIN, so a game with ZERO events 404'd;
+    //   - it was GROUP-AGNOSTIC on an authenticated-but-group-blind route, so
+    //     it shipped every group's sessions, participants and winner usernames
+    //     for a game to any logged-in caller (cross-group exposure).
+    // If a consumer of a game's events is ever wanted here, it must be scoped
+    // to the caller's groups — do NOT restore this include as it was.
     const game = await Game.findByPk(req.params.id, {
       include: [
-        {
-          model: Event,
-          include: [
-            { model: User, as: 'Winner', attributes: ['id', 'username'] },
-            { model: EventParticipation, include: [{ model: User, attributes: ['username'] }] }
-          ]
-        },
         {
           model: GameReview,
           include: [
@@ -262,7 +272,11 @@ router.get('/:id', async (req, res) => {
     
     res.json(game);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    // Phase 88-34 (r1 triage #5, Rule 2): raw `error.message` was returned to
+    // the client — Sequelize errors leak column names, constraint names and
+    // fragments of SQL. Log the detail server-side, return a generic message.
+    console.error('[games:get-by-id] failed:', error.message);
+    res.status(500).json({ error: 'Unable to retrieve game' });
   }
 });
 

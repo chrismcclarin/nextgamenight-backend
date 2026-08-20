@@ -229,9 +229,31 @@ router.get('/user/:user_id', async (req, res) => {
           through: { where: { status: 'active' }, attributes: ['role', 'joined_at'] }
         },
         {
+          // DECISION Phase 88-34 WI-B2: this include is the group card's
+          // "Last Game" (grouplist.js:230 reads `group.Events?.[0]`), so it
+          // means HISTORY. It carried TWO defects, both fixed here:
+          //   1. NO where clause — a future event was eligible to BE the last
+          //      game played. History means past: start_date <= NOW() AND
+          //      status != 'cancelled' (the one contract this sweep applies at
+          //      every surface that presents events as history).
+          //   2. order was `createdAt DESC` — ROW-INSERTION time, not when the
+          //      game was played. Backfilling an old session today made it the
+          //      "last game". Ordered by start_date DESC instead.
+          // `required: false` is LOAD-BEARING, not decoration: with limit +
+          // where, Sequelize emits a subquery join, and a required/INNER join
+          // would DROP the whole Group row for any group whose only events are
+          // future or cancelled — the group would vanish from the user's group
+          // list entirely. That is the same include-drops-the-parent class this
+          // plan kills in games.js. A group with no past events must still
+          // return, with an empty Events array. Test-pinned in groups.test.js.
           model: Event,
+          required: false,
           limit: 1,
-          order: [['createdAt', 'DESC']],
+          where: {
+            start_date: { [Op.lte]: new Date() },
+            status: { [Op.ne]: 'cancelled' },
+          },
+          order: [['start_date', 'DESC']],
           include: [{
             model: Game,
             attributes: ['name', 'image_url', 'theme']
