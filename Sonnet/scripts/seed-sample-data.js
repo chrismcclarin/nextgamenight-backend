@@ -1,8 +1,16 @@
 // scripts/seed-sample-data.js
+const crypto = require('crypto');
 const { Op } = require('sequelize');
 const {
   User, Group, UserGroup, Game, Event, EventParticipation, GameReview,
-  AvailabilityPrompt, AvailabilityResponse, AvailabilitySuggestion, sequelize,
+  AvailabilityPrompt, AvailabilityResponse, AvailabilitySuggestion,
+  // Phase 88-34 Task 5 (WI-B4): these five were NOT imported before — the seed
+  // could not produce future events, friendships, a game collection, recurring
+  // availability or a pending invite, so five Test-2 walk gates were reachable
+  // only by hand-seeding the DB (and that hand-seeded state is exactly what a
+  // reseed destroys).
+  Friendship, UserGame, UserAvailability, GroupInvite,
+  sequelize,
 } = require('../models');
 const heatmapService = require('../services/heatmapService');
 const { assertNotProductionDb } = require('./lib/assert-not-production-db');
@@ -186,11 +194,22 @@ async function seedDatabase() {
     // prompt, and the prompt references group_id — so all three go before
     // Group.destroy. None of the three models is paranoid (confirmed against the
     // model files), so a plain destroy fully removes rows — no force needed.
+    //
+    // Phase 88-34 Task 5 (WI-B4): the four newly-seeded models join the wipe
+    // list, in FK order — GroupInvite references Groups and Users; Friendship,
+    // UserGame and UserAvailability reference Users — so all four go BEFORE
+    // Group.destroy and User.destroy. A model seeded but not wiped accumulates
+    // duplicates run after run (and for GroupInvite, whose token column is
+    // UNIQUE, the second run would hard-fail).
     await AvailabilitySuggestion.destroy({ where: {} });
     await AvailabilityResponse.destroy({ where: {} });
     await AvailabilityPrompt.destroy({ where: {} });
     await GameReview.destroy({ where: {} });
     await EventParticipation.destroy({ where: {} });
+    await GroupInvite.destroy({ where: {} });
+    await Friendship.destroy({ where: {} });
+    await UserGame.destroy({ where: {} });
+    await UserAvailability.destroy({ where: {} });
     await Event.destroy({ where: {}, force: true });
     await UserGroup.destroy({ where: {}, force: true });
     await Game.destroy({ where: {} });
@@ -419,6 +438,52 @@ async function seedDatabase() {
     await EventParticipation.create({ event_id: event7.id, user_id: users[4].id, score: 22, placement: 2, is_new_player: true });
     await EventParticipation.create({ event_id: event7.id, user_id: users[5].id, score: 28, placement: 1, is_new_player: true });
 
+    // ────────────────────────────────────────────────────────────────────────
+    // Phase 88-34 Task 5 (WI-B4) — FUTURE events.
+    //
+    // Every one of the seven events above is in the PAST with status
+    // 'completed', so a fresh seed produced a database in which Upcoming Events
+    // was permanently empty, no RSVP/ballot surface was reachable, and the walk's
+    // Test-2 gates could only be walked after hand-inserting rows. Two future
+    // events fix that.
+    //
+    // status is set EXPLICITLY here even though Task 1 made 'scheduled' both the
+    // model default and what the create route derives — a seed should state the
+    // state it intends rather than inherit it, and this row is written straight
+    // through the model, bypassing the route's derivation entirely.
+    // ────────────────────────────────────────────────────────────────────────
+    console.log('📅 Creating FUTURE events (88-34 WI-B4)...');
+
+    // ~3 days out, fully populated: participants + a game the group has played,
+    // so it exercises Upcoming Events, RSVP and the group/game detail surfaces.
+    const futureEvent1 = await Event.create({
+      group_id: weekendGroup.id,
+      game_id: games[0].id, // Catan
+      start_date: new Date(now.getTime() + 3 * 24 * 60 * 60 * 1000),
+      duration_minutes: 90,
+      is_group_win: false,
+      comments: 'Game night at Alice\'s — bring snacks!',
+      status: 'scheduled',
+    });
+    events.push(futureEvent1);
+    for (const u of weekendUsers) {
+      await EventParticipation.create({ event_id: futureEvent1.id, user_id: u.id });
+    }
+
+    // ~10 days out, sparse: an upcoming event with no participants yet, which is
+    // the state most real upcoming events are actually in.
+    const futureEvent2 = await Event.create({
+      group_id: strategyGroup.id,
+      game_id: games[3].id,
+      start_date: new Date(now.getTime() + 10 * 24 * 60 * 60 * 1000),
+      duration_minutes: 120,
+      is_group_win: false,
+      comments: 'Tentative — checking availability.',
+      status: 'scheduled',
+    });
+    events.push(futureEvent2);
+
+    console.log(`   ✓ Created 2 future events (status 'scheduled')`);
     console.log(`✅ Created ${events.length} events with participations\n`);
 
     // Create Game Reviews
@@ -587,14 +652,151 @@ async function seedDatabase() {
     });
     console.log(`   ✓ Consensus check: respondedCount ${respondedCount} / totalActive ${totalActive} — prompt stays '${availabilityPrompt.status}' (Alice deliberately withheld)\n`);
 
+    // ────────────────────────────────────────────────────────────────────────
+    // Phase 88-34 Task 5 (WI-B4) — the four models the walk had to hand-seed.
+    //
+    // These blocks codify the shapes the Phase 88 UAT walk built BY HAND on
+    // 2026-08-10. Hand-seeded state is destroyed by the next reseed, which is
+    // why the walk DB became hand-curated and un-reseedable — this section is
+    // what makes a fresh `npm run seed` walkable end-to-end instead.
+    // ────────────────────────────────────────────────────────────────────────
+
+    // --- Friendships: one accepted, one pending -----------------------------
+    // Both states are needed: accepted drives the friend list + the
+    // invite-by-friend path, pending drives the incoming-request surface AND
+    // the friend-pill staleness the walk flagged.
+    console.log('🤝 Seeding friendships (88-34 WI-B4)...');
+    await Friendship.create({
+      requester_uuid: users[0].id, // Alice
+      addressee_uuid: users[3].id, // Diana
+      status: 'accepted',
+    });
+    await Friendship.create({
+      requester_uuid: users[2].id, // Charlie
+      addressee_uuid: users[0].id, // -> Alice (INCOMING pending request for Alice)
+      status: 'pending',
+    });
+    console.log('   ✓ 2 friendships (Alice<->Diana accepted, Charlie->Alice pending)\n');
+
+    // --- Game collections ---------------------------------------------------
+    // UserGame is the "my collection" surface and the BringGamePicker source.
+    // Two users so the picker has something to show for more than one member.
+    console.log('🎒 Seeding game collections (88-34 WI-B4)...');
+    const collectionRows = [
+      { user: users[0], game: games[0] }, // Alice: Catan
+      { user: users[0], game: games[1] },
+      { user: users[0], game: games[2] },
+      { user: users[1], game: games[3] }, // Bob
+    ];
+    for (const { user, game } of collectionRows) {
+      await UserGame.findOrCreate({
+        where: { user_id: user.id, game_id: game.id },
+        defaults: {},
+      });
+    }
+    console.log(`   ✓ ${collectionRows.length} collection games (Alice x3, Bob x1)\n`);
+
+    // --- Recurring availability patterns ------------------------------------
+    // These feed the saved-availability PREFILL endpoint, which is what makes
+    // the check-in grid pre-paintable from a fresh seed.
+    //
+    // WHY A FULL WEEK OF EVENING PATTERNS FOR ONE USER (88-34 Task 3 / M6): the
+    // check-in window is a ROLLING seven days anchored on the prompt date, so
+    // which weekday lands on the window's LAST local day depends on the day the
+    // seed is run. The M6 bug specifically dropped the last local day's evening
+    // (>= 17:00 local) from the prefill response. Seeding an evening pattern on
+    // EVERY weekday for Alice guarantees the last local day always has one,
+    // whatever day the seed runs — so the Task-3 fix is exercised by every seed,
+    // not just by seeds that happen to run on the right weekday. Do not "tidy"
+    // this down to a single day; the coverage is the point.
+    //
+    // The timezone is deliberately a NEGATIVE-offset zone (America/Los_Angeles):
+    // that is the sign that produces the M6 clip (local 17:00 PDT is already the
+    // next UTC day), so a positive-offset zone would not exercise it.
+    console.log('🗓️  Seeding recurring availability patterns (88-34 WI-B4)...');
+    const AVAIL_TZ = 'America/Los_Angeles';
+    const patternStart = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000)
+      .toISOString().slice(0, 10);
+
+    const availabilityRows = [];
+    // Alice — evenings all week (the Task-3 / M6 exerciser).
+    for (let dayOfWeek = 0; dayOfWeek < 7; dayOfWeek++) {
+      availabilityRows.push({
+        user: users[0],
+        pattern_data: { dayOfWeek, startTime: '17:00', endTime: '22:00', timezone: AVAIL_TZ },
+      });
+    }
+    // Bob — weekday afternoons.
+    for (const dayOfWeek of [1, 2, 3, 4, 5]) {
+      availabilityRows.push({
+        user: users[1],
+        pattern_data: { dayOfWeek, startTime: '13:00', endTime: '17:00', timezone: AVAIL_TZ },
+      });
+    }
+    // Charlie — weekend daytime.
+    for (const dayOfWeek of [0, 6]) {
+      availabilityRows.push({
+        user: users[2],
+        pattern_data: { dayOfWeek, startTime: '10:00', endTime: '15:00', timezone: AVAIL_TZ },
+      });
+    }
+    // Diana — two evenings, so a third user shows on the heatmap.
+    for (const dayOfWeek of [2, 4]) {
+      availabilityRows.push({
+        user: users[3],
+        pattern_data: { dayOfWeek, startTime: '19:00', endTime: '23:00', timezone: AVAIL_TZ },
+      });
+    }
+
+    for (const { user, pattern_data } of availabilityRows) {
+      await UserAvailability.create({
+        // Phase 87.5 UUID re-key: user_uuid is Users.id, NOT the Auth0 sub.
+        user_uuid: user.id,
+        type: 'recurring_pattern',
+        pattern_data,
+        start_date: patternStart,
+        end_date: null,
+        is_available: null,
+        timezone: AVAIL_TZ,
+      });
+    }
+    console.log(`   ✓ ${availabilityRows.length} recurring patterns (Alice 7 evenings, Bob 5, Charlie 2, Diana 2)\n`);
+
+    // --- One pending group invite -------------------------------------------
+    // Exercises the invite-pending surface AND the two 409 paths Task 4 added
+    // machine-readable codes to (re-inviting this email now returns
+    // invite_pending; inviting an existing member returns already_member).
+    //
+    // SECURITY — the token is generated AT RUNTIME, never committed. This
+    // repository is PUBLIC, and a GroupInvite token IS the credential that joins
+    // a group: a hard-coded literal here would be a permanently-published,
+    // predictable join credential for every database this seed has ever touched.
+    // Do not replace this with a fixed string "so tests can find it" — query the
+    // row for its token instead.
+    console.log('✉️  Seeding a pending group invite (88-34 WI-B4)...');
+    const pendingInvite = await GroupInvite.create({
+      group_id: weekendGroup.id,
+      invited_email: 'pending-invitee@example.com',
+      invited_by_uuid: users[0].id, // Alice, the Weekend Warriors owner
+      token: crypto.randomBytes(32).toString('hex'), // runtime-generated, never a literal
+      status: 'pending',
+    });
+    console.log(`   ✓ 1 pending invite to ${pendingInvite.invited_email} (token generated at runtime)\n`);
+
     console.log('🎉 Database seeding completed successfully!\n');
     console.log('📊 Summary:');
     console.log(`   - ${users.length} users`);
     console.log(`   - ${groups.length} groups`);
     console.log(`   - ${userGroups.length} user-group memberships`);
     console.log(`   - ${games.length} games`);
-    console.log(`   - ${events.length} events`);
+    console.log(`   - ${events.length} events (7 past + 2 future)`);
     console.log(`   - ${reviews.length} reviews`);
+    // Phase 88-34 Task 5 (WI-B4): report the new sections too, so a human
+    // running the seed can see at a glance that the Test-2 gates are walkable.
+    console.log(`   - 2 friendships (1 accepted, 1 pending)`);
+    console.log(`   - ${collectionRows.length} collection games`);
+    console.log(`   - ${availabilityRows.length} recurring availability patterns`);
+    console.log(`   - 1 pending group invite`);
     console.log('\n✨ Your database is now populated with sample data!');
 
   } catch (error) {
