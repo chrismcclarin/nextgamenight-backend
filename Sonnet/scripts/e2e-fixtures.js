@@ -27,8 +27,37 @@
 // token validation will fail server-side).
 
 const crypto = require('crypto');
+const { Op } = require('sequelize');
 const { User, Group, UserGroup, Friendship, SingleUseToken, Event, EventRsvp, AvailabilityPrompt, GroupInvite, sequelize } = require('../models');
 const { generateToken } = require('../services/magicTokenService');
+
+/**
+ * Assert an ACCEPTED friendship for a pair, direction-agnostic.
+ *
+ * A directional findOrCreate is NOT idempotent against this table: the unique
+ * index is symmetric — (LEAST(requester,addressee), GREATEST(...)) — so a row
+ * seeded in the OPPOSITE direction is invisible to the directional find, the
+ * insert then 23505s, and Sequelize's directional re-find misses too. That is
+ * exactly how BE 88-34's seed (Charlie -> Alice PENDING, `4ff570f`) broke the
+ * FE e2e fixture mint on 2026-08-21. Fixtures OWN their invariants (same rule
+ * as the UserGroup/GroupInvite teardowns below), so an existing row in either
+ * direction is normalized to 'accepted' rather than trusted.
+ */
+async function assertAcceptedFriendship(aId, bId) {
+  const existing = await Friendship.findOne({
+    where: {
+      [Op.or]: [
+        { requester_uuid: aId, addressee_uuid: bId },
+        { requester_uuid: bId, addressee_uuid: aId },
+      ],
+    },
+  });
+  if (existing) {
+    if (existing.status !== 'accepted') await existing.update({ status: 'accepted' });
+    return;
+  }
+  await Friendship.create({ requester_uuid: aId, addressee_uuid: bId, status: 'accepted' });
+}
 
 // RSVP single-use link lifetime — mirrors routes/rsvp.js RSVP_TOKEN_TTL_MS (30d).
 const RSVP_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -144,6 +173,21 @@ async function main() {
   if (!diana || !bob) {
     throw new Error('Seed data missing (Diana / Bob) — run seed-sample-data.js first');
   }
+  // RE-ASSERT Diana is NOT Alice's friend: her RSVP row's add-friend "+" is the
+  // element touch-targets.spec.ts:365/:423 measures ("fixture must seed a
+  // not-yet-friend RSVP row"). BE 88-34's seed (`4ff570f`) now creates
+  // Alice <-> Diana ACCEPTED for the walk env, which would silently remove the
+  // "+" here — so the fixture deletes the pair in either direction, the same
+  // fixtures-own-their-invariants rule as the UserGroup teardown below.
+  await Friendship.destroy({
+    where: {
+      [Op.or]: [
+        { requester_uuid: alice.id, addressee_uuid: diana.id },
+        { requester_uuid: diana.id, addressee_uuid: alice.id },
+      ],
+    },
+    force: true,
+  });
   for (const member of [diana, bob]) {
     const [row] = await EventRsvp.findOrCreate({
       where: { event_id: event.id, user_uuid: member.id },
@@ -231,11 +275,9 @@ async function main() {
   if (!friend.email) {
     await friend.update({ email: 'e2e-invite-friend@example.com' });
   }
-  // Accepted, bidirectional friendship Alice <-> Bob.
-  await Friendship.findOrCreate({
-    where: { requester_uuid: alice.id, addressee_uuid: friend.id },
-    defaults: { requester_uuid: alice.id, addressee_uuid: friend.id, status: 'accepted' },
-  });
+  // Accepted, bidirectional friendship Alice <-> Bob (direction-agnostic upsert
+  // — see assertAcceptedFriendship for why findOrCreate cannot be trusted here).
+  await assertAcceptedFriendship(alice.id, friend.id);
   // Make sure Bob is NOT in the invite group (so the friend checkbox stays enabled).
   // F-02: hard delete — a soft-deleted membership row still occupies the roster from
   // the fixture's point of view on the next run, so the teardown must really remove it.
@@ -256,10 +298,12 @@ async function main() {
   if (!friendPhone.email) {
     await friendPhone.update({ email: 'e2e-invite-friend-phone@example.com' });
   }
-  await Friendship.findOrCreate({
-    where: { requester_uuid: alice.id, addressee_uuid: friendPhone.id },
-    defaults: { requester_uuid: alice.id, addressee_uuid: friendPhone.id, status: 'accepted' },
-  });
+  // 88-34's seed creates this pair as Charlie -> Alice PENDING (incoming-request
+  // walk surface); the phone invite journey needs it ACCEPTED, and the fixture
+  // owns the CI database's state. No e2e spec reads the pending-request surface
+  // (verified 2026-08-21 — padding-budget.spec.ts:429 deliberately anchors on a
+  // card that renders without it).
+  await assertAcceptedFriendship(alice.id, friendPhone.id);
   await UserGroup.destroy({ where: { user_uuid: friendPhone.id, group_id: inviteGroup.id }, force: true });
 
   // Hard-delete EVERY invite row for the invite group, force: true — mirroring the
