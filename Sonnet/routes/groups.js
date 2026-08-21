@@ -21,6 +21,7 @@ const { sendError, ERROR_REGISTRY } = require('../utils/errors');
 // resolveTargetUser (dual-key) removed with POST /:group_id/users (Phase 87.6
 // groups-add-user); the UUID-only resolver remains for the role/transfer routes.
 const { resolveTargetUserUuidOnly } = require('../utils/resolveTargetUser');
+const { clampProvisionedUsername } = require('../utils/provisionedUsername');
 const { lockGroupRow } = require('../utils/groupRowLock');
 const { matchesSelf } = require('../middleware/objectAuth');
 const { Op } = require('sequelize');
@@ -80,6 +81,19 @@ async function cascadeDeleteFutureEventDataOnLeaveGroup({
   //      happened yet, the leaving user's RSVP/brings/vote on it is moot
   //      regardless of whether it's scheduled, in_progress, completed, or
   //      cancelled. Past events stay untouched (history preserved).
+  //
+  // AMENDMENT Phase 88-34 (WI-B1, 2026-08-20) — reason 1's "separate todo" is now
+  // DONE, but the no-status-filter decision STANDS on reason 2 alone.
+  //   - The source is fixed: routes/events.js derives status from start_date on
+  //     create and re-derives it on reschedule; models/Event.js defaults to
+  //     'scheduled' (migration 20260820000001).
+  //   - The historical rows are repaired: migration 20260820000002 re-stamps
+  //     future-dated 'completed' rows as 'scheduled' (idempotent).
+  // Do NOT read that as licence to add a status filter here. Reason 2 was never
+  // about the bug — 'cancelled' and 'in_progress' future events still carry the
+  // leaving user's forward commitments, and those rows must still cascade.
+  // Original decision preserved verbatim above; this note records who reopened
+  // it and why it survived.
   const now = new Date();
   const futureEvents = await Event.findAll({
     where: {
@@ -167,7 +181,14 @@ router.get('/user/:user_id', async (req, res) => {
       // Email is required, so use a valid email format if not provided
       // This should rarely happen with Google sign-in
       const finalEmail = userEmail || `${userId.replace(/[|:]/g, '-')}@auth0.local`;
-      const userName = req.user.name || req.user.nickname || req.user.given_name || req.user.email?.split('@')[0] || 'User';
+      // Wave-12 review HIGH #2: clamp per-candidate against the User.username
+      // len[1,50] backstop — this JIT provisioner races users.js/events.js on
+      // first load, and an unclamped >50-char name 500s whichever wins.
+      const userName = clampProvisionedUsername(req.user.name)
+        || clampProvisionedUsername(req.user.nickname)
+        || clampProvisionedUsername(req.user.given_name)
+        || clampProvisionedUsername(req.user.email?.split('@')[0])
+        || 'User';
 
       try {
         const [newUser, created] = await User.findOrCreate({
@@ -216,9 +237,37 @@ router.get('/user/:user_id', async (req, res) => {
           through: { where: { status: 'active' }, attributes: ['role', 'joined_at'] }
         },
         {
+          // DECISION Phase 88-34 WI-B2: this include is the group card's
+          // "Last Game" (grouplist.js:230 reads `group.Events?.[0]`), so it
+          // means HISTORY. It carried TWO defects, both fixed here:
+          //   1. NO where clause — a future event was eligible to BE the last
+          //      game played. History means past: start_date <= NOW() AND
+          //      status != 'cancelled' (the one contract this sweep applies at
+          //      every surface that presents events as history).
+          //   2. order was `createdAt DESC` — ROW-INSERTION time, not when the
+          //      game was played. Backfilling an old session today made it the
+          //      "last game". Ordered by start_date DESC instead.
+          // `required: false` is DEFENSIVE and explicit — MEASURED, not assumed
+          // (probed 2026-08-20): with `limit` present Sequelize resolves this
+          // hasMany via a separate/subquery path, so flipping it to `required:
+          // true` today does NOT drop the parent Group. It is written out anyway
+          // because adding a `where` to an include is exactly how the
+          // include-drops-the-parent class (the one this plan kills in games.js,
+          // where an INNER-JOINed Events include 404'd every zero-event game)
+          // gets reintroduced: remove the `limit` and an implicit-required
+          // include would make every group whose only events are future or
+          // cancelled VANISH from the user's group list. The behavior — a group
+          // with no past events still returns, with an empty Events array — is
+          // test-pinned in groups.test.js independently of which mechanism
+          // holds it.
           model: Event,
+          required: false,
           limit: 1,
-          order: [['createdAt', 'DESC']],
+          where: {
+            start_date: { [Op.lte]: new Date() },
+            status: { [Op.ne]: 'cancelled' },
+          },
+          order: [['start_date', 'DESC']],
           include: [{
             model: Game,
             attributes: ['name', 'image_url', 'theme']
@@ -757,8 +806,16 @@ router.post('/join-by-token', async (req, res) => {
     const joinerEmail = req.user.email_verified === true && req.user.email
       ? req.user.email
       : syntheticEmail;
-    const joinerName = req.user.name || req.user.nickname || req.user.given_name
-      || req.user.email?.split('@')[0] || 'User';
+    // Wave-12 review HIGH #2: clamp per-candidate at the assignment so BOTH
+    // findOrCreate defaults below (primary + unique-collision retry) inherit a
+    // len[1,50]-safe value — the catch below retries ONLY unique-constraint
+    // errors, so an unclamped >50-char name would 500 the join (a primary
+    // onboarding path, Phase 36 two-QR model).
+    const joinerName = clampProvisionedUsername(req.user.name)
+      || clampProvisionedUsername(req.user.nickname)
+      || clampProvisionedUsername(req.user.given_name)
+      || clampProvisionedUsername(req.user.email?.split('@')[0])
+      || 'User';
 
     // SPEC Req 6 (Phase 87.2 tombstone guard, self-keyed): covers BOTH findOrCreate
     // calls below (primary + unique-collision retry — same sub). A still-valid token

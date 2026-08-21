@@ -222,3 +222,60 @@ describe('88.2 AF-10 — GET /api/games/:id hides a soft-deleted group\'s review
     expect(reviews[0].Group).toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Phase 88-34 Task 2 (WI-B2, fork B) — GET /api/games/:id ships NO Events key.
+//
+// The Event include here was dead payload (zero FE readers: gameDetail calls
+// this route, does setGame(gameData), and never reads game.Events — its Game
+// Sessions list consumes GET /events/group/:group_id instead). It was also an
+// INNER JOIN, so a game with zero events 404'd, and it was group-agnostic on a
+// group-blind route, so it leaked every group's sessions for a game.
+// ---------------------------------------------------------------------------
+describe('Phase 88-34 WI-B2 — GET /api/games/:id carries no Events payload (fork B)', () => {
+  const DAY_MS = 24 * 60 * 60 * 1000;
+
+  it('response has NO Events key, even for a game that HAS events', async () => {
+    const game = await Game.create({ name: 'Include-Deleted Game', is_custom: true });
+    const group = await Group.create({ group_id: 'gid-88-34-fb', name: 'FB Group' });
+    await Event.create({
+      group_id: group.id, game_id: game.id,
+      start_date: new Date(Date.now() - 3 * DAY_MS), status: 'completed',
+    });
+
+    const res = await request(app).get(`/api/games/${game.id}`).expect(200);
+
+    expect(res.body.id).toBe(game.id);
+    expect(res.body.Events).toBeUndefined();
+    expect(Object.keys(res.body)).not.toContain('Events');
+  });
+
+  // The include-404 class dies with the include: an INNER JOIN on Events made a
+  // game with zero events unreachable (AutoFix#2, resolved-by-deletion).
+  it('a game with ZERO events returns 200, not 404', async () => {
+    const game = await Game.create({ name: 'Eventless Game', is_custom: true });
+
+    const res = await request(app).get(`/api/games/${game.id}`).expect(200);
+    expect(res.body.id).toBe(game.id);
+    expect(res.body.name).toBe('Eventless Game');
+  });
+
+  // r1 triage #5: the 500 handler used to return raw error.message (Sequelize
+  // errors leak column/constraint names and SQL fragments).
+  it('the 500 handler does not leak raw error detail to the client', async () => {
+    const spy = jest
+      .spyOn(Game, 'findByPk')
+      .mockRejectedValueOnce(new Error('column "secret_internal_col" does not exist'));
+    const logSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    const res = await request(app)
+      .get('/api/games/00000000-0000-0000-0000-000000000001')
+      .expect(500);
+
+    expect(res.body.error).toBe('Unable to retrieve game');
+    expect(JSON.stringify(res.body)).not.toContain('secret_internal_col');
+
+    spy.mockRestore();
+    logSpy.mockRestore();
+  });
+});

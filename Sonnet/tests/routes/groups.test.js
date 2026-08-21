@@ -3,7 +3,7 @@ const request = require('supertest');
 const express = require('express');
 const groupRoutes = require('../../routes/groups');
 const { Group, User, UserGroup, Event, Game } = require('../../models');
-const { makeUser, addToGroup } = require('../factories');
+const { makeUser, makeGroup, addToGroup } = require('../factories');
 
 // D-05 include-pin shapes (Phase 87.3 Task 1): the nested member id the FE
 // cutover (PR-B) compares against is a UUID; the Auth0 sub is provider-prefixed.
@@ -609,5 +609,103 @@ describe('GET /api/groups/:group_id/deletion-impact', () => {
     await request(makeApp(null))
       .get(`/api/groups/${group.id}/deletion-impact`)
       .expect(401);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 88-34 Task 2 (WI-B2) — "Last Game" means the latest PAST game.
+//
+// The GET /api/groups/user/:user_id Event include (read by grouplist.js:230 as
+// `group.Events?.[0]`) had NO where clause and ordered by createdAt DESC, so a
+// future event created today won "Last Game".
+// ---------------------------------------------------------------------------
+describe('Phase 88-34 WI-B2 — Last Game include means PAST (history)', () => {
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  let owner, group, oldGame, recentGame, futureGame;
+
+  const lastGameOf = async () => {
+    const res = await request(makeApp(owner))
+      .get(`/api/groups/user/${owner.user_id}`)
+      .expect(200);
+    return res.body.find((g) => g.id === group.id);
+  };
+
+  beforeEach(async () => {
+    owner = await makeUser({ user_id: 'test-user-lastgame', username: 'lastgameowner' });
+    group = await makeGroup({ group_id: 'test-group-lastgame', name: 'Last Game Group' });
+    await addToGroup(owner, group, 'owner');
+    oldGame = await Game.create({ name: 'Old Game', is_custom: true });
+    recentGame = await Game.create({ name: 'Recent Game', is_custom: true });
+    futureGame = await Game.create({ name: 'Future Game', is_custom: true });
+  });
+
+  it('a FUTURE event is invisible to Last Game — the latest PAST one wins', async () => {
+    await Event.create({
+      group_id: group.id, game_id: oldGame.id,
+      start_date: new Date(Date.now() - 30 * DAY_MS), status: 'completed',
+    });
+    await Event.create({
+      group_id: group.id, game_id: recentGame.id,
+      start_date: new Date(Date.now() - 2 * DAY_MS), status: 'completed',
+    });
+    // Created LAST (so it wins createdAt DESC) and dated in the future — the
+    // exact shape the walk caught.
+    await Event.create({
+      group_id: group.id, game_id: futureGame.id,
+      start_date: new Date(Date.now() + 5 * DAY_MS), status: 'scheduled',
+    });
+
+    const g = await lastGameOf();
+    expect(g.Events).toHaveLength(1);
+    expect(g.Events[0].Game.name).toBe('Recent Game');
+  });
+
+  it('orders by start_date, not createdAt (a backfilled OLD session is not "last")', async () => {
+    // Inserted second but played long ago: createdAt DESC would pick it.
+    await Event.create({
+      group_id: group.id, game_id: recentGame.id,
+      start_date: new Date(Date.now() - 2 * DAY_MS), status: 'completed',
+    });
+    await Event.create({
+      group_id: group.id, game_id: oldGame.id,
+      start_date: new Date(Date.now() - 300 * DAY_MS), status: 'completed',
+    });
+
+    const g = await lastGameOf();
+    expect(g.Events[0].Game.name).toBe('Recent Game');
+  });
+
+  it('excludes cancelled past events', async () => {
+    await Event.create({
+      group_id: group.id, game_id: recentGame.id,
+      start_date: new Date(Date.now() - 10 * DAY_MS), status: 'completed',
+    });
+    await Event.create({
+      group_id: group.id, game_id: oldGame.id,
+      start_date: new Date(Date.now() - 1 * DAY_MS), status: 'cancelled',
+    });
+
+    const g = await lastGameOf();
+    expect(g.Events[0].Game.name).toBe('Recent Game');
+  });
+
+  // The parent-drop class: with limit + where, a required/INNER join would drop
+  // the whole Group row. A group whose only events are future must STILL return.
+  it('(parent-drop pin, required:false) a group with ONLY future events still returns, with lastGame empty', async () => {
+    await Event.create({
+      group_id: group.id, game_id: futureGame.id,
+      start_date: new Date(Date.now() + 5 * DAY_MS), status: 'scheduled',
+    });
+
+    const g = await lastGameOf();
+    expect(g).toBeDefined();
+    expect(g.id).toBe(group.id);
+    expect(g.Events).toHaveLength(0);
+  });
+
+  it('(parent-drop pin) a group with ZERO events still returns', async () => {
+    const g = await lastGameOf();
+    expect(g).toBeDefined();
+    expect(g.Events).toHaveLength(0);
   });
 });

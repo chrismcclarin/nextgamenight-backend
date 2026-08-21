@@ -222,3 +222,96 @@ describe('List Routes', () => {
   });
 });
 
+
+// ---------------------------------------------------------------------------
+// Phase 88-34 Task 2 (WI-B2) — play stats mean HISTORY.
+//
+// GET /api/lists/games/:group_id/:user_id computed play_count / last_played /
+// first_played (and winner/picker tallies) from EVERY event, so scheduling next
+// Saturday's game night immediately bumped that game's play_count and set
+// last_played to a FUTURE date.
+//
+// Ruled scope (2026-08-20): stats only. List MEMBERSHIP is unchanged — a game
+// whose only events are future still appears, with play_count 0/last_played null.
+// ---------------------------------------------------------------------------
+describe('Phase 88-34 WI-B2 — play_count/last_played ignore future events', () => {
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  let actor, group, playedGame, futureOnlyGame;
+
+  const fetchGames = async () => {
+    currentActor = actor.user_id;
+    const res = await request(app)
+      .get(`/api/lists/games/${group.id}/${actor.user_id}`)
+      .expect(200);
+    return res.body;
+  };
+
+  beforeEach(async () => {
+    actor = await makeUser({ user_id: 'test-user-hist-stats', username: 'histactor' });
+    group = await makeGroup({ group_id: 'test-group-hist-stats', name: 'History Stats Group' });
+    await addToGroup(actor, group);
+    playedGame = await Game.create({ name: 'Played Game', is_custom: true });
+    futureOnlyGame = await Game.create({ name: 'Future Only Game', is_custom: true });
+  });
+
+  afterEach(() => {
+    currentActor = null;
+  });
+
+  it('a future event does NOT bump play_count and does NOT become last_played', async () => {
+    await Event.create({
+      group_id: group.id, game_id: playedGame.id,
+      start_date: new Date(Date.now() - 10 * DAY_MS), status: 'completed',
+    });
+    await Event.create({
+      group_id: group.id, game_id: playedGame.id,
+      start_date: new Date(Date.now() + 10 * DAY_MS), status: 'scheduled',
+    });
+
+    const entry = (await fetchGames()).find((g) => g.id === playedGame.id);
+    expect(entry.play_count).toBe(1);
+    expect(new Date(entry.last_played).getTime()).toBeLessThan(Date.now());
+  });
+
+  it('the PAST event still counts (the filter is not over-broad)', async () => {
+    await Event.create({
+      group_id: group.id, game_id: playedGame.id,
+      start_date: new Date(Date.now() - 20 * DAY_MS), status: 'completed',
+    });
+    await Event.create({
+      group_id: group.id, game_id: playedGame.id,
+      start_date: new Date(Date.now() - 5 * DAY_MS), status: 'completed',
+    });
+
+    const entry = (await fetchGames()).find((g) => g.id === playedGame.id);
+    expect(entry.play_count).toBe(2);
+  });
+
+  it('cancelled past events do not count as plays', async () => {
+    await Event.create({
+      group_id: group.id, game_id: playedGame.id,
+      start_date: new Date(Date.now() - 5 * DAY_MS), status: 'completed',
+    });
+    await Event.create({
+      group_id: group.id, game_id: playedGame.id,
+      start_date: new Date(Date.now() - 2 * DAY_MS), status: 'cancelled',
+    });
+
+    const entry = (await fetchGames()).find((g) => g.id === playedGame.id);
+    expect(entry.play_count).toBe(1);
+  });
+
+  // MEMBERSHIP is deliberately NOT gated — the ruled reading. A game whose only
+  // events are future must still APPEAR in the list, with zeroed stats.
+  it('(membership pin) a game whose ONLY events are future still appears, with play_count 0 / last_played null', async () => {
+    await Event.create({
+      group_id: group.id, game_id: futureOnlyGame.id,
+      start_date: new Date(Date.now() + 4 * DAY_MS), status: 'scheduled',
+    });
+
+    const entry = (await fetchGames()).find((g) => g.id === futureOnlyGame.id);
+    expect(entry).toBeDefined();
+    expect(entry.play_count).toBe(0);
+    expect(entry.last_played).toBeNull();
+  });
+});

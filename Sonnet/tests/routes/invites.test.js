@@ -1191,3 +1191,93 @@ describe('88.2 WR-01 — invite write paths refuse a soft delete that lands MID-
     expect(reloaded.status).toBe('pending');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Phase 88-34 Task 4 (fork F, owner-ruled 2026-08-20) — machine-readable codes
+// on the two invite 409s, so the FE can branch on a code instead of
+// string-matching English prose (WI-F2). Error strings and the raw
+// { error, code } body shape are deliberately unchanged: these handlers are NOT
+// converted to sendError.
+// ---------------------------------------------------------------------------
+const { ERROR_REGISTRY } = require('../../utils/errors');
+
+describe('Phase 88-34 Task 4 — invite 409 machine-readable codes (fork F)', () => {
+  let owner, target, group;
+
+  beforeEach(async () => {
+    owner = await User.create({
+      user_id: 'auth0|code-owner', username: 'code-owner', email: 'code-owner@example.com',
+    });
+    target = await User.create({
+      user_id: 'auth0|code-target', username: 'code-target', email: 'code-target@example.com',
+    });
+    group = await Group.create({ name: 'Code Group', group_id: 'code-group-001' });
+    await UserGroup.create({ user_uuid: owner.id, group_id: group.id, role: 'owner', status: 'active' });
+    currentActor = owner.user_id;
+  });
+
+  afterEach(() => {
+    currentActor = null;
+  });
+
+  it('already-member 409 carries code "already_member" with the string unchanged', async () => {
+    await UserGroup.create({
+      user_uuid: target.id, group_id: group.id, role: 'member', status: 'active',
+    });
+
+    const res = await request(app)
+      .post('/api/invites/send')
+      .send({ group_id: group.id, email: target.email })
+      .expect(409);
+
+    expect(res.body.code).toBe('already_member');
+    expect(res.body.error).toBe('This person is already a member of the group');
+    // Raw body shape preserved — NOT a sendError envelope (no nested details).
+    expect(res.body.details).toBeUndefined();
+  });
+
+  it('pending-invite 409 carries code "invite_pending" with the string unchanged', async () => {
+    await GroupInvite.create({
+      group_id: group.id,
+      invited_email: target.email.toLowerCase(),
+      invited_by_uuid: owner.id,
+      token: 'code-pending-token',
+      status: 'pending',
+    });
+
+    const res = await request(app)
+      .post('/api/invites/send')
+      .send({ group_id: group.id, email: target.email })
+      .expect(409);
+
+    expect(res.body.code).toBe('invite_pending');
+    expect(res.body.error).toBe('This person already has a pending invite');
+    expect(res.body.details).toBeUndefined();
+  });
+
+  // The registry is the canonical status/message record the FE contract anchors
+  // on. A code emitted outside sendError is invisible to it unless registered,
+  // and a registry message that drifts from the wire string is worse than none.
+  it('both codes are registered with httpStatus 409 and the EXACT live wire strings', async () => {
+    expect(ERROR_REGISTRY.already_member).toEqual({
+      httpStatus: 409,
+      message: 'This person is already a member of the group',
+    });
+    expect(ERROR_REGISTRY.invite_pending).toEqual({
+      httpStatus: 409,
+      message: 'This person already has a pending invite',
+    });
+  });
+
+  it('(anti-drift) the registry messages equal the strings the routes actually emit', async () => {
+    await UserGroup.create({
+      user_uuid: target.id, group_id: group.id, role: 'member', status: 'active',
+    });
+    const memberRes = await request(app)
+      .post('/api/invites/send')
+      .send({ group_id: group.id, email: target.email })
+      .expect(409);
+    expect(memberRes.body.error).toBe(ERROR_REGISTRY[memberRes.body.code].message);
+    expect(memberRes.status).toBe(ERROR_REGISTRY[memberRes.body.code].httpStatus);
+  });
+});

@@ -9,6 +9,7 @@ const { requireParamMatchesToken, matchesSelf } = require('../middleware/objectA
 // Phase 87.4 Plan 02 (KEYMISS mitigation): resolve a UUID self-param to the
 // sub-keyed Users row.
 const { isUuid } = require('../utils/resolveTargetUser');
+const { clampProvisionedUsername } = require('../utils/provisionedUsername');
 const auth0Service = require('../services/auth0Service');
 const smsService = require('../services/smsService');
 const accountDeletionService = require('../services/accountDeletionService');
@@ -203,7 +204,15 @@ router.get('/:user_id', requireParamMatchesToken('user_id'), async (req, res) =>
       }
 
       // Start with username from token (for email/password users, this is what they entered during signup)
-      let userName = req.user.username || req.user.name || req.user.nickname || req.user.given_name || req.user.email?.split('@')[0] || 'User';
+      // Wave-12 review HIGH #2 (extends fork D): clamp per-candidate — see
+      // utils/provisionedUsername.js. A whitespace-only claim returns null and
+      // falls through; the final 'User' literal guarantees the min-1 bound.
+      let userName = clampProvisionedUsername(req.user.username)
+        || clampProvisionedUsername(req.user.name)
+        || clampProvisionedUsername(req.user.nickname)
+        || clampProvisionedUsername(req.user.given_name)
+        || clampProvisionedUsername(req.user.email?.split('@')[0])
+        || 'User';
       let userEmail = req.user.email;
 
       // ALWAYS try to fetch from Auth0 Management API if we have credentials
@@ -229,8 +238,9 @@ router.get('/:user_id', requireParamMatchesToken('user_id'), async (req, res) =>
           
           // Always use username from Management API if available and not generic
           // This is critical for email/password users who entered a username during signup
-          if (userDetails.username && userDetails.username.trim().length > 0 && userDetails.username !== 'User') {
-            userName = userDetails.username.trim();
+          const mgmtUsername = clampProvisionedUsername(userDetails.username);
+          if (mgmtUsername && mgmtUsername !== 'User') {
+            userName = mgmtUsername;
           }
         }
       } catch (auth0Error) {
@@ -250,24 +260,64 @@ router.get('/:user_id', requireParamMatchesToken('user_id'), async (req, res) =>
       
       // If username is still generic, try to extract from email
       if (userName === 'User' && userEmail && !userEmail.includes('@auth0.local') && !userEmail.includes('@auth0')) {
-        userName = userEmail.split('@')[0];
+        userName = clampProvisionedUsername(userEmail.split('@')[0]) || userName;
       }
-      
+
       // Combine given_name and family_name if available
       if (req.user.given_name || req.user.family_name) {
         const fullName = [req.user.given_name, req.user.family_name].filter(Boolean).join(' ').trim();
         if (fullName) {
-          userName = fullName;
+          userName = clampProvisionedUsername(fullName) || userName;
         }
       }
       
+      // DECISION Phase 88-34 Task 4 (fork D, owner-ruled 2026-08-20): CLAMP the
+      // derived username at this writer, over dropping the User.username
+      // len[1,50] model backstop.
+      //
+      // This is the ONE writer that legitimately receives input it does not
+      // control: the value above comes from Auth0 (token claims, then the
+      // Management API, then given_name + family_name which OVERRIDES
+      // everything at :257-262). Real people have full names longer than 50
+      // characters. With the model backstop and without this clamp, their very
+      // FIRST LOGIN 500s and they can never get an account — an outage with no
+      // user-side workaround.
+      //
+      // Clamp rather than reject, because a human's legal name is not invalid
+      // input; and clamp HERE rather than widening/removing the backstop,
+      // because the backstop is what protects every OTHER (human-entered,
+      // already route-validated) write path. Trim first so the 50 characters
+      // are 50 real characters, not padding.
+      //
+      // Applies to BOTH write paths below — the findOrCreate defaults AND the
+      // !created needsUpdate branch. Test-pinned (a >50-char Auth0 full name
+      // must provision successfully with a 50-char username).
+      //
+      // AMENDED (wave-12 review HIGH #2, owner-approved 2026-08-21): the chain
+      // above now clamps PER-CANDIDATE via the shared
+      // utils/provisionedUsername.js helper — the review found 8 more unclamped
+      // machine-derived writers shipping the same outage this comment warns
+      // about, so the mechanism moved to a util applied at every one. This line
+      // stays as the final belt for this writer's two paths.
+      const clampedUserName = clampProvisionedUsername(userName) || 'User';
+
       try {
-        const [newUser, created] = await User.findOrCreate({
+        // Phase 88-34 (Rule 1, found by the fork-D !created test): this was a
+        // bare `User.findOrCreate`, so the returned instance came back under the
+        // DEFAULT SCOPE — which EXCLUDES `email` (models/User.js defaultScope,
+        // BSEC-01 D-03). The `!created` repair branch below then evaluated
+        // `newUser.email.includes('@auth0.local')` on `undefined` and THREW
+        // ("Cannot read properties of undefined"), so that entire
+        // fix-a-wrong-email/username path has been dead: every run fell into the
+        // catch, re-fetched, and returned the row unrepaired. Scoping the find
+        // half to withContactInfo loads `email` and makes the branch do what it
+        // has always claimed to do. Test-pinned below.
+        const [newUser, created] = await User.scope('withContactInfo').findOrCreate({
           where: { user_id: req.params.user_id },
           defaults: {
             user_id: req.params.user_id,
             email: userEmail,
-            username: userName,
+            username: clampedUserName,
             // TZ-01: persist browser-detected timezone on first creation if supplied.
             // If detectedTimezone is null we DELIBERATELY omit the key so Sequelize
             // applies the model defaultValue (null per migration 78-01) — sending
@@ -279,19 +329,24 @@ router.get('/:user_id', requireParamMatchesToken('user_id'), async (req, res) =>
         
         // If user already existed but has wrong email/username, update them
         if (!created) {
-          const needsUpdate = 
+          const needsUpdate =
             (newUser.email !== userEmail && !newUser.email.includes('@auth0.local') && !newUser.email.includes('@auth0')) ||
-            (newUser.username === 'User' && userName !== 'User');
-          
+            (newUser.username === 'User' && clampedUserName !== 'User');
+
           if (needsUpdate) {
             await newUser.update({
               email: userEmail,
-              username: userName
+              username: clampedUserName
             });
-            console.log(`Updated user ${newUser.user_id} with email: ${userEmail}, username: ${userName}`);
+            // Phase 88-34 (r3 triage #7): log the row ID, never the identity.
+            // This line used to print the user's EMAIL and USERNAME to stdout,
+            // i.e. into Railway's log retention, on every provisioning update.
+            // Log ids, not identities.
+            console.log(`[users:provision] updated contact fields for user ${newUser.id}`);
           }
         } else {
-          console.log(`Auto-created user: ${newUser.user_id} (${newUser.username}) with email: ${newUser.email}`);
+          // Phase 88-34 (r3 triage #7): same — id only, no email/username.
+          console.log(`[users:provision] auto-created user ${newUser.id}`);
         }
         
         user = newUser;
@@ -327,9 +382,12 @@ router.get('/:user_id', requireParamMatchesToken('user_id'), async (req, res) =>
               updateData.email = userDetails.email;
             }
             
-            // Update username if generic or missing
-            if (hasGenericUsername && userDetails.username && userDetails.username.trim().length > 0 && userDetails.username !== 'User') {
-              updateData.username = userDetails.username.trim();
+            // Update username if generic or missing. Wave-12 review HIGH #2:
+            // clamped — unclamped, a >50-char Management-API username threw
+            // here and the outer catch swallowed it, silently killing the repair.
+            const repairedUsername = clampProvisionedUsername(userDetails.username);
+            if (hasGenericUsername && repairedUsername && repairedUsername !== 'User') {
+              updateData.username = repairedUsername;
             }
             
             if (Object.keys(updateData).length > 0) {

@@ -6,6 +6,7 @@ const { sendError } = require('../utils/errors');
 // Phase 87.4 Plan 02 (KEYMISS mitigation): resolve a self-param that may be the
 // caller's own Users.id UUID (post-PR-2) to the sub-keyed Users row.
 const { isUuid } = require('../utils/resolveTargetUser');
+const { clampProvisionedUsername } = require('../utils/provisionedUsername');
 const { Op } = require('sequelize');
 const sequelize = require('../config/database');
 const router = express.Router();
@@ -211,7 +212,14 @@ router.get('/user/:user_id', requireParamMatchesToken('user_id'), async (req, re
         return sendError(res, 'account_deleted');
       }
       let userEmail = req.user.email;
-      let userName = req.user.name || req.user.nickname || req.user.given_name || req.user.email?.split('@')[0] || 'User';
+      // Wave-12 review HIGH #2: clamp per-candidate so a >50-char (or
+      // whitespace-only) identity-provider name can't throw the User.username
+      // len[1,50] backstop and 500 first-login JIT provisioning.
+      let userName = clampProvisionedUsername(req.user.name)
+        || clampProvisionedUsername(req.user.nickname)
+        || clampProvisionedUsername(req.user.given_name)
+        || clampProvisionedUsername(req.user.email?.split('@')[0])
+        || 'User';
       
       // If email is missing from token, try to fetch from Auth0 Management API
       if (!userEmail || userEmail.includes('@auth0.local') || userEmail.includes('@auth0')) {
@@ -220,7 +228,7 @@ router.get('/user/:user_id', requireParamMatchesToken('user_id'), async (req, re
           if (auth0User) {
             const userDetails = auth0Service.extractUserDetails(auth0User);
             userEmail = userDetails.email;
-            userName = userDetails.username;
+            userName = clampProvisionedUsername(userDetails.username) || userName;
           }
         } catch (auth0Error) {
           // If Management API fails, continue with fallback
@@ -235,19 +243,25 @@ router.get('/user/:user_id', requireParamMatchesToken('user_id'), async (req, re
       
       // If username is still generic, try to extract from email
       if (userName === 'User' && userEmail && !userEmail.includes('@auth0.local') && !userEmail.includes('@auth0')) {
-        userName = userEmail.split('@')[0];
+        userName = clampProvisionedUsername(userEmail.split('@')[0]) || userName;
       }
-      
+
       // Combine given_name and family_name if available
       if (req.user.given_name || req.user.family_name) {
         const fullName = [req.user.given_name, req.user.family_name].filter(Boolean).join(' ').trim();
         if (fullName) {
-          userName = fullName;
+          userName = clampProvisionedUsername(fullName) || userName;
         }
       }
       
       try {
-        const [newUser, created] = await User.findOrCreate({
+        // Wave-12 review MED #11 (mirrors the 88-34 Rule-1 fix in users.js):
+        // a bare findOrCreate returns the instance under the DEFAULT SCOPE,
+        // which EXCLUDES email (models/User.js defaultScope, BSEC-01 D-03) —
+        // so the !created repair branch below evaluated `.includes` on
+        // undefined, threw, and has been dead since it was written. Scoping to
+        // withContactInfo loads email and makes the branch real.
+        const [newUser, created] = await User.scope('withContactInfo').findOrCreate({
           where: { user_id: req.params.user_id },
           defaults: {
             user_id: req.params.user_id,
@@ -255,10 +269,10 @@ router.get('/user/:user_id', requireParamMatchesToken('user_id'), async (req, re
             username: userName,
           }
         });
-        
+
         // If user already existed but has wrong email/username, update them
         if (!created) {
-          const needsUpdate = 
+          const needsUpdate =
             (newUser.email !== userEmail && !newUser.email.includes('@auth0.local') && !newUser.email.includes('@auth0')) ||
             (newUser.username === 'User' && userName !== 'User');
           
@@ -567,7 +581,20 @@ router.post('/', validateEventCreate, async (req, res) => {
         custom_participants: custom_participants || [],
         is_group_win,
         comments,
-        status: 'completed',
+        // DECISION Phase 88-34 WI-B1 (walk MAJOR M4): status is DERIVED FROM
+        // start_date here, over the previous hardcoded 'completed' AND over
+        // accepting a client-sent status. The hardcode meant every event born
+        // through the create-event modal — including future ones — was stamped
+        // 'completed', so UpcomingEventsCard (which filters to
+        // scheduled/in_progress) never showed them. Accepting status from the
+        // body was rejected because it hands a client control of a field that
+        // gates RSVP/cancellation semantics (T-88-34-01): the body destructure
+        // above deliberately does NOT read status and validateEventCreate
+        // declares no status rule — client-sent status stays silently ignored.
+        // The poll->event path (services/eventCreationService.js) is the
+        // correctness exemplar this converges on. Changing this to a constant
+        // is a decision, not a cleanup.
+        status: new Date(start_date) > new Date() ? 'scheduled' : 'completed',
         rsvp_deadline: rsvp_deadline || null,
         ballot_status: null
       }, { transaction: t });
@@ -900,9 +927,31 @@ router.put('/:id', validateUUID('id'), validateEventUpdate, async (req, res) => 
     // Capture old start_date before update to detect date changes
     const oldStartDate = event.start_date;
 
+    // DECISION Phase 88-34 WI-B1 (r3 triage #0): re-derive status on RESCHEDULE
+    // — over leaving status alone on update. Without this, the one-time M4
+    // backfill repairs history once and then every reschedule regenerates the
+    // symptom per-event: moving a past event forward would leave it
+    // 'completed' and invisible to Upcoming Events forever.
+    // Two deliberate guards, both load-bearing:
+    //   1. Only when start_date actually CHANGES — an unrelated edit (comments,
+    //      winner) must never move status.
+    //   2. Only from within the DERIVED PAIR ('scheduled' | 'completed').
+    //      'cancelled' and 'in_progress' are operator/lifecycle states that
+    //      this derivation has no authority to overwrite — cancelling an event
+    //      and then correcting its date must not un-cancel it.
+    const DERIVED_STATUSES = ['scheduled', 'completed'];
+    const startDateChanged =
+      start_date !== undefined &&
+      new Date(start_date).getTime() !== new Date(oldStartDate).getTime();
+    const rederivedStatus =
+      startDateChanged && DERIVED_STATUSES.includes(event.status)
+        ? (new Date(start_date) > new Date() ? 'scheduled' : 'completed')
+        : event.status;
+
     await event.update({
       game_id: game_id !== undefined ? (game_id || null) : event.game_id,
       start_date,
+      status: rederivedStatus,
       duration_minutes,
       winner_id: winner_id || null,
       picked_by_id: picked_by_id || null,

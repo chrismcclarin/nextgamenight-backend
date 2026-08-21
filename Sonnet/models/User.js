@@ -11,6 +11,30 @@ const User = sequelize.define('User', {
   username: {
     type: DataTypes.STRING,
     allowNull: false,
+    // DECISION Phase 88-34 Task 4: an APP-SIDE `len` backstop, deliberately NOT
+    // a STRING(50) column type. A type change needs a migration and tangles with
+    // the 88.4 migrate-cli-replay drift gate for zero user-visible gain — the
+    // route (routes/users.js PUT username, 50) is the enforcement, this is the
+    // last line if a future write path forgets.
+    //
+    // WARNING (fork D, owner-ruled 2026-08-20; census corrected by the wave-12
+    // code review, owner-approved 2026-08-21): this backstop is only safe
+    // BECAUSE every machine-derived username writer clamps via
+    // utils/provisionedUsername.js. Identity-provider names can exceed 50
+    // chars (or be whitespace-only) — an unclamped writer 500s its whole flow.
+    // Clamped writers (grep census 2026-08-21, 9 write expressions):
+    //   routes/users.js       — JIT provisioning (defaults + !created update)
+    //                           and the Management-API repair writer
+    //   routes/events.js      — JIT provisioning (defaults + !created update)
+    //   routes/groups.js      — JIT provisioning + group-join provisioning
+    //                           (primary + unique-collision retry)
+    //   routes/googleAuth.js  — OAuth-URL mint (defaults + existing-user update)
+    // The human PUT-username route stays on its route validator (400 > silent
+    // truncation for typed input). If you add a NEW machine writer, clamp it
+    // with the util; if you ever remove the clamps, remove this too (or you
+    // ship that outage). Test-pinned in tests/routes/users.test.js and the
+    // per-surface wave-12 tests.
+    validate: { len: [1, 50] },
   },
   email: {
     type: DataTypes.STRING,

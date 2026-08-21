@@ -45,6 +45,15 @@ const EXPECTED_STATUS = {
   invalid_token: 410,
   already_used: 410,
   window_expired: 410,
+  // Phase 88-34 (fork F): the two group-invite 409s. Same registered-but-
+  // hand-rolled shape as the 88.2 block above — routes/invites.js keeps its raw
+  // { error, code } body and is NOT routed through sendError, because existing
+  // consumers read the `error` string straight off those responses. The FE
+  // branches on the CODE (already-a-member vs already-invited need different
+  // copy), which is why 409 must also land in the FE's NON_RETRYABLE set — a
+  // 409 that is not classified terminal is silently retried.
+  already_member: 409,
+  invite_pending: 409,
 };
 
 describe('utils/errors — exports', () => {

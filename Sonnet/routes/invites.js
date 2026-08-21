@@ -365,7 +365,19 @@ router.post(
         });
 
         if (activeUserGroup) {
-          return res.status(409).json({ error: 'This person is already a member of the group' });
+          // Phase 88-34 Task 4 (fork F): machine-readable `code` ADDED alongside
+          // the existing prose. The FE has to distinguish "already a member"
+          // from "already invited" to branch its copy, and string-matching
+          // English is not a contract. The error string and the raw
+          // { error, code } body shape are deliberately UNCHANGED — this handler
+          // is NOT converted to sendError (which would nest the payload under
+          // `details` and break existing raw-body readers). Registered in
+          // ERROR_REGISTRY per the 88.2 MED-1 registered-but-hand-rolled pattern;
+          // if you change this string, change the registry message with it.
+          return res.status(409).json({
+            error: 'This person is already a member of the group',
+            code: 'already_member',
+          });
         }
       }
 
@@ -379,7 +391,13 @@ router.post(
       });
 
       if (existingInvite) {
-        return res.status(409).json({ error: 'This person already has a pending invite' });
+        // Phase 88-34 Task 4 (fork F) — see the already_member sibling above for
+        // the full rationale. Same shape: code added, string and body shape
+        // unchanged, no sendError conversion, registered in ERROR_REGISTRY.
+        return res.status(409).json({
+          error: 'This person already has a pending invite',
+          code: 'invite_pending',
+        });
       }
 
       // Generate secure token
