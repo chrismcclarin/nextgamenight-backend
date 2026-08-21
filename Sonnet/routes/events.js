@@ -6,6 +6,7 @@ const { sendError } = require('../utils/errors');
 // Phase 87.4 Plan 02 (KEYMISS mitigation): resolve a self-param that may be the
 // caller's own Users.id UUID (post-PR-2) to the sub-keyed Users row.
 const { isUuid } = require('../utils/resolveTargetUser');
+const { clampProvisionedUsername } = require('../utils/provisionedUsername');
 const { Op } = require('sequelize');
 const sequelize = require('../config/database');
 const router = express.Router();
@@ -211,7 +212,14 @@ router.get('/user/:user_id', requireParamMatchesToken('user_id'), async (req, re
         return sendError(res, 'account_deleted');
       }
       let userEmail = req.user.email;
-      let userName = req.user.name || req.user.nickname || req.user.given_name || req.user.email?.split('@')[0] || 'User';
+      // Wave-12 review HIGH #2: clamp per-candidate so a >50-char (or
+      // whitespace-only) identity-provider name can't throw the User.username
+      // len[1,50] backstop and 500 first-login JIT provisioning.
+      let userName = clampProvisionedUsername(req.user.name)
+        || clampProvisionedUsername(req.user.nickname)
+        || clampProvisionedUsername(req.user.given_name)
+        || clampProvisionedUsername(req.user.email?.split('@')[0])
+        || 'User';
       
       // If email is missing from token, try to fetch from Auth0 Management API
       if (!userEmail || userEmail.includes('@auth0.local') || userEmail.includes('@auth0')) {
@@ -220,7 +228,7 @@ router.get('/user/:user_id', requireParamMatchesToken('user_id'), async (req, re
           if (auth0User) {
             const userDetails = auth0Service.extractUserDetails(auth0User);
             userEmail = userDetails.email;
-            userName = userDetails.username;
+            userName = clampProvisionedUsername(userDetails.username) || userName;
           }
         } catch (auth0Error) {
           // If Management API fails, continue with fallback
@@ -235,14 +243,14 @@ router.get('/user/:user_id', requireParamMatchesToken('user_id'), async (req, re
       
       // If username is still generic, try to extract from email
       if (userName === 'User' && userEmail && !userEmail.includes('@auth0.local') && !userEmail.includes('@auth0')) {
-        userName = userEmail.split('@')[0];
+        userName = clampProvisionedUsername(userEmail.split('@')[0]) || userName;
       }
-      
+
       // Combine given_name and family_name if available
       if (req.user.given_name || req.user.family_name) {
         const fullName = [req.user.given_name, req.user.family_name].filter(Boolean).join(' ').trim();
         if (fullName) {
-          userName = fullName;
+          userName = clampProvisionedUsername(fullName) || userName;
         }
       }
       

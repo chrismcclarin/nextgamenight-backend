@@ -17,13 +17,23 @@ const User = sequelize.define('User', {
     // route (routes/users.js PUT username, 50) is the enforcement, this is the
     // last line if a future write path forgets.
     //
-    // WARNING (fork D, owner-ruled 2026-08-20): this backstop is only safe
-    // BECAUSE routes/users.js CLAMPS the Auth0-derived username to 50 at the
-    // provisioning writer. Auth0 given_name + family_name can exceed 50, and
-    // that value is written untruncated on FIRST LOGIN — with this backstop and
-    // without that clamp, first login 500s for anyone with a long full name.
-    // If you ever remove the provisioning clamp, remove this too (or you ship
-    // that outage). Test-pinned in tests/routes/users.test.js.
+    // WARNING (fork D, owner-ruled 2026-08-20; census corrected by the wave-12
+    // code review, owner-approved 2026-08-21): this backstop is only safe
+    // BECAUSE every machine-derived username writer clamps via
+    // utils/provisionedUsername.js. Identity-provider names can exceed 50
+    // chars (or be whitespace-only) — an unclamped writer 500s its whole flow.
+    // Clamped writers (grep census 2026-08-21, 9 write expressions):
+    //   routes/users.js       — JIT provisioning (defaults + !created update)
+    //                           and the Management-API repair writer
+    //   routes/events.js      — JIT provisioning (defaults + !created update)
+    //   routes/groups.js      — JIT provisioning + group-join provisioning
+    //                           (primary + unique-collision retry)
+    //   routes/googleAuth.js  — OAuth-URL mint (defaults + existing-user update)
+    // The human PUT-username route stays on its route validator (400 > silent
+    // truncation for typed input). If you add a NEW machine writer, clamp it
+    // with the util; if you ever remove the clamps, remove this too (or you
+    // ship that outage). Test-pinned in tests/routes/users.test.js and the
+    // per-surface wave-12 tests.
     validate: { len: [1, 50] },
   },
   email: {

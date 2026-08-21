@@ -21,6 +21,7 @@ const { sendError, ERROR_REGISTRY } = require('../utils/errors');
 // resolveTargetUser (dual-key) removed with POST /:group_id/users (Phase 87.6
 // groups-add-user); the UUID-only resolver remains for the role/transfer routes.
 const { resolveTargetUserUuidOnly } = require('../utils/resolveTargetUser');
+const { clampProvisionedUsername } = require('../utils/provisionedUsername');
 const { lockGroupRow } = require('../utils/groupRowLock');
 const { matchesSelf } = require('../middleware/objectAuth');
 const { Op } = require('sequelize');
@@ -180,7 +181,14 @@ router.get('/user/:user_id', async (req, res) => {
       // Email is required, so use a valid email format if not provided
       // This should rarely happen with Google sign-in
       const finalEmail = userEmail || `${userId.replace(/[|:]/g, '-')}@auth0.local`;
-      const userName = req.user.name || req.user.nickname || req.user.given_name || req.user.email?.split('@')[0] || 'User';
+      // Wave-12 review HIGH #2: clamp per-candidate against the User.username
+      // len[1,50] backstop — this JIT provisioner races users.js/events.js on
+      // first load, and an unclamped >50-char name 500s whichever wins.
+      const userName = clampProvisionedUsername(req.user.name)
+        || clampProvisionedUsername(req.user.nickname)
+        || clampProvisionedUsername(req.user.given_name)
+        || clampProvisionedUsername(req.user.email?.split('@')[0])
+        || 'User';
 
       try {
         const [newUser, created] = await User.findOrCreate({
@@ -798,8 +806,16 @@ router.post('/join-by-token', async (req, res) => {
     const joinerEmail = req.user.email_verified === true && req.user.email
       ? req.user.email
       : syntheticEmail;
-    const joinerName = req.user.name || req.user.nickname || req.user.given_name
-      || req.user.email?.split('@')[0] || 'User';
+    // Wave-12 review HIGH #2: clamp per-candidate at the assignment so BOTH
+    // findOrCreate defaults below (primary + unique-collision retry) inherit a
+    // len[1,50]-safe value — the catch below retries ONLY unique-constraint
+    // errors, so an unclamped >50-char name would 500 the join (a primary
+    // onboarding path, Phase 36 two-QR model).
+    const joinerName = clampProvisionedUsername(req.user.name)
+      || clampProvisionedUsername(req.user.nickname)
+      || clampProvisionedUsername(req.user.given_name)
+      || clampProvisionedUsername(req.user.email?.split('@')[0])
+      || 'User';
 
     // SPEC Req 6 (Phase 87.2 tombstone guard, self-keyed): covers BOTH findOrCreate
     // calls below (primary + unique-collision retry — same sub). A still-valid token

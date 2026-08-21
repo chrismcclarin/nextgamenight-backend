@@ -5,6 +5,7 @@ const crypto = require('crypto');
 const { google } = require('googleapis');
 const { User, SingleUseToken, PendingAuth0Deletion } = require('../models');
 const { sendError, AppError } = require('../utils/errors');
+const { clampProvisionedUsername } = require('../utils/provisionedUsername');
 const { resolveAllowedFrontendUrl } = require('../config/allowedOrigins');
 const { matchesSelf } = require('../middleware/objectAuth');
 const router = express.Router();
@@ -54,21 +55,27 @@ const generateGoogleAuthUrl = async (user_id, email = null, username = null, fro
     throw new AppError('account_deleted');
   }
 
-  // Create or find user (auto-create if doesn't exist)
+  // Create or find user (auto-create if doesn't exist).
+  // Wave-12 review HIGH #2: clamp per-candidate — the token `name` claim is a
+  // full name that can exceed the User.username len[1,50] backstop; unclamped,
+  // this save throws and the whole Connect-Google-Calendar flow 500s.
+  const clampedUsername = clampProvisionedUsername(username);
   const [user, created] = await User.findOrCreate({
     where: { user_id },
     defaults: {
       user_id,
       email: email || null,
-      username: username || email?.split('@')[0] || 'User',
+      username: clampedUsername || clampProvisionedUsername(email?.split('@')[0]) || 'User',
     }
   });
 
-  // Update user info if provided and user already existed
-  if (!created && (email || username)) {
+  // Update user info if provided and user already existed. This runs for
+  // EXISTING users on every OAuth-URL mint, so the clamp above is what keeps a
+  // >50-char Google display name from 500ing a previously-working connect.
+  if (!created && (email || clampedUsername)) {
     const updateData = {};
     if (email) updateData.email = email;
-    if (username) updateData.username = username;
+    if (clampedUsername) updateData.username = clampedUsername;
     await user.update(updateData);
   }
 
