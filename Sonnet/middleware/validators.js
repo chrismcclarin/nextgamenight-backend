@@ -172,6 +172,14 @@ const GUEST_NAME_MAX = 50;
 const MAX_CUSTOM_PARTICIPANTS = 50;
 const CUSTOM_PARTICIPANT_KEYS = ['username', 'score', 'faction', 'is_new_player', 'placement'];
 
+// Wave-12 review MED #7: value bounds for the non-username whitelist keys.
+const FACTION_MAX = 100;
+// Accepts a finite number OR a short numeric string (the FE's number inputs
+// submit e.target.value strings); rejects objects, arrays, '', and NaN.
+const isNumericish = (v) =>
+  (typeof v === 'number' && Number.isFinite(v)) ||
+  (typeof v === 'string' && v.trim() !== '' && v.length <= 20 && Number.isFinite(Number(v)));
+
 // The ONE normalization. Every guest-name carrier runs exactly this.
 const normalizeGuestName = (value) => (typeof value === 'string' ? value.trim() : value);
 
@@ -210,6 +218,29 @@ const validateCustomParticipants = (value) => {
     // Already trimmed by the sanitizer that runs before this validator.
     if (el.username.length < 1 || el.username.length > GUEST_NAME_MAX) {
       throw new Error(`Guest name must be between 1 and ${GUEST_NAME_MAX} characters`);
+    }
+    // Wave-12 review MED #7: the key whitelist alone let arbitrary JSON (nested
+    // objects, unbounded strings) ride the non-username keys into JSONB. Bound
+    // each value to its wire shape. The FE sends score as a NUMERIC STRING
+    // (ParticipantRow's <input type="number"> e.target.value) or null — accept
+    // both numbers and numeric strings, never objects/arrays.
+    if (el.score !== undefined && el.score !== null && !isNumericish(el.score)) {
+      throw new Error('Custom participant score must be a number');
+    }
+    if (el.faction !== undefined && el.faction !== null) {
+      if (typeof el.faction !== 'string') {
+        throw new Error('Custom participant faction must be a string');
+      }
+      if (el.faction.length > FACTION_MAX) {
+        throw new Error(`Custom participant faction cannot exceed ${FACTION_MAX} characters`);
+      }
+    }
+    if (el.is_new_player !== undefined && el.is_new_player !== null && typeof el.is_new_player !== 'boolean') {
+      throw new Error('Custom participant is_new_player must be a boolean');
+    }
+    if (el.placement !== undefined && el.placement !== null
+        && (!isNumericish(el.placement) || !Number.isInteger(Number(el.placement)) || Number(el.placement) < 1)) {
+      throw new Error('Custom participant placement must be a positive integer');
     }
   }
   return true;

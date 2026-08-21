@@ -1103,6 +1103,38 @@ describe('Phase 88-34 Task 4 — guest-name cap on all three Event carriers', ()
         .expect(400);
     });
 
+    // Wave-12 review MED #7: whitelisted keys are value-bounded too — arbitrary
+    // JSON must not ride score/faction/is_new_player/placement into JSONB.
+    it('rejects non-scalar values on whitelisted guest keys', async () => {
+      await request(makeApp(owner))
+        .post('/api/events')
+        .send(baseEvent({ custom_participants: [{ username: 'Bob', score: { $gt: 0 } }] }))
+        .expect(400);
+      await request(makeApp(owner))
+        .post('/api/events')
+        .send(baseEvent({ custom_participants: [{ username: 'Bob', faction: ['a', 'b'] }] }))
+        .expect(400);
+      await request(makeApp(owner))
+        .post('/api/events')
+        .send(baseEvent({ custom_participants: [{ username: 'Bob', is_new_player: 'yes' }] }))
+        .expect(400);
+      await request(makeApp(owner))
+        .post('/api/events')
+        .send(baseEvent({ custom_participants: [{ username: 'Bob', faction: 'x'.repeat(101) }] }))
+        .expect(400);
+    });
+
+    it('accepts the live FE wire shapes for guest values (numeric-string score, null faction)', async () => {
+      const res = await request(makeApp(owner))
+        .post('/api/events')
+        .send(baseEvent({
+          custom_participants: [{ username: 'Bob', score: '12.5', faction: null, is_new_player: false, placement: null }],
+        }))
+        .expect(200);
+      const row = await Event.findByPk(res.body.id);
+      expect(row.custom_participants[0].score).toBe('12.5');
+    });
+
     it('preserves sibling fields and element order', async () => {
       const res = await request(makeApp(owner))
         .post('/api/events')

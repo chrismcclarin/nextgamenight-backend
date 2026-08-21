@@ -255,7 +255,13 @@ router.get('/user/:user_id', requireParamMatchesToken('user_id'), async (req, re
       }
       
       try {
-        const [newUser, created] = await User.findOrCreate({
+        // Wave-12 review MED #11 (mirrors the 88-34 Rule-1 fix in users.js):
+        // a bare findOrCreate returns the instance under the DEFAULT SCOPE,
+        // which EXCLUDES email (models/User.js defaultScope, BSEC-01 D-03) —
+        // so the !created repair branch below evaluated `.includes` on
+        // undefined, threw, and has been dead since it was written. Scoping to
+        // withContactInfo loads email and makes the branch real.
+        const [newUser, created] = await User.scope('withContactInfo').findOrCreate({
           where: { user_id: req.params.user_id },
           defaults: {
             user_id: req.params.user_id,
@@ -263,10 +269,10 @@ router.get('/user/:user_id', requireParamMatchesToken('user_id'), async (req, re
             username: userName,
           }
         });
-        
+
         // If user already existed but has wrong email/username, update them
         if (!created) {
-          const needsUpdate = 
+          const needsUpdate =
             (newUser.email !== userEmail && !newUser.email.includes('@auth0.local') && !newUser.email.includes('@auth0')) ||
             (newUser.username === 'User' && userName !== 'User');
           
