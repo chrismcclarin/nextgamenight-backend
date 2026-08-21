@@ -168,6 +168,13 @@ const validateGroupUpdate = [
 // is already enforced by validateGroupCreate/Update above, and username max-50
 // by routes/users.js. Duplicating either is a regression risk, not a fix.
 // ---------------------------------------------------------------------------
+// DECISION Phase 88 wave-12 review #4/#8 (owner-ruled ACCEPTED-FOREVER, 2026-08-21): the
+// length checks here count UTF-16 code units (.length) while the 20260820000003 clamp
+// migration counted Postgres characters (code points) — chosen OVER converging the units
+// ([...name].length), which was offered and declined. A legacy name with astral characters
+// (emoji, rare CJK) past position 50 can escape the clamp and 400 on future edits; the owner
+// accepted that edge. Converging the units later is a decision, not a cleanup — it re-opens
+// which unit the 50 means for every carrier at once. Record: 88-CODE-REVIEW-WAVE12.md.
 const GUEST_NAME_MAX = 50;
 const MAX_CUSTOM_PARTICIPANTS = 50;
 const CUSTOM_PARTICIPANT_KEYS = ['username', 'score', 'faction', 'is_new_player', 'placement'];
