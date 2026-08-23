@@ -28,7 +28,7 @@
 
 const crypto = require('crypto');
 const { Op } = require('sequelize');
-const { User, Group, UserGroup, Friendship, SingleUseToken, Event, EventRsvp, AvailabilityPrompt, GroupInvite, sequelize } = require('../models');
+const { User, Group, UserGroup, Friendship, SingleUseToken, Event, EventRsvp, AvailabilityPrompt, GroupInvite, UserAvailability, sequelize } = require('../models');
 const { generateToken } = require('../services/magicTokenService');
 
 /**
@@ -197,6 +197,88 @@ async function main() {
   }
   // Same URL shape EventCalendar/GroupGamesList build for this surface.
   const eventDetailPath = `/gameDetail?event_id=${event.id}&group_id=${group.id}`;
+
+  // ── Group-availability invariant for the create-event scheduler e2e spec ────
+  //
+  // WHAT DEPENDS ON IT: `e2e/event-scheduler-touch.spec.ts` asserts
+  // UNCONDITIONALLY that the visual scheduler opens scrolled to peak availability
+  // (createEvent.js's `peakScrollTime` -> EventScheduler's `scrollToTime`), and
+  // its touch cases read availability-annotated gridcells. `peakScrollTime` is
+  // null the moment the group has no availability, so a skip-if-absent version of
+  // that assertion would be green forever. This block is what lets the spec assert
+  // rather than skip — fixtures OWN their invariants here, the same rule the
+  // Friendship / UserGroup / GroupInvite teardowns in this file follow.
+  //
+  // PREMISE CORRECTED 2026-08-22 (plan 88.1-14 verified this against the code, and
+  // the plan's own text was wrong): the group heatmap is NOT built from
+  // AvailabilityResponse rows. `getGroupHeatmap` -> `calculateGroupOverlaps` ->
+  // `calculateUserAvailability` reads members' **UserAvailability** patterns
+  // (services/availabilityService.js:351), and scripts/seed-sample-data.js:699-763
+  // seeds 16 recurring patterns for Alice/Bob/Charlie/Diana — who are exactly the
+  // Weekend Warriors roster (seed-sample-data.js:249-253), i.e. THIS fixture group.
+  // So on a normal run the check below finds data and seeds NOTHING; the note above
+  // this prompt ("carries NO response data") is still true and still irrelevant to
+  // the heatmap.
+  //
+  // WHY IT EXISTS ANYWAY: the seed's patterns were added for a different purpose
+  // (88-34 WI-B4, the check-in prefill), so nothing stops a future edit from
+  // dropping them. When that happens the failure must surface HERE, with a message
+  // naming the cause, rather than three steps later as an unexplained Playwright
+  // red. The fallback keeps CI green; the throw is the backstop if even that fails.
+  //
+  // Idempotent: fallback rows are keyed on a sentinel `start_date` no other
+  // producer uses, and are converged (destroy-then-create) rather than accumulated.
+  const FIXTURE_AVAILABILITY_START = '2020-01-01';
+  const fixtureRoster = await UserGroup.findAll({
+    where: { group_id: group.id },
+    attributes: ['user_uuid'],
+  });
+  const fixtureRosterUuids = fixtureRoster.map((r) => r.user_uuid);
+  if (fixtureRosterUuids.length === 0) {
+    throw new Error('Fixture group has no members — the create-event heatmap would be empty (run seed-sample-data.js first)');
+  }
+  const rosterAvailabilityCount = await UserAvailability.count({
+    where: { user_uuid: { [Op.in]: fixtureRosterUuids } },
+  });
+  if (rosterAvailabilityCount === 0) {
+    // Deterministic evening peak: Alice 18:00-22:00 every day, Diana 19:00-21:00
+    // every day, so the busiest half-hours (19:00-20:30) carry TWO members and sit
+    // well down the 10:00-23:59 grid — which is what makes "the column did not open
+    // at the top" a real assertion. Times are plain hours with no timezone of their
+    // own on purpose: the matcher interprets a pattern in the MEMBER's timezone
+    // (availabilityService.js:518), and these seeded users have none, so UTC hours
+    // are what the grid shows.
+    const fallback = [
+      { user: alice, startTime: '18:00', endTime: '22:00' },
+      { user: diana, startTime: '19:00', endTime: '21:00' },
+    ];
+    await UserAvailability.destroy({
+      where: { user_uuid: { [Op.in]: fallback.map((f) => f.user.id) }, start_date: FIXTURE_AVAILABILITY_START },
+      force: true,
+    });
+    for (const { user, startTime, endTime } of fallback) {
+      for (let dayOfWeek = 0; dayOfWeek < 7; dayOfWeek++) {
+        await UserAvailability.create({
+          user_uuid: user.id, // Phase 87.5 UUID re-key: Users.id, never the Auth0 sub.
+          type: 'recurring_pattern',
+          pattern_data: { dayOfWeek, startTime, endTime, timezone: 'UTC' },
+          start_date: FIXTURE_AVAILABILITY_START,
+          end_date: null,
+          is_available: null,
+          timezone: 'UTC',
+        });
+      }
+    }
+    console.log('   ↳ fixture group had no availability data — seeded the fallback evening-peak patterns');
+  }
+  const finalAvailabilityCount = await UserAvailability.count({
+    where: { user_uuid: { [Op.in]: fixtureRosterUuids } },
+  });
+  if (finalAvailabilityCount === 0) {
+    throw new Error(
+      'Fixture group has no availability data after seeding — the create-event scheduler heatmap would be empty and e2e/event-scheduler-touch.spec.ts cannot assert scrollToTime',
+    );
+  }
 
   // D-07 (Phase 87.8): arming --project=phone alongside --project=journeys runs
   // every e2e/*.spec.ts twice per CI job, concurrently, and the RSVP journey is
