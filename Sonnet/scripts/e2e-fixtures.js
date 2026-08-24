@@ -224,7 +224,8 @@ async function main() {
   // (88-34 WI-B4, the check-in prefill), so nothing stops a future edit from
   // dropping them. When that happens the failure must surface HERE, with a message
   // naming the cause, rather than three steps later as an unexplained Playwright
-  // red. The fallback keeps CI green; the throw is the backstop if even that fails.
+  // red. The fallback seeds a DAY-VARYING shape (see the block below); the throw is
+  // the backstop if even that fails.
   //
   // Idempotent: fallback rows are keyed on a sentinel `start_date` no other
   // producer uses, and are converged (destroy-then-create) rather than accumulated.
@@ -241,23 +242,50 @@ async function main() {
     where: { user_uuid: { [Op.in]: fixtureRosterUuids } },
   });
   if (rosterAvailabilityCount === 0) {
-    // Deterministic evening peak: Alice 18:00-22:00 every day, Diana 19:00-21:00
-    // every day, so the busiest half-hours (19:00-20:30) carry TWO members and sit
-    // well down the 10:00-23:59 grid — which is what makes "the column did not open
-    // at the top" a real assertion. Times are plain hours with no timezone of their
-    // own on purpose: the matcher interprets a pattern in the MEMBER's timezone
-    // (availabilityService.js:518), and these seeded users have none, so UTC hours
-    // are what the grid shows.
+    /* DECISION Phase 88.1-20 (WR-04): the fallback's peaks now VARY BY WEEKDAY, and the
+       comment that used to sit here has been CORRECTED rather than extended. It claimed this
+       fallback was what kept CI green; that claim was FALSE. The old block seeded one identical
+       pattern for all seven days, and a day-invariant fixture is precisely what plan 18's
+       non-vacuity guard rejects (`periodictabletop/e2e/event-scheduler-touch.spec.ts`, "the
+       seeded availability is DAY-INVARIANT ... Fix the FIXTURE, never this assertion" — it
+       names THIS block by path). So the fallback firing would have turned the Req 13 case red
+       while blaming the fixture. Day-invariance is not an option here; that is the whole point.
+
+       The shape MIRRORS seed-sample-data.js's per-user weekday distribution, which is what the
+       guard's own failure message points at as the correct shape. THE TIMEZONE IS NOT MIRRORED,
+       deliberately: seed-sample-data uses America/Los_Angeles, but these fixture users have no
+       profile timezone, so availabilityService.js:518 interprets a pattern in UTC and UTC hours
+       are what the grid shows. Copying the seed's timezone across would shift every hour and
+       break the evening-peak premise.
+
+       Resulting peaks — THREE distinct hours across the week, comfortably above the guard's
+       >= 2 threshold, and all well down the 10:00-23:59 grid so "the column did not open at the
+       top" stays a real assertion:
+         Tue / Thu  -> 19:00 (Alice + Diana, two members)
+         Mon/Wed/Fri -> 13:00 (a one-member tie, resolved to the earliest maximal hour)
+         Sat / Sun  -> 18:00 (Alice alone)
+       Flattening these back to one pattern per user re-breaks the guard; it is a decision. */
     const fallback = [
-      { user: alice, startTime: '18:00', endTime: '22:00' },
-      { user: diana, startTime: '19:00', endTime: '21:00' },
+      { user: alice, startTime: '18:00', endTime: '22:00', days: [0, 1, 2, 3, 4, 5, 6] },
+      { user: bob, startTime: '13:00', endTime: '17:00', days: [1, 2, 3, 4, 5] },
+      { user: diana, startTime: '19:00', endTime: '21:00', days: [2, 4] },
     ];
+    // alice, bob and diana are all resolved above (`:85`, `:172`, `:171`) and the lookups there
+    // already throw on a miss for diana/bob — re-assert for alice so a null `user.id` can never
+    // reach UserAvailability.create as a silent null FK.
+    for (const { user } of fallback) {
+      if (!user || !user.id) {
+        throw new Error('Fallback availability seed: expected Alice, Bob and Diana to exist — run seed-sample-data.js first');
+      }
+    }
+    // Covers all THREE users now (it covered only the two in the old `fallback`), so a re-run
+    // converges instead of accumulating.
     await UserAvailability.destroy({
       where: { user_uuid: { [Op.in]: fallback.map((f) => f.user.id) }, start_date: FIXTURE_AVAILABILITY_START },
       force: true,
     });
-    for (const { user, startTime, endTime } of fallback) {
-      for (let dayOfWeek = 0; dayOfWeek < 7; dayOfWeek++) {
+    for (const { user, startTime, endTime, days } of fallback) {
+      for (const dayOfWeek of days) {
         await UserAvailability.create({
           user_uuid: user.id, // Phase 87.5 UUID re-key: Users.id, never the Auth0 sub.
           type: 'recurring_pattern',
@@ -269,7 +297,7 @@ async function main() {
         });
       }
     }
-    console.log('   ↳ fixture group had no availability data — seeded the fallback evening-peak patterns');
+    console.log('   ↳ fixture group had no availability data — seeded the fallback day-varying patterns (peaks: Tue/Thu 19:00, Mon/Wed/Fri 13:00, Sat/Sun 18:00)');
   }
   const finalAvailabilityCount = await UserAvailability.count({
     where: { user_uuid: { [Op.in]: fixtureRosterUuids } },
