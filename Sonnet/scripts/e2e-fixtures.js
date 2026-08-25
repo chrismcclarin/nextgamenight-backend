@@ -30,6 +30,7 @@ const crypto = require('crypto');
 const { Op } = require('sequelize');
 const { User, Group, UserGroup, Friendship, SingleUseToken, Event, EventRsvp, AvailabilityPrompt, GroupInvite, UserAvailability, sequelize } = require('../models');
 const { generateToken } = require('../services/magicTokenService');
+const { assertNotProductionDb } = require('./lib/assert-not-production-db');
 
 /**
  * Assert an ACCEPTED friendship for a pair, direction-agnostic.
@@ -82,6 +83,14 @@ function generateRsvpToken(eventId, userId, status) {
 }
 
 async function main() {
+  // FIRST statement, deliberately — not merely before the first destroy at `:182`. main()
+  // does an `alice.update` and an `Event.create` well before that, and a guard that lets a
+  // write through is not a guard. Shared helper, never a second copy: it resolves the host in
+  // config/database.js's env-var order, so it checks the database these statements actually
+  // hit. Local dev passes silently, CI's localhost service container passes, any remote target
+  // throws before a row moves (override only via an explicit ALLOW_DESTRUCTIVE_SEED=1).
+  assertNotProductionDb(sequelize);
+
   const alice = await User.findOne({ where: { username: 'Alice' } });
   const group = await Group.findOne({ where: { name: 'Weekend Warriors' } });
   if (!alice || !group) {
@@ -468,8 +477,11 @@ async function main() {
   // a secret-derived nonce would be a live restore credential re-derivable by
   // anyone holding that secret. The RSVP pattern stays acceptable for its
   // lower-stakes per-event/user/status links; a group-restore credential is not.
-  // Task 0's assert-not-production-db guard is defence-in-depth against
-  // wrong-database runs — it is NOT a substitute for this.
+  // The assert-not-production-db guard — called by THIS script as main()'s first
+  // statement since Phase 88.1-21 (owner ruling `guard`, security O-05), rather
+  // than reached transitively through ci.yml step ordering — is defence-in-depth
+  // against wrong-database runs. It is NOT a substitute for this: it bounds WHICH
+  // database gets written, not what a nonce in that database is derivable from.
   const restoreTokenKey = { purpose: 'group_restore', group_id: restoreGroup.id };
   let restoreToken = await SingleUseToken.findOne({ where: restoreTokenKey });
   const restoreExpiresAt = new Date(Date.now() + RESTORE_RECOVERY_WINDOW_MS + RESTORE_TOKEN_MARGIN_MS);
