@@ -28,8 +28,9 @@
 
 const crypto = require('crypto');
 const { Op } = require('sequelize');
-const { User, Group, UserGroup, Friendship, SingleUseToken, Event, EventRsvp, AvailabilityPrompt, GroupInvite, sequelize } = require('../models');
+const { User, Group, UserGroup, Friendship, SingleUseToken, Event, EventRsvp, AvailabilityPrompt, GroupInvite, UserAvailability, sequelize } = require('../models');
 const { generateToken } = require('../services/magicTokenService');
+const { assertNotProductionDb } = require('./lib/assert-not-production-db');
 
 /**
  * Assert an ACCEPTED friendship for a pair, direction-agnostic.
@@ -82,6 +83,14 @@ function generateRsvpToken(eventId, userId, status) {
 }
 
 async function main() {
+  // FIRST statement, deliberately — not merely before the first destroy at `:182`. main()
+  // does an `alice.update` and an `Event.create` well before that, and a guard that lets a
+  // write through is not a guard. Shared helper, never a second copy: it resolves the host in
+  // config/database.js's env-var order, so it checks the database these statements actually
+  // hit. Local dev passes silently, CI's localhost service container passes, any remote target
+  // throws before a row moves (override only via an explicit ALLOW_DESTRUCTIVE_SEED=1).
+  assertNotProductionDb(sequelize);
+
   const alice = await User.findOne({ where: { username: 'Alice' } });
   const group = await Group.findOne({ where: { name: 'Weekend Warriors' } });
   if (!alice || !group) {
@@ -197,6 +206,116 @@ async function main() {
   }
   // Same URL shape EventCalendar/GroupGamesList build for this surface.
   const eventDetailPath = `/gameDetail?event_id=${event.id}&group_id=${group.id}`;
+
+  // ── Group-availability invariant for the create-event scheduler e2e spec ────
+  //
+  // WHAT DEPENDS ON IT: `e2e/event-scheduler-touch.spec.ts` asserts
+  // UNCONDITIONALLY that the visual scheduler opens scrolled to peak availability
+  // (createEvent.js's `peakScrollTime` -> EventScheduler's `scrollToTime`), and
+  // its touch cases read availability-annotated gridcells. `peakScrollTime` is
+  // null the moment the group has no availability, so a skip-if-absent version of
+  // that assertion would be green forever. This block is what lets the spec assert
+  // rather than skip — fixtures OWN their invariants here, the same rule the
+  // Friendship / UserGroup / GroupInvite teardowns in this file follow.
+  //
+  // PREMISE CORRECTED 2026-08-22 (plan 88.1-14 verified this against the code, and
+  // the plan's own text was wrong): the group heatmap is NOT built from
+  // AvailabilityResponse rows. `getGroupHeatmap` -> `calculateGroupOverlaps` ->
+  // `calculateUserAvailability` reads members' **UserAvailability** patterns
+  // (services/availabilityService.js:351), and scripts/seed-sample-data.js:699-763
+  // seeds 16 recurring patterns for Alice/Bob/Charlie/Diana — who are exactly the
+  // Weekend Warriors roster (seed-sample-data.js:249-253), i.e. THIS fixture group.
+  // So on a normal run the check below finds data and seeds NOTHING; the note above
+  // this prompt ("carries NO response data") is still true and still irrelevant to
+  // the heatmap.
+  //
+  // WHY IT EXISTS ANYWAY: the seed's patterns were added for a different purpose
+  // (88-34 WI-B4, the check-in prefill), so nothing stops a future edit from
+  // dropping them. When that happens the failure must surface HERE, with a message
+  // naming the cause, rather than three steps later as an unexplained Playwright
+  // red. The fallback seeds a DAY-VARYING shape (see the block below); the throw is
+  // the backstop if even that fails.
+  //
+  // Idempotent: fallback rows are keyed on a sentinel `start_date` no other
+  // producer uses, and are converged (destroy-then-create) rather than accumulated.
+  const FIXTURE_AVAILABILITY_START = '2020-01-01';
+  const fixtureRoster = await UserGroup.findAll({
+    where: { group_id: group.id },
+    attributes: ['user_uuid'],
+  });
+  const fixtureRosterUuids = fixtureRoster.map((r) => r.user_uuid);
+  if (fixtureRosterUuids.length === 0) {
+    throw new Error('Fixture group has no members — the create-event heatmap would be empty (run seed-sample-data.js first)');
+  }
+  const rosterAvailabilityCount = await UserAvailability.count({
+    where: { user_uuid: { [Op.in]: fixtureRosterUuids } },
+  });
+  if (rosterAvailabilityCount === 0) {
+    /* DECISION Phase 88.1-20 (WR-04): the fallback's peaks now VARY BY WEEKDAY, and the
+       comment that used to sit here has been CORRECTED rather than extended. It claimed this
+       fallback was what kept CI green; that claim was FALSE. The old block seeded one identical
+       pattern for all seven days, and a day-invariant fixture is precisely what plan 18's
+       non-vacuity guard rejects (`periodictabletop/e2e/event-scheduler-touch.spec.ts`, "the
+       seeded availability is DAY-INVARIANT ... Fix the FIXTURE, never this assertion" — it
+       names THIS block by path). So the fallback firing would have turned the Req 13 case red
+       while blaming the fixture. Day-invariance is not an option here; that is the whole point.
+
+       The shape MIRRORS seed-sample-data.js's per-user weekday distribution, which is what the
+       guard's own failure message points at as the correct shape. THE TIMEZONE IS NOT MIRRORED,
+       deliberately: seed-sample-data uses America/Los_Angeles, but these fixture users have no
+       profile timezone, so availabilityService.js:518 interprets a pattern in UTC and UTC hours
+       are what the grid shows. Copying the seed's timezone across would shift every hour and
+       break the evening-peak premise.
+
+       Resulting peaks — THREE distinct hours across the week, comfortably above the guard's
+       >= 2 threshold, and all well down the 10:00-23:59 grid so "the column did not open at the
+       top" stays a real assertion:
+         Tue / Thu  -> 19:00 (Alice + Diana, two members)
+         Mon/Wed/Fri -> 13:00 (a one-member tie, resolved to the earliest maximal hour)
+         Sat / Sun  -> 18:00 (Alice alone)
+       Flattening these back to one pattern per user re-breaks the guard; it is a decision. */
+    const fallback = [
+      { user: alice, startTime: '18:00', endTime: '22:00', days: [0, 1, 2, 3, 4, 5, 6] },
+      { user: bob, startTime: '13:00', endTime: '17:00', days: [1, 2, 3, 4, 5] },
+      { user: diana, startTime: '19:00', endTime: '21:00', days: [2, 4] },
+    ];
+    // alice, bob and diana are all resolved above (`:85`, `:172`, `:171`) and the lookups there
+    // already throw on a miss for diana/bob — re-assert for alice so a null `user.id` can never
+    // reach UserAvailability.create as a silent null FK.
+    for (const { user } of fallback) {
+      if (!user || !user.id) {
+        throw new Error('Fallback availability seed: expected Alice, Bob and Diana to exist — run seed-sample-data.js first');
+      }
+    }
+    // Covers all THREE users now (it covered only the two in the old `fallback`), so a re-run
+    // converges instead of accumulating.
+    await UserAvailability.destroy({
+      where: { user_uuid: { [Op.in]: fallback.map((f) => f.user.id) }, start_date: FIXTURE_AVAILABILITY_START },
+      force: true,
+    });
+    for (const { user, startTime, endTime, days } of fallback) {
+      for (const dayOfWeek of days) {
+        await UserAvailability.create({
+          user_uuid: user.id, // Phase 87.5 UUID re-key: Users.id, never the Auth0 sub.
+          type: 'recurring_pattern',
+          pattern_data: { dayOfWeek, startTime, endTime, timezone: 'UTC' },
+          start_date: FIXTURE_AVAILABILITY_START,
+          end_date: null,
+          is_available: null,
+          timezone: 'UTC',
+        });
+      }
+    }
+    console.log('   ↳ fixture group had no availability data — seeded the fallback day-varying patterns (peaks: Tue/Thu 19:00, Mon/Wed/Fri 13:00, Sat/Sun 18:00)');
+  }
+  const finalAvailabilityCount = await UserAvailability.count({
+    where: { user_uuid: { [Op.in]: fixtureRosterUuids } },
+  });
+  if (finalAvailabilityCount === 0) {
+    throw new Error(
+      'Fixture group has no availability data after seeding — the create-event scheduler heatmap would be empty and e2e/event-scheduler-touch.spec.ts cannot assert scrollToTime',
+    );
+  }
 
   // D-07 (Phase 87.8): arming --project=phone alongside --project=journeys runs
   // every e2e/*.spec.ts twice per CI job, concurrently, and the RSVP journey is
@@ -358,8 +477,11 @@ async function main() {
   // a secret-derived nonce would be a live restore credential re-derivable by
   // anyone holding that secret. The RSVP pattern stays acceptable for its
   // lower-stakes per-event/user/status links; a group-restore credential is not.
-  // Task 0's assert-not-production-db guard is defence-in-depth against
-  // wrong-database runs — it is NOT a substitute for this.
+  // The assert-not-production-db guard — called by THIS script as main()'s first
+  // statement since Phase 88.1-21 (owner ruling `guard`, security O-05), rather
+  // than reached transitively through ci.yml step ordering — is defence-in-depth
+  // against wrong-database runs. It is NOT a substitute for this: it bounds WHICH
+  // database gets written, not what a nonce in that database is derivable from.
   const restoreTokenKey = { purpose: 'group_restore', group_id: restoreGroup.id };
   let restoreToken = await SingleUseToken.findOne({ where: restoreTokenKey });
   const restoreExpiresAt = new Date(Date.now() + RESTORE_RECOVERY_WINDOW_MS + RESTORE_TOKEN_MARGIN_MS);
