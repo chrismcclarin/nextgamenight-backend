@@ -22,6 +22,11 @@
 //                              add-friend specs (R4/D-13) — the RsvpSection surface;
 //                              rows below make Diana (not-yet-friend) + Bob (friend)
 //                              render there
+// - coloured_group_id        → E2E_COLOURED_GROUP_ID (Phase 88.3 Req 9(ii), the
+//                              light-mode contrast probe — it needs a group that
+//                              actually carries a preset colour, because every other
+//                              fixture group is left at the models/Group.js '#ffffff'
+//                              default and the frontend treats that as UNSET)
 //
 // Requires MAGIC_TOKEN_SECRET in env (same value the booted server uses, or
 // token validation will fail server-side).
@@ -384,6 +389,53 @@ async function main() {
     defaults: { user_uuid: alice.id, group_id: inviteGroup.id, role: 'owner', status: 'active' },
   });
 
+  // ── Light-mode contrast fixture (Phase 88.3 Req 9(ii)): a group that actually
+  // carries a preset colour. Every other fixture group leaves background_color at
+  // models/Group.js's '#ffffff' default, and the frontend's isUnsetBackgroundColor
+  // (periodictabletop/src/lib/colorUtils.js:106-109) treats #fff/#ffffff as UNSET —
+  // so a Navy-preset probe pointed at any of them would assert against an unset group
+  // and pass without ever seeing a tint. Hence the colour is set EXPLICITLY here.
+  //
+  // DECISION Phase 88.3 (OQ-1): a DEDICATED coloured fixture group, chosen OVER two
+  // named alternatives. (1) OVER mutating the shared 'Weekend Warriors' seed group
+  // from inside the spec — it is reused by the create-event, padding-budget and
+  // touch-target journeys, and a failed restore poisons every later run. (2) OVER
+  // narrowing Req 9's acceptance to vitest maths plus the unset group only — that is
+  // exactly the "gate that cannot red" failure this codebase has recorded fourteen
+  // times (ci.yml:203-215, src/test-utils/sourceScan.ts:41-58).
+  // The invariant the frontend depends on: the value stored here is the RAW Navy
+  // preset hex #172554 (GroupSettings.js:47-56) — the group's identity colour. The
+  // light tint is a RENDERING transform living in
+  // periodictabletop/src/lib/colorUtils.js and must NEVER reach this column.
+  // Changing this hex, or "tidying" it to a lighter value to match what light mode
+  // renders, is a decision, not a cleanup.
+  //
+  // findOrCreate alone is NOT sufficient: `defaults` apply only on INSERT, so a re-run
+  // against a database that already holds this row would keep a stale
+  // background_color. The explicit update below reconverges every run on the same
+  // state — the same idiom the availability-prompt block above uses. Group IS
+  // paranoid, but unlike restoreGroup this fixture never soft-deletes its own row, so
+  // findOrCreate is the correct shape here, matching e2e-invite-group above.
+  const [colouredGroup] = await Group.findOrCreate({
+    where: { group_id: 'e2e-coloured-group' },
+    defaults: {
+      group_id: 'e2e-coloured-group',
+      name: 'E2E Coloured Group',
+      background_color: '#172554',
+    },
+  });
+  await colouredGroup.update({ background_color: '#172554' });
+  // Alice is the SOLE member, as owner: /groupHomePage?id=... does not render for an
+  // authenticated identity that is not a member. Nobody else is added, deliberately —
+  // the 87.2 account-deletion gate (accountDeletionService.getDeletionBlockers) treats
+  // a group the user OWNS with >= 1 OTHER membership row of ANY status as a hard
+  // blocker, so a single-member group can never trip it. That is the same property
+  // e2e-invite-group above already relies on.
+  await UserGroup.findOrCreate({
+    where: { user_uuid: alice.id, group_id: colouredGroup.id },
+    defaults: { user_uuid: alice.id, group_id: colouredGroup.id, role: 'owner', status: 'active' },
+  });
+
   // Pick a seeded friend (Bob) who is NOT a member of the invite group.
   const friend = await User.findOne({ where: { username: 'Bob' } });
   if (!friend) {
@@ -515,6 +567,7 @@ async function main() {
     rsvp_path_phone: rsvpPathPhone,
     restore_path: restorePath,
     event_detail_path: eventDetailPath,
+    coloured_group_id: colouredGroup.id,
   })}`);
 
   await sequelize.close();
@@ -524,6 +577,14 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error('❌ e2e-fixtures failed:', err);
+  // Log ONLY the error's name and message — never the whole error object. A Sequelize
+  // error carries `sql` and `parameters` fields, and this script's own bulkCreate calls
+  // inline literal values (including single-use-token nonces) into those parameters, so
+  // printing `err` leaks them straight into the CI job's plain-text, retained log.
+  // Plan 12's marker-line redaction only touches the emitted marker line and can never
+  // reach anything this handler prints, so this is the only mitigation for that leak
+  // (T-88.3-07). tests/unit/e2e-fixtures-guard.test.js scans guard ordering only and
+  // does not cover this line.
+  console.error('e2e-fixtures failed:', err && err.name, err && err.message);
   process.exit(1);
 });
