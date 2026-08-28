@@ -106,6 +106,21 @@ if (databaseUrl) {
       host: process.env.DB_HOST || 'localhost',
       port: process.env.DB_PORT || 5432,
       dialect: 'postgresql',
+      // DECISION Phase 88.3-cr (CR-05, code-adversarial-review 2026-08-27): THIS BRANCH
+      // LOGS EVERY QUERY UNFILTERED, unlike the DATABASE_URL branch above, whose custom
+      // logger drops any message containing SELECT/INSERT/UPDATE/DELETE. That asymmetry
+      // is a latent secret-disclosure coupling with the frontend repo: `scripts/
+      // e2e-fixtures.js` bulk-inserts rows carrying single-use token nonces, and the FE
+      // CI job (`.github/workflows/ci.yml`, "Seed e2e fixtures") tails the last 40 lines
+      // of that script's output into a PUBLIC Actions log on failure. CI selects the URL
+      // branch because it sets DATABASE_URL — but it ALSO sets DB_HOST/DB_NAME/DB_USER,
+      // so dropping DATABASE_URL would silently switch to this branch and print those
+      // INSERTs verbatim. DO NOT run the e2e fixture step against this branch.
+      // The FE tail no longer depends on this: CR-05 also made its `sed` drop lines
+      // beginning with `Executing (`, so the redaction holds whichever branch is live.
+      // REJECTED: converging the two loggers here — the URL branch's filter is tuned to
+      // Railway's log volume and changing it is a deploy-visible decision, not a
+      // cleanup. Fixing it at the consumer is the layer that fails independently.
       logging: process.env.NODE_ENV === 'test' ? false : console.log,
       dialectOptions: {
         ssl: false,
