@@ -391,8 +391,11 @@ async function main() {
 
   // ── Light-mode contrast fixture (Phase 88.3 Req 9(ii)): a group that actually
   // carries a preset colour. Every other fixture group leaves background_color at
-  // models/Group.js's '#ffffff' default, and the frontend's isUnsetBackgroundColor
-  // (periodictabletop/src/lib/colorUtils.js:106-109) treats #fff/#ffffff as UNSET —
+  // models/Group.js's '#ffffff' default, and the frontend's `isUnsetBackgroundColor`
+  // (exported from periodictabletop/src/lib/colorUtils.js — cited BY SYMBOL on purpose;
+  // CR-07, 88.3-cr 2026-08-27: this said ":106-109", which is the SUBTEXT pole comment,
+  // and a cross-repo line number drifts on every edit in the other repo with nothing
+  // here to catch it) treats #fff/#ffffff as UNSET —
   // so a Navy-preset probe pointed at any of them would assert against an unset group
   // and pass without ever seeing a tint. Hence the colour is set EXPLICITLY here.
   //
