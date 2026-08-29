@@ -353,7 +353,7 @@ router.get('/user/:user_id', requireParamMatchesToken('user_id'), async (req, re
         // replacement for it. Removing the flag re-arms the ghost-card path.
         {
           model: Group,
-          attributes: ['id', 'name', 'profile_picture_url', 'background_color', 'background_image_url'],
+          attributes: ['id', 'name', 'profile_picture_url', 'background_color', 'color_preset', 'background_image_url'],
           required: true
         },
         // PR-C (87.3-09 Task 2b): Winner include sub-free — id/username only.
@@ -407,7 +407,7 @@ router.get('/group/:group_id', async (req, res) => {
         // Phase 88.2 D-01 — see the marker on the GET /user/:user_id include above.
         {
           model: Group,
-          attributes: ['id', 'name', 'profile_picture_url', 'background_color', 'background_image_url'],
+          attributes: ['id', 'name', 'profile_picture_url', 'background_color', 'color_preset', 'background_image_url'],
           required: true
         },
         // PR-C (87.3-09 Task 2b): Winner include sub-free — id/username only.

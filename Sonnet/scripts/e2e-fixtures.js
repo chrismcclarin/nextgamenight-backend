@@ -413,6 +413,29 @@ async function main() {
   // Changing this hex, or "tidying" it to a lighter value to match what light mode
   // renders, is a decision, not a cleanup.
   //
+  // AMENDED Phase 88.3.1 (plan 02, CONTEXT D-01): the invariant above now reads
+  // "a preset ID, with the Navy hex RETAINED through the expand window". This row
+  // DUAL-WRITES the preset id AND the legacy Navy hex. It is not a
+  // swap, and the hex is not redundant.
+  //
+  // WHY THE HEX STAYS. This backend change is BE PR-1 and merges FIRST; frontend
+  // `main` has never heard of color_preset and still reads background_color only.
+  // e2e/contrast.spec.ts:667-673 carries a vacuity guard that REDS if this
+  // coloured group's rendered ground equals the unset group's — so swapping the
+  // hex out for the preset id would break frontend `main`'s e2e run before the
+  // frontend PR even opens (88.3.1-RESEARCH Pitfall 3). Dual-writing means BOTH
+  // the pre-cutover frontend (reads the hex) and the post-cutover frontend
+  // (reads the preset, which wins) render a colour, at every point in the
+  // sequence, with no window.
+  //
+  // Navy #172554 is also the exact legacy value the remap migration maps to
+  // `blue` (UI-SPEC 4.2, deltaE 4.81), so the pair here is self-consistent: the
+  // preset id written is the one the migration would have produced.
+  //
+  // Removing the hex once the frontend cutover has shipped is a DECISION for a
+  // follow-up (it retires the pre-cutover half of the guarantee above) — not a
+  // cleanup for whoever notices the duplication first.
+  //
   // findOrCreate alone is NOT sufficient: `defaults` apply only on INSERT, so a re-run
   // against a database that already holds this row would keep a stale
   // background_color. The explicit update below reconverges every run on the same
@@ -425,9 +448,13 @@ async function main() {
       group_id: 'e2e-coloured-group',
       name: 'E2E Coloured Group',
       background_color: '#172554',
+      color_preset: 'blue',
     },
   });
-  await colouredGroup.update({ background_color: '#172554' });
+  // BOTH here as well as in `defaults`, per the findOrCreate note above: defaults
+  // apply only on INSERT, so a re-run against an existing row (one seeded before
+  // 88.3.1) would keep color_preset null and never reach the post-cutover path.
+  await colouredGroup.update({ background_color: '#172554', color_preset: 'blue' });
   // Alice is the SOLE member, as owner: /groupHomePage?id=... does not render for an
   // authenticated identity that is not a member. Nobody else is added, deliberately —
   // the 87.2 account-deletion gate (accountDeletionService.getDeletionBlockers) treats
