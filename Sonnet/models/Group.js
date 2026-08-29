@@ -34,6 +34,31 @@ const Group = sequelize.define('Group', {
     allowNull: true,
     defaultValue: '#ffffff', // Default white
   },
+  color_preset: {
+    // Phase 88.3.1 (SPEC Req 5 / CONTEXT D-01): the group's colour stored as a
+    // preset ID (the word 'blue'), so a palette re-tune is a frontend-only edit
+    // with no data migration. Renders via the FE resolver; the backend never
+    // derives or renders a colour from it.
+    //
+    // NO defaultValue — NULL *is* "no preset". Contrast background_color above,
+    // whose legacy '#ffffff' default is why the frontend needs
+    // `isUnsetBackgroundColor` to treat white as unset at all. Do not give this
+    // column a default; that mistake is the one directly above it.
+    //
+    // Dual-write with migration 20260828000001-add-color-preset-to-groups.js
+    // (prod source); this model builds the sync()-built CI/test DB.
+    //
+    // NO model-level `isIn` allowlist, deliberately: middleware/validators.js
+    // (validateGroupUpdate) is the single enforcement point, sourced from
+    // utils/groupColourPresets.js. A second allowlist here would mean a ninth
+    // preset had to be added in two files, and the one that got forgotten would
+    // fail at a different layer with a different error shape.
+    //
+    // defaultScope excludes only invite_token, so this column is returned by
+    // GET /groups/:group_id and GET /groups/user/:user_id for free.
+    type: DataTypes.STRING,
+    allowNull: true,
+  },
   background_image_url: {
     type: DataTypes.STRING,
     allowNull: true,
