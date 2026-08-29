@@ -219,29 +219,11 @@ function decideFor(value) {
   };
 }
 
-/**
- * The canonical old hex `down()` restores for each preset: the row that mapped to
- * that preset with the SMALLEST deltaE. Declared as an explicit literal table
- * rather than derived at runtime, so a rollback statement can never change shape
- * because someone re-sorted a data file.
- *
- * THIS IS LOSSY AND THE LOSS IS NAMED IN NUMBERS. `blue` received SIX of the
- * fifteen (Charcoal, Slate, Navy, Storm, legacy blue, legacy grey); all six come
- * back as Navy `#172554`. `violet` received two (Indigo, legacy purple) and
- * `orange` received two (Espresso, legacy orange). Exact per-row restore comes
- * from the census pasted into 88.3.1-05-SUMMARY.md, by hand (CONTEXT D-03).
- * @type {Readonly<Record<string,string>>}
- */
-const CANONICAL_DOWN_HEX = Object.freeze({
-  red: '#fce4ec', // legacy pink, deltaE 7.00
-  orange: '#2c1f14', // Espresso, deltaE 9.91
-  amber: '#fffde7', // legacy yellow, deltaE 10.99
-  green: '#e8f5e9', // legacy green, deltaE 12.54
-  teal: '#14332a', // Forest, deltaE 6.72
-  blue: '#172554', // Navy, deltaE 4.81 — the six-way merge lands here
-  violet: '#1e1b4b', // Indigo, deltaE 4.57
-  rose: '#3b1030', // Wine, deltaE 3.41
-});
+// NOTE: the canonical old hex that down() restores per preset is DELIBERATELY not
+// here. It lives as an explicit literal table inside
+// migrations/20260828000002-remap-group-colours-to-presets.js, its only consumer,
+// so a rollback statement can never change shape because someone re-sorted a data
+// file in utils/. That is not duplication — nothing else needs it.
 
 module.exports = {
   UNSET_BACKGROUND_PATTERN,
@@ -251,5 +233,4 @@ module.exports = {
   knownRemapFor,
   nearestPresetFor,
   decideFor,
-  CANONICAL_DOWN_HEX,
 };
