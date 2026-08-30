@@ -46,6 +46,50 @@
 //      exit code never costs the operator the diagnostic.
 
 require('dotenv').config();
+
+// DECISION Phase 88.3.1-11: reuse scripts/run-migration-prod.js's public-URL remap
+// here, rather than having the operator hand-assemble a connection string, and
+// rather than teaching config/database.js a new "prefer public" mode.
+//
+// WHY THIS EXISTS AT ALL. The Usage block above says
+//   prod : railway run -- node scripts/census-group-colours.js
+// and that alone does NOT work. `railway run` injects the service's variables but
+// does NOT put your laptop on Railway's private network (Phase 74 operational
+// note). config/database.js:16-19 then picks, by priority,
+//   POSTGRES_PRIVATE_URL || POSTGRES_URL || DATABASE_URL || PGDATABASE_URL
+// and Railway's DATABASE_URL names the INTERNAL host postgres.railway.internal,
+// which does not resolve off-platform. Measured 2026-08-30, banner PrivateURL=false:
+//   HostNotFoundError: getaddrinfo ENOTFOUND postgres.railway.internal
+//
+// The house already solved this. scripts/run-migration-prod.js:50-55 remaps
+// DATABASE_PUBLIC_URL (Railway's *.proxy.rlwy.net TCP proxy) onto DATABASE_URL and
+// blanks the three higher-priority names BEFORE config/database.js is required.
+// This script's own header cites that script as "the same pattern" -- it just never
+// copied the preamble. This is that copy, kept deliberately identical to it so the
+// two cannot drift into two different ways of reaching production.
+//
+// REJECTED: (a) appending ?sslmode=require ourselves -- run-migration-prod.js passes
+// the URL verbatim and is proven against this Postgres, so rewriting the string here
+// would deviate from a working precedent on a guess; if the server ever does demand
+// TLS, adding sslmode=require to the URL is the one-line fix. (b) making
+// config/database.js prefer the public URL -- that would change how the DEPLOYED
+// service connects, which is the opposite of what is wanted; internally the private
+// URL is correct and SSL-free by design.
+//
+// SAFETY: this only fires when DATABASE_PUBLIC_URL is present, i.e. under
+// `railway run`. A local `npm run census:group-colours` sees no such variable and is
+// untouched, so this cannot silently point a local census at production, or a
+// production census at localhost. config/database.js prints the host it actually
+// reached on every run -- read that banner before trusting any census output. It
+// prints protocol/host/port/database/user only, never the password.
+if (process.env.DATABASE_PUBLIC_URL) {
+  process.env.DATABASE_URL = process.env.DATABASE_PUBLIC_URL;
+  process.env.POSTGRES_URL = '';
+  process.env.POSTGRES_PRIVATE_URL = '';
+  process.env.PGDATABASE_URL = '';
+  console.log('Using Railway PUBLIC proxy URL (DATABASE_PUBLIC_URL) - off-platform run.');
+}
+
 const { QueryTypes } = require('sequelize');
 const { sequelize } = require('../models');
 const { GROUP_COLOUR_PRESETS, LEGACY_COLOUR_REMAP } = require('../utils/groupColourPresets');
