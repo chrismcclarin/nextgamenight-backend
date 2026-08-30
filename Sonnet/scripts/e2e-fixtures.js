@@ -27,6 +27,12 @@
 //                              actually carries a preset colour, because every other
 //                              fixture group is left at the models/Group.js '#ffffff'
 //                              default and the frontend treats that as UNSET)
+// - preset_only_group_id     → E2E_PRESET_ONLY_GROUP_ID (Phase 88.3.1 AMENDMENT W): the
+//                              SAME preset as above but with background_color NULL, so
+//                              the light-mode probe reds the moment the frontend stops
+//                              reading `color_preset`. The coloured group above cannot
+//                              do that job — it dual-writes a usable hex. See the
+//                              DECISION marker at the seed block.
 //
 // Requires MAGIC_TOKEN_SECRET in env (same value the booted server uses, or
 // token validation will fail server-side).
@@ -466,6 +472,70 @@ async function main() {
     defaults: { user_uuid: alice.id, group_id: colouredGroup.id, role: 'owner', status: 'active' },
   });
 
+  // ── Preset-ONLY fixture group (Phase 88.3.1 AMENDMENT W) ──────────────────────
+  //
+  // DECISION Phase 88.3.1-W: a SECOND fixture group, chosen OVER changing the
+  // dual-write on `e2e-coloured-group` directly above.
+  //
+  // WHY A SECOND GROUP EXISTS AT ALL. The block above writes `color_preset:'blue'`
+  // AND `background_color:'#172554'`, so `periodictabletop/e2e/contrast.spec.ts`
+  // receives a usable hex WHETHER OR NOT the frontend ever reads `color_preset`.
+  // The cross-repo proof therefore passes IDENTICALLY on the correct path and on
+  // the broken one, and is vacuous with respect to SPEC Req 4 — the one thing this
+  // phase exists to do (88.3.1-PLAN-REVIEW Defect 5, folding M14/M15; owner-ruled
+  // "fix it" 2026-08-30). Every `background_color`-only read site could ship green
+  // underneath it.
+  //
+  // AND WHY THE DUAL-WRITE ABOVE MUST NOT BE "FIXED" BY DELETING ITS HEX. That hex
+  // is what keeps frontend `main` green through the expand window: `main` has never
+  // heard of `color_preset`, and contrast.spec.ts's Req 9(ii) vacuity guard REDS if
+  // the coloured group's rendered ground equals the unset group's. Removing it
+  // breaks `main`'s e2e run before the frontend PR even opens (88.3.1-RESEARCH
+  // Pitfall 3). The two rows are not redundant — they prove OPPOSITE halves:
+  // `e2e-coloured-group` proves the legacy hex path still renders during the
+  // window, and THIS row proves the preset path renders on its own. Collapsing
+  // them into one is a decision that re-opens Defect 5, not a cleanup.
+  //
+  // `background_color: null` IS THE ASSERTION. It is written explicitly rather
+  // than omitted because models/Group.js gives that column a legacy `'#ffffff'`
+  // default — an omitted key would seed WHITE, which `isUnsetBackgroundColor`
+  // treats as unset, so the fixture would look right by accident instead of by
+  // construction, and a future reader could not tell the difference. NULL is also
+  // exactly the state BE PR-2's remap leaves every coloured group in, so this row
+  // rehearses the post-remap estate a wave early.
+  //
+  // WHY IT IS ON THIS BRANCH (PR-1) AND NOT THE REMAP BRANCH (PR-2). The frontend
+  // workflow checks the backend out at `ref: inputs.backend-ref || 'main'`
+  // (periodictabletop/.github/workflows/ci.yml:347), and the recorded merge order
+  // is BE PR-1 -> FE PR -> BE PR-2. A fixture landing on PR-2 would not exist on
+  // backend `main` when the frontend PR runs, so ci.yml's `jq -e` guard would red
+  // the whole e2e job at the fixture step. Moving this block to a later branch is
+  // a decision, not a rebase convenience.
+  //
+  // Same findOrCreate-plus-explicit-update idiom as every block above, for the
+  // same reason: `defaults` apply only on INSERT, so a re-run against a row seeded
+  // by an earlier revision of this script would keep whatever it had.
+  const [presetOnlyGroup] = await Group.findOrCreate({
+    where: { group_id: 'e2e-preset-only-group' },
+    defaults: {
+      group_id: 'e2e-preset-only-group',
+      name: 'E2E Preset Only Group',
+      background_color: null,
+      color_preset: 'blue',
+    },
+  });
+  await presetOnlyGroup.update({ background_color: null, color_preset: 'blue' });
+  // Alice is the SOLE member, as owner — the SAME single-member reasoning the
+  // coloured-group block above spells out: the 87.2 account-deletion gate
+  // (accountDeletionService.getDeletionBlockers) treats a group the user OWNS with
+  // >= 1 OTHER membership row of ANY status as a hard blocker, so a single-member
+  // group can never trip it. Membership is also the render precondition —
+  // /groupHomePage?id=... does not render for an authenticated non-member.
+  await UserGroup.findOrCreate({
+    where: { user_uuid: alice.id, group_id: presetOnlyGroup.id },
+    defaults: { user_uuid: alice.id, group_id: presetOnlyGroup.id, role: 'owner', status: 'active' },
+  });
+
   // Pick a seeded friend (Bob) who is NOT a member of the invite group.
   const friend = await User.findOne({ where: { username: 'Bob' } });
   if (!friend) {
@@ -598,6 +668,7 @@ async function main() {
     restore_path: restorePath,
     event_detail_path: eventDetailPath,
     coloured_group_id: colouredGroup.id,
+    preset_only_group_id: presetOnlyGroup.id,
   })}`);
 
   await sequelize.close();
