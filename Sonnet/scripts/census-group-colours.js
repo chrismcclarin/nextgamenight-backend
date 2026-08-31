@@ -76,12 +76,35 @@ require('dotenv').config();
 // service connects, which is the opposite of what is wanted; internally the private
 // URL is correct and SSL-free by design.
 //
-// SAFETY: this only fires when DATABASE_PUBLIC_URL is present, i.e. under
-// `railway run`. A local `npm run census:group-colours` sees no such variable and is
-// untouched, so this cannot silently point a local census at production, or a
-// production census at localhost. config/database.js prints the host it actually
-// reached on every run -- read that banner before trusting any census output. It
-// prints protocol/host/port/database/user only, never the password.
+// TARGETING: this remap fires when DATABASE_PUBLIC_URL is present, i.e. under
+// `railway run`.
+//
+// CORRECTED 2026-08-30 (code review #10). This comment used to claim the remap
+// "cannot silently point a local census at production" because "a local run sees no
+// such variable". That is a claim about the OPERATOR'S ENVIRONMENT, not a control
+// this script enforces: `require('dotenv').config()` runs above and populates
+// process.env from `.env`, so any operator whose `.env` carries DATABASE_PUBLIC_URL
+// gets a production connection from a command that reads as local. The sibling
+// scripts/run-migration-prod.js fails CLOSED instead -- it errors when the variable
+// is absent, so it can only ever mean "prod". This one is conditional, so it can
+// silently mean either.
+//
+// The impact is bounded -- this script issues only SELECTs, so the worst case is an
+// unintended production READ, never a write. It is corrected rather than re-armed
+// because this script IS the CONTEXT D-03 confirmation gate for a destructive
+// unattended production UPDATE, and a gate whose targeting is described rather than
+// enforced is weak in BOTH directions: a run the operator believes is production but
+// is actually local would approve the migration against the wrong dataset.
+//
+// THE ONLY REAL CONTROL IS THE BANNER. config/database.js prints the host it actually
+// reached on every run (protocol/host/port/database/user -- never the password).
+// READ IT before trusting any census output, and before pasting that output into a
+// SUMMARY as the D-03 approval record.
+//
+// UNVERIFIED, deliberately: whether a local `.env` here actually carries
+// DATABASE_PUBLIC_URL was NOT checked. Env files are off-limits by project rule
+// (CLAUDE.md), so the trigger condition is plausible and unconfirmed -- which is
+// itself the reason to rely on the banner rather than on an assumption about `.env`.
 if (process.env.DATABASE_PUBLIC_URL) {
   process.env.DATABASE_URL = process.env.DATABASE_PUBLIC_URL;
   process.env.POSTGRES_URL = '';
@@ -132,16 +155,26 @@ async function censusGroupColours() {
 
   // Only the three columns this census reads, plus a BOOLEAN derived in SQL so a
   // user-authored image URL is never pulled into this process (AMENDMENT L/AD).
+  // DISCLOSURE added 2026-08-30 (code review #19): `Group` is `paranoid: true`
+  // (`models/Group.js`), but this is hand-written SQL, so Sequelize's
+  // `deletedAt IS NULL` clause never applies -- soft-deleted groups inside the Phase
+  // 88.2 recovery window ARE counted here and ARE remapped by the migration's up().
+  // Remapping them is the right behaviour (a restored group should render with the new
+  // palette). What was wrong was showing them to the owner indistinguishably from live
+  // rows, in the table that IS the approval dialog for a permanent UPDATE. `is_live`
+  // now says which is which; no filter is applied and no behaviour changed.
   const rows = await sequelize.query(
     `SELECT id,
             background_color,
             ${hasPresetColumn ? 'color_preset' : 'NULL::text AS color_preset'},
+            ("deletedAt" IS NULL) AS is_live,
             (background_image_url IS NOT NULL AND btrim(background_image_url) <> '') AS has_image
        FROM "Groups"
       WHERE ${COLOURED_ROW_SQL}
       ORDER BY background_color, id`,
     { type: QueryTypes.SELECT }
   );
+  const softDeletedCount = rows.filter((r) => r.is_live === false).length;
 
   const totalGroups = (
     await sequelize.query('SELECT COUNT(*)::int AS n FROM "Groups"', { type: QueryTypes.SELECT })
@@ -155,8 +188,8 @@ async function censusGroupColours() {
   //    considered and declined. Not an oversight.
   // ---------------------------------------------------------------------------
   console.log('\n1. PER-ROW CENSUS — every coloured group (no names, by design)\n');
-  console.log(`   ${pad('group id', 38)} ${pad('old hex', 10)} destination`);
-  console.log(`   ${'-'.repeat(38)} ${'-'.repeat(10)} ${'-'.repeat(24)}`);
+  console.log(`   ${pad('group id', 38)} ${pad('old hex', 10)} ${pad('state', 8)} destination`);
+  console.log(`   ${'-'.repeat(38)} ${'-'.repeat(10)} ${'-'.repeat(8)} ${'-'.repeat(24)}`);
   let alreadyPreset = 0;
   for (const row of rows) {
     const decision = decideFor(row.background_color);
@@ -169,10 +202,26 @@ async function censusGroupColours() {
     } else {
       destination = `${decision.to} (${decision.arm.toUpperCase()})`;
     }
-    console.log(`   ${pad(row.id, 38)} ${pad(normaliseHex(row.background_color), 10)} ${destination}`);
+    console.log(
+      `   ${pad(row.id, 38)} ${pad(normaliseHex(row.background_color), 10)} ` +
+        `${pad(row.is_live === false ? 'DELETED' : 'live', 8)} ${destination}`
+    );
   }
   if (rows.length === 0) console.log('   (no coloured groups)');
-  console.log(`\n   ${rows.length} coloured row(s) of ${totalGroups} group(s) total.`);
+  console.log(
+    `\n   ${rows.length} coloured row(s) of ${totalGroups} group(s) total` +
+      (softDeletedCount > 0
+        ? ` — ${rows.length - softDeletedCount} live, ${softDeletedCount} SOFT-DELETED.`
+        : ' (all live).')
+  );
+  if (softDeletedCount > 0) {
+    console.log(
+      '      ^ soft-deleted rows are inside the Phase 88.2 recovery window. They ARE remapped by\n' +
+        '        up(), deliberately, so a restored group renders with the new palette — but they are\n' +
+        '        marked here because this table is the owner approval record and a purge-pending row\n' +
+        '        should not read as a live one.'
+    );
+  }
 
   // ---------------------------------------------------------------------------
   // 2. DISTINCT-VALUE CENSUS — this is the assertion-closing output, not a
@@ -325,10 +374,10 @@ async function censusGroupColours() {
   // AMENDMENT AD — a VISIBILITY line, not a STOP condition and not a repair.
   console.log(`    rows with BOTH a colour and an image:  ${withImage}`);
   console.log('      ^ not a stop condition and NOT repaired here. The UI has enforced');
-  console.log('        colour-or-image exclusivity both ways for some time (GroupSettings.js:228-230');
-  console.log('        clears the image when a colour is picked, :240-243 clears the colour when an');
-  console.log('        image is set) and the renderer gives the image priority when both exist');
-  console.log('        (groupHomePage/page.js:534). So these are legacy rows that predate or bypassed');
+  console.log('        colour-or-image exclusivity both ways for some time: handleSelectDefaultColor');
+  console.log('        clears the image when a colour is picked, and handleUseCustomBackground clears');
+  console.log('        the colour when an image is set. The renderer gives the image priority when both');
+  console.log('        exist (the groupHomePage ground class). So these are legacy rows that predate or bypassed');
   console.log('        that UI, and the remap does not make them worse: image-wins before, image-wins');
   console.log('        after — behaviour identical either side. Nulling a column here would be silent');
   console.log('        data loss on a value the owner may still want. The count exists because it is');
