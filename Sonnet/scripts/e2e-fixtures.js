@@ -426,7 +426,7 @@ async function main() {
   //
   // WHY THE HEX STAYS. This backend change is BE PR-1 and merges FIRST; frontend
   // `main` has never heard of color_preset and still reads background_color only.
-  // e2e/contrast.spec.ts:667-673 carries a vacuity guard that REDS if this
+  // e2e/contrast.spec.ts's Req 9(ii) vacuity-guard step carries a guard that REDS if this
   // coloured group's rendered ground equals the unset group's — so swapping the
   // hex out for the preset id would break frontend `main`'s e2e run before the
   // frontend PR even opens (88.3.1-RESEARCH Pitfall 3). Dual-writing means BOTH

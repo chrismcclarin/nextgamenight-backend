@@ -1539,9 +1539,11 @@ router.put('/:group_id/settings', validateUUID('group_id'), validateGroupUpdate,
     // 2026-08-29): when a request carries a colour AND a background_image_url,
     // BOTH are stored unchanged and the request 200s. The IMAGE wins for
     // RENDERING, decided by the renderer that already exists
-    // (periodictabletop/src/app/groupHomePage/page.js:534, and groupInkVars's
+    // (periodictabletop's groupHomePage ground class, and groupInkVars's
     // required `hasBackgroundImage`). Exclusivity is enforced in the picker UI
-    // (GroupSettings.js:228-230 / :240-243), not here.
+    // (GroupSettings.js's handleSelectDefaultColor / handleUseCustomBackground), not here.
+    // Citations de-numbered 2026-08-30 (code review #6): the old line numbers had
+    // rotted onto unrelated code. Symbol names do not rot.
     // REJECTED (1) 400 on the conflicting pair — it would make exactly the
     // groups that already carry both UNSAVEABLE: their picker seeds both state
     // variables, so the owner's next save sends both and fails. Worse, this
