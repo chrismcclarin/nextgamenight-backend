@@ -709,3 +709,161 @@ describe('Phase 88-34 WI-B2 — Last Game include means PAST (history)', () => {
     expect(g.Events).toHaveLength(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Phase 88.3.1 plan 02 Task 3 — PUT /:group_id/settings colour storage.
+//
+// This route had ZERO tests before this block (grep 'settings' on this file
+// returned nothing), which is why the phase adds them here rather than only
+// pinning the new field: an untested route is where a new column goes to be
+// silently dropped.
+//
+// The two-column contract (CONTEXT D-01 / D-06):
+//   color_preset     one of the eight preset ids -> the new path
+//   background_color a legacy or custom #rrggbb  -> still supported, forever
+//   both null        "no colour" (D-06's tap-again-to-clear payload)
+// The backend STORES and RETURNS; it never derives, resolves or renders. Every
+// round-trip case below asserts BOTH the response body AND a fresh findByPk,
+// because they can disagree (the handler returns the in-memory instance) and
+// SPEC Req 5's guarantee is about what was PERSISTED.
+// ---------------------------------------------------------------------------
+describe('PUT /:group_id/settings — colour preset storage (SPEC Req 5, D-01/D-06)', () => {
+  let owner;
+  let plainMember;
+  let group;
+
+  beforeEach(async () => {
+    owner = await makeUser({ user_id: 'auth0|cp-owner', username: 'cp-owner' });
+    plainMember = await makeUser({ user_id: 'auth0|cp-member', username: 'cp-member' });
+    group = await makeGroup({ name: 'Colour Preset Group' });
+    await addToGroup(owner, group, 'owner');
+    await addToGroup(plainMember, group, 'member');
+  });
+
+  const putSettings = (actor, body) =>
+    request(makeApp(actor)).put(`/api/groups/${group.id}/settings`).send(body);
+
+  // Read the row back WITHOUT the in-memory instance the handler returned.
+  const reloadColour = async () => {
+    const fresh = await Group.findByPk(group.id);
+    return { color_preset: fresh.color_preset, background_color: fresh.background_color };
+  };
+
+  it('accepts a preset id and round-trips it byte-identical, in the body AND the row', async () => {
+    const res = await putSettings(owner, { color_preset: 'blue', background_color: null }).expect(200);
+
+    expect(res.body.color_preset).toBe('blue');
+    expect(res.body.background_color).toBeNull();
+    // The stored value is the WORD, never a resolved hex — D-01's whole point,
+    // and SPEC's "the stored value never becomes a rendered value".
+    await expect(reloadColour()).resolves.toEqual({ color_preset: 'blue', background_color: null });
+  });
+
+  it('still accepts a legacy/custom hex — D-01 keeps the fallback path open', async () => {
+    const res = await putSettings(owner, { background_color: '#123456', color_preset: null }).expect(200);
+
+    expect(res.body.background_color).toBe('#123456');
+    expect(res.body.color_preset).toBeNull();
+    await expect(reloadColour()).resolves.toEqual({ color_preset: null, background_color: '#123456' });
+  });
+
+  it('accepts BOTH null — this is D-06 tap-again-to-clear and must NOT 400', async () => {
+    // Seed a colour first, so the clear has something to clear.
+    await group.update({ color_preset: 'rose', background_color: '#3e133c' });
+
+    const res = await putSettings(owner, { color_preset: null, background_color: null }).expect(200);
+
+    expect(res.body.color_preset).toBeNull();
+    expect(res.body.background_color).toBeNull();
+    await expect(reloadColour()).resolves.toEqual({ color_preset: null, background_color: null });
+  });
+
+  it('normalises an empty / whitespace-only preset to NULL rather than storing it', async () => {
+    // A stored '' is the worst outcome available: not a valid preset, and NOT
+    // matched by the remap migration's `color_preset IS NULL` predicate, so the
+    // row would be skipped forever. The validator's sanitizer collapses it.
+    const res = await putSettings(owner, { color_preset: '   ' }).expect(200);
+
+    expect(res.body.color_preset).toBeNull();
+    const stored = await reloadColour();
+    expect(stored.color_preset).toBeNull();
+    expect(stored.color_preset).not.toBe('');
+  });
+
+  it('trims surrounding whitespace off an otherwise-valid preset id', async () => {
+    await putSettings(owner, { color_preset: ' teal ' }).expect(200);
+    await expect(reloadColour()).resolves.toMatchObject({ color_preset: 'teal' });
+  });
+
+  it('REJECTS an unknown preset id with a message naming the allowed ids', async () => {
+    const res = await putSettings(owner, { color_preset: 'blurple' }).expect(400);
+
+    const fieldError = res.body.errors.find((e) => e.field === 'color_preset');
+    expect(fieldError).toBeDefined();
+    expect(fieldError.message).toMatch(/red, orange, amber, green, teal, blue, violet, rose/);
+    // Nothing was written.
+    await expect(reloadColour()).resolves.toMatchObject({ color_preset: null });
+  });
+
+  it('REJECTS a HEX sent in the preset field — the two shapes are not interchangeable', async () => {
+    // If a hex were accepted here the round-trip guarantee would be meaningless:
+    // the frontend resolver looks the value up in the preset table, so a stored
+    // hex in this column renders as nothing at all.
+    const res = await putSettings(owner, { color_preset: '#00274d' }).expect(400);
+
+    const fieldError = res.body.errors.find((e) => e.field === 'color_preset');
+    expect(fieldError.message).toMatch(/must be one of/i);
+    await expect(reloadColour()).resolves.toMatchObject({ color_preset: null });
+  });
+
+  it('REJECTS a non-string preset', async () => {
+    const res = await putSettings(owner, { color_preset: 7 }).expect(400);
+    const fieldError = res.body.errors.find((e) => e.field === 'color_preset');
+    expect(fieldError.message).toMatch(/must be a string/i);
+  });
+
+  it('403s a plain member — the owner/admin gate is unchanged and still fires', async () => {
+    const res = await putSettings(plainMember, { color_preset: 'blue' }).expect(403);
+
+    expect(res.body.error).toMatch(/owners and admins/i);
+    await expect(reloadColour()).resolves.toMatchObject({ color_preset: null });
+  });
+
+  // DECISION Phase 88.3.1 (colour vs. image precedence) — pinned so a future
+  // "tidy-up" cannot turn this into a 400 or a silent null without reading the
+  // marker at routes/groups.js. A conflicting pair STORES BOTH and 200s; the
+  // image wins for RENDERING, decided by the frontend renderer that already
+  // exists. A 400 here would make every legacy group that already carries both
+  // permanently unsaveable (their picker seeds both, so the next save sends
+  // both) — and this ships in BE PR-1, which merges first.
+  it('stores BOTH a colour and an image when sent together, and 200s (precedence is a RENDER rule)', async () => {
+    const res = await putSettings(owner, {
+      color_preset: 'green',
+      background_image_url: 'https://example.com/bg.png',
+    }).expect(200);
+
+    expect(res.body.color_preset).toBe('green');
+    expect(res.body.background_image_url).toBe('https://example.com/bg.png');
+
+    const fresh = await Group.findByPk(group.id);
+    expect(fresh.color_preset).toBe('green');
+    expect(fresh.background_image_url).toBe('https://example.com/bg.png');
+  });
+
+  // Anti-vacuity / mass assignment. AMENDMENT S (verified 2026-08-29): the guard
+  // on this route is NOT the `validateStrict` matchedData strip — that middleware
+  // has zero route usages and this route wires plain `validateGroupUpdate`. The
+  // guard is the handler's explicit key-by-key `updateData` build
+  // (routes/groups.js:1505-1524). This case proves THAT: a real column that is
+  // not one of the four declared fields must not move, even though it is a valid
+  // column name that Sequelize would happily have written.
+  it('an undeclared body key does not reach the row — the explicit destructure is the guard', async () => {
+    const originalName = group.name;
+
+    await putSettings(owner, { color_preset: 'violet', name: 'HIJACKED' }).expect(200);
+
+    const fresh = await Group.findByPk(group.id);
+    expect(fresh.color_preset).toBe('violet'); // the declared field landed
+    expect(fresh.name).toBe(originalName);     // the undeclared one did not
+  });
+});

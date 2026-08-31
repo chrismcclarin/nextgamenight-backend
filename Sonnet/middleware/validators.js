@@ -2,6 +2,9 @@
 // Input validation middleware using express-validator
 const { body, param, query, validationResult, matchedData } = require('express-validator');
 const { sendError } = require('../utils/errors');
+// Phase 88.3.1 (D-01): the group colour preset allowlist. Single source — the
+// model deliberately carries no second `isIn`, so a ninth preset is one edit here.
+const { GROUP_COLOUR_PRESET_IDS } = require('../utils/groupColourPresets');
 
 // Middleware to check validation results
 const validate = (req, res, next) => {
@@ -111,6 +114,47 @@ const validateGroupUpdate = [
       }
       if (!/^#[0-9A-Fa-f]{6}$/.test(value)) {
         throw new Error('Background color must be a valid hex color (e.g., #ffffff)');
+      }
+      return true;
+    }),
+  // Phase 88.3.1 (SPEC Req 5 / CONTEXT D-01, D-06): the group's colour as a
+  // preset ID. This arm is the VALUE ALLOWLIST — it is what makes an unknown id,
+  // or a hex sent in the preset field, a 400. (It is NOT a mass-assignment
+  // guard: the strip-unknown `validateStrict` above has ZERO route usages, and
+  // PUT /groups/:group_id/settings wires plain `validateGroupUpdate`. The
+  // mass-assignment guard on that route is its explicit three-field destructure
+  // at routes/groups.js:1505-1524, not matchedData. Verified 2026-08-29.)
+  //
+  // The `background_color` hex rule above is left completely intact: D-01 keeps
+  // a legacy/custom #rrggbb an accepted value, forever, as the fallback path.
+  body('color_preset')
+    // Normalise BEFORE validating, so '' and whitespace-only become NULL rather
+    // than being stored verbatim. A stored '' is the worst outcome available: it
+    // is not a valid preset, and it does not satisfy the remap migration's
+    // `color_preset IS NULL` predicate, so the row would be skipped forever.
+    // An ABSENT field returns undefined here and express-validator then leaves
+    // the key off req.body entirely (probed against express-validator 7.3.1) —
+    // so "field not sent" stays distinguishable from "field sent as null".
+    .customSanitizer((value) => {
+      if (value === undefined) return undefined;
+      if (typeof value !== 'string') return value;
+      const trimmed = value.trim();
+      return trimmed === '' ? null : trimmed;
+    })
+    .custom((value) => {
+      // Falsy is ALLOWED, matching the background_color arm above: null (and the
+      // '' the sanitizer just turned into null) is D-06's tap-again-to-clear
+      // payload — "no colour" sends both columns null and must not 400.
+      if (value === null || value === undefined) {
+        return true;
+      }
+      if (typeof value !== 'string') {
+        throw new Error('Colour preset must be a string');
+      }
+      if (!GROUP_COLOUR_PRESET_IDS.includes(value)) {
+        throw new Error(
+          `Colour preset must be one of: ${GROUP_COLOUR_PRESET_IDS.join(', ')}`
+        );
       }
       return true;
     }),

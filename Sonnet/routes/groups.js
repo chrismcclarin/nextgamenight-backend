@@ -1503,7 +1503,7 @@ router.put('/:group_id/settings', validateUUID('group_id'), validateGroupUpdate,
       return res.status(401).json({ error: 'Unauthorized' });
     }
     
-    const { profile_picture_url, background_color, background_image_url } = req.body;
+    const { profile_picture_url, background_color, background_image_url, color_preset } = req.body;
     const { group_id } = req.params;
     
     // Check if user has permission (owner or admin)
@@ -1517,12 +1517,49 @@ router.put('/:group_id/settings', validateUUID('group_id'), validateGroupUpdate,
       return res.status(404).json({ error: 'Group not found' });
     }
     
-    // Update only provided fields
+    // Update only provided fields.
+    //
+    // This explicit, key-by-key build IS the mass-assignment guard on this route
+    // (BSEC-01 class): `group.update(updateData)` can only ever receive the keys
+    // named below, whatever else the body carried. It is NOT the strip-unknown
+    // `validateStrict` middleware — that has zero route usages; this route wires
+    // plain `validateGroupUpdate`. Verified 2026-08-29. Do not delete these
+    // `if (x !== undefined)` lines in favour of spreading req.body.
+    //
+    // DECISION Phase 88.3.1 (D-01): the route STORES whichever of the two colour
+    // columns the client sends and DERIVES NOTHING. Precedence ("preset wins")
+    // is a RENDERING rule and lives in the frontend resolver.
+    // REJECTED: resolving a preset id to its hex here and storing that — it
+    // would persist a RENDERED value, which is exactly what SPEC's "the stored
+    // value never becomes a rendered value" constraint and Gate B test 1 forbid,
+    // and it would put the palette back into the database (undoing D-01, whose
+    // whole point is that a re-tune is a frontend-only edit).
+    //
+    // DECISION Phase 88.3.1 (colour vs. image precedence, owner-raised
+    // 2026-08-29): when a request carries a colour AND a background_image_url,
+    // BOTH are stored unchanged and the request 200s. The IMAGE wins for
+    // RENDERING, decided by the renderer that already exists
+    // (periodictabletop's groupHomePage ground class, and groupInkVars's
+    // required `hasBackgroundImage`). Exclusivity is enforced in the picker UI
+    // (GroupSettings.js's handleSelectDefaultColor / handleUseCustomBackground), not here.
+    // Citations de-numbered 2026-08-30 (code review #6): the old line numbers had
+    // rotted onto unrelated code. Symbol names do not rot.
+    // REJECTED (1) 400 on the conflicting pair — it would make exactly the
+    // groups that already carry both UNSAVEABLE: their picker seeds both state
+    // variables, so the owner's next save sends both and fails. Worse, this
+    // ships in BE PR-1, which merges FIRST, so the window would open before
+    // anything could clean the data.
+    // REJECTED (2) server-side nulling of the loser — the data layer would be
+    // inventing a second precedence rule that could disagree with the
+    // renderer's, and silently destroying a value the user did not clear.
+    // Pinned by the "stores both, 200s" route test. Changing this is a
+    // decision, not a cleanup.
     const updateData = {};
     if (profile_picture_url !== undefined) updateData.profile_picture_url = profile_picture_url;
     if (background_color !== undefined) updateData.background_color = background_color;
     if (background_image_url !== undefined) updateData.background_image_url = background_image_url;
-    
+    if (color_preset !== undefined) updateData.color_preset = color_preset;
+
     await group.update(updateData);
     
     res.json(group);
