@@ -365,6 +365,39 @@ router.post('/', verifyAuth0Token, validateRsvpCreate, async (req, res) => {
     const { event_id, status, note } = req.body;
     const userId = req.user.user_id;
 
+    // DECISION Phase 88.5 (Owner Ruling 1a, 2026-08-31 review): an UPDATE writes
+    // the note ONLY when the request body actually carried a `note` key. Both
+    // update paths below previously wrote `note: note || null` unconditionally, so
+    // a status-only POST /rsvp — exactly what a hero-card status tap sends, since
+    // submitRsvp's JSON.stringify drops an undefined `note`
+    // (periodictabletop/src/lib/api.ts, rsvpAPI.submitRsvp) — silently NULLED a
+    // member's previously-saved note. The magic-link path above (`existing.update
+    // ({ status })`, ~:316) already had this right; this brings the authenticated
+    // path in line with it.
+    //
+    // Presence, NOT truthiness: `note: null` and `note: ''` are legitimate
+    // explicit-clear values and must keep clearing, which is why this is a
+    // hasOwnProperty check on req.body and not `note !== undefined` or a falsy
+    // test. VERIFIED against express-validator 7.3.1 (the version this route's
+    // validateRsvpCreate chain runs on): an absent optional `note` is NOT injected
+    // into req.body by the `.optional({ nullable: true }).trim()` chain, while an
+    // explicit null/'' survives as a present key — so the presence test is reading
+    // the caller's real intent, not a sanitizer artifact.
+    //
+    // REJECTED alternative: have the frontend forward the existing note on every
+    // RSVP call. That only narrows the window — a hero-card tap that lands before
+    // (or after a failed) own-status fetch still forwards a stale/empty note and
+    // wipes it. Fixed at origin instead. Changing this back is a decision, not a
+    // cleanup.
+    //
+    // Cross-repo consumer sweep CLOSED: both production frontend call sites
+    // (RsvpSection.js:70 handleStatusClick and :89 handleSaveNote) already pass
+    // `note || null` on every call, so the key is always present for them and
+    // their behaviour under this fix is byte-identical. No frontend change is
+    // required or in scope.
+    const hasNoteKey = Object.prototype.hasOwnProperty.call(req.body, 'note');
+    const noteUpdate = hasNoteKey ? { note: note || null } : {};
+
     // Phase 71.1: gate widened from group-membership to event-scoped surface.
     // Game-only participants (EventParticipation row, no UserGroup row) can
     // RSVP on the specific event they joined.
@@ -409,8 +442,10 @@ router.post('/', verifyAuth0Token, validateRsvpCreate, async (req, res) => {
     const oldStatus = existing ? existing.status : null;
 
     if (existing) {
-      // Update existing RSVP
-      await existing.update({ status, note: note || null });
+      // Update existing RSVP. Phase 88.5: `noteUpdate` spreads to nothing when the
+      // body carried no `note` key (hasOwnProperty test above), leaving the stored
+      // note untouched — this is the status-only, note-preserving path.
+      await existing.update({ status, ...noteUpdate });
       rsvp = existing;
     } else {
       // Create new RSVP. Phase 87 / BINT-01 (T-87-06): a concurrent first-RSVP
@@ -435,7 +470,11 @@ router.post('/', verifyAuth0Token, validateRsvpCreate, async (req, res) => {
             where: { event_id, user_uuid: caller.id },
           });
           if (raceRow) {
-            await raceRow.update({ status, note: note || null });
+            // Phase 88.5: an update is an update — the race-retry path gets the
+            // SAME key-presence (hasOwnProperty) note semantics as the primary
+            // update above, via the same hoisted `noteUpdate`. Diverging here
+            // would make a note-wipe depend on losing a create race.
+            await raceRow.update({ status, ...noteUpdate });
             rsvp = raceRow;
             isCreate = false;
           } else {
