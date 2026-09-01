@@ -218,8 +218,10 @@ describe('Event Routes', () => {
         });
 
       // Loud failure — never a 2xx that quietly stores something unreadable.
+      // Deliberately NO hard `toBe(400)` here: the comment above promises this
+      // test survives a degradation to a DB-level 500, and a hard pin would break
+      // that promise (round-3 review, ML3). Observed today: 400 from isISO8601.
       expect(response.status).toBeGreaterThanOrEqual(400);
-      expect(response.status).toBe(400); // observed today: the isISO8601 validator
 
       // The load-bearing half: nothing was persisted for this group.
       const after = await Event.count({ where: { group_id: testGroup.id } });
