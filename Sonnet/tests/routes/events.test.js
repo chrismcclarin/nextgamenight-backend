@@ -181,6 +181,51 @@ describe('Event Routes', () => {
       spy.mockRestore();
     });
 
+    // ------------------------------------------------------------------
+    // Phase 88.5 (OWNER RULING O1a companion, 2026-09-01) — a garbage
+    // start_date must FAIL LOUDLY AT CREATION, never save-then-vanish.
+    //
+    // Why this pin exists: 88.5-02's OWNER RULING O1a makes both frontend
+    // selectors EXCLUDE events whose start_date does not parse. That is only
+    // safe because an unparseable start_date can never reach the database —
+    // Events.start_date is `DataTypes.DATE, allowNull: false` (models/Event.js:20-23),
+    // a Postgres timestamptz that cannot store garbage. But "the framework
+    // happens to protect us" is an assumption, not a contract: a refactor of the
+    // route, the validator chain, or the column would silently start accepting
+    // garbage, and under O1a such an event would then be INVISIBLE everywhere on
+    // the frontend — the exact "I created an event and it disappeared" failure
+    // the owner ruled must be impossible. This turns the inherited protection
+    // into a tested contract.
+    //
+    // OBSERVED rejection today: HTTP 400 from `validateEventCreate`'s
+    // `body('start_date').isISO8601()` rule (middleware/validators.js:345-347),
+    // which fires before the handler ever runs. The assertion below accepts any
+    // >= 400 on purpose — if a future refactor drops that validator rule and the
+    // rejection degrades to a Sequelize/Postgres 500, the contract that MATTERS
+    // (loud failure + no row) still holds and this test should still pass. The
+    // row-absence assertion is the load-bearing half; do not weaken it to a
+    // status-only check.
+    it('REJECTS an unparseable start_date and writes no Event row (O1a companion)', async () => {
+      const before = await Event.count({ where: { group_id: testGroup.id } });
+
+      const response = await request(makeApp(testUser1))
+        .post('/api/events')
+        .send({
+          group_id: testGroup.id,
+          game_id: testGame.id,
+          start_date: 'not a date',
+          duration_minutes: 60,
+        });
+
+      // Loud failure — never a 2xx that quietly stores something unreadable.
+      expect(response.status).toBeGreaterThanOrEqual(400);
+      expect(response.status).toBe(400); // observed today: the isISO8601 validator
+
+      // The load-bearing half: nothing was persisted for this group.
+      const after = await Event.count({ where: { group_id: testGroup.id } });
+      expect(after).toBe(before);
+    });
+
     // Phase 87 (T-87-08-01): ballot_options are de-duped by game_name before
     // bulkCreate so the (event_id, game_name) unique index cannot 500.
     it('de-dups ballot_options by game_name (one row per name, no 500)', async () => {
