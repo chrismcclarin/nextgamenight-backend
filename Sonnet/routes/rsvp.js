@@ -390,11 +390,13 @@ router.post('/', verifyAuth0Token, validateRsvpCreate, async (req, res) => {
     // wipes it. Fixed at origin instead. Changing this back is a decision, not a
     // cleanup.
     //
-    // Cross-repo consumer sweep CLOSED: both production frontend call sites
-    // (RsvpSection.js:70 handleStatusClick and :89 handleSaveNote) already pass
-    // `note || null` on every call, so the key is always present for them and
-    // their behaviour under this fix is byte-identical. No frontend change is
-    // required or in scope.
+    // Cross-repo consumer sweep CLOSED (amended by the 2026-09-01 adversarial code
+    // review, owner ruling a): the production frontend call sites are
+    // RsvpSection.js handleStatusClick — STATUS-ONLY (no `note` key, rides the
+    // preserve semantics; it previously sent `note || null`, which kept the wipe
+    // window open on stale-empty local state) — RsvpSection.js handleSaveNote,
+    // which sends `note || null` as the sole explicit note write, and
+    // NextGameNightCard's status tap (status-only, arity-pinned in its test).
     const hasNoteKey = Object.prototype.hasOwnProperty.call(req.body, 'note');
     const noteUpdate = hasNoteKey ? { note: note || null } : {};
 
