@@ -1,6 +1,10 @@
 {
   "$schema": "https://railway.com/railway.schema.json",
   "deploy": {
-    "preDeployCommand": ["node scripts/log-db-resolution.js && npm run migrate:apply"]
+    "preDeployCommand": [
+      "node scripts/log-db-resolution.js && npm run migrate:apply"
+    ],
+    "healthcheckPath": "/health",
+    "healthcheckTimeout": 120
   }
 }
