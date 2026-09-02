@@ -37,6 +37,7 @@ if (process.env.SENTRY_DSN) {
 }
 
 // Import middleware
+const { httpsRedirect } = require('./middleware/httpsRedirect');
 const { verifyAuth0Token, optionalAuth } = require('./middleware/auth0');
 const { apiLimiter, authLimiter, feedbackLimiter, writeOperationLimiter } = require('./middleware/rateLimiter');
 const requestLogger = require('./middleware/requestLogger');
@@ -96,20 +97,11 @@ const PORT = process.env.PORT || 4000;
 // the apiLimiter ceiling (middleware/rateLimiter.js). See .planning/deferred/phase-91.md.
 app.set('trust proxy', 1);
 
-// HTTPS Enforcement (for production)
-// Note: Heroku handles HTTPS at the load balancer, but this adds extra protection
+// HTTPS Enforcement (for production). Railway terminates TLS at the edge and forwards plain HTTP
+// with x-forwarded-proto; this 301s anything that did not arrive over HTTPS. `/health` is exempt so
+// Railway's plain-HTTP deploy healthcheck gets its 200 — see middleware/httpsRedirect.js (DECISION).
 if (process.env.NODE_ENV === 'production') {
-  app.use((req, res, next) => {
-    // Check if request is secure (Heroku sets x-forwarded-proto)
-    const isSecure = req.secure || 
-                     req.headers['x-forwarded-proto'] === 'https' ||
-                     req.headers['x-forwarded-ssl'] === 'on';
-    
-    if (!isSecure && req.method === 'GET') {
-      return res.redirect(301, `https://${req.headers.host}${req.url}`);
-    }
-    next();
-  });
+  app.use(httpsRedirect());
 }
 
 // Security Middleware
