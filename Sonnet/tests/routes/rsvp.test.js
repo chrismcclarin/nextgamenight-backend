@@ -307,6 +307,129 @@ describe('RSVP concurrent first-write idempotency (BINT-01 / T-87-06)', () => {
 });
 
 // ============================================================================
+// Phase 88.5 (Owner Ruling 1a, 2026-08-31 review): POST /rsvp note preservation.
+//
+// The route used to write `note: note || null` unconditionally at BOTH update
+// paths, so a status-only call (no `note` key in the body — what the hero card's
+// status tap sends, because submitRsvp's JSON.stringify drops an undefined note)
+// silently destroyed a member's saved note. These pins hold BOTH halves of the
+// fixed contract: an ABSENT key preserves, a PRESENT key (including null/'')
+// still writes/clears. Presence, not truthiness.
+// ============================================================================
+describe('POST /rsvp note preservation (Phase 88.5, Owner Ruling 1a)', () => {
+  const NOTE_USER = 'auth0|rsvp-note-test';
+  const SAVED_NOTE = 'Bringing snacks and the expansion';
+  let noteGroup;
+  let noteGame;
+  let noteEvent;
+  let noteUserUuid;
+
+  beforeEach(async () => {
+    currentActor = NOTE_USER;
+    const noteUser = await User.create({
+      user_id: NOTE_USER,
+      username: 'RSVP Noter',
+      email: 'note@test.com',
+    });
+    noteUserUuid = noteUser.id;
+    noteGroup = await Group.create({ name: 'RSVP Note Group', group_id: 'rsvp-note-group-001' });
+    noteGame = await Game.create({ name: 'Note Game' });
+    noteEvent = await Event.create({
+      group_id: noteGroup.id,
+      game_id: noteGame.id,
+      start_date: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+      status: 'scheduled',
+    });
+    // Active membership so canReadEventScopedSurface (real, unmocked) authorizes.
+    await UserGroup.create({
+      user_uuid: noteUser.id,
+      group_id: noteGroup.id,
+      role: 'member',
+      status: 'active',
+    });
+    // The pre-existing RSVP carrying the note the fix must not destroy.
+    await EventRsvp.create({
+      event_id: noteEvent.id,
+      user_uuid: noteUserUuid,
+      status: 'yes',
+      note: SAVED_NOTE,
+    });
+  });
+
+  afterEach(() => {
+    currentActor = null;
+    jest.restoreAllMocks();
+  });
+
+  const storedRsvp = () =>
+    EventRsvp.findOne({ where: { event_id: noteEvent.id, user_uuid: noteUserUuid } });
+
+  it('a status-only POST (no note key in the body) leaves an existing note UNCHANGED', async () => {
+    const res = await request(app)
+      .post('/api/rsvp')
+      .send({ event_id: noteEvent.id, status: 'maybe' });
+
+    expect(res.status).toBe(200);
+    const row = await storedRsvp();
+    expect(row.status).toBe('maybe'); // the status DID change
+    expect(row.note).toBe(SAVED_NOTE); // the note did NOT
+  });
+
+  it('the race-retry update path preserves the note too (not just the primary path)', async () => {
+    // Force the create branch on the pre-check (call 1 -> null) so the create
+    // hits the unique index, gets absorbed, and re-finds + updates via the
+    // race-retry path. Same spy idiom as the BINT-01 idempotency test above.
+    const realFindOne = EventRsvp.findOne.bind(EventRsvp);
+    let findOneCalls = 0;
+    jest.spyOn(EventRsvp, 'findOne').mockImplementation((...args) => {
+      findOneCalls += 1;
+      if (findOneCalls === 1) return Promise.resolve(null);
+      return realFindOne(...args);
+    });
+
+    const res = await request(app)
+      .post('/api/rsvp')
+      .send({ event_id: noteEvent.id, status: 'no' });
+
+    expect(res.status).toBe(200);
+    jest.restoreAllMocks();
+    const row = await storedRsvp();
+    expect(row.status).toBe('no');
+    expect(row.note).toBe(SAVED_NOTE);
+  });
+
+  it('an explicit note: null STILL clears the note (present key = write it)', async () => {
+    const res = await request(app)
+      .post('/api/rsvp')
+      .send({ event_id: noteEvent.id, status: 'yes', note: null });
+
+    expect(res.status).toBe(200);
+    const row = await storedRsvp();
+    expect(row.note).toBeNull();
+  });
+
+  it("an explicit note: '' STILL clears the note (falsy but PRESENT)", async () => {
+    const res = await request(app)
+      .post('/api/rsvp')
+      .send({ event_id: noteEvent.id, status: 'yes', note: '' });
+
+    expect(res.status).toBe(200);
+    const row = await storedRsvp();
+    expect(row.note).toBeNull();
+  });
+
+  it('a non-empty note still overwrites the previous one', async () => {
+    const res = await request(app)
+      .post('/api/rsvp')
+      .send({ event_id: noteEvent.id, status: 'yes', note: 'Actually bringing dice' });
+
+    expect(res.status).toBe(200);
+    const row = await storedRsvp();
+    expect(row.note).toBe('Actually bringing dice');
+  });
+});
+
+// ============================================================================
 // Phase 87.1 (BINT-02, D-11/D-12): RSVP ownership gates + wire shims on the
 // UUID keyspace. Owners CAN act, non-owners CANNOT; responses serialize the
 // Auth0 sub (never a raw user_uuid); null caller / magic-link resolves fail
