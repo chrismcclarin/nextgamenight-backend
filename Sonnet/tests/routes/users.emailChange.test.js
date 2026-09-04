@@ -716,3 +716,761 @@ describe('source: the five email-change handlers obey the load rule', () => {
     expect(registrations.length).toBeGreaterThanOrEqual(3);
   });
 });
+
+// ===========================================================================
+// TASK 2 — verify and revert: the one transaction that overwrites the identity
+// column, plus the D-41 invite move, the D-42 feedback move and the A13 notice.
+// ===========================================================================
+
+/** Request a change and hand back the raw code the CODE mail was given. */
+async function requestChange(app, row, address) {
+  emailService.sendEmailChangeCode.mockClear();
+  const res = await request(app)
+    .post(`/api/users/${row.user_id}/email`)
+    .send({ email: address })
+    .expect(200);
+  const code = sentCodes()[0];
+  return { res, code };
+}
+
+let groupSeq = 0;
+async function seedGroup() {
+  groupSeq += 1;
+  return Group.create({ group_id: `ec-group-${groupSeq}-${Date.now()}`, name: `EC Group ${groupSeq}` });
+}
+
+let inviteSeq = 0;
+async function seedPendingInvite(group, email) {
+  inviteSeq += 1;
+  return GroupInvite.create({
+    group_id: group.id,
+    invited_email: email,
+    token: `ec-invite-token-${inviteSeq}-${Date.now()}`,
+    status: 'pending',
+  });
+}
+
+describe('POST /api/users/:user_id/email/verify — the happy path', () => {
+  beforeEach(() => mailSucceeds());
+
+  it('overwrites Users.email with the code row target, stamps email_changed_at, consumes the row', async () => {
+    const row = await seedUser({ email: 'old@example.com' });
+    const app = makeApp(actorFor(row));
+    const { code } = await requestChange(app, row, 'new@example.com');
+
+    const res = await request(app)
+      .post(`/api/users/${row.user_id}/email/verify`)
+      .send({ code })
+      .expect(200);
+
+    expect(res.body.outcome).toBe('verified');
+    expect(res.body.email).toBe('new@example.com');
+    expect(res.body.pending_email_change).toBeNull();
+    expect(res.body.verification_sent).toBe(false);
+    expect(res.body.email_changed_at).toBeTruthy();
+
+    const after = await User.scope('withContactInfo').findByPk(row.id);
+    expect(after.email).toBe('new@example.com');
+    expect(after.email_changed_at).not.toBeNull();
+
+    const [token] = await tokensFor(row.user_id);
+    expect(token.status).toBe('used');
+    expect(token.used_at).not.toBeNull();
+  });
+
+  it('accepts the code with its display dash and in lower case', async () => {
+    const row = await seedUser({ email: 'old@example.com' });
+    const app = makeApp(actorFor(row));
+    const { code } = await requestChange(app, row, 'dashed@example.com');
+    const typed = `${code.slice(0, 4)}-${code.slice(4)}`.toLowerCase();
+
+    const res = await request(app).post(`/api/users/${row.user_id}/email/verify`).send({ code: typed }).expect(200);
+    expect(res.body.outcome).toBe('verified');
+    expect(res.body.email).toBe('dashed@example.com');
+  });
+
+  it('THE OVERWRITE IS KEYED ON row.target, never on whatever is pending at flip time', async () => {
+    // Two active rows, seeded directly so the revoke-then-mint does not collapse
+    // them: X's code is the one typed, Y is the NEWEST pending. If the handler read
+    // the pending address instead of the consumed row, Y would be written.
+    const row = await seedUser({ email: 'old@example.com' });
+    const codeX = 'ABCD2345';
+    await SingleUseToken.create({
+      nonce: sha256(codeX),
+      user_id: row.user_id,
+      purpose: PURPOSE,
+      target: 'x@example.com',
+      status: 'active',
+      expires_at: new Date(Date.now() + 60000),
+    });
+    await SingleUseToken.create({
+      nonce: sha256('ZZZZ9999'),
+      user_id: row.user_id,
+      purpose: PURPOSE,
+      target: 'y@example.com',
+      status: 'active',
+      expires_at: new Date(Date.now() + 60000),
+    });
+
+    const res = await request(makeApp(actorFor(row)))
+      .post(`/api/users/${row.user_id}/email/verify`)
+      .send({ code: codeX })
+      .expect(200);
+
+    expect(res.body.outcome).toBe('verified');
+    expect(res.body.email).toBe('x@example.com');
+  });
+
+  it('the stored row holds sha256(code); the code appears in NO response body and NO console output', async () => {
+    const row = await seedUser();
+    const app = makeApp(actorFor(row));
+    const logs = [];
+    for (const method of ['log', 'warn', 'error']) {
+      jest.spyOn(console, method).mockImplementation((...args) => {
+        logs.push(args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' '));
+      });
+    }
+
+    const { res: requestRes, code } = await requestChange(app, row, 'quiet@example.com');
+    const verifyRes = await request(app).post(`/api/users/${row.user_id}/email/verify`).send({ code }).expect(200);
+
+    const [token] = await tokensFor(row.user_id);
+    expect(token.nonce).toBe(sha256(code));
+    expect(JSON.stringify(requestRes.body)).not.toContain(code);
+    expect(JSON.stringify(verifyRes.body)).not.toContain(code);
+    expect(logs.join('\n')).not.toContain(code);
+  });
+});
+
+describe('POST /api/users/:user_id/email/verify — the four-way fallback (DR-B)', () => {
+  beforeEach(() => mailSucceeds());
+
+  it('(i) the SAME code entered a second time is IDEMPOTENT: verified, with no write', async () => {
+    const row = await seedUser({ email: 'old@example.com' });
+    const app = makeApp(actorFor(row));
+    const { code } = await requestChange(app, row, 'new@example.com');
+    await request(app).post(`/api/users/${row.user_id}/email/verify`).send({ code }).expect(200);
+
+    const first = await User.scope('withContactInfo').findByPk(row.id);
+    const res = await request(app).post(`/api/users/${row.user_id}/email/verify`).send({ code }).expect(200);
+
+    expect(res.body.outcome).toBe('verified');
+    const second = await User.scope('withContactInfo').findByPk(row.id);
+    expect(second.email).toBe('new@example.com');
+    expect(new Date(second.email_changed_at).getTime()).toBe(new Date(first.email_changed_at).getTime());
+  });
+
+  it('(i) is deliberately NOT gated on expires_at — a completed change stays true after the window', async () => {
+    const row = await seedUser({ email: 'now@example.com' });
+    const code = 'MNPQ2345';
+    await SingleUseToken.create({
+      nonce: sha256(code),
+      user_id: row.user_id,
+      purpose: PURPOSE,
+      target: 'now@example.com',
+      status: 'used',
+      used_at: new Date(Date.now() - 2 * 60 * 60 * 1000),
+      expires_at: new Date(Date.now() - 60 * 60 * 1000),
+    });
+
+    const res = await request(makeApp(actorFor(row)))
+      .post(`/api/users/${row.user_id}/email/verify`)
+      .send({ code })
+      .expect(200);
+    expect(res.body.outcome).toBe('verified');
+  });
+
+  it('(ii) an EXPIRED but still-active row returns expired, so the section can promote Resend', async () => {
+    const row = await seedUser();
+    const code = 'QRST2345';
+    await SingleUseToken.create({
+      nonce: sha256(code),
+      user_id: row.user_id,
+      purpose: PURPOSE,
+      target: 'expired@example.com',
+      status: 'active',
+      expires_at: new Date(Date.now() - 1000),
+    });
+
+    const res = await request(makeApp(actorFor(row)))
+      .post(`/api/users/${row.user_id}/email/verify`)
+      .send({ code })
+      .expect(200);
+    expect(res.body.outcome).toBe('expired');
+  });
+
+  it('(iii) a USED row whose target is no longer the current address returns invalid', async () => {
+    const row = await seedUser({ email: 'current@example.com' });
+    const code = 'VWXY2345';
+    await SingleUseToken.create({
+      nonce: sha256(code),
+      user_id: row.user_id,
+      purpose: PURPOSE,
+      target: 'stale@example.com',
+      status: 'used',
+      used_at: new Date(),
+      expires_at: new Date(Date.now() + 60000),
+    });
+
+    const res = await request(makeApp(actorFor(row)))
+      .post(`/api/users/${row.user_id}/email/verify`)
+      .send({ code })
+      .expect(200);
+    expect(res.body.outcome).toBe('invalid');
+    expect(res.body.email).toBe('current@example.com');
+  });
+
+  it('(iv) a code minted for a PREVIOUS pending address returns invalid — the later request revoked it', async () => {
+    const row = await seedUser({ email: 'old@example.com' });
+    const app = makeApp(actorFor(row));
+    const { code: firstCode } = await requestChange(app, row, 'first@example.com');
+    await requestChange(app, row, 'second@example.com');
+
+    const res = await request(app).post(`/api/users/${row.user_id}/email/verify`).send({ code: firstCode }).expect(200);
+    expect(res.body.outcome).toBe('invalid');
+    const after = await User.scope('withContactInfo').findByPk(row.id);
+    expect(after.email).toBe('old@example.com');
+  });
+
+  it('(iv) after a CANCEL the previously-mailed code returns invalid', async () => {
+    const row = await seedUser({ email: 'old@example.com' });
+    const app = makeApp(actorFor(row));
+    const { code } = await requestChange(app, row, 'discard@example.com');
+    await request(app).post(`/api/users/${row.user_id}/email/cancel`).send().expect(200);
+
+    const res = await request(app).post(`/api/users/${row.user_id}/email/verify`).send({ code }).expect(200);
+    expect(res.body.outcome).toBe('invalid');
+  });
+
+  it('(iv) ANOTHER USER\'S valid code returns invalid and leaves that user\'s row active', async () => {
+    const mine = await seedUser({ email: 'mine@example.com' });
+    const theirs = await seedUser({ email: 'theirs@example.com' });
+    const { code } = await requestChange(makeApp(actorFor(theirs)), theirs, 'their-new@example.com');
+
+    const res = await request(makeApp(actorFor(mine)))
+      .post(`/api/users/${mine.user_id}/email/verify`)
+      .send({ code })
+      .expect(200);
+
+    expect(res.body.outcome).toBe('invalid');
+    expect(res.body.email).toBe('mine@example.com');
+    const [theirToken] = await tokensFor(theirs.user_id);
+    expect(theirToken.status).toBe('active');
+    const theirRow = await User.scope('withContactInfo').findByPk(theirs.id);
+    expect(theirRow.email).toBe('theirs@example.com');
+  });
+
+  it('a WRONG code returns invalid and leaves the caller\'s pending row active', async () => {
+    const row = await seedUser();
+    const app = makeApp(actorFor(row));
+    const { code } = await requestChange(app, row, 'pending@example.com');
+
+    const wrong = await request(app).post(`/api/users/${row.user_id}/email/verify`).send({ code: 'ZZZZ2345' }).expect(200);
+    expect(wrong.body.outcome).toBe('invalid');
+    expect(wrong.body.pending_email_change).toMatchObject({ address: 'pending@example.com' });
+
+    const right = await request(app).post(`/api/users/${row.user_id}/email/verify`).send({ code }).expect(200);
+    expect(right.body.outcome).toBe('verified');
+  });
+
+  it.each([
+    ['no code', {}],
+    ['an empty code', { code: '' }],
+    ['a non-string code', { code: 12345678 }],
+    ['a code of the wrong length', { code: 'ABC123' }],
+    ['a code carrying an excluded Crockford symbol', { code: 'ABCDEFGU' }],
+    ['a wrong body key', { verification_code: 'ABCD2345' }],
+  ])('a malformed body (%s) returns the validation envelope', async (_label, body) => {
+    const row = await seedUser();
+    const res = await request(makeApp(actorFor(row)))
+      .post(`/api/users/${row.user_id}/email/verify`)
+      .send(body)
+      .expect(400);
+    expect(res.body.code).toBe('validation');
+  });
+
+  it('CONCURRENCY: two entries of the same code consume it exactly once and BOTH return verified', async () => {
+    const row = await seedUser({ email: 'old@example.com' });
+    const app = makeApp(actorFor(row));
+    const { code } = await requestChange(app, row, 'raced@example.com');
+
+    const [a, b] = await Promise.all([
+      request(app).post(`/api/users/${row.user_id}/email/verify`).send({ code }),
+      request(app).post(`/api/users/${row.user_id}/email/verify`).send({ code }),
+    ]);
+
+    expect(a.status).toBe(200);
+    expect(b.status).toBe(200);
+    expect(a.body.outcome).toBe('verified');
+    expect(b.body.outcome).toBe('verified');
+
+    const consumed = (await tokensFor(row.user_id)).filter((t) => t.used_at !== null);
+    expect(consumed).toHaveLength(1);
+  });
+
+  it('is self-only', async () => {
+    const mine = await seedUser();
+    const theirs = await seedUser();
+    await request(makeApp(actorFor(mine)))
+      .post(`/api/users/${theirs.user_id}/email/verify`)
+      .send({ code: 'ABCD2345' })
+      .expect(403);
+  });
+});
+
+describe('T-88.8-78 — NEITHER email unique constraint may surface as a 500', () => {
+  beforeEach(() => mailSucceeds());
+
+  it('an EXACT collision answers 200 address_taken, writes nothing, and leaves the code row ACTIVE', async () => {
+    await seedUser({ email: 'taken@example.com' });
+    const row = await seedUser({ email: 'old@example.com' });
+    const app = makeApp(actorFor(row));
+    const { code } = await requestChange(app, row, 'taken@example.com');
+
+    const res = await request(app).post(`/api/users/${row.user_id}/email/verify`).send({ code }).expect(200);
+
+    expect(res.body.outcome).toBe('address_taken');
+    expect(res.body.email).toBe('old@example.com');
+    const after = await User.scope('withContactInfo').findByPk(row.id);
+    expect(after.email).toBe('old@example.com');
+    expect(after.email_changed_at).toBeNull();
+    const [token] = await tokensFor(row.user_id);
+    expect(token.status).toBe('active');
+  });
+
+  it('a CASE-VARIANT collision — the users_email_lower_unique arm — also answers address_taken, not 500', async () => {
+    // The occupying row holds a MIXED-CASE address, so `Users_email_key`
+    // (case-sensitive) does NOT fire; only the LOWER(email) unique index does, and
+    // its err.fields is keyed `lower(email::text)` with err.fields.email undefined.
+    // A predicate written against one constraint name rethrows here and 500s.
+    await seedUser({ email: 'Mixed@Example.com' });
+    const row = await seedUser({ email: 'old@example.com' });
+    const app = makeApp(actorFor(row));
+    const { code } = await requestChange(app, row, 'mixed@example.com');
+
+    const res = await request(app).post(`/api/users/${row.user_id}/email/verify`).send({ code }).expect(200);
+    expect(res.body.outcome).toBe('address_taken');
+    const after = await User.scope('withContactInfo').findByPk(row.id);
+    expect(after.email).toBe('old@example.com');
+  });
+
+  it('reports ONE Sentry event tagged email-change/collision with the sub and the DOMAIN only', async () => {
+    await seedUser({ email: 'occupied@collide-domain.test' });
+    const row = await seedUser({ email: 'old@example.com' });
+    const app = makeApp(actorFor(row));
+    const { code } = await requestChange(app, row, 'occupied@collide-domain.test');
+    Sentry.captureException.mockClear();
+
+    await request(app).post(`/api/users/${row.user_id}/email/verify`).send({ code }).expect(200);
+
+    expect(Sentry.captureException).toHaveBeenCalledTimes(1);
+    const [, context] = Sentry.captureException.mock.calls[0];
+    expect(context.tags).toMatchObject({ feature: 'email-change', op: 'collision' });
+    const payload = JSON.stringify(context);
+    expect(payload).toContain('collide-domain.test');
+    expect(payload).not.toContain('occupied@');
+  });
+});
+
+describe('D-41 — the pending-invite move, and the gate on it', () => {
+  beforeEach(() => mailSucceeds());
+
+  it('MIRROR 1: a row whose email_changed_at is non-null ON ENTRY DOES move its pending invites', async () => {
+    const row = await seedUser({ email: 'proved@example.com', email_changed_at: new Date() });
+    const group = await seedGroup();
+    const invite = await seedPendingInvite(group, 'proved@example.com');
+    const app = makeApp(actorFor(row));
+    const { code } = await requestChange(app, row, 'moved@example.com');
+
+    const res = await request(app).post(`/api/users/${row.user_id}/email/verify`).send({ code }).expect(200);
+    expect(res.body.outcome).toBe('verified');
+
+    await invite.reload();
+    expect(invite.invited_email).toBe('moved@example.com');
+  });
+
+  it('MIRROR 2: a row whose previousEmail EQUALS the verified claim DOES move its pending invites', async () => {
+    const row = await seedUser({ email: 'claimed@example.com', email_changed_at: null });
+    const group = await seedGroup();
+    const invite = await seedPendingInvite(group, 'claimed@example.com');
+    // The auth claim equals the stored address AND is verified — the gate's second arm.
+    const app = makeApp({ user_id: row.user_id, email: 'Claimed@Example.com', email_verified: true });
+    const { code } = await requestChange(app, row, 'moved2@example.com');
+
+    await request(app).post(`/api/users/${row.user_id}/email/verify`).send({ code }).expect(200);
+    await invite.reload();
+    expect(invite.invited_email).toBe('moved2@example.com');
+  });
+
+  it('SKIP 1: email_changed_at null AND the claim is a DIFFERENT address — the change succeeds, the invite is byte-unchanged', async () => {
+    const row = await seedUser({ email: 'victim@example.com', email_changed_at: null });
+    const group = await seedGroup();
+    const invite = await seedPendingInvite(group, 'victim@example.com');
+    // Mallory's claim is her OWN address; the row holds victim@ she never proved.
+    const app = makeApp({ user_id: row.user_id, email: 'mallory@evil.test', email_verified: true });
+    const { code } = await requestChange(app, row, 'mallory@evil.test');
+
+    const res = await request(app).post(`/api/users/${row.user_id}/email/verify`).send({ code }).expect(200);
+
+    // The change itself completes normally — the response is byte-identical to an
+    // ungated successful verify, and there is NO ninth outcome literal.
+    expect(res.body.outcome).toBe('verified');
+    expect(res.body.email).toBe('mallory@evil.test');
+    expect(res.body.email_changed_at).toBeTruthy();
+
+    await invite.reload();
+    expect(invite.invited_email).toBe('victim@example.com');
+  });
+
+  it('SKIP 2: email_verified false with the claim EQUAL to the stored address — the arm that proves the gate reads the flag', async () => {
+    const row = await seedUser({ email: 'unverified@example.com', email_changed_at: null });
+    const group = await seedGroup();
+    const invite = await seedPendingInvite(group, 'unverified@example.com');
+    const app = makeApp({ user_id: row.user_id, email: 'unverified@example.com', email_verified: false });
+    const { code } = await requestChange(app, row, 'proven@example.com');
+
+    const res = await request(app).post(`/api/users/${row.user_id}/email/verify`).send({ code }).expect(200);
+    expect(res.body.outcome).toBe('verified');
+
+    await invite.reload();
+    expect(invite.invited_email).toBe('unverified@example.com');
+  });
+
+  it('a SKIP emits telemetry tagged invite-move-skipped with the sub, the DOMAIN only and the count left behind', async () => {
+    const row = await seedUser({ email: 'left@skip-domain.test', email_changed_at: null });
+    const group = await seedGroup();
+    await seedPendingInvite(group, 'left@skip-domain.test');
+    const app = makeApp({ user_id: row.user_id, email: 'other@evil.test', email_verified: true });
+    const { code } = await requestChange(app, row, 'other@evil.test');
+    Sentry.captureMessage.mockClear();
+
+    await request(app).post(`/api/users/${row.user_id}/email/verify`).send({ code }).expect(200);
+
+    expect(Sentry.captureMessage).toHaveBeenCalledTimes(1);
+    const [, context] = Sentry.captureMessage.mock.calls[0];
+    expect(context.tags).toMatchObject({ feature: 'email-change', op: 'invite-move-skipped' });
+    expect(context.extra).toMatchObject({ sub: row.user_id, pendingInvitesLeftBehind: 1 });
+    const payload = JSON.stringify(context);
+    expect(payload).toContain('skip-domain.test');
+    expect(payload).not.toContain('left@');
+  });
+
+  it('the eight-value outcome enum is CLOSED — no ninth literal is ever emitted', async () => {
+    const ALLOWED = [
+      'code_sent', 'unchanged', 'cancelled', 'verified',
+      'expired', 'invalid', 'address_taken', 'reverted',
+    ];
+    expect(ALLOWED).toHaveLength(8);
+
+    const row = await seedUser({ email: 'enum@example.com', email_changed_at: null });
+    const group = await seedGroup();
+    await seedPendingInvite(group, 'enum@example.com');
+    const app = makeApp({ user_id: row.user_id, email: 'elsewhere@evil.test', email_verified: true });
+    const { code } = await requestChange(app, row, 'elsewhere@evil.test');
+    const res = await request(app).post(`/api/users/${row.user_id}/email/verify`).send({ code }).expect(200);
+    expect(ALLOWED).toContain(res.body.outcome);
+  });
+
+  it('a COLLIDING pending invite is SKIPPED, the non-colliding one moves, and the change still succeeds', async () => {
+    const row = await seedUser({ email: 'movable@example.com', email_changed_at: new Date() });
+    const groupA = await seedGroup();
+    const groupB = await seedGroup();
+    const movable = await seedPendingInvite(groupA, 'movable@example.com');
+    const colliding = await seedPendingInvite(groupB, 'movable@example.com');
+    // groupB ALREADY has a pending invite to the NEW address — a blanket UPDATE
+    // would violate group_invites_pending_unique and abort the whole transaction.
+    const blocker = await seedPendingInvite(groupB, 'landing@example.com');
+
+    const app = makeApp(actorFor(row));
+    const { code } = await requestChange(app, row, 'landing@example.com');
+    const res = await request(app).post(`/api/users/${row.user_id}/email/verify`).send({ code }).expect(200);
+
+    expect(res.body.outcome).toBe('verified');
+    await movable.reload();
+    await colliding.reload();
+    await blocker.reload();
+    expect(movable.invited_email).toBe('landing@example.com');
+    expect(colliding.invited_email).toBe('movable@example.com');
+    expect(blocker.invited_email).toBe('landing@example.com');
+  });
+
+  it('matches the old address CASE-INSENSITIVELY and only touches PENDING rows', async () => {
+    const row = await seedUser({ email: 'mixed@example.com', email_changed_at: new Date() });
+    const group = await seedGroup();
+    const pending = await seedPendingInvite(group, 'Mixed@Example.COM');
+    const accepted = await GroupInvite.create({
+      group_id: group.id,
+      invited_email: 'mixed@example.com',
+      token: `ec-accepted-${Date.now()}`,
+      status: 'accepted',
+    });
+
+    const app = makeApp(actorFor(row));
+    const { code } = await requestChange(app, row, 'newmixed@example.com');
+    await request(app).post(`/api/users/${row.user_id}/email/verify`).send({ code }).expect(200);
+
+    await pending.reload();
+    await accepted.reload();
+    expect(pending.invited_email).toBe('newmixed@example.com');
+    expect(accepted.invited_email).toBe('mixed@example.com');
+  });
+
+  it('never touches ANOTHER user\'s pending invite', async () => {
+    const row = await seedUser({ email: 'me@example.com', email_changed_at: new Date() });
+    const other = await seedUser({ email: 'other@example.com' });
+    const group = await seedGroup();
+    const theirs = await seedPendingInvite(group, other.email);
+
+    const app = makeApp(actorFor(row));
+    const { code } = await requestChange(app, row, 'menew@example.com');
+    await request(app).post(`/api/users/${row.user_id}/email/verify`).send({ code }).expect(200);
+
+    await theirs.reload();
+    expect(theirs.invited_email).toBe('other@example.com');
+  });
+});
+
+describe('D-42 — the feedback move', () => {
+  beforeEach(() => mailSucceeds());
+
+  it('moves Feedback rows whose user_email equals the OLD address, case-insensitively', async () => {
+    const row = await seedUser({ email: 'writer@example.com' });
+    const mine = await Feedback.create({
+      type: 'bug', subject: 'S', description: 'D', user_email: 'Writer@Example.com', user_id: null,
+    });
+    const someoneElse = await Feedback.create({
+      type: 'bug', subject: 'S2', description: 'D2', user_email: 'stranger@example.com', user_id: null,
+    });
+
+    const app = makeApp(actorFor(row));
+    const { code } = await requestChange(app, row, 'writernew@example.com');
+    await request(app).post(`/api/users/${row.user_id}/email/verify`).send({ code }).expect(200);
+
+    await mine.reload();
+    await someoneElse.reload();
+    expect(mine.user_email).toBe('writernew@example.com');
+    expect(someoneElse.user_email).toBe('stranger@example.com');
+  });
+
+  it('runs even when the D-41 invite move is GATED OFF — the two are independent', async () => {
+    const row = await seedUser({ email: 'gated@example.com', email_changed_at: null });
+    const fb = await Feedback.create({
+      type: 'bug', subject: 'S', description: 'D', user_email: 'gated@example.com', user_id: null,
+    });
+    const app = makeApp({ user_id: row.user_id, email: 'elsewhere@evil.test', email_verified: true });
+    const { code } = await requestChange(app, row, 'elsewhere@evil.test');
+    await request(app).post(`/api/users/${row.user_id}/email/verify`).send({ code }).expect(200);
+
+    await fb.reload();
+    expect(fb.user_email).toBe('elsewhere@evil.test');
+  });
+});
+
+describe('D-40 / A13 — the security notice to the PRIOR address', () => {
+  beforeEach(() => mailSucceeds());
+
+  it('a successful verify enqueues exactly one job addressed to the PRIOR address', async () => {
+    const row = await seedUser({ email: 'prior@example.com' });
+    const app = makeApp(actorFor(row));
+    const { code } = await requestChange(app, row, 'after@example.com');
+
+    const res = await request(app).post(`/api/users/${row.user_id}/email/verify`).send({ code }).expect(200);
+
+    expect(emailNoticeQueue.add).toHaveBeenCalledTimes(1);
+    const [, payload] = emailNoticeQueue.add.mock.calls[0];
+    expect(payload).toMatchObject({
+      to: 'prior@example.com',
+      sub: row.user_id,
+      action: 'changed',
+      newAddress: 'after@example.com',
+    });
+    // Nothing about the notice appears in the response body (D-40).
+    expect(JSON.stringify(res.body)).not.toContain('notice');
+  });
+
+  it('a rejected .add() leaves the 200 unchanged and reports to Sentry', async () => {
+    const row = await seedUser({ email: 'prior@notice-domain.test' });
+    const app = makeApp(actorFor(row));
+    const { code } = await requestChange(app, row, 'after@example.com');
+    emailNoticeQueue.add.mockRejectedValueOnce(new Error('redis down'));
+    Sentry.captureException.mockClear();
+
+    const res = await request(app).post(`/api/users/${row.user_id}/email/verify`).send({ code }).expect(200);
+    expect(res.body.outcome).toBe('verified');
+    expect(res.body.email).toBe('after@example.com');
+    expect(Sentry.captureException).toHaveBeenCalledTimes(1);
+    const [, context] = Sentry.captureException.mock.calls[0];
+    expect(context.tags).toMatchObject({ feature: 'email-change', op: 'notice-enqueue' });
+    const payload = JSON.stringify(context);
+    expect(payload).toContain('notice-domain.test');
+    expect(payload).not.toContain('prior@');
+  });
+
+  it('a SYNTHETIC prior address enqueues nothing — there is no inbox, and refusing would lock out the repair population', async () => {
+    const row = await seedUser({ email: 'google-oauth2-1|abc@auth0.local' });
+    const app = makeApp({ user_id: row.user_id, email: 'google-oauth2-1|abc@auth0.local', email_verified: true });
+    const { code } = await requestChange(app, row, 'real@example.com');
+
+    const res = await request(app).post(`/api/users/${row.user_id}/email/verify`).send({ code }).expect(200);
+    expect(res.body.outcome).toBe('verified');
+    expect(res.body.email).toBe('real@example.com');
+    expect(emailNoticeQueue.add).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /api/users/:user_id/email/revert (D-38)', () => {
+  beforeEach(() => mailSucceeds());
+
+  async function changedUser(claimEmail = 'claim@example.com') {
+    const row = await seedUser({ email: 'changed@example.com', email_changed_at: new Date() });
+    return { row, app: makeApp({ user_id: row.user_id, email: claimEmail, email_verified: true }) };
+  }
+
+  it('writes the verified claim back, clears email_changed_at, revokes any pending code, returns reverted', async () => {
+    const { row, app } = await changedUser();
+    await SingleUseToken.create({
+      nonce: `pending-${Date.now()}`,
+      user_id: row.user_id,
+      purpose: PURPOSE,
+      target: 'somethingelse@example.com',
+      status: 'active',
+      expires_at: new Date(Date.now() + 60000),
+    });
+
+    const res = await request(app).post(`/api/users/${row.user_id}/email/revert`).send().expect(200);
+
+    expect(res.body.outcome).toBe('reverted');
+    expect(res.body.email).toBe('claim@example.com');
+    expect(res.body.email_changed_at).toBeNull();
+    expect(res.body.pending_email_change).toBeNull();
+
+    const after = await User.scope('withContactInfo').findByPk(row.id);
+    expect(after.email).toBe('claim@example.com');
+    expect(after.email_changed_at).toBeNull();
+    expect((await tokensFor(row.user_id)).every((t) => t.status === 'revoked')).toBe(true);
+  });
+
+  it('normalises the claim before writing it', async () => {
+    const { row, app } = await changedUser('  Claim@Example.COM ');
+    await request(app).post(`/api/users/${row.user_id}/email/revert`).send().expect(200);
+    const after = await User.scope('withContactInfo').findByPk(row.id);
+    expect(after.email).toBe('claim@example.com');
+  });
+
+  it('passes the D-41 gate BY CONSTRUCTION — its pending invites DO move', async () => {
+    const { row, app } = await changedUser();
+    const group = await seedGroup();
+    const invite = await seedPendingInvite(group, 'changed@example.com');
+    const fb = await Feedback.create({
+      type: 'bug', subject: 'S', description: 'D', user_email: 'changed@example.com', user_id: null,
+    });
+
+    await request(app).post(`/api/users/${row.user_id}/email/revert`).send().expect(200);
+
+    await invite.reload();
+    await fb.reload();
+    expect(invite.invited_email).toBe('claim@example.com');
+    expect(fb.user_email).toBe('claim@example.com');
+  });
+
+  it('enqueues a notice to the PRIOR address with the reverted action', async () => {
+    const { row, app } = await changedUser();
+    await request(app).post(`/api/users/${row.user_id}/email/revert`).send().expect(200);
+
+    expect(emailNoticeQueue.add).toHaveBeenCalledTimes(1);
+    const [, payload] = emailNoticeQueue.add.mock.calls[0];
+    expect(payload).toMatchObject({
+      to: 'changed@example.com',
+      action: 'reverted',
+      newAddress: 'claim@example.com',
+    });
+  });
+
+  it('D-40: with the hourly budget exhausted it STILL reverts and SKIPS the notice', async () => {
+    const { row, app } = await changedUser();
+    for (let i = 0; i < 3; i += 1) {
+      await SingleUseToken.create({
+        nonce: `budget-${i}-${Date.now()}`,
+        user_id: row.user_id,
+        purpose: PURPOSE,
+        target: `b${i}@example.com`,
+        status: 'revoked',
+        expires_at: new Date(Date.now() + 60000),
+      });
+    }
+
+    const res = await request(app).post(`/api/users/${row.user_id}/email/revert`).send().expect(200);
+    expect(res.body.outcome).toBe('reverted');
+    expect(res.body.email).toBe('claim@example.com');
+    expect(emailNoticeQueue.add).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['email_changed_at is null', { changed: false, claim: 'claim@example.com', verified: true }],
+    ['the claim is absent', { changed: true, claim: undefined, verified: true }],
+    ['the claim is not verified', { changed: true, claim: 'claim@example.com', verified: false }],
+    ['the claim is SYNTHETIC (@auth0, broad test)', { changed: true, claim: 'google-oauth2-1|x@auth0.local', verified: true }],
+    ['the claim is @auth0 without .local', { changed: true, claim: 'x@auth0.example.com', verified: true }],
+  ])('refuses with the validation envelope when %s', async (_label, { changed, claim, verified }) => {
+    const row = await seedUser({
+      email: 'current@example.com',
+      email_changed_at: changed ? new Date() : null,
+    });
+    const app = makeApp({ user_id: row.user_id, email: claim, email_verified: verified });
+
+    const res = await request(app).post(`/api/users/${row.user_id}/email/revert`).send().expect(400);
+    expect(res.body.code).toBe('validation');
+    const after = await User.scope('withContactInfo').findByPk(row.id);
+    expect(after.email).toBe('current@example.com');
+  });
+
+  it('a revert that would COLLIDE returns address_taken and writes nothing', async () => {
+    await seedUser({ email: 'claim@example.com' });
+    const { row, app } = await changedUser('claim@example.com');
+
+    const res = await request(app).post(`/api/users/${row.user_id}/email/revert`).send().expect(200);
+    expect(res.body.outcome).toBe('address_taken');
+    const after = await User.scope('withContactInfo').findByPk(row.id);
+    expect(after.email).toBe('changed@example.com');
+    expect(after.email_changed_at).not.toBeNull();
+  });
+
+  it('is self-only', async () => {
+    const mine = await seedUser();
+    const theirs = await seedUser({ email: 'theirs@example.com', email_changed_at: new Date() });
+    await request(makeApp(actorFor(mine)))
+      .post(`/api/users/${theirs.user_id}/email/revert`)
+      .send()
+      .expect(403);
+  });
+});
+
+describe('source: verify and revert are ordinary authenticated routes', () => {
+  const fs = require('fs');
+  const path = require('path');
+  const usersSource = fs.readFileSync(path.join(__dirname, '../../routes/users.js'), 'utf8');
+  const serverSource = fs.readFileSync(path.join(__dirname, '../../server.js'), 'utf8');
+  const stripLineComments = (src) =>
+    src.split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
+
+  it('all FIVE routes are registered, each behind writeOperationLimiter', () => {
+    const block = usersSource.slice(usersSource.indexOf('EMAIL-CHANGE ROUTES (Phase 88.8 plan 09)'));
+    const registrations = block.match(/router\.post\('\/:user_id\/email[^']*',\s*writeOperationLimiter/g) || [];
+    expect(registrations).toHaveLength(5);
+    for (const p of ['/:user_id/email/verify', '/:user_id/email/revert']) {
+      expect(block).toContain(`router.post('${p}', writeOperationLimiter`);
+    }
+  });
+
+  it('server.js carries NO email/verify registration — the retired public-link design stays retired', () => {
+    expect(stripLineComments(serverSource)).not.toContain('email/verify');
+  });
+
+  it('routes/users.js carries NO magicTokenLimiter', () => {
+    expect(stripLineComments(usersSource)).not.toContain('magicTokenLimiter');
+  });
+
+  it('the D-38 revert rationale survives a line-comment-stripping grep', () => {
+    expect(stripLineComments(usersSource)).toContain('DECISION Phase 88.8 D-38');
+  });
+});
