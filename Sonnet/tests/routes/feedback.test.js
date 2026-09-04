@@ -338,6 +338,29 @@ describe('POST /api/feedback/github — the address is SERVER-DERIVED (88.8-09 T
     expect(source.split('\n').filter((l) => !/^\s*\/\//.test(l)).join('\n'))
       .toContain('DECISION Phase 88.8 D-42');
   });
+
+  it('source: BOTH feedback writers carry the broad synthetic guard, via the ONE shared predicate', () => {
+    // The plan's own gate for this criterion counts non-comment lines containing the
+    // literal `@auth0` and expects at least two. That proxy assumes the guard is
+    // INLINED at both sites. It is not, and deliberately so: plans 04/05 exported
+    // `isSyntheticAddress` precisely so the ninth-and-tenth copies of this predicate
+    // would not be written, and a second inline copy could be narrowed at one site
+    // and not the other — the exact failure DECISION Phase 88.2 NIX-AUTH0 warns
+    // about. This asserts the criterion's real content: TWO call sites, ONE
+    // predicate, in executable code rather than in a comment.
+    const fs = require('fs');
+    const path = require('path');
+    const source = fs.readFileSync(path.join(__dirname, '../../routes/feedback.js'), 'utf8');
+    const code = source.split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
+    const calls = code.match(/isSyntheticAddress\(/g) || [];
+    expect(calls.length).toBeGreaterThanOrEqual(2);
+    expect(code).toContain("require('../services/provisioningService')");
+    // And the predicate itself really is the BROAD one.
+    const { isSyntheticAddress } = require('../../services/provisioningService');
+    expect(isSyntheticAddress('x@auth0.local')).toBe(true);
+    expect(isSyntheticAddress('x@auth0.example.com')).toBe(true);
+    expect(isSyntheticAddress('real@example.com')).toBe(false);
+  });
 });
 
 describe('POST /api/feedback — the PUBLIC writer keeps its client-supplied address but drops a SYNTHETIC one', () => {
