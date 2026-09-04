@@ -168,7 +168,7 @@ jest.mock('../../services/auth0Service', () => ({
 const auth0Service = require('../../services/auth0Service');
 const provisioningService = require('../../services/provisioningService');
 const { isEmailCollision, EMAIL_UNIQUE_CONSTRAINTS } = provisioningService;
-const { User } = require('../../models');
+const { User, Group, UserGroup } = require('../../models');
 
 const SERVICE_PATH = path.join(__dirname, '..', '..', 'services', 'provisioningService.js');
 
@@ -635,7 +635,7 @@ describe('services/provisioningService — provisionOrRepair', () => {
   // is the only thing that can recognise it. A predicate written against CONTEXT D-15's
   // original one-name spelling fails BOTH cases.
   // -----------------------------------------------------------------------
-  describe('email unique collision (placeholder handling — plan 05 owns the four branches)', () => {
+  describe('email unique collision — the predicate (plan 04) and the four branches (plan 05)', () => {
     it('THE SHAPE MATRIX, measured not assumed: the predicate recognises a collision from findOrCreate, create AND instance.update, on BOTH constraints', async () => {
       // This is the assertion that stops plan 05 from being written against an
       // incomplete shape. CONTEXT D-15 (as amended) and plan 05's plan text both say
@@ -717,17 +717,22 @@ describe('services/provisioningService — provisionOrRepair', () => {
       await User.create({ user_id: 'auth0|occupant', username: 'Occupant', email: 'Taken@Example.com' });
 
       const sub = 'auth0|svc-collide-create';
+      // getUserById rejects by default (the beforeEach), so this is branch (d) —
+      // Management unavailable, fail SAFE, the occupant's address is never released.
       const result = await provision({ sub, claims: { email: 'taken@example.com', email_verified: true } });
 
       expect(result.status).toBe('provisioned');
       expect(result.created).toBe(true);
       expect(result.user.email).toBe(syntheticFor(sub));
-      expect(result.reason).toBe('unique_email_collision');
+      expect(result.reason).toBe('mgmt_api_failed');
+      expect(result.notes).toContain('email_repair_collided');
+      expect(result.notes).toContain('collision_management_unavailable');
       expect(mockSentryCaptureException).toHaveBeenCalledTimes(1);
-      expect(mockSentryCaptureException.mock.calls[0][1].tags.reason).toBe('unique_email_collision');
-      // The occupant is untouched — releasing a dead identity's address is plan 05's job.
+      expect(mockSentryCaptureException.mock.calls[0][1].tags.reason).toBe('mgmt_api_failed');
+      // The occupant is untouched — an unconfirmable identity is never released.
       const occupant = await User.scope('withContactInfo').findOne({ where: { user_id: 'auth0|occupant' } });
       expect(occupant.email).toBe('Taken@Example.com');
+      expect(occupant.orphaned_at).toBeNull();
     });
 
     it('REPAIR: a collision on the repair UPDATE leaves the row intact and REPORTS rather than swallowing', async () => {
@@ -735,17 +740,286 @@ describe('services/provisioningService — provisionOrRepair', () => {
       const sub = 'auth0|svc-collide-repair';
       await User.create({ user_id: sub, username: 'Someone', email: syntheticFor(sub) });
 
+      // Branch (d) again — getUserById rejects, so the occupant cannot be confirmed dead.
       const result = await provision({ sub, claims: { email: 'held@example.com', email_verified: true } });
 
       expect(result.status).toBe('provisioned');
       expect(result.changed).toBe(false);
-      expect(result.reason).toBe('unique_email_collision');
+      expect(result.reason).toBe('mgmt_api_failed');
       expect(result.notes).toContain('email_repair_collided');
+      expect(result.notes).toContain('collision_management_unavailable');
       // Reloaded, so the caller never sees the rejected in-memory value.
       expect(result.user.email).toBe(syntheticFor(sub));
       const row = await User.scope('withContactInfo').findOne({ where: { user_id: sub } });
       expect(row.email).toBe(syntheticFor(sub));
-      expect(mockSentryCaptureException.mock.calls[0][1].tags.reason).toBe('unique_email_collision');
+      expect(mockSentryCaptureException.mock.calls[0][1].tags.reason).toBe('mgmt_api_failed');
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // SPEC R5 — the four collision branches (plan 05)
+  //
+  // Every case here drives a REAL 23505 through the call shape production uses
+  // (findOrCreate on the create path, instance.update on the repair path) against the
+  // suite's real Postgres. Nothing constructs an error object: a hand-built one encodes
+  // the assumption under test, which is how the shape defect survived two rounds.
+  // -----------------------------------------------------------------------
+  describe('SPEC R5 — the four collision branches', () => {
+    const ORPHAN_SUB = 'auth0|r5-dead-identity';
+    const SHARED = 'shared@example.com';
+
+    // getUserById answers PER SUB. A blanket mockResolvedValue(null) would classify
+    // every occupant as identity-gone, including the ones branches (a)/(c) need alive.
+    function mockIdentities(map) {
+      auth0Service.getUserById.mockImplementation(async (id) => {
+        if (!(id in map)) {
+          throw new Error(`unexpected getUserById(${id})`);
+        }
+        const answer = map[id];
+        if (answer instanceof Error) {
+          throw answer;
+        }
+        return answer;
+      });
+    }
+
+    // The occupant, plus one group membership. The membership is the SPEC prohibition's
+    // subject: releasing an address must not touch a single one of these rows.
+    async function seedOccupantWithGroup({ sub = ORPHAN_SUB, email = SHARED, emailChangedAt = null } = {}) {
+      const occupant = await User.create({
+        user_id: sub,
+        username: 'Occupant',
+        email,
+        email_changed_at: emailChangedAt,
+      });
+      const group = await Group.create({ name: 'Orphan Group', group_id: `orphan-grp-${Date.now()}` });
+      await UserGroup.create({
+        user_uuid: occupant.id,
+        group_id: group.id,
+        role: 'owner',
+        status: 'active',
+      });
+      return occupant;
+    }
+
+    it('branch (a): the occupying row IS the caller — same_sub, no vendor call, no write, no Sentry', async () => {
+      // WHY THIS ARM IS TESTED THROUGH resolveRepairCollision AND NOT END-TO-END, said
+      // plainly rather than papered over: under the one-row-per-sub invariant
+      // (Users.user_id is unique) a repair UPDATE cannot collide with the caller's OWN
+      // row — Postgres does not raise 23505 when a row keeps or re-takes its own key.
+      // Branch (a) is therefore a DEFENSIVE outcome of the occupant lookup, reachable
+      // only if the database moves under us. The honest test is the real classifier
+      // against real rows; fabricating a 23505 to reach the arm end-to-end would encode
+      // exactly the assumption the shape matrix exists to stop us encoding.
+      const sub = 'auth0|r5-same-sub';
+      const row = await User.scope('withContactInfo').create({
+        user_id: sub, username: 'Self', email: 'self@example.com',
+      });
+      const before = row.toJSON();
+
+      const notes = [];
+      const outcome = await provisioningService.resolveRepairCollision({
+        row, sub, changes: { email: 'Self@Example.com' }, auth0: auth0Service, notes,
+      });
+
+      expect(outcome).toEqual({ reason: null, changed: false });
+      expect(notes).toContain('collision_same_sub');
+      // No Auth0 call: we never ask the vendor about our own identity.
+      expect(auth0Service.getUserById).not.toHaveBeenCalled();
+      expect(mockSentryCaptureException).not.toHaveBeenCalled();
+      expect(updateCount).toBe(0);
+      const after = await User.scope('withContactInfo').findOne({ where: { user_id: sub } });
+      expect(after.toJSON()).toEqual(before);
+    });
+
+    it('branch (b) REPAIR: a dead occupant releases the address, keeps its groups, and the real user is repaired', async () => {
+      const occupant = await seedOccupantWithGroup();
+      const sub = 'auth0|r5-real-user';
+      await User.create({ user_id: sub, username: 'User', email: syntheticFor(sub) });
+      mockIdentities({ [ORPHAN_SUB]: null });
+
+      const result = await provision({ sub, claims: { email: SHARED, email_verified: true } });
+
+      // The real user now holds the address.
+      expect(result.status).toBe('provisioned');
+      expect(result.changed).toBe(true);
+      expect(result.user.email).toBe(SHARED);
+      expect(result.reason).toBe('orphan_released');
+      expect(result.notes).toContain('collision_orphan_released');
+
+      // The occupant released the address, is stamped, and its user-set marker is cleared.
+      const released = await User.scope('withContactInfo').findOne({ where: { user_id: ORPHAN_SUB } });
+      expect(released.email).toBe(syntheticFor(ORPHAN_SUB));
+      expect(released.orphaned_at).toBeInstanceOf(Date);
+      expect(released.email_changed_at).toBeNull();
+
+      // THE SPEC PROHIBITION, asserted rather than implied: keep the data.
+      expect(await UserGroup.count({ where: { user_uuid: occupant.id } })).toBe(1);
+      expect(await User.count({ where: { user_id: ORPHAN_SUB } })).toBe(1);
+
+      expect(mockSentryCaptureException).toHaveBeenCalledTimes(1);
+      expect(mockSentryCaptureException.mock.calls[0][1].tags.reason).toBe('orphan_released');
+    });
+
+    it('branch (b) with a NON-NULL email_changed_at on the occupant behaves identically and leaves it NULL (D-36 seam)', async () => {
+      // The case an executor would not think to seed: after SPEC A12 the occupant's
+      // stored address may be one the USER set (plan 09), so its D-36 marker is set.
+      // Leaving it set would assert "the user chose this" about a synthetic value and
+      // would make plan 04's repair guard refuse that row forever.
+      const occupant = await seedOccupantWithGroup({ emailChangedAt: new Date('2026-08-01T00:00:00Z') });
+      const sub = 'auth0|r5-real-user-2';
+      await User.create({ user_id: sub, username: 'User', email: syntheticFor(sub) });
+      mockIdentities({ [ORPHAN_SUB]: null });
+
+      const result = await provision({ sub, claims: { email: SHARED, email_verified: true } });
+
+      expect(result.user.email).toBe(SHARED);
+      expect(result.reason).toBe('orphan_released');
+      const released = await User.scope('withContactInfo').findOne({ where: { user_id: ORPHAN_SUB } });
+      expect(released.email).toBe(syntheticFor(ORPHAN_SUB));
+      expect(released.orphaned_at).toBeInstanceOf(Date);
+      expect(released.email_changed_at).toBeNull();
+      expect(await UserGroup.count({ where: { user_uuid: occupant.id } })).toBe(1);
+    });
+
+    it('branch (b) then a SECOND fetch: the real address is returned and NO further Sentry event fires', async () => {
+      await seedOccupantWithGroup();
+      const sub = 'auth0|r5-second-fetch';
+      await User.create({ user_id: sub, username: 'User', email: syntheticFor(sub) });
+      mockIdentities({ [ORPHAN_SUB]: null });
+
+      await provision({ sub, claims: { email: SHARED, email_verified: true } });
+      expect(mockSentryCaptureException).toHaveBeenCalledTimes(1);
+
+      mockSentryCaptureException.mockClear();
+      const second = await provision({ sub, claims: { email: SHARED, email_verified: true } });
+      expect(second.user.email).toBe(SHARED);
+      expect(second.changed).toBe(false);
+      expect(second.reason).toBeNull();
+      expect(mockSentryCaptureException).not.toHaveBeenCalled();
+    });
+
+    it('branch (c) REPAIR: the occupying identity EXISTS — neither row changes, genuine_conflict is reported', async () => {
+      const occupant = await seedOccupantWithGroup();
+      const sub = 'auth0|r5-conflict';
+      await User.create({ user_id: sub, username: 'User', email: syntheticFor(sub) });
+      mockIdentities({ [ORPHAN_SUB]: { user_id: ORPHAN_SUB, email: SHARED, email_verified: true } });
+
+      const result = await provision({ sub, claims: { email: SHARED, email_verified: true } });
+
+      expect(result.changed).toBe(false);
+      expect(result.user.email).toBe(syntheticFor(sub));
+      expect(result.reason).toBe('genuine_conflict');
+      expect(result.notes).toContain('collision_genuine_conflict');
+
+      const untouched = await User.scope('withContactInfo').findOne({ where: { id: occupant.id } });
+      expect(untouched.email).toBe(SHARED);
+      expect(untouched.orphaned_at).toBeNull();
+      expect(mockSentryCaptureException).toHaveBeenCalledTimes(1);
+      expect(mockSentryCaptureException.mock.calls[0][1].tags.reason).toBe('genuine_conflict');
+    });
+
+    it('branch (d) REPAIR: the Management API is unavailable — fail SAFE, treated as (c), reported mgmt_api_failed', async () => {
+      const occupant = await seedOccupantWithGroup();
+      const sub = 'auth0|r5-unavailable';
+      await User.create({ user_id: sub, username: 'User', email: syntheticFor(sub) });
+      mockIdentities({ [ORPHAN_SUB]: new Error('Failed to fetch Auth0 user: 503') });
+
+      const result = await provision({ sub, claims: { email: SHARED, email_verified: true } });
+
+      expect(result.changed).toBe(false);
+      expect(result.user.email).toBe(syntheticFor(sub));
+      expect(result.reason).toBe('mgmt_api_failed');
+      expect(result.notes).toContain('collision_management_unavailable');
+      // An address is NEVER released on a guess.
+      const untouched = await User.scope('withContactInfo').findOne({ where: { id: occupant.id } });
+      expect(untouched.email).toBe(SHARED);
+      expect(untouched.orphaned_at).toBeNull();
+      expect(mockSentryCaptureException).toHaveBeenCalledTimes(1);
+      expect(mockSentryCaptureException.mock.calls[0][1].tags.reason).toBe('mgmt_api_failed');
+    });
+
+    it('branch (b) CREATE: a first-time user takes the address a dead identity was holding', async () => {
+      const occupant = await seedOccupantWithGroup();
+      const sub = 'auth0|r5-create-orphan';
+      mockIdentities({ [ORPHAN_SUB]: null });
+
+      const result = await provision({ sub, claims: { email: SHARED, email_verified: true } });
+
+      expect(result.created).toBe(true);
+      expect(result.user.email).toBe(SHARED);
+      expect(result.outcome).toBe('created_after_orphan_release');
+      expect(result.reason).toBe('orphan_released');
+      const released = await User.scope('withContactInfo').findOne({ where: { id: occupant.id } });
+      expect(released.email).toBe(syntheticFor(ORPHAN_SUB));
+      expect(released.orphaned_at).toBeInstanceOf(Date);
+      expect(await UserGroup.count({ where: { user_uuid: occupant.id } })).toBe(1);
+      expect(mockSentryCaptureException.mock.calls[0][1].tags.reason).toBe('orphan_released');
+    });
+
+    it('branch (c) CREATE: a live occupying identity leaves the caller on the synthetic address', async () => {
+      const occupant = await seedOccupantWithGroup();
+      const sub = 'auth0|r5-create-conflict';
+      mockIdentities({ [ORPHAN_SUB]: { user_id: ORPHAN_SUB, email: SHARED, email_verified: true } });
+
+      const result = await provision({ sub, claims: { email: SHARED, email_verified: true } });
+
+      expect(result.created).toBe(true);
+      expect(result.user.email).toBe(syntheticFor(sub));
+      expect(result.reason).toBe('genuine_conflict');
+      const untouched = await User.scope('withContactInfo').findOne({ where: { id: occupant.id } });
+      expect(untouched.email).toBe(SHARED);
+      expect(untouched.orphaned_at).toBeNull();
+    });
+
+    it('CONCURRENCY: two overlapping repairs for one caller release the dead occupant exactly ONCE', async () => {
+      const occupant = await seedOccupantWithGroup();
+      const sub = 'auth0|r5-concurrent';
+      await User.create({ user_id: sub, username: 'User', email: syntheticFor(sub) });
+      mockIdentities({ [ORPHAN_SUB]: null });
+      const claims = { email: SHARED, email_verified: true };
+
+      const [a, b] = await Promise.all([
+        provisioningService.provisionOrRepair({ sub, claims }),
+        provisioningService.provisionOrRepair({ sub, claims }),
+      ]);
+
+      // Neither call is a server error.
+      expect(a.status).toBe('provisioned');
+      expect(b.status).toBe('provisioned');
+
+      const caller = await User.scope('withContactInfo').findOne({ where: { user_id: sub } });
+      expect(caller.email).toBe(SHARED);
+
+      const released = await User.scope('withContactInfo').findOne({ where: { id: occupant.id } });
+      expect(released.email).toBe(syntheticFor(ORPHAN_SUB));
+      expect(await UserGroup.count({ where: { user_uuid: occupant.id } })).toBe(1);
+
+      // Released exactly once: one orphan_released event, and the loser says so.
+      const orphanEvents = mockSentryCaptureException.mock.calls.filter(
+        ([, opts]) => opts && opts.tags && opts.tags.reason === 'orphan_released'
+      );
+      expect(orphanEvents).toHaveLength(1);
+      const outcomes = [a, b].map((r) => r.reason).sort();
+      expect(outcomes).toEqual([null, 'orphan_released']);
+      expect([...a.notes, ...b.notes]).toContain('collision_already_released');
+    });
+
+    it('SOURCE SCAN: the service can only ever release an ADDRESS — it holds no path to any other table', () => {
+      // T-88.8-23. The prohibition is "no group, event, membership, participation or
+      // friendship row is deleted, archived or reassigned"; the strongest mechanical
+      // form of that is that the service does not reference those models at all.
+      const source = fs.readFileSync(SERVICE_PATH, 'utf8');
+      const codeOnly = source
+        .split('\n')
+        .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+        .join('\n');
+      expect(codeOnly.length).toBeGreaterThan(2000); // anti-vacuity
+      for (const forbidden of ['destroy(', 'UserGroup', 'EventParticipation', 'Friendship', 'AvailabilityResponse']) {
+        expect(codeOnly).not.toContain(forbidden);
+      }
+      // orphaned_at is written, and in exactly one place.
+      expect(codeOnly.split('orphaned_at').length - 1).toBe(1);
     });
   });
 

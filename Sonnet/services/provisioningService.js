@@ -37,7 +37,10 @@
 //   - per-candidate username clamping              (utils/provisionedUsername.js)
 //   - domain-only provisioning telemetry           (utils/provisioningReport.js, D-17)
 
-const { User } = require('../models');
+// `sequelize` is imported for exactly two things, both in the SPEC R5 collision path:
+// the `lower(email)` occupant lookup and the one managed transaction that releases a
+// dead identity's address. Nothing else in this service opens a transaction.
+const { User, sequelize } = require('../models');
 const { clampProvisionedUsername } = require('../utils/provisionedUsername');
 const { SOCIAL_CONNECTION_STRATEGIES } = require('../config/auth0Claims');
 const defaultAuth0Service = require('./auth0Service');
@@ -80,6 +83,9 @@ const PROVISIONING_OUTCOMES = Object.freeze({
   CREATED_FROM_MANAGEMENT: 'created_from_management',
   CREATED_SYNTHETIC: 'created_synthetic',
   CREATED_SYNTHETIC_AFTER_COLLISION: 'created_synthetic_after_collision',
+  // SPEC R5 branch (b) on the CREATE path: the address was held by a row whose Auth0
+  // identity is gone, that row was released, and the caller got the real address.
+  CREATED_AFTER_ORPHAN_RELEASE: 'created_after_orphan_release',
   IDENTITY_GONE: 'identity_gone',
   REPAIRED: 'repaired',
   UNCHANGED: 'unchanged',
@@ -92,6 +98,14 @@ const PROVISIONING_NOTES = Object.freeze({
   EMAIL_LEFT_CLAIM_UNVERIFIED: 'email_left_claim_unverified',
   EMAIL_LEFT_MANAGEMENT_UNVERIFIED: 'email_left_management_unverified',
   EMAIL_REPAIR_COLLIDED: 'email_repair_collided',
+  // The five SPEC R5 collision outcomes. EMAIL_REPAIR_COLLIDED above still fires on
+  // every collision ("a collision happened here"); exactly one of these says how it
+  // RESOLVED, so the two are not redundant.
+  COLLISION_SAME_SUB: 'collision_same_sub',
+  COLLISION_ORPHAN_RELEASED: 'collision_orphan_released',
+  COLLISION_ALREADY_RELEASED: 'collision_already_released',
+  COLLISION_GENUINE_CONFLICT: 'collision_genuine_conflict',
+  COLLISION_MANAGEMENT_UNAVAILABLE: 'collision_management_unavailable',
   AUTH0_IDENTITY_GONE: 'auth0_identity_gone',
   MANAGEMENT_LOOKUP_FAILED: 'management_lookup_failed',
   USERNAME_REPAIRED: 'username_repaired',
@@ -407,6 +421,369 @@ function resolvePictureClaim(claims) {
 }
 
 // ---------------------------------------------------------------------------
+// SPEC R5 — the four collision branches (plan 05)
+// ---------------------------------------------------------------------------
+
+// The five outcomes of looking up who is holding a colliding address. Four are SPEC
+// R5's (a)-(d); OCCUPANT_VANISHED is the fifth real state — the constraint fired but by
+// the time we looked, nobody holds the address any more.
+const COLLISION_BRANCHES = Object.freeze({
+  SAME_SUB: 'same_sub',                            // (a)
+  IDENTITY_GONE: 'identity_gone',                  // (b)
+  GENUINE_CONFLICT: 'genuine_conflict',            // (c)
+  MANAGEMENT_UNAVAILABLE: 'management_unavailable', // (d)
+  OCCUPANT_VANISHED: 'occupant_vanished',
+});
+
+// -------------------------------------------------------------------------
+// DECISION Phase 88.8 D-15: collision detection is REACTIVE — catch the UNIQUE
+// violation, THEN look up the occupant. Chosen OVER a `SELECT ... WHERE email = ?`
+// pre-check before the write.
+//
+// The rejected pre-check is a TOCTOU window: two concurrent FIRST fetches for two
+// different subs carrying the same verified address both read "free", both write, and
+// one of them 500s anyway — so the pre-check costs a query per login and does not
+// remove the case it exists to remove. The UNIQUE constraint is the only atomic
+// arbiter of who owns an address, so the constraint firing IS the detector.
+//
+// And DECISION Phase 88.8 D-15 (second half): branch (d) FAILS SAFE — when the
+// Management API cannot confirm the occupant's identity is gone, the address is NOT
+// released. Chosen OVER optimistically releasing it. Releasing on a guess would take a
+// LIVE user's address away and hand it to a different account; `Users.email` is an
+// AUTHORIZATION gate here, not just contact data (routes/invites.js:593/:664/:757
+// accept an invite only when the addresses match), so a wrong release is a
+// cross-account grant, not an inconvenience. The cost of failing safe is that a real
+// user keeps a synthetic address until the vendor answers again, and the R6 hygiene
+// script is what makes that visible. Both halves are decisions, not cleanups.
+//
+// NOT A CONTRADICTION of the three-way claims-first rule above: that rule is about the
+// CALLER's own identity, which their token already answered. This lookup asks about a
+// DIFFERENT row's identity, which no token can answer, and it runs only after a
+// collision — never on the ordinary login path.
+// -------------------------------------------------------------------------
+
+/**
+ * Who holds `collidingEmail`, and is their Auth0 identity still alive?
+ *
+ * Looked up case-INSENSITIVELY (`lower(email)`), because the violation may have come
+ * from either constraint and `users_email_lower_unique` matches rows an `=` compare
+ * would miss. Same rule as the writer half (normaliseEmail) and the reader half
+ * (routes/friendships.js:210).
+ *
+ * Exported for tests: branch (a) is unreachable end-to-end (see resolveRepairCollision).
+ *
+ * @returns {Promise<{ branch: string, occupant: object|null, error: Error|null }>}
+ */
+async function classifyEmailCollision({ sub, collidingEmail, auth0 }) {
+  const normalised = normaliseEmail(collidingEmail);
+  if (!normalised) {
+    return { branch: COLLISION_BRANCHES.OCCUPANT_VANISHED, occupant: null, error: null };
+  }
+
+  // Scoped `withContactInfo`: the default scope EXCLUDES `email`, so a default-scope
+  // read returns an instance whose `email` is undefined — the exact defect
+  // routes/users.js:304-315 records, and it would make every comparison below false.
+  const occupant = await User.scope('withContactInfo').findOne({
+    where: sequelize.where(sequelize.fn('lower', sequelize.col('email')), normalised),
+  });
+
+  if (!occupant) {
+    return { branch: COLLISION_BRANCHES.OCCUPANT_VANISHED, occupant: null, error: null };
+  }
+  if (occupant.user_id === sub) {
+    // (a) It is us. Never ask the vendor about our own identity here.
+    return { branch: COLLISION_BRANCHES.SAME_SUB, occupant, error: null };
+  }
+
+  try {
+    const identity = await auth0.getUserById(occupant.user_id);
+    // services/auth0Service.js:194-196 returns null ONLY on a hard 404 — the identity
+    // is GONE. Anything else means it exists.
+    return {
+      branch: identity === null ? COLLISION_BRANCHES.IDENTITY_GONE : COLLISION_BRANCHES.GENUINE_CONFLICT,
+      occupant,
+      error: null,
+    };
+  } catch (lookupFailed) {
+    // (d) We cannot tell (b) from (c). Fail safe.
+    return { branch: COLLISION_BRANCHES.MANAGEMENT_UNAVAILABLE, occupant, error: lookupFailed };
+  }
+}
+
+/**
+ * Branch (b): release a dead identity's address and complete the real user's work in
+ * ONE transaction, so the address is never briefly unowned for a third writer.
+ *
+ * Locking idiom copied from services/accountDeletionService.js:117-141 /:596-607: take
+ * `FOR UPDATE` on the row we are about to mutate and hold it for the rest of the
+ * transaction.
+ *
+ * THE IN-LOCK RE-READ, and why it is NOT the pre-check D-15 forbids: the identity-gone
+ * decision above was taken on an UNLOCKED read, and two requests for the same caller can
+ * both reach it before either commits (plan 04's concurrency backstop fires two
+ * provisionOrRepair calls for one sub, and the frontend self-fetch has several mount
+ * points). So we re-read the occupant UNDER THE LOCK and abort if it no longer holds the
+ * address. D-15 forbids a SELECT taken BEFORE the constraint fires, as a substitute for
+ * it; this is a re-check AFTER it fired, with the row locked. Different thing, opposite
+ * direction.
+ *
+ * @param {{ occupantId: string, collidingEmail: string,
+ *           complete: (t: import('sequelize').Transaction) => Promise<any> }} args
+ * @returns {Promise<{ released: boolean, completed: any }>}
+ */
+async function releaseOrphanAndComplete({ occupantId, collidingEmail, complete }) {
+  return sequelize.transaction(async (t) => {
+    const locked = await User.scope('withContactInfo').findOne({
+      where: { id: occupantId },
+      transaction: t,
+      lock: t.LOCK.UPDATE,
+    });
+
+    if (!locked || normaliseEmail(locked.email) !== normaliseEmail(collidingEmail)) {
+      // Another request released it first (or it moved). Do not release twice.
+      return { released: false, completed: null };
+    }
+
+    await locked.update(
+      {
+        // ITS OWN synthetic address, built by the same helper every other mint uses —
+        // never a random value, so the row stays identifiable and idempotent.
+        email: syntheticEmailFor(locked.user_id),
+        orphaned_at: new Date(),
+        // DECISION Phase 88.8 D-36 (the 2026-09-03 replan's seam): the release CLEARS
+        // email_changed_at in the same UPDATE. Chosen OVER leaving it set and treating
+        // the row as user-owned.
+        //
+        // After SPEC A12 the address we are overwriting may be one the USER set
+        // themselves (plan 09), in which case this marker is non-null. Leaving it set
+        // would assert "the user chose this address" about a <sub>@auth0.local value
+        // nobody chose — and plan 04's repair guard READS this marker to decide whether
+        // it may repair a row at all (see the D-36 block in repairExistingRow), so the
+        // row would become permanently unrepairable and would sit in the R6 hygiene
+        // report's synthetic class forever with no path out.
+        //
+        // This is not a policy claim about the user's intent; it is keeping the marker's
+        // meaning TRUE. The occupant is by definition a row whose Auth0 identity is
+        // gone, so nobody can sign in to object.
+        email_changed_at: null,
+      },
+      { transaction: t }
+    );
+
+    // TOUCH NOTHING ELSE. SPEC R5's prohibition and the owner's ruling are "release the
+    // address, keep the data": no group, event, membership, participation or friendship
+    // row may be deleted, archived or reassigned. This service references none of those
+    // models at all, which is the strongest form of that guarantee, and a source scan in
+    // tests/services/provisioningService.test.js asserts it.
+    const completed = await complete(t);
+    return { released: true, completed };
+  });
+}
+
+/**
+ * The collision resolver for the REPAIR path. Returns what the caller should report;
+ * it never throws for a collision it understands.
+ *
+ * Exported for tests. Branch (a) cannot be reached end-to-end: `Users.user_id` is
+ * unique, so a repair UPDATE cannot collide with the caller's OWN row (Postgres does
+ * not raise 23505 when a row keeps or re-takes its own key). It is a defensive outcome
+ * of the occupant lookup, reachable only if the database moves under us — and the
+ * honest way to test it is the real classifier against real rows, not a fabricated
+ * 23505 that would encode the assumption under test.
+ *
+ * @returns {Promise<{ reason: string|null, changed: boolean }>}
+ */
+async function resolveRepairCollision({ row, sub, changes, auth0, notes }) {
+  const collidingEmail = changes.email;
+
+  // Defensive: a unique-email violation on an UPDATE that carried no email change is a
+  // collision we did not cause and cannot resolve. Report it rather than guessing.
+  if (!collidingEmail) {
+    await row.reload();
+    notes.push(PROVISIONING_NOTES.COLLISION_GENUINE_CONFLICT);
+    return { reason: PROVISIONING_REASONS.GENUINE_CONFLICT, changed: false };
+  }
+
+  // Retry the repair once — used when the address turns out to be free after all.
+  const retryOnce = async () => {
+    try {
+      await row.reload();
+      await row.update(changes);
+      notes.push(PROVISIONING_NOTES.COLLISION_ALREADY_RELEASED);
+      return { reason: null, changed: true };
+    } catch (retryFailed) {
+      if (!isEmailCollision(retryFailed)) {
+        throw retryFailed;
+      }
+      await row.reload();
+      notes.push(PROVISIONING_NOTES.COLLISION_GENUINE_CONFLICT);
+      return { reason: PROVISIONING_REASONS.GENUINE_CONFLICT, changed: false };
+    }
+  };
+
+  const { branch, occupant, error } = await classifyEmailCollision({ sub, collidingEmail, auth0 });
+
+  if (branch === COLLISION_BRANCHES.SAME_SUB) {
+    // (a) Nothing to resolve. No write, no report — nothing fell back.
+    await row.reload();
+    notes.push(PROVISIONING_NOTES.COLLISION_SAME_SUB);
+    return { reason: null, changed: false };
+  }
+
+  if (branch === COLLISION_BRANCHES.OCCUPANT_VANISHED) {
+    return retryOnce();
+  }
+
+  if (branch === COLLISION_BRANCHES.IDENTITY_GONE) {
+    try {
+      const { released } = await releaseOrphanAndComplete({
+        occupantId: occupant.id,
+        collidingEmail,
+        complete: async (t) => {
+          // Re-read inside the transaction so Sequelize issues a real UPDATE rather
+          // than reasoning from the in-memory values the failed save left behind.
+          await row.reload({ transaction: t });
+          await row.update(changes, { transaction: t });
+        },
+      });
+
+      if (released) {
+        notes.push(PROVISIONING_NOTES.COLLISION_ORPHAN_RELEASED);
+        return { reason: PROVISIONING_REASONS.ORPHAN_RELEASED, changed: true };
+      }
+
+      // Someone else released it first. If they also completed OUR repair (the two
+      // concurrent callers case), we are done and there is nothing to report — a second
+      // orphan_released event would double-count one release.
+      await row.reload();
+      if (normaliseEmail(row.email) === normaliseEmail(collidingEmail)) {
+        notes.push(PROVISIONING_NOTES.COLLISION_ALREADY_RELEASED);
+        return { reason: null, changed: false };
+      }
+      return retryOnce();
+    } catch (releaseFailed) {
+      if (!isEmailCollision(releaseFailed)) {
+        throw releaseFailed;
+      }
+      // A collision raised INSIDE the collision handler must never become a 500. Treat
+      // it exactly as branch (c): both rows keep what they have.
+      await row.reload();
+      notes.push(PROVISIONING_NOTES.COLLISION_GENUINE_CONFLICT);
+      return { reason: PROVISIONING_REASONS.GENUINE_CONFLICT, changed: false };
+    }
+  }
+
+  // (c) and (d): both rows untouched, the caller keeps what it has.
+  await row.reload();
+  if (branch === COLLISION_BRANCHES.MANAGEMENT_UNAVAILABLE) {
+    notes.push(PROVISIONING_NOTES.COLLISION_MANAGEMENT_UNAVAILABLE);
+    return { reason: PROVISIONING_REASONS.MGMT_API_FAILED, changed: false, error };
+  }
+  notes.push(PROVISIONING_NOTES.COLLISION_GENUINE_CONFLICT);
+  return { reason: PROVISIONING_REASONS.GENUINE_CONFLICT, changed: false };
+}
+
+/**
+ * The same four branches on the CREATE path.
+ *
+ * The tail after (c) and (d) is today's SHIPPED graceful behaviour
+ * (routes/groups.js:834-847, pinned by tests/routes/groups.test.js:236-252): retry with
+ * the synthetic address so a legitimate first-time user still gets an account. It must
+ * stay observable even before plan 06 rewires that route.
+ *
+ * @returns {Promise<{ row: object, created: boolean, reason: string|null,
+ *                     outcome: string|null, error: Error|null }>}
+ *   `outcome: null` means "the caller's original outcome still stands".
+ */
+async function resolveCreateCollision({ sub, defaults, collidingEmail, auth0, notes }) {
+  const withRealAddress = async () => {
+    const [r, c] = await User.scope('withContactInfo').findOrCreate({
+      where: { user_id: sub },
+      defaults,
+    });
+    return { row: r, created: c };
+  };
+
+  const syntheticTail = async (reason, error) => {
+    const [r, c] = await User.scope('withContactInfo').findOrCreate({
+      where: { user_id: sub },
+      defaults: { ...defaults, email: syntheticEmailFor(sub) },
+    });
+    return {
+      row: r,
+      created: c,
+      reason,
+      outcome: PROVISIONING_OUTCOMES.CREATED_SYNTHETIC_AFTER_COLLISION,
+      error: error || null,
+    };
+  };
+
+  const retryOnce = async () => {
+    try {
+      const { row, created } = await withRealAddress();
+      notes.push(PROVISIONING_NOTES.COLLISION_ALREADY_RELEASED);
+      return { row, created, reason: null, outcome: null, error: null };
+    } catch (retryFailed) {
+      if (!isEmailCollision(retryFailed)) {
+        throw retryFailed;
+      }
+      notes.push(PROVISIONING_NOTES.COLLISION_GENUINE_CONFLICT);
+      return syntheticTail(PROVISIONING_REASONS.GENUINE_CONFLICT);
+    }
+  };
+
+  const { branch, occupant, error } = await classifyEmailCollision({ sub, collidingEmail, auth0 });
+
+  // (a) on the create path means a row for this sub appeared between the concurrency
+  // backstop's re-find and here. There is nothing to release — take the address if it
+  // is free, and let the !created path hand the row to the repair rules.
+  if (branch === COLLISION_BRANCHES.SAME_SUB || branch === COLLISION_BRANCHES.OCCUPANT_VANISHED) {
+    return retryOnce();
+  }
+
+  if (branch === COLLISION_BRANCHES.IDENTITY_GONE) {
+    try {
+      const { released, completed } = await releaseOrphanAndComplete({
+        occupantId: occupant.id,
+        collidingEmail,
+        complete: async (t) =>
+          User.scope('withContactInfo').findOrCreate({
+            where: { user_id: sub },
+            defaults,
+            transaction: t,
+          }),
+      });
+
+      if (released) {
+        const [r, c] = completed;
+        notes.push(PROVISIONING_NOTES.COLLISION_ORPHAN_RELEASED);
+        return {
+          row: r,
+          created: c,
+          reason: PROVISIONING_REASONS.ORPHAN_RELEASED,
+          outcome: PROVISIONING_OUTCOMES.CREATED_AFTER_ORPHAN_RELEASE,
+          error: null,
+        };
+      }
+      return retryOnce();
+    } catch (releaseFailed) {
+      if (!isEmailCollision(releaseFailed)) {
+        throw releaseFailed;
+      }
+      notes.push(PROVISIONING_NOTES.COLLISION_GENUINE_CONFLICT);
+      return syntheticTail(PROVISIONING_REASONS.GENUINE_CONFLICT);
+    }
+  }
+
+  if (branch === COLLISION_BRANCHES.MANAGEMENT_UNAVAILABLE) {
+    notes.push(PROVISIONING_NOTES.COLLISION_MANAGEMENT_UNAVAILABLE);
+    return syntheticTail(PROVISIONING_REASONS.MGMT_API_FAILED, error);
+  }
+  notes.push(PROVISIONING_NOTES.COLLISION_GENUINE_CONFLICT);
+  return syntheticTail(PROVISIONING_REASONS.GENUINE_CONFLICT);
+}
+
+// ---------------------------------------------------------------------------
 // The public entry point
 // ---------------------------------------------------------------------------
 
@@ -612,20 +989,19 @@ async function createRow({
       row = raced;
       created = false;
     } else if (isEmailCollision(createFailed)) {
-      // PLACEHOLDER, and deliberately narrow — plan 05 replaces this with the four SPEC
-      // R5 orphan branches (look up the occupant, release a dead identity's address,
-      // report genuine_conflict otherwise). Until then this is the shipped graceful tail
-      // from routes/groups.js:834-847: retry with the synthetic address so a legitimate
-      // first-time user still provisions instead of hitting a raw 500. D-13 requires it
-      // for tests/routes/groups.test.js:236-252 to stay green when plan 06 routes the
-      // join path through here.
-      reason = PROVISIONING_REASONS.UNIQUE_EMAIL_COLLISION;
-      outcome = PROVISIONING_OUTCOMES.CREATED_SYNTHETIC_AFTER_COLLISION;
+      // SPEC R5, all four branches (plan 05). The address we tried to take is
+      // `emailToPersist`; who holds it decides what happens next.
       notes.push(PROVISIONING_NOTES.EMAIL_REPAIR_COLLIDED);
-      [row, created] = await User.scope('withContactInfo').findOrCreate({
-        where: { user_id: sub },
-        defaults: { ...defaults, email: syntheticEmailFor(sub) },
+      const resolved = await resolveCreateCollision({
+        sub, defaults, collidingEmail: emailToPersist, auth0, notes,
       });
+      row = resolved.row;
+      created = resolved.created;
+      reason = resolved.reason;
+      // null means "the outcome computed above still stands" (the retry took the real
+      // address, so nothing fell back).
+      outcome = resolved.outcome || outcome;
+      fallbackError = resolved.error || fallbackError;
     } else {
       throw createFailed;
     }
@@ -850,15 +1226,17 @@ async function repairExistingRow({
       console.log(`[users:provision] repaired user ${row.id} fields=${Object.keys(changes).sort().join(',')}`);
     } catch (repairFailed) {
       if (isEmailCollision(repairFailed)) {
-        // PLACEHOLDER — plan 05 replaces this with the four SPEC R5 orphan branches.
-        // Until then the difference from today is that this REPORTS rather than being
-        // swallowed by a console warning (routes/users.js:472-478), so a real user whose
-        // address is held by a dead row is at least visible.
-        reason = PROVISIONING_REASONS.UNIQUE_EMAIL_COLLISION;
+        // SPEC R5, all four branches (plan 05). Before this, routes/users.js:472-478
+        // swallowed this in a console warning, so a real user whose address was held by
+        // a dead row kept the synthetic address forever with no signal anywhere.
+        //
+        // Every arm below reloads the row: the instance holds the REJECTED values in
+        // memory after a failed save, so the caller must never be handed it unreloaded.
         notes.push(PROVISIONING_NOTES.EMAIL_REPAIR_COLLIDED);
-        // The instance holds the rejected values in memory after a failed save; reload
-        // so the caller is handed the row as it actually is in the database.
-        await row.reload();
+        const resolved = await resolveRepairCollision({ row, sub, changes, auth0, notes });
+        reason = resolved.reason;
+        changed = resolved.changed;
+        fallbackError = resolved.error || fallbackError;
       } else {
         throw repairFailed;
       }
@@ -889,6 +1267,14 @@ module.exports = {
   // tests/unit/provisioningCollision.test.js.
   isEmailCollision,
   EMAIL_UNIQUE_CONSTRAINTS,
+  // Exported for tests ONLY. Branch (a) of SPEC R5 is unreachable end-to-end under the
+  // one-row-per-sub invariant (see the resolveRepairCollision header), so the only
+  // honest way to pin it is to call the resolver against real rows. No production
+  // caller outside this file may use either of these — the entry point is
+  // provisionOrRepair.
+  resolveRepairCollision,
+  classifyEmailCollision,
+  COLLISION_BRANCHES,
   PROVISIONING_OUTCOMES,
   PROVISIONING_NOTES,
 };
