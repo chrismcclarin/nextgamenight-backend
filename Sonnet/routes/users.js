@@ -9,8 +9,11 @@ const { requireParamMatchesToken, matchesSelf } = require('../middleware/objectA
 // Phase 87.4 Plan 02 (KEYMISS mitigation): resolve a UUID self-param to the
 // sub-keyed Users row.
 const { isUuid } = require('../utils/resolveTargetUser');
-const { clampProvisionedUsername } = require('../utils/provisionedUsername');
-const auth0Service = require('../services/auth0Service');
+// Phase 88.8 plan 04 (D-13): the JIT provisioning + repair policy moved to this service.
+// The `clampProvisionedUsername` and `auth0Service` imports that used to sit here went
+// with it — this file no longer derives a username or calls the Auth0 Management API at
+// any point. Verified dead before removal (grep, 2026-09-04), not removed on assumption.
+const provisioningService = require('../services/provisioningService');
 const smsService = require('../services/smsService');
 const accountDeletionService = require('../services/accountDeletionService');
 const { sendError } = require('../utils/errors');
@@ -187,294 +190,79 @@ router.get('/:user_id', requireParamMatchesToken('user_id'), async (req, res) =>
           include: [{ model: Group }],
         });
     
-    // Only auto-create if:
-    // 1. User doesn't exist in our database
-    // 2. Request has authenticated user info (valid Auth0 token)
-    // 3. The authenticated user_id matches the requested user_id
-    // SECURITY: The verifyAuth0Token middleware ensures they exist in Auth0 (token is signed by Auth0)
-    // A valid Auth0 token can ONLY be issued by Auth0, which means the user MUST exist in Auth0
-    // Therefore, we can safely create them in our database
-    if (!user && req.user && req.user.user_id === req.params.user_id) {
-      // SPEC Req 6 (tombstone guard): a still-valid access token whose Auth0 identity
-      // was deleted must NOT JIT re-create the Users row (Auth0 deletion does not revoke
-      // issued tokens for up to ~24h). Refuse with the pinned 410 account_deleted envelope
-      // — the SAME shape as repeat DELETE — and create nothing.
-      if (await PendingAuth0Deletion.isTombstoned(req.params.user_id)) {
+    // SECURITY (unchanged, and the reason auto-creation is safe at all): the
+    // verifyAuth0Token middleware proves the caller exists in Auth0, because a valid
+    // access token can only be issued by Auth0; requireParamMatchesToken above proves the
+    // target is the caller themselves. Both hold before the delegate below runs.
+    // -----------------------------------------------------------------------
+    // Phase 88.8 plan 04 (D-13; SPEC R2, R3, R4 and the storage half of R11).
+    //
+    // The ENTIRE just-in-time provisioning and repair policy that used to live inline
+    // here — the claims-first three-way rule, the Auth0 Management fallback, the
+    // username chain with its Phase 88-34 clamp DECISION block, the synthetic-address
+    // mint, the verified-email posture, the picture_url cadence, and BOTH of the two
+    // Management repair sites this handler used to carry — now lives in
+    // services/provisioningService.js. This handler is a thin delegate, the shape the
+    // shipped DELETE /me at :93-130 established. Every DECISION marker that explained
+    // the old code MOVED WITH IT. Do not re-inline any of it here.
+    //
+    // KEY ON THE TOKEN SUB (req.user.user_id), NEVER req.params.user_id.
+    // This route is gated by requireParamMatchesToken('user_id'), whose UUID arm
+    // (middleware/objectAuth.js:59-84) accepts the caller's OWN Users.id UUID as well as
+    // their Auth0 sub, and the self-read above resolves that shape deliberately (Phase
+    // 87.4 M-4, the KEYMISS path). The service keys findOrCreate on Users.user_id, which
+    // holds SUBS — handing it a UUID would miss, mint a brand-new UUID-keyed row, and
+    // return that row to the caller as their own profile: exactly the class-2 hygiene row
+    // plan 05's report exists to find. The gate has ALREADY proved the param is the
+    // caller's identity in one keyspace or the other, so the token sub is the only value
+    // that can correctly key Users.user_id. The analogue site records the same intent in
+    // shipped code — routes/events.js:193-195. (The two `req.user.user_id ===
+    // req.params.user_id` guards that used to wrap the create and repair branches were
+    // what kept a UUID param out of them; they are gone with the branches, and this rule
+    // is what replaces them.)
+    // -----------------------------------------------------------------------
+    if (req.user && req.user.user_id) {
+      if (!user) {
+        // SPEC Req 6 (tombstone guard): a still-valid access token whose Auth0 identity
+        // was deleted must NOT JIT re-create the Users row (Auth0 deletion does not
+        // revoke issued tokens for up to ~24h). Refuse with the pinned 410
+        // account_deleted envelope — the SAME shape as repeat DELETE — and create
+        // nothing. Runs BEFORE the service and only on the no-row path, exactly as
+        // before, and keys on the SUB because PendingAuth0Deletion keys on auth0_sub: a
+        // UUID here would make the whole check a silent no-op.
+        if (await PendingAuth0Deletion.isTombstoned(req.user.user_id)) {
+          return sendError(res, 'account_deleted');
+        }
+      }
+
+      const provisioned = await provisioningService.provisionOrRepair({
+        sub: req.user.user_id,
+        claims: req.user,
+        detectedTimezone,
+      });
+
+      if (provisioned.status === 'identity_gone') {
+        // Phase 87.2 SPEC Req 6, preserved exactly: getUserById returned null (a hard
+        // 404), so the Auth0 identity was DELETED from the dashboard. Nothing is
+        // re-materialised. Only the CREATE path can produce this — on the repair path a
+        // null Management result deliberately leaves a live user's row alone rather than
+        // signing them out; see the DECISION marker in the service.
         return sendError(res, 'account_deleted');
       }
 
-      // Start with username from token (for email/password users, this is what they entered during signup)
-      // Wave-12 review HIGH #2 (extends fork D): clamp per-candidate — see
-      // utils/provisionedUsername.js. A whitespace-only claim returns null and
-      // falls through; the final 'User' literal guarantees the min-1 bound.
-      let userName = clampProvisionedUsername(req.user.username)
-        || clampProvisionedUsername(req.user.name)
-        || clampProvisionedUsername(req.user.nickname)
-        || clampProvisionedUsername(req.user.given_name)
-        || clampProvisionedUsername(req.user.email?.split('@')[0])
-        || 'User';
-      let userEmail = req.user.email;
-
-      // ---------------------------------------------------------------------
-      // Phase 88.8 / BOPS-05 (SPEC R2) — CLAIMS-FIRST provisioning.
-      //
-      // The Auth0 post-login Action (auth0/actions/post-login-claims.js) now puts the
-      // email and its verification state on the access token itself, so the Management
-      // API is consulted ONLY when those claims are absent. That Management call is
-      // what has been 403ing since 2026-04 (the audience was built from the CUSTOM
-      // login domain — see .planning/.../88.8-CONFIG-FINDING.md), which is why every
-      // account provisioned between 2026-04 and 2026-09 was given a synthetic
-      // <sub>@auth0.local address instead of the person's real one. Getting that call
-      // off the first-login critical path is the whole point of BOPS-05.
-      //
-      // The three-way rule (plan 04 lifts this into services/provisioningService.js;
-      // the assertions in tests/routes/users.claimsFirst.test.js pin all three arms and
-      // are written to survive that move unchanged):
-      //   1. claim present AND verified  -> adopt it; ZERO Management calls
-      //   2. claim present, NOT verified -> adopt NOTHING, so the synthetic mint below
-      //      fires; still ZERO Management calls. A present-but-unverified claim is not
-      //      a reason to phone the vendor, and must never land in Users.email.
-      //   3. claim absent                -> the Management lookup runs, unchanged.
-      //
-      // DECISION Phase 88.8: claims-first, chosen OVER keeping a Management call on the
-      // first-login critical path purely to preserve the Phase 87.2 SPEC Req 6
-      // identity-gone 410 in arm 3 below. That guard fires when getUserById returns
-      // null (a hard 404 = the Auth0 identity was DELETED from the dashboard) and
-      // refuses to re-materialise the row; on arms 1 and 2 it cannot run, because the
-      // Management API is never called.
-      // The residual is bounded, and is recorded here rather than glossed: a token
-      // carrying claims proves the identity existed at mint time, so the only exposure
-      // is an identity deleted from the dashboard AFTER its token was minted and within
-      // that token's remaining lifetime. Such a row is created with its own real
-      // verified address (no privilege gain; the unverified arm yields the synthetic
-      // address, which is LESS exposure than today) and is listed by the R6 hygiene
-      // script's "Auth0 identity gone" class. The rejected alternative is named because
-      // it re-introduces exactly the vendor dependency BOPS-05 exists to remove.
-      // The tombstone check (PendingAuth0Deletion.isTombstoned, above) still runs on
-      // BOTH paths and is untouched. Changing this is a decision, not a cleanup.
-      // ---------------------------------------------------------------------
-      const claimEmailPresent =
-        typeof req.user.email === 'string' &&
-        req.user.email.trim().length > 0 &&
-        !req.user.email.includes('@auth0.local') &&
-        !req.user.email.includes('@auth0');
-
-      if (claimEmailPresent) {
-        // Arms 1 and 2. `=== true` is deliberate: the middleware defaults an ABSENT
-        // verification claim to false, and no other truthy shape counts as proof.
-        userEmail = req.user.email_verified === true ? req.user.email : null;
-      } else {
-        // Arm 3 — byte-for-byte the pre-88.8 path.
-        // ALWAYS try to fetch from Auth0 Management API if we have credentials
-        // This ensures we get the username they entered during signup (for email/password users)
-        // Even if email is in token, username might not be, so we need Management API
-        try {
-          const auth0User = await auth0Service.getUserById(req.params.user_id);
-          if (auth0User === null) {
-            // SPEC Req 6: getUserById returns null ONLY on a 404 — the Auth0 identity is
-            // GONE (deleted). Refuse to re-provision from token claims; a deleted identity
-            // must never re-materialize email/username as a fresh Users row. (Management-API
-            // *errors* throw and are handled by the catch below as the optional-lookup path.)
-            return sendError(res, 'account_deleted');
-          }
-          if (auth0User) {
-            // User exists in Auth0 (verified), safe to use their details
-            const userDetails = auth0Service.extractUserDetails(auth0User);
-
-            // Always use email from Management API if available and valid
-            if (userDetails.email && !userDetails.email.includes('@auth0.local') && !userDetails.email.includes('@auth0')) {
-              userEmail = userDetails.email;
-            }
-
-            // Always use username from Management API if available and not generic
-            // This is critical for email/password users who entered a username during signup
-            const mgmtUsername = clampProvisionedUsername(userDetails.username);
-            if (mgmtUsername && mgmtUsername !== 'User') {
-              userName = mgmtUsername;
-            }
-          }
-        } catch (auth0Error) {
-          // If Management API is not configured or fails, log and continue with token data
-          // This allows the system to work without Management API (with reduced functionality)
-          console.warn('Auth0 Management API lookup failed during user creation (this is optional):', auth0Error.message);
-          if (process.env.NODE_ENV === 'development') {
-            console.log('Falling back to token data. Make sure AUTH0_MANAGEMENT_CLIENT_ID and AUTH0_MANAGEMENT_CLIENT_SECRET are set for full functionality.');
-          }
-        }
-      }
-      
-      // Improve username extraction for email/password users
-      if (!userEmail || userEmail.includes('@auth0.local') || userEmail.includes('@auth0')) {
-        // Fallback: construct email from user_id if still missing
-        userEmail = `${req.params.user_id.replace(/[|:]/g, '-')}@auth0.local`;
-      }
-      
-      // If username is still generic, try to extract from email
-      if (userName === 'User' && userEmail && !userEmail.includes('@auth0.local') && !userEmail.includes('@auth0')) {
-        userName = clampProvisionedUsername(userEmail.split('@')[0]) || userName;
-      }
-
-      // Combine given_name and family_name if available
-      if (req.user.given_name || req.user.family_name) {
-        const fullName = [req.user.given_name, req.user.family_name].filter(Boolean).join(' ').trim();
-        if (fullName) {
-          userName = clampProvisionedUsername(fullName) || userName;
-        }
-      }
-      
-      // DECISION Phase 88-34 Task 4 (fork D, owner-ruled 2026-08-20): CLAMP the
-      // derived username at this writer, over dropping the User.username
-      // len[1,50] model backstop.
-      //
-      // This is the ONE writer that legitimately receives input it does not
-      // control: the value above comes from Auth0 (token claims, then the
-      // Management API, then given_name + family_name which OVERRIDES
-      // everything at :257-262). Real people have full names longer than 50
-      // characters. With the model backstop and without this clamp, their very
-      // FIRST LOGIN 500s and they can never get an account — an outage with no
-      // user-side workaround.
-      //
-      // Clamp rather than reject, because a human's legal name is not invalid
-      // input; and clamp HERE rather than widening/removing the backstop,
-      // because the backstop is what protects every OTHER (human-entered,
-      // already route-validated) write path. Trim first so the 50 characters
-      // are 50 real characters, not padding.
-      //
-      // Applies to BOTH write paths below — the findOrCreate defaults AND the
-      // !created needsUpdate branch. Test-pinned (a >50-char Auth0 full name
-      // must provision successfully with a 50-char username).
-      //
-      // AMENDED (wave-12 review HIGH #2, owner-approved 2026-08-21): the chain
-      // above now clamps PER-CANDIDATE via the shared
-      // utils/provisionedUsername.js helper — the review found 8 more unclamped
-      // machine-derived writers shipping the same outage this comment warns
-      // about, so the mechanism moved to a util applied at every one. This line
-      // stays as the final belt for this writer's two paths.
-      const clampedUserName = clampProvisionedUsername(userName) || 'User';
-
-      try {
-        // Phase 88-34 (Rule 1, found by the fork-D !created test): this was a
-        // bare `User.findOrCreate`, so the returned instance came back under the
-        // DEFAULT SCOPE — which EXCLUDES `email` (models/User.js defaultScope,
-        // BSEC-01 D-03). The `!created` repair branch below then evaluated
-        // `newUser.email.includes('@auth0.local')` on `undefined` and THREW
-        // ("Cannot read properties of undefined"), so that entire
-        // fix-a-wrong-email/username path has been dead: every run fell into the
-        // catch, re-fetched, and returned the row unrepaired. Scoping the find
-        // half to withContactInfo loads `email` and makes the branch do what it
-        // has always claimed to do. Test-pinned below.
-        const [newUser, created] = await User.scope('withContactInfo').findOrCreate({
-          where: { user_id: req.params.user_id },
-          defaults: {
-            user_id: req.params.user_id,
-            email: userEmail,
-            username: clampedUserName,
-            // TZ-01: persist browser-detected timezone on first creation if supplied.
-            // If detectedTimezone is null we DELIBERATELY omit the key so Sequelize
-            // applies the model defaultValue (null per migration 78-01) — sending
-            // `timezone: null` explicitly would risk a future model default of 'UTC'
-            // sneaking back in undetected. Absence is the safest signal.
-            ...(detectedTimezone ? { timezone: detectedTimezone } : {}),
-          }
+      if (!user) {
+        // First provisioning: respond with the row the SERVICE returns, so a UUID-keyed
+        // self-read and a sub-keyed one return the same row.
+        user = provisioned.user;
+      } else if (provisioned.changed) {
+        // A repair landed. Re-read with the Group include so the response keeps the
+        // association the initial self-read carried — the same reload the old repair
+        // block performed after an update.
+        // BSEC-01 (D-03): withContactInfo — own profile returned with email.
+        user = await User.scope('withContactInfo').findOne({
+          where: { user_id: req.user.user_id },
+          include: [{ model: Group }],
         });
-        
-        // If user already existed but has wrong email/username, update them
-        if (!created) {
-          // Rule 1 (Phase 88.8 plan 01, found by tests/routes/users.test.js:248):
-          // `userEmail` may legitimately be the SYNTHETIC <sub>@auth0.local address by
-          // the time we get here — the claims-first rule mints it for a present-but-
-          // unverified claim, and the pre-88.8 path already minted it whenever the
-          // Management lookup failed. Writing that over a row that already holds a REAL
-          // address is data loss: it replaces a usable email with a placeholder, and
-          // friend-search-by-email then cannot find the person. The old condition guarded
-          // the SOURCE row (`newUser.email` not synthetic) but never the VALUE being
-          // written, so this branch could downgrade a good address to a synthetic one.
-          // Only ever write a real address; a synthetic one is a no-op for the email arm.
-          const emailIsReal =
-            typeof userEmail === 'string' &&
-            userEmail.length > 0 &&
-            !userEmail.includes('@auth0.local') &&
-            !userEmail.includes('@auth0');
-
-          const needsUpdate =
-            (emailIsReal && newUser.email !== userEmail && !newUser.email.includes('@auth0.local') && !newUser.email.includes('@auth0')) ||
-            (newUser.username === 'User' && clampedUserName !== 'User');
-
-          if (needsUpdate) {
-            await newUser.update({
-              ...(emailIsReal ? { email: userEmail } : {}),
-              username: clampedUserName
-            });
-            // Phase 88-34 (r3 triage #7): log the row ID, never the identity.
-            // This line used to print the user's EMAIL and USERNAME to stdout,
-            // i.e. into Railway's log retention, on every provisioning update.
-            // Log ids, not identities.
-            console.log(`[users:provision] updated contact fields for user ${newUser.id}`);
-          }
-        } else {
-          // Phase 88-34 (r3 triage #7): same — id only, no email/username.
-          console.log(`[users:provision] auto-created user ${newUser.id}`);
-        }
-        
-        user = newUser;
-      } catch (error) {
-        // If creation fails (e.g., email already exists), try to find the user
-        console.error('Error auto-creating user:', error.message);
-        // BSEC-01 (D-03): withContactInfo — same self-profile read as above.
-        user = await User.scope('withContactInfo').findOne({ where: { user_id: req.params.user_id } });
-        if (!user) {
-          throw error; // Re-throw if we still can't find/create the user
-        }
-      }
-    }
-    
-    // If user exists but has incorrect email/username, try to fix it
-    // This handles cases where users were created before we had proper email extraction
-    if (user && req.user && req.user.user_id === req.params.user_id) {
-      const hasIncorrectEmail = user.email && (user.email.includes('@auth0.local') || user.email.includes('@auth0'));
-      const hasGenericUsername = user.username === 'User' || !user.username || user.username.trim().length === 0;
-      
-      if (hasIncorrectEmail || hasGenericUsername) {
-        // ALWAYS try Auth0 Management API to get correct data
-        // This is especially important for email/password users with username from signup
-        try {
-          const auth0User = await auth0Service.getUserById(req.params.user_id);
-          if (auth0User) {
-            const userDetails = auth0Service.extractUserDetails(auth0User);
-            
-            const updateData = {};
-            
-            // Update email if incorrect
-            if (hasIncorrectEmail && userDetails.email && !userDetails.email.includes('@auth0.local') && !userDetails.email.includes('@auth0')) {
-              updateData.email = userDetails.email;
-            }
-            
-            // Update username if generic or missing. Wave-12 review HIGH #2:
-            // clamped — unclamped, a >50-char Management-API username threw
-            // here and the outer catch swallowed it, silently killing the repair.
-            const repairedUsername = clampProvisionedUsername(userDetails.username);
-            if (hasGenericUsername && repairedUsername && repairedUsername !== 'User') {
-              updateData.username = repairedUsername;
-            }
-            
-            if (Object.keys(updateData).length > 0) {
-              await user.update(updateData);
-              console.log(`Fixed user ${user.user_id} with Management API data:`, updateData);
-              // Reload user to get updated data.
-              // BSEC-01 (D-03): withContactInfo — own profile returned with email.
-              user = await User.scope('withContactInfo').findOne({
-                where: { user_id: req.params.user_id },
-                include: [{ model: Group }]
-              });
-            }
-          }
-        } catch (auth0Error) {
-          // If Management API fails, log but don't break
-          console.warn('Auth0 Management API lookup failed during user update:', auth0Error.message);
-          if (process.env.NODE_ENV === 'development') {
-            console.log('Make sure AUTH0_MANAGEMENT_CLIENT_ID and AUTH0_MANAGEMENT_CLIENT_SECRET are set.');
-          }
-        }
       }
     }
 

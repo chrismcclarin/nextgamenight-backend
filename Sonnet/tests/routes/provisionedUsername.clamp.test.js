@@ -45,6 +45,15 @@ const { stubAuth } = require('../helpers/authStub');
 const { User, Group, UserGroup, sequelize } = require('../../models');
 const { clampProvisionedUsername } = require('../../utils/provisionedUsername');
 
+// Phase 88.8 (SPEC R3): every claim object below that carries an `email` also carries
+// `email_verified: true`. An email is adopted ONLY when the token says Auth0 verified it,
+// and an absent flag reads as UNVERIFIED — which provisions the synthetic
+// <sub>@auth0.local address instead of the injected one. Each case here is a normal
+// verified signup (this suite is about the len[1,50] username clamp, not the unverified
+// posture), so the flag is load-bearing, not decoration. The join case at the bottom
+// already carried it, because routes/groups.js:806 is the one shipped writer that has
+// always checked verification.
+
 const LONG_NAME = 'Bartholomew Maximilian Fitzgerald Wolfeschlegelsteinhausenbergerdorff'; // 68 chars
 const CLAMPED = LONG_NAME.trim().slice(0, 50);
 
@@ -82,7 +91,7 @@ describe('wave-12 HIGH #2 — machine-derived username writers clamp to len[1,50
     it('provisions a first-time user with a >50-char token name (200, 50-char username)', async () => {
       const sub = 'auth0|gauth-long-name';
       const app = makeApp('/api/auth', googleAuthRoutes,
-        { user_id: sub, email: 'gauth-long@example.com', name: LONG_NAME });
+        { user_id: sub, email: 'gauth-long@example.com', email_verified: true, name: LONG_NAME });
 
       await request(app).get('/api/auth/google/url').expect(200);
 
@@ -95,7 +104,7 @@ describe('wave-12 HIGH #2 — machine-derived username writers clamp to len[1,50
       const sub = 'auth0|gauth-existing';
       await User.create({ user_id: sub, username: 'Old Name', email: 'gauth-old@example.com' });
       const app = makeApp('/api/auth', googleAuthRoutes,
-        { user_id: sub, email: 'gauth-old@example.com', name: LONG_NAME });
+        { user_id: sub, email: 'gauth-old@example.com', email_verified: true, name: LONG_NAME });
 
       await request(app).get('/api/auth/google/url').expect(200); // NOT 500
 
@@ -113,6 +122,7 @@ describe('wave-12 HIGH #2 — machine-derived username writers clamp to len[1,50
       const app = makeApp('/api/events', eventRoutes, {
         user_id: sub,
         email: 'events-long@example.com',
+        email_verified: true,
         given_name: given,
         family_name: rest.join(' '),
       });
@@ -132,7 +142,7 @@ describe('wave-12 HIGH #2 — machine-derived username writers clamp to len[1,50
     it('provisions a first-time user with a >50-char token name (200, 50-char username)', async () => {
       const sub = 'auth0|groups-long-name';
       const app = makeApp('/api/groups', groupRoutes,
-        { user_id: sub, email: 'groups-long@example.com', name: LONG_NAME });
+        { user_id: sub, email: 'groups-long@example.com', email_verified: true, name: LONG_NAME });
 
       await request(app).get(`/api/groups/user/${encodeURIComponent(sub)}`).expect(200);
 
@@ -178,7 +188,7 @@ describe('wave-12 HIGH #2 — machine-derived username writers clamp to len[1,50
     it("JIT provisioning with a whitespace-only name writes 'User', never ''", async () => {
       const sub = 'auth0|whitespace-name';
       const app = makeApp('/api/users', userRoutes,
-        { user_id: sub, email: 'ws@example.com', name: '   ' });
+        { user_id: sub, email: 'ws@example.com', email_verified: true, name: '   ' });
 
       await request(app).get(`/api/users/${encodeURIComponent(sub)}`).expect(200); // NOT 500
 

@@ -40,6 +40,14 @@ app.use((req, _res, next) => {
     req.user = {
       user_id: tid,
       email: temail || `${tid.replace(/[|:]/g, '-')}@test.local`,
+      // Phase 88.8 (SPEC R3): an email is adopted ONLY when the token says Auth0 has
+      // verified it; an absent claim reads as UNVERIFIED and provisions the synthetic
+      // <sub>@auth0.local address instead. Every case in this suite is a normal verified
+      // signup — the suite is about the timezone query param, not the unverified posture
+      // — so the flag is load-bearing here, not decoration. Without it these fixtures
+      // would still pass (they assert on timezone) but would silently stop exercising
+      // the real-address path.
+      email_verified: true,
       username: (temail && temail.split('@')[0]) || 'TestUser',
     };
   }

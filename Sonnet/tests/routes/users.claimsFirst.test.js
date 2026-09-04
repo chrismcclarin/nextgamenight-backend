@@ -14,9 +14,17 @@
 // behaviour that has been live since 2026-04), so arm 1 passing proves the provisioning
 // path no longer depends on the Management API at all.
 //
-// THESE ASSERTIONS ARE DURABLE. Plan 04 moves the rule out of routes/users.js and into
-// services/provisioningService.js; this file describes the OBSERVABLE contract and must
-// survive that move unedited (plan 04 Task 3(b) exempts it by name).
+// THESE ASSERTIONS ARE DURABLE. Plan 04 moved the rule out of routes/users.js and into
+// services/provisioningService.js; this file describes the OBSERVABLE contract and
+// survived that move with its three email assertions untouched. Plan 04 Task 3(b)
+// exempts this file BY NAME from the `email_verified: true` harness repair applied to
+// the other suites — arms 2 and 3 deliberately inject an unverified / absent claim, and
+// that is the rule under test. If a future change makes this suite red, the SERVICE is
+// wrong; do not fix the test.
+//
+// ONE assertion did change in plan 04, and it got STRICTER, not looser: arm 2's
+// getUserById count went 1 -> 0 when the second Management call site was collapsed into
+// the service. The reason is written at that line.
 //
 // Harness shape copied from tests/routes/users.timezone-autocreate.test.js:12-48.
 
@@ -110,23 +118,24 @@ describe('GET /api/users/:user_id — claims-first provisioning (BOPS-05 / SPEC 
     expect(dbUser.email).toBe(`${userId.replace(/[|:]/g, '-')}@auth0.local`);
     expect(dbUser.email).not.toBe('unverified@example.com');
 
-    // The CREATE branch made zero Management calls — the claim was present, so it was
-    // never consulted.
+    // The WHOLE REQUEST made zero Management calls — the claim was present, so the
+    // vendor was never consulted on any path.
     //
-    // DEVIATION FROM PLAN 01, recorded deliberately (see 88.8-01-SUMMARY.md): the plan
-    // asked for `toHaveBeenCalledTimes(0)` here. That is not reachable from plan 01's
-    // scope. GET /api/users/:user_id has a SECOND Auth0 Management call site — the
-    // "fix an incorrect email/username" repair block (routes/users.js:420-462), which
-    // fires on the SAME request whenever the row ends up with an @auth0.local address.
-    // Plan 01's guard was scoped to the create branch only, so the ONE call recorded
-    // here comes from that repair block, not from provisioning.
+    // RESTORED TO THE PLAN-01 NUMBER BY PLAN 04 (2026-09-04), exactly as the note this
+    // replaces predicted. Plan 01 had to assert 1 here because GET /api/users/:user_id
+    // carried a SECOND Auth0 Management call site — the "fix an incorrect
+    // email/username" repair block (routes/users.js:431-479 at the time) — which fired
+    // on the same request whenever the row ended up with an @auth0.local address, and
+    // which had NO email_verified gate at all: with a working Management API it would
+    // have written the vendor's address onto the row regardless of verification,
+    // silently undoing the R3 rule this arm enforces. Plan 04 collapsed BOTH call sites
+    // into services/provisioningService.js, so the count is genuinely 0 now.
     //
-    // FOR PLAN 04: the repair block has NO email_verified gate at all — with a working
-    // Management API it will write the vendor's email onto the row regardless of
-    // verification, which silently undoes the R3 rule this arm enforces. Collapsing
-    // both call sites into provisionOrRepair is what closes it. When plan 04 does that,
-    // this count legitimately becomes 0; the two email assertions above do not change.
-    expect(auth0Service.getUserById).toHaveBeenCalledTimes(1);
+    // This is the STRICTER assertion, not a weakened one — 0 is what plan 01's own plan
+    // text asked for and could not reach. The two email assertions above are unchanged,
+    // and this file remains exempt from the email_verified harness repair (plan 04 Task
+    // 3(b)): its arms deliberately inject an unverified claim.
+    expect(auth0Service.getUserById).toHaveBeenCalledTimes(0);
   });
 
   it('ARM 3: NO email claim falls back to exactly one Auth0 Management API lookup', async () => {
@@ -138,11 +147,13 @@ describe('GET /api/users/:user_id — claims-first provisioning (BOPS-05 / SPEC 
     };
 
     // DEVIATION FROM PLAN 01, recorded deliberately: the plan's harness leaves
-    // getUserById REJECTING for this arm too. With a rejecting stub the row is created
-    // synthetic, which then trips the downstream repair block (routes/users.js:420) and
-    // produces TWO calls, not the one the plan asserts. Resolving the lookup is both the
-    // realistic fallback scenario and a strictly stronger assertion: it proves the
-    // fallback is invoked AND that its answer is the one persisted.
+    // getUserById REJECTING for this arm too. Under plan 01 a rejecting stub created the
+    // row synthetic, which then tripped the downstream repair block and produced TWO
+    // calls, not the one the plan asserts. (Plan 04 collapsed that second call site, so
+    // a rejecting stub would now produce exactly one — but keeping the RESOLVING stub is
+    // still the stronger assertion, and the count below is unchanged either way.)
+    // Resolving the lookup is both the realistic fallback scenario and strictly stronger:
+    // it proves the fallback is invoked AND that its answer is the one persisted.
     auth0Service.getUserById.mockResolvedValueOnce({
       user_id: userId,
       email: 'fallback-real@example.com',
@@ -158,5 +169,43 @@ describe('GET /api/users/:user_id — claims-first provisioning (BOPS-05 / SPEC 
     const dbUser = await User.scope('withContactInfo').findOne({ where: { user_id: userId } });
     expect(dbUser).not.toBeNull();
     expect(dbUser.email).toBe('fallback-real@example.com');
+  });
+  // -------------------------------------------------------------------------
+  // Phase 88.8 plan 04 (Task 3a) — the KEYSPACE pin.
+  //
+  // requireParamMatchesToken('user_id') accepts the caller's own Users.id UUID as well
+  // as their Auth0 sub (middleware/objectAuth.js:59-84, the Phase 87.4 M-4 KEYMISS
+  // path). Before plan 04, a UUID-shaped param could never enter the create or repair
+  // branches because BOTH were wrapped in `req.user.user_id === req.params.user_id`.
+  // Plan 04 deleted those branches and their guards, so the ONLY thing keeping a UUID
+  // out of Users.user_id (which holds SUBS) is that the delegate keys on the TOKEN sub.
+  // Get that wrong and the phase mints a NEW row keyed by a UUID and hands it back as
+  // the caller's own profile — a class-2 hygiene row of exactly the kind plan 05's
+  // report exists to find.
+  //
+  // Nothing else catches a regression here: no shipped frontend caller passes a UUID to
+  // this route today (usersAPI.getUser has one caller, src/lib/hooks/useSelfIdentity.ts:94,
+  // which passes user.sub) and no other backend test does either — but
+  // src/app/userProfile/page.js:527, :600 and :656 already send the UUID to this route's
+  // phone siblings, so the keyspace is live on that page.
+  // -------------------------------------------------------------------------
+  it('KEYSPACE: a UUID-shaped self-param provisions nothing new and returns the caller\'s own row', async () => {
+    const userId = 'auth0|claims-first-uuid-param';
+    const seeded = await User.create({
+      user_id: userId,
+      username: 'Seeded Person',
+      email: 'seeded@example.com',
+    });
+    const before = await User.count();
+
+    currentUser = { user_id: userId };
+
+    const res = await request(app).get(`/api/users/${seeded.id}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.id).toBe(seeded.id);
+    expect(await User.count()).toBe(before);
+    // A healthy row with absent claims never consults the vendor.
+    expect(auth0Service.getUserById).toHaveBeenCalledTimes(0);
   });
 });
