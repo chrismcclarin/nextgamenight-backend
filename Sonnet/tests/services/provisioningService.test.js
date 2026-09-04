@@ -167,6 +167,7 @@ jest.mock('../../services/auth0Service', () => ({
 
 const auth0Service = require('../../services/auth0Service');
 const provisioningService = require('../../services/provisioningService');
+const { isEmailUniqueViolation, EMAIL_UNIQUE_CONSTRAINTS } = provisioningService;
 const { User } = require('../../models');
 
 const SERVICE_PATH = path.join(__dirname, '..', '..', 'services', 'provisioningService.js');
@@ -619,6 +620,132 @@ describe('services/provisioningService — provisionOrRepair', () => {
         },
       });
       expect(result.user.picture_url).toBeNull();
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Email UNIQUE collision — the PLACEHOLDER tail plan 05 replaces
+  //
+  // These two cases exist because plan 04 deliberately went one step beyond its own
+  // "collision handling is NOT in this task" instruction, and an addition with no test
+  // is decorative. See the SUMMARY's deviation note. Both cases drive a CASE-VARIANT
+  // collision on purpose: that fires ONLY `users_email_lower_unique` (the LOWER(email)
+  // index plan 02 added), whose error carries `err.fields` keyed `lower(email::text)` —
+  // so `err.fields.email` is undefined and the `parent.constraint` arm of the predicate
+  // is the only thing that can recognise it. A predicate written against CONTEXT D-15's
+  // original one-name spelling fails BOTH cases.
+  // -----------------------------------------------------------------------
+  describe('email unique collision (placeholder handling — plan 05 owns the four branches)', () => {
+    it('THE SHAPE MATRIX, measured not assumed: the predicate recognises a collision from findOrCreate, create AND instance.update, on BOTH constraints', async () => {
+      // This is the assertion that stops plan 05 from being written against an
+      // incomplete shape. CONTEXT D-15 (as amended) and plan 05's plan text both say
+      // `parent.constraint` is the primary discriminator and the ONLY arm carrying the
+      // lower index. That holds for create/update and FAILS for findOrCreate, which is
+      // the call every provisioning writer uses: findOrCreate sets options.exception,
+      // wrapping the INSERT in a PL/pgSQL block, so the rebuilt parent has code + detail
+      // and NO constraint. Plan 02 measured a bare create, which is why the recorded
+      // shape is incomplete rather than wrong.
+      await User.create({ user_id: 'auth0|matrix-case', username: 'mc', email: 'Case@Example.com' });
+      await User.create({ user_id: 'auth0|matrix-exact', username: 'me', email: 'exact@example.com' });
+      const victim = await User.create({ user_id: 'auth0|matrix-victim', username: 'mv', email: 'victim@example.com' });
+
+      const capture = async (fn) => {
+        try {
+          await fn();
+          return null;
+        } catch (e) {
+          return e;
+        }
+      };
+
+      const shapes = {
+        'findOrCreate / lower(email) index': await capture(() =>
+          User.findOrCreate({
+            where: { user_id: 'auth0|matrix-n1' },
+            defaults: { user_id: 'auth0|matrix-n1', username: 'n1', email: 'case@example.com' },
+          })),
+        'findOrCreate / case-sensitive constraint': await capture(() =>
+          User.findOrCreate({
+            where: { user_id: 'auth0|matrix-n2' },
+            defaults: { user_id: 'auth0|matrix-n2', username: 'n2', email: 'exact@example.com' },
+          })),
+        'create / lower(email) index': await capture(() =>
+          User.create({ user_id: 'auth0|matrix-n3', username: 'n3', email: 'case@example.com' })),
+      };
+      shapes['instance.update / lower(email) index'] = await capture(() => victim.update({ email: 'case@example.com' }));
+      await victim.reload();
+      shapes['instance.update / case-sensitive constraint'] = await capture(() => victim.update({ email: 'exact@example.com' }));
+      await victim.reload();
+
+      // Jest's expect() takes no message argument, so the label rides in the VALUE:
+      // a failure names the exact call form that broke rather than just "false".
+      const raised = {};
+      const recognised = {};
+      for (const [label, err] of Object.entries(shapes)) {
+        raised[label] = err !== null;
+        recognised[label] = isEmailUniqueViolation(err);
+      }
+      const allTrue = Object.fromEntries(Object.keys(shapes).map((k) => [k, true]));
+      expect(raised).toEqual(allTrue);
+      expect(recognised).toEqual(allTrue);
+
+      // The two facts that make BOTH arms load-bearing, asserted rather than described.
+      expect(shapes['findOrCreate / lower(email) index'].parent.constraint).toBeUndefined();
+      expect(Object.keys(shapes['findOrCreate / lower(email) index'].fields)).toEqual(['lower(email::text)']);
+      expect(shapes['instance.update / lower(email) index'].parent.constraint).toBe('users_email_lower_unique');
+      expect(shapes['instance.update / lower(email) index'].fields.email).toBeUndefined();
+      expect(EMAIL_UNIQUE_CONSTRAINTS).toEqual(['Users_email_key', 'users_email_lower_unique']);
+    });
+
+    it('rejects a non-email unique violation and a plain Error', async () => {
+      await User.create({ user_id: 'auth0|matrix-sub', username: 'ms', email: 'subdupe@example.com' });
+      let subErr = null;
+      try {
+        await User.create({ user_id: 'auth0|matrix-sub', username: 'ms2', email: 'other@example.com' });
+      } catch (e) {
+        subErr = e;
+      }
+      expect(subErr.name).toBe('SequelizeUniqueConstraintError');
+      expect(isEmailUniqueViolation(subErr)).toBe(false);
+      expect(isEmailUniqueViolation(new Error('nope'))).toBe(false);
+      expect(isEmailUniqueViolation(null)).toBe(false);
+    });
+
+    it('CREATE: a first-time user whose verified address is already taken provisions with the synthetic address instead of 500ing', async () => {
+      // Seeded MIXED CASE and directly, bypassing the service normaliser, so the
+      // collision is case-variant and can only be seen through parent.constraint.
+      await User.create({ user_id: 'auth0|occupant', username: 'Occupant', email: 'Taken@Example.com' });
+
+      const sub = 'auth0|svc-collide-create';
+      const result = await provision({ sub, claims: { email: 'taken@example.com', email_verified: true } });
+
+      expect(result.status).toBe('provisioned');
+      expect(result.created).toBe(true);
+      expect(result.user.email).toBe(syntheticFor(sub));
+      expect(result.reason).toBe('unique_email_collision');
+      expect(mockSentryCaptureException).toHaveBeenCalledTimes(1);
+      expect(mockSentryCaptureException.mock.calls[0][1].tags.reason).toBe('unique_email_collision');
+      // The occupant is untouched — releasing a dead identity's address is plan 05's job.
+      const occupant = await User.scope('withContactInfo').findOne({ where: { user_id: 'auth0|occupant' } });
+      expect(occupant.email).toBe('Taken@Example.com');
+    });
+
+    it('REPAIR: a collision on the repair UPDATE leaves the row intact and REPORTS rather than swallowing', async () => {
+      await User.create({ user_id: 'auth0|occupant2', username: 'Occupant', email: 'Held@Example.com' });
+      const sub = 'auth0|svc-collide-repair';
+      await User.create({ user_id: sub, username: 'Someone', email: syntheticFor(sub) });
+
+      const result = await provision({ sub, claims: { email: 'held@example.com', email_verified: true } });
+
+      expect(result.status).toBe('provisioned');
+      expect(result.changed).toBe(false);
+      expect(result.reason).toBe('unique_email_collision');
+      expect(result.notes).toContain('email_repair_collided');
+      // Reloaded, so the caller never sees the rejected in-memory value.
+      expect(result.user.email).toBe(syntheticFor(sub));
+      const row = await User.scope('withContactInfo').findOne({ where: { user_id: sub } });
+      expect(row.email).toBe(syntheticFor(sub));
+      expect(mockSentryCaptureException.mock.calls[0][1].tags.reason).toBe('unique_email_collision');
     });
   });
 

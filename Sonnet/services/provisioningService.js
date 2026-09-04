@@ -142,11 +142,51 @@ function isGenericUsername(value) {
 }
 
 /**
+ * Whether a `fields` key from a UniqueConstraintError names the email column, in either
+ * the plain-column spelling (`email`, from `Users_email_key`) or the index-expression
+ * spelling (`lower(email::text)`, from `users_email_lower_unique`).
+ */
+function isEmailUniqueField(key) {
+  if (typeof key !== 'string') {
+    return false;
+  }
+  const normalised = key.replace(/\s+/g, '').toLowerCase();
+  return normalised === 'email' || normalised.startsWith('lower(email');
+}
+
+/**
  * Whether an error is a violation of EITHER email unique constraint.
- * `parent.constraint` is the PRIMARY discriminator and `fields.email` the fast path,
- * in that order: Sequelize populates `fields` only when the Postgres `Key (col)=(val)`
- * DETAIL line parses, while `parent.constraint` comes off the wire unconditionally —
- * and `fields.email` is never present for the LOWER(email) index at all.
+ *
+ * MEASURED 2026-09-04 against the real database, all five shapes, because the ordering
+ * this predicate needs is NOT the one CONTEXT D-15 (as amended) and plan 05's plan text
+ * describe. They say `parent.constraint` is the primary discriminator and "the only arm
+ * that carries the lower index". That is true for `Model.create` and `instance.update`,
+ * and FALSE for `findOrCreate` — which is the call every one of the seven provisioning
+ * writers uses:
+ *
+ *   call form              parent.constraint            fields keys
+ *   ---------------------  ---------------------------  ----------------------
+ *   findOrCreate / lower   undefined                    ['lower(email::text)']
+ *   findOrCreate / exact   undefined                    ['email']
+ *   instance.update/lower  'users_email_lower_unique'   ['lower(email::text)']
+ *   instance.update/exact  'Users_email_key'            ['email']
+ *   create / lower         'users_email_lower_unique'   ['lower(email::text)']
+ *
+ * findOrCreate sets `options.exception = true` (sequelize/lib/model.js, findOrCreate),
+ * which wraps the INSERT in a PL/pgSQL block; the error is then reconstructed from the
+ * raised exception's `code` + `detail` only, so `parent` carries `sql, parameters, code,
+ * detail` and NO `constraint`. Plan 02 measured a bare `User.create`, which is why the
+ * recorded shape is incomplete rather than wrong.
+ *
+ * So BOTH arms are load-bearing and neither alone is sufficient: the field-KEY arm is
+ * what covers findOrCreate, and the constraint-NAME arm is what covers an error whose
+ * DETAIL line did not parse into `fields`. Note the field arm must recognise the
+ * index-expression key, not just `email` — `err.fields.email` is undefined for the lower
+ * index, which is the trap CONTEXT D-15's original one-name predicate fell into.
+ *
+ * ROUTED TO PLAN 05: this is the predicate plan 05 promotes to an exported
+ * `isEmailCollision`, and its plan text's stated ordering rationale needs correcting
+ * against the matrix above before it is written.
  */
 function isEmailUniqueViolation(err) {
   if (!err || err.name !== 'SequelizeUniqueConstraintError') {
@@ -156,7 +196,7 @@ function isEmailUniqueViolation(err) {
   if (typeof constraint === 'string' && EMAIL_UNIQUE_CONSTRAINTS.includes(constraint)) {
     return true;
   }
-  return Boolean(err.fields && err.fields.email);
+  return Object.keys((err && err.fields) || {}).some(isEmailUniqueField);
 }
 
 // ---------------------------------------------------------------------------
@@ -812,6 +852,11 @@ async function repairExistingRow({
 
 module.exports = {
   provisionOrRepair,
+  // Exported for the shape-matrix assertions in
+  // tests/services/provisioningService.test.js. Plan 05 promotes this to the public
+  // `isEmailCollision` and builds the four SPEC R5 orphan branches on top of it.
+  isEmailUniqueViolation,
+  EMAIL_UNIQUE_CONSTRAINTS,
   PROVISIONING_OUTCOMES,
   PROVISIONING_NOTES,
 };
