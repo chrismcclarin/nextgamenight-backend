@@ -36,6 +36,7 @@ module.exports = {
   deadlineQueue: stubQueue(),
   gcalSyncQueue: stubQueue(),
   auth0CleanupQueue: stubQueue(),
+  emailNoticeQueue: stubQueue(),
   connection: {
     quit: jest.fn(),
     disconnect: jest.fn(),
