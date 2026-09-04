@@ -49,7 +49,7 @@
 // new Event.winner_id/picked_by_id SET NULL FKs from plan 87.2-01) fire automatically
 // on User.destroy via the 87.1 CASCADE / SET NULL graph — no explicit code needed here.
 
-const { Op } = require('sequelize');
+const { Op, UniqueConstraintError } = require('sequelize');
 const {
   User,
   Group,
@@ -542,6 +542,50 @@ async function runGoogleCleanup(captured, budgetMs) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Concurrent double-delete discriminator (Phase 88.8 plan 07, SPEC R8 / D-21)
+// ---------------------------------------------------------------------------
+
+// Verified empirically against the test Postgres on 2026-09-04, not assumed: a duplicate
+// PendingAuth0Deletion.create raises name 'SequelizeUniqueConstraintError' with
+// parent.constraint === 'PendingAuth0Deletions_auth0_sub_key' and fields
+// { auth0_sub: '<sub>' }.
+const MARKER_SUB_UNIQUE_CONSTRAINT = 'PendingAuth0Deletions_auth0_sub_key';
+const MARKER_SUB_COLUMN = 'auth0_sub';
+
+/**
+ * DECISION Phase 88.8 plan 07 (R8): a SIBLING discriminator for the marker constraint was
+ * chosen OVER reusing `isEmailCollision` / `isEmailUniqueViolation` from
+ * services/provisioningService.js. The two share a SHAPE, deliberately not a function: one
+ * predicate keyed on two unrelated constraints would make BOTH callers' intent unreadable
+ * at the call site ("is this an email collision or a marker collision?") and would silently
+ * widen either one the next time the other gained a constraint. Copying ten lines is the
+ * cheaper mistake here.
+ *
+ * TWO ARMS, and the second is not redundant. Plan 05 measured that a `findOrCreate`-shaped
+ * error carries NO `parent.constraint` at all (sequelize sets `options.exception = true`,
+ * and the postgres driver rebuilds the error with only `code` and `detail`), so a
+ * constraint-name-only predicate fails OPEN. The `fields` arm is the backstop.
+ *
+ * The `fields` arm is safe from over-matching HERE specifically: `auth0_sub` exists on
+ * exactly one model in this repo (PendingAuth0Deletion — grep-verified 2026-09-04), and the
+ * only INSERT inside the deletion transaction is the marker's. Every other statement in the
+ * transaction is an UPDATE or a DELETE, neither of which can raise this constraint.
+ *
+ * @param {unknown} err
+ * @returns {boolean}
+ */
+function isMarkerSubUniqueViolation(err) {
+  if (!err || err.name !== 'SequelizeUniqueConstraintError') {
+    return false;
+  }
+  const constraint = err.parent && err.parent.constraint;
+  if (constraint === MARKER_SUB_UNIQUE_CONSTRAINT) {
+    return true;
+  }
+  return Object.prototype.hasOwnProperty.call((err && err.fields) || {}, MARKER_SUB_COLUMN);
+}
+
 /**
  * The two ways a `Users` row can be absent for an authenticated caller. These are the
  * `deleteAccount` STATUS tokens, not wire codes — routes/users.js maps them to envelopes
@@ -679,6 +723,39 @@ async function deleteAccount({ userId }, overrides = {}) {
         groups: err._blockedGroups,
         ...(googleAccessRevoked ? { google_access_revoked: true } : {}),
       };
+    }
+    // Phase 88.8 plan 07 (SPEC R8, D-21, threats T-88.8-34 / T-88.8-35) — the loser of a
+    // concurrent double delete. Two overlapping DELETE /users/me for one sub both reach
+    // applyDispositions Step 6 and both try to INSERT the durable marker; the second hits
+    // the unique constraint on auth0_sub. Before this arm that surfaced as a 500, which a
+    // client would then RETRY against an account that is already gone.
+    //
+    // CAUGHT AT THE TRANSACTION BOUNDARY, NOT AT THE `create` CALL (this placement IS
+    // D-21). By the time this catch runs the MANAGED transaction has already rolled back,
+    // so the loser committed nothing and the winner is untouched. Catching at the `create`
+    // would leave the loser executing inside a half-finished transaction and it would go
+    // on to destroy the user row the winner is also destroying.
+    //
+    // KNOWN, ACCEPTED CONSEQUENCE (threat T-88.8-36): the loser's Step 2 Google cleanup has
+    // already run by now. It is best-effort and idempotent, so it simply re-runs against
+    // an already-cleaned grant. That is recorded and accepted, not an oversight. What the
+    // marker DOES prevent is a second Auth0 delete and a second deletion-notice email,
+    // because Step 4 and Step 5 are past this return.
+    //
+    // REJECTED ALTERNATIVES, recorded so they are not re-proposed:
+    //   (a) `PendingAuth0Deletion.findOrCreate` for the marker instead of `create`. The
+    //       loser would then NOT fail: it would proceed through Step 7, destroy zero rows,
+    //       return 200 "your account was deleted", and send a SECOND deletion notice plus a
+    //       second Auth0 delete. Absorbing the violation is the point; swallowing it is not.
+    //   (b) Taking a `FOR UPDATE` lock on the Users row before the marker insert. That
+    //       changes the documented in-transaction owner-re-check lock ordering (Step 3's
+    //       comment above) that the Phase 87.2 threat model depends on, to buy a
+    //       serialization the unique constraint already provides for free.
+    if (isMarkerSubUniqueViolation(err)) {
+      console.warn(
+        `[accountDeletion] Concurrent delete lost the marker race for ${captured.sub}; the winning request owns the deletion. Returning the already-deleted status.`
+      );
+      return { status: MISSING_ROW_STATUS.ALREADY_DELETED };
     }
     // Real DB failure: nothing was committed; surface a retryable (500-mappable) error.
     throw err;
