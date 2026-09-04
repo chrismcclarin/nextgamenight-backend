@@ -1,6 +1,20 @@
 // routes/users.js
+const crypto = require('crypto');
 const express = require('express');
-const { User, Group, UserGroup, PendingAuth0Deletion, sequelize } = require('../models');
+const { Op, QueryTypes, Transaction } = require('sequelize');
+const {
+  User,
+  Group,
+  UserGroup,
+  PendingAuth0Deletion,
+  // Phase 88.8 plan 09: the email-change routes write three tables. GroupInvite
+  // (D-41) and Feedback (D-42) are moved in the SAME transaction as the identity
+  // overwrite, and SingleUseToken holds the pending address and the code hash.
+  GroupInvite,
+  Feedback,
+  SingleUseToken,
+  sequelize,
+} = require('../models');
 const router = express.Router();
 // (validateUserSearch import removed — its only consumer, GET /search/email/:email,
 // was deleted in Phase 87.6 users-search-email.)
@@ -16,6 +30,13 @@ const { isUuid } = require('../utils/resolveTargetUser');
 const provisioningService = require('../services/provisioningService');
 const smsService = require('../services/smsService');
 const accountDeletionService = require('../services/accountDeletionService');
+// Phase 88.8 plan 09: the SPEC A9 code mail and the SPEC A13 notice both live in
+// plan 10's primitives (sendEmailChangeCode / the email-notice queue). This file
+// calls them; it renders no mail copy of its own.
+const emailService = require('../services/emailService');
+// Phase 88.8 plan 04's PII scrubber — every email-change telemetry payload carries
+// the DOMAIN only, never the local part.
+const { emailDomain } = require('../utils/provisioningReport');
 const { sendError } = require('../utils/errors');
 
 // Phase 88.8 plan 07 (SPEC R7, D-19 backend half): the two "no Users row" statuses the
@@ -740,6 +761,621 @@ router.delete('/:user_id/phone', async (req, res) => {
   } catch (error) {
     console.error('[users] Phone removal cascade failed:', error.message);
     res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================================
+// EMAIL-CHANGE ROUTES (Phase 88.8 plan 09) — SPEC R12 as amended by A9, A11, A12
+// and A13; CONTEXT D-06, D-07, D-08, D-09, D-10, D-35..D-43.
+//
+// Five self-only, authenticated, write-limited routes:
+//   POST /:user_id/email         request a change (takes an address)
+//   POST /:user_id/email/verify  prove control  (takes a code)
+//   POST /:user_id/email/resend  re-send for the STORED pending address (no body)
+//   POST /:user_id/email/cancel  discard the pending change              (no body)
+//   POST /:user_id/email/revert  restore the Auth0 claim                 (no body)
+//
+// ORDERING NOTE, said out loud because this file already carries a
+// must-register-above rule for the deletion routes: every path here carries at
+// least TWO segments, so `router.get('/:user_id')` above cannot shadow any of
+// them — and that route is a GET while these are all POST. They are registered
+// last purely for readability.
+//
+// PUBLIC LISTS ARE UNTOUCHED. None of these five appears in either server.js
+// public list and none carries magicTokenLimiter — all three belonged to the
+// RETIRED public-link design (D-09 as amended: a typed code, no link, no public
+// route). A link in the mail could be fetched and auto-submitted by a corporate
+// link scanner, which would let an attacker's verification complete inside a
+// stranger's mail infrastructure.
+//
+// LOAD RULE, IDENTICAL IN ALL FIVE HANDLERS. Self-gate with `matchesSelf`, then
+// ALWAYS load the caller with `User.scope('withContactInfo')` keyed on
+// `req.user.user_id` — NEVER `req.selfUser`. matchesSelf's UUID arm memoizes a
+// DEFAULT-scope row (middleware/objectAuth.js:73-74 is a bare `User.findOne`, so
+// the model's defaultScope exclusion applies), which carries NO `email` and, after
+// plan 02, no `email_changed_at`. The profile page sends the UUID shape, so a memo
+// reuse would run every address compare against `undefined` in production while
+// every sub-shaped test stayed green — the 88-34 Rule-1 defect class.
+//
+// LOCK ORDER — the caller's `Users` row is taken with SELECT ... FOR UPDATE as the
+// FIRST statement inside EVERY one of the five transactions. Each handler touches
+// two tables (`Users` and `single_use_tokens`); if any one took them in the other
+// order, two handlers racing on the same account could take a Postgres 40P01
+// deadlock, which reaches the user as a 500 on a routine double-tap — and this
+// plan's own concurrency tests drive exactly that interleave. Do NOT "solve" a
+// deadlock here with a retry-on-40P01 wrapper: that hides a lock-order bug behind
+// a retry loop. An EARLIER lock on a DIFFERENT table is compatible with
+// models/SingleUseToken.js:187-189 ("Do NOT convert this to findOne-then-update",
+// T-88.2-07); restructuring the consume itself is not. Inverting this order is a
+// decision, not a cleanup.
+// ============================================================================
+
+const EMAIL_CHANGE_PURPOSE = 'email_change_verify';
+// D-08 as AMENDED: 30 minutes, not 24 hours. The original figure was sized for a
+// LINK that might be opened later on another device; a code typed in the session
+// that requested it needs no such window.
+const EMAIL_CHANGE_CODE_TTL_MS = 30 * 60 * 1000;
+// D-10: at most three verification mails per user per hour.
+const EMAIL_CHANGE_HOURLY_CAP = 3;
+const EMAIL_CHANGE_WINDOW_MS = 60 * 60 * 1000;
+// Users.email is a plain STRING, i.e. varchar(255) on both the migration-built and
+// the sync-built database.
+const EMAIL_MAX_LENGTH = 255;
+const EMAIL_FORMAT = /^[^\s@]+@[^\s@.]+(?:\.[^\s@.]+)+$/;
+
+// Crockford base32: 0-9 and A-Z without I, L, O and U — the four that are misread
+// as 1, 1, 0 and V when a person copies a code off a screen. 32 symbols.
+const CROCKFORD_ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+const EMAIL_CHANGE_CODE_LENGTH = 8;
+
+/**
+ * Mint one code. 8 symbols over a 32-symbol alphabet is about 1.1 x 10^12.
+ *
+ * THE ARITHMETIC, written down because it is WHY there is no attempt counter.
+ * The only party who can submit a guess at all is the signed-in account holder,
+ * guessing a code for an address they do not control. At the PRODUCTION write
+ * limiter's ceiling (10,000 requests / 15 minutes per IP,
+ * middleware/rateLimiter.js:43, :78) that is roughly 3 x 10^4 guesses inside the
+ * 30-minute lifetime against 10^12 — about 3 in 10^8 per lifetime — and it is
+ * capped again at three mints per user per hour. A 6-digit numeric code (10^6)
+ * was the rejected alternative: it needs an attempt counter to be safe, which is
+ * why the phone flow leans on Twilio's. This one does not.
+ */
+function generateEmailChangeCode() {
+  let out = '';
+  for (let i = 0; i < EMAIL_CHANGE_CODE_LENGTH; i += 1) {
+    out += CROCKFORD_ALPHABET[crypto.randomInt(CROCKFORD_ALPHABET.length)];
+  }
+  return out;
+}
+
+/** The mail shows XXXX-XXXX; the dash is display only and is stripped on entry. */
+function formatEmailChangeCode(code) {
+  return `${code.slice(0, 4)}-${code.slice(4)}`;
+}
+
+/** Entry normalisation: uppercase, dashes and whitespace ignored. */
+function normaliseEmailChangeCode(value) {
+  return typeof value === 'string' ? value.replace(/[\s-]/g, '').toUpperCase() : '';
+}
+
+/**
+ * The code is stored ONLY as its sha256 hash, so a database read exposure yields
+ * no live code. consumeByNonce's single atomic UPDATE is untouched — the route
+ * hashes first, then looks the hash up.
+ */
+function hashEmailChangeCode(normalisedCode) {
+  return crypto.createHash('sha256').update(normalisedCode).digest('hex');
+}
+
+/**
+ * ONE telemetry seam for this feature. Every payload carries the sub and the email
+ * DOMAIN only (plan 04's `emailDomain`) — never the local part, in Sentry or in
+ * the log line. Uses the same defensive try-require Sentry binding as the rest of
+ * this file.
+ */
+function emailChangeTelemetry(op, { sub, address, error = null, message = null, extra = {} } = {}) {
+  const payload = { sub, emailDomain: emailDomain(address), ...extra };
+  try {
+    console.warn(`[users] email-change ${op}:`, JSON.stringify(payload));
+  } catch (_e) {
+    // Telemetry must never be the thing that throws.
+  }
+  if (!Sentry) return;
+  const context = { tags: { feature: 'email-change', op }, extra: payload };
+  if (error && typeof Sentry.captureException === 'function') {
+    Sentry.captureException(error, context);
+  } else if (typeof Sentry.captureMessage === 'function') {
+    Sentry.captureMessage(message || `email-change: ${op}`, { level: 'warning', ...context });
+  }
+}
+
+/** The load rule, in one place. */
+async function loadSelfWithContactInfo(sub, options = {}) {
+  return User.scope('withContactInfo').findOne({ where: { user_id: sub }, ...options });
+}
+
+/** The lock-order invariant, in one place: the caller's own row, FOR UPDATE. */
+async function lockSelfRow(sub, t) {
+  return User.scope('withContactInfo').findOne({
+    where: { user_id: sub },
+    transaction: t,
+    lock: Transaction.LOCK.UPDATE,
+  });
+}
+
+/**
+ * The LIVE pending change: active AND unexpired. Rides the leading `purpose,
+ * user_id` prefix of single_use_tokens_purpose_user_event_status
+ * (models/SingleUseToken.js:142-143), so no index is added.
+ *
+ * DELIBERATELY NO `send_failed_at IS NULL` CLAUSE, even though the hourly count
+ * below has one. The two predicates answer different questions: the count asks
+ * "did a mail leave?", this asks "is there a live pending change?". A row whose
+ * mail the provider refused is still a live pending change — keeping it
+ * hydratable IS the owner's 2026-09-04 ruling, and filtering it out here would
+ * restore the dead end from the other direction (a reload would drop the section
+ * to idle while Resend still found the row). The column is right there and the
+ * filter looks like an omission; it is not.
+ */
+async function loadPendingEmailChange(sub, options = {}) {
+  return SingleUseToken.findOne({
+    where: {
+      purpose: EMAIL_CHANGE_PURPOSE,
+      user_id: sub,
+      status: 'active',
+      expires_at: { [Op.gt]: new Date() },
+    },
+    order: [['createdAt', 'DESC']],
+    ...options,
+  });
+}
+
+function projectPendingEmailChange(row) {
+  return row ? { address: row.target, expires_at: row.expires_at } : null;
+}
+
+/**
+ * THE ONE PINNED WIRE BODY, shared by all five routes. Plan 13 keys its entire
+ * section state machine on it, so neither repo may change it alone and neither
+ * repo's CI can see the other.
+ *
+ * `email_changed_at` is in here for a MECHANICAL reason, not for completeness.
+ * Plan 13 renders the D-38 revert affordance from `self.email_changed_at` and the
+ * section's only refresh path is `patchSelfCache`, a SHALLOW merge
+ * (src/lib/hooks/selfIdentityCache.ts:39) over a self row pinned
+ * staleTime: Infinity that "NEVER self-refreshes" (useSelfIdentity.ts:34, :102).
+ * A key missing from THIS body keeps its pre-mutation value in the cache forever,
+ * so dropping it would make the revert affordance unreachable in the UI. Removing
+ * it is a decision, not a cleanup.
+ */
+function emailChangeBody(user, pendingRow, outcome, verificationSent) {
+  return {
+    outcome,
+    email: user ? user.email : null,
+    pending_email_change: projectPendingEmailChange(pendingRow),
+    verification_sent: verificationSent === true,
+    email_changed_at:
+      user && user.email_changed_at ? new Date(user.email_changed_at).toISOString() : null,
+  };
+}
+
+async function respondEmailChange(res, sub, outcome, verificationSent) {
+  const fresh = await loadSelfWithContactInfo(sub);
+  const pending = await loadPendingEmailChange(sub);
+  return res.json(emailChangeBody(fresh, pending, outcome, verificationSent));
+}
+
+/**
+ * D-10's hourly count. Runs INSIDE the caller's transaction, AFTER the row lock.
+ *
+ * DECISION Phase 88.8 D-10 (review round 3, carried forward): counted INSIDE the
+ * locked transaction, chosen OVER counting it before the transaction opens.
+ * Counted outside, the count runs on its own connection with no lock held: under
+ * READ COMMITTED — the default here, since config/database.js sets no isolation
+ * level — K concurrent requests all read the same pre-burst count, all pass, all
+ * then serialise on the row lock, and all mint and send. The row lock serialises
+ * the writes but cannot un-send the mails, so a burst mails a stranger K times
+ * instead of three. writeOperationLimiter is no backstop at 10,000 requests /
+ * 15 minutes per IP. This is the SOLE control behind T-88.8-42, and the
+ * sequential fourth-request test PASSES while the control is bypassed — the
+ * concurrency test is the one that proves it. Moving this count back outside the
+ * transaction is a decision, not a cleanup.
+ *
+ * THE PREDICATE'S POLARITY IS THE OTHER HALF, and only one polarity is safe:
+ * "count by default, exclude on PROVEN failure" — never "count only proven
+ * successes". The send happens AFTER the commit, outside the lock, so a count
+ * keyed on a success marker would read zero for every member of a concurrent
+ * burst, all of which would then mint and send. Count-by-default keeps the
+ * T-88.8-42 proof intact: every fresh row counts the instant it commits. The
+ * `send_failed_at` exclusion is a strictly-later compensating write on a row that
+ * has ALREADY been counted, so it can never open the burst window. Inverting this
+ * is a decision, not a cleanup.
+ */
+async function countRecentEmailChangeMints(sub, t) {
+  return SingleUseToken.count({
+    where: {
+      purpose: EMAIL_CHANGE_PURPOSE,
+      user_id: sub,
+      createdAt: { [Op.gt]: new Date(Date.now() - EMAIL_CHANGE_WINDOW_MS) },
+      send_failed_at: null,
+    },
+    transaction: t,
+  });
+}
+
+/** The revoke half of revoke-then-mint (the routes/rsvp.js:147-158 idiom, minus its event scoping). */
+async function revokeActiveEmailChangeTokens(sub, t) {
+  return SingleUseToken.update(
+    { status: 'revoked' },
+    {
+      where: { purpose: EMAIL_CHANGE_PURPOSE, user_id: sub, status: 'active' },
+      transaction: t,
+    }
+  );
+}
+
+/**
+ * The mint half. A nonce collision at 10^12 is a unique violation, so retry once.
+ *
+ * The retry runs inside a SAVEPOINT (a nested Sequelize transaction) and not
+ * directly on `t`: in Postgres a unique violation ABORTS the enclosing
+ * transaction, so a bare retry would itself fail with "current transaction is
+ * aborted". Without the savepoint the retry is decorative.
+ */
+async function mintEmailChangeToken(sub, target, t) {
+  let lastError = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const code = generateEmailChangeCode();
+    try {
+      const row = await sequelize.transaction({ transaction: t }, async (sp) =>
+        SingleUseToken.create(
+          {
+            nonce: hashEmailChangeCode(code),
+            user_id: sub,
+            purpose: EMAIL_CHANGE_PURPOSE,
+            target,
+            status: 'active',
+            expires_at: new Date(Date.now() + EMAIL_CHANGE_CODE_TTL_MS),
+          },
+          { transaction: sp }
+        )
+      );
+      return { row, code };
+    } catch (err) {
+      lastError = err;
+      if (err && err.name === 'SequelizeUniqueConstraintError') continue;
+      throw err;
+    }
+  }
+  throw lastError;
+}
+
+/**
+ * Send the CODE mail, synchronously, AFTER the commit, to the NEW address only.
+ * Returns the value `verification_sent` carries — the provider's own result
+ * (services/emailService.js:45-47 returns `{ success: false }` rather than
+ * throwing when unconfigured), NEVER a literal `true` written after the commit.
+ *
+ * DECISION Phase 88.8 (owner ruling 2026-09-04, review round 4): the token
+ * SURVIVES a provider refusal, chosen OVER destroying it. This marker sits at the
+ * failure arm because it REVERSES an earlier version of this plan — a reader who
+ * finds the destroy in the history must be able to see why it went.
+ *
+ * Destroying the row created a state with no exit while the response and the UI
+ * both claimed otherwise. All four follow mechanically from the destroy: resend
+ * reads the address to re-send from the ACTIVE TOKEN ROW, so with no row it
+ * answers the validation envelope forever; verify has no `nonce` to match; the
+ * self read computes `pending_email_change: null`, so a reload drops the section
+ * to idle; and yet the response still said `outcome: 'code_sent'`, which plan 13
+ * renders as awaiting-code with Resend promoted. Three controls, two that cannot
+ * work and one that reports an error that is not the truth.
+ *
+ * The intent behind the destroy — NOT charging a user for a mail that never left
+ * — is preserved separately and explicitly by `send_failed_at`, whose column
+ * comment in models/SingleUseToken.js names the same four rejected alternatives:
+ *   (a) let the refused attempt consume the budget — a provider outage would spend
+ *       a user's whole hourly allowance on mails that never left, and the shipped
+ *       remedy for a refusal is Resend, which mints again;
+ *   (b) revoke instead of destroy — a revoked row still counts under a
+ *       created-rows predicate, and it kills hydration too;
+ *   (c) back-date `createdAt` so the row falls out of the window — a falsified
+ *       timestamp is the fragile-shortcut class this project bans;
+ *   (d) send the mail INSIDE the transaction and roll back on refusal — that holds
+ *       a `Users` row lock across a network call to the mail provider while four
+ *       other handlers queue behind it, and it deletes the pending change the
+ *       owner ruled must survive.
+ * Re-adding the destroy is a decision, not a cleanup.
+ *
+ * LOCAL AND CI CONSEQUENCE, stated so nobody reads it as a bug: emailService
+ * no-ops without RESEND_API_KEY and returns `{ success: false }`, so in any
+ * environment without a mail key EVERY send is a refusal, `send_failed_at` is
+ * always stamped, and the hourly cap therefore never trips unless the test mocks
+ * a SUCCESSFUL send.
+ */
+async function sendEmailChangeCodeMail({ sub, address, code, tokenId }) {
+  let result = null;
+  try {
+    result = await emailService.sendEmailChangeCode(address, formatEmailChangeCode(code));
+  } catch (err) {
+    result = { success: false, error: err && err.message };
+  }
+  if (result && result.success === true) return true;
+
+  try {
+    // ONE narrow UPDATE. `status` is untouched, so the row stays consumable by
+    // consumeByNonce and still hydrates `pending_email_change`.
+    await SingleUseToken.update({ send_failed_at: new Date() }, { where: { id: tokenId } });
+  } catch (stampFailed) {
+    emailChangeTelemetry('code-mail-stamp', { sub, address, error: stampFailed });
+  }
+  // A console.warn-only failure here would be the exact warn-only class SPEC R4
+  // eliminates one file over.
+  emailChangeTelemetry('code-mail', {
+    sub,
+    address,
+    error: new Error(
+      `Email-change code mail refused by the provider: ${(result && result.error) || 'unknown'}`
+    ),
+  });
+  return false;
+}
+
+/** The shared self-gate preamble. Returns the sub, or null once it has answered. */
+async function emailChangeSelfGate(req, res) {
+  const sub = req.user && req.user.user_id;
+  if (!sub) {
+    sendError(res, 'unauthorized');
+    return null;
+  }
+  if (!(await matchesSelf(req, req.params.user_id))) {
+    sendError(res, 'forbidden');
+    return null;
+  }
+  return sub;
+}
+
+/**
+ * The 429 body. `middleware/rateLimiter.js:10` builds it as
+ * `formatEnvelope('rate_limited', undefined, message).body`; `sendError` is the
+ * same call plus the status, so the wire body is byte-identical without exporting
+ * a second helper from the limiter module.
+ */
+function sendEmailChangeRateLimited(res) {
+  return sendError(
+    res,
+    'rate_limited',
+    undefined,
+    'Too many verification emails for this account. Please try again in an hour.'
+  );
+}
+
+// ---------------------------------------------------------------------------
+// POST /:user_id/email — request a change
+// ---------------------------------------------------------------------------
+//
+// DECISION Phase 88.8 D-10: a PER-ROUTE write limiter on all five, chosen OVER
+// matching the three neighbouring phone routes, which carry none. These endpoints
+// send mail to an arbitrary caller-supplied address and the phone routes cannot.
+// The shape follows the shipped self-delete at DELETE /me, not the phone block.
+// Without this note someone will harmonize the limiter away.
+router.post('/:user_id/email', writeOperationLimiter, async (req, res) => {
+  try {
+    const sub = await emailChangeSelfGate(req, res);
+    if (!sub) return undefined;
+
+    // The `email` request key is PINNED and asserted on both sides. It is the
+    // shared referent after SPEC A12 (`Users.email` here, `self.email` in the
+    // frontend UserSchema) and it matches the shipped phone analogue, which sends
+    // `{ phone }`. A body carrying any OTHER key is refused, because a positive
+    // test alone does not pin a key — it passes under whatever key the route
+    // happens to read.
+    const body = req.body || {};
+    const keys = Object.keys(body);
+    if (keys.length !== 1 || keys[0] !== 'email' || typeof body.email !== 'string') {
+      return sendError(res, 'validation');
+    }
+    const normalised = provisioningService.normaliseEmail(body.email);
+    if (!normalised || normalised.length > EMAIL_MAX_LENGTH || !EMAIL_FORMAT.test(normalised)) {
+      return sendError(res, 'validation');
+    }
+
+    const state = { outcome: null, minted: null, code: null, rateLimited: false, missing: false };
+    await sequelize.transaction(async (t) => {
+      const locked = await lockSelfRow(sub, t);
+      if (!locked) {
+        state.missing = true;
+        return;
+      }
+
+      if (provisioningService.normaliseEmail(locked.email) === normalised) {
+        // There is NO clear-the-column branch any more, and that is worth a
+        // sentence: the previous design cleared a SECOND address column here,
+        // which is precisely what made a resend-by-re-POST unsafe and forced SPEC
+        // A11's separate route. Nothing is cleared now, so that hazard is gone —
+        // but the dedicated resend route STAYS, because A11 is a locked amendment
+        // and because a resend that accepted an address would be a second request
+        // endpoint wearing the first one's name.
+        state.outcome = 'unchanged';
+        return;
+      }
+
+      const recent = await countRecentEmailChangeMints(sub, t);
+      if (recent >= EMAIL_CHANGE_HOURLY_CAP) {
+        state.rateLimited = true;
+        return;
+      }
+
+      await revokeActiveEmailChangeTokens(sub, t);
+      const minted = await mintEmailChangeToken(sub, normalised, t);
+      state.minted = minted.row;
+      state.code = minted.code;
+      state.outcome = 'code_sent';
+    });
+
+    // `Users.email` IS NOT WRITTEN HERE. AT ALL (D-35). `email` is an identity key
+    // and `phone` is not, so the phone flow's store-then-verify shape at
+    // routes/users.js POST /:user_id/phone is exactly wrong here: an unverified
+    // address sitting in the identity column is matched by all FOUR
+    // `invited_email` authorization sites (routes/invites.js:512-518 — the
+    // GET /pending visibility list — plus the accept gates at :593, :664 and :757)
+    // and returned by friend search (routes/friendships.js:146), which would let
+    // anyone type a stranger's address, never verify it, and be matched to that
+    // stranger's invites.
+    if (state.missing) return sendError(res, 'not_found');
+    if (state.rateLimited) return sendEmailChangeRateLimited(res);
+
+    let verificationSent = false;
+    if (state.outcome === 'code_sent') {
+      verificationSent = await sendEmailChangeCodeMail({
+        sub,
+        address: normalised,
+        code: state.code,
+        tokenId: state.minted.id,
+      });
+    }
+    return respondEmailChange(res, sub, state.outcome, verificationSent);
+  } catch (error) {
+    console.error('[users] email-change request failed:', error.message);
+    return sendError(res, 'internal');
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /:user_id/email/resend — re-send for the STORED pending address
+// ---------------------------------------------------------------------------
+/**
+ * DECISION Phase 88.8 DR-F: a DEDICATED route, chosen OVER re-POSTing the request
+ * endpoint with the stored address. A separate route cannot take an address BY
+ * CONSTRUCTION, which is a stronger guarantee than remembering a guard inside an
+ * already multi-branch handler; and reusing the request endpoint would put
+ * resend-intent and change-intent behind one conditional, i.e. a second endpoint
+ * wearing the first one's name. Merging this back into the request route is a
+ * decision, not a cleanup.
+ *
+ * (Written as a BLOCK comment on purpose. This plan's marker gate greps this file
+ * with line comments STRIPPED FIRST, so the plan's own prose in a line comment
+ * cannot satisfy it — and a line-comment marker would be stripped too and the gate
+ * would read 0. Same reason applies to the D-38 marker on the revert route below.)
+ */
+router.post('/:user_id/email/resend', writeOperationLimiter, async (req, res) => {
+  try {
+    const sub = await emailChangeSelfGate(req, res);
+    if (!sub) return undefined;
+
+    const state = { missing: false, none: false, rateLimited: false, target: null, code: null, tokenId: null };
+    await sequelize.transaction(async (t) => {
+      const locked = await lockSelfRow(sub, t);
+      if (!locked) {
+        state.missing = true;
+        return;
+      }
+
+      // THE ROW PREDICATE IS `status === 'active'` AND NOTHING ELSE. There is NO
+      // `expires_at` clause, and its absence is the whole point of this route
+      // (review round 5, cross-finding synthesis ruling). Verify returns
+      // `outcome: 'expired'` in exactly ONE situation — the row is still
+      // `status: 'active'` and its `expires_at` has passed — and plan 13 renders
+      // that outcome by PROMOTING Resend as the remedy. Under an "active AND
+      // unexpired" predicate the promoted control was guaranteed to fail: the one
+      // row Resend would have to find is the one row the predicate excluded, so
+      // the user pressed the control the UI had just recommended and got the
+      // validation envelope. That is the same dead-end class the owner's
+      // 2026-09-04 keep-the-token ruling closed on the provider-refused arm,
+      // reopened one branch over. Adding an `expires_at` clause back is a
+      // decision, not a cleanup.
+      //
+      // CANCEL SEMANTICS ARE PRESERVED BY THIS EXACT PHRASING. Cancel sets
+      // `revoked`, and a revoked row is not active — so a change the user
+      // deliberately discarded still cannot be resent, with no extra clause. Do
+      // NOT rewrite this as "non-consumed, non-revoked": that phrasing is
+      // ambiguous about the `used` state and invites a `status !== 'revoked'`
+      // inversion that would resurrect a CONSUMED row. `status === 'active'`
+      // already excludes both.
+      const existing = await SingleUseToken.findOne({
+        where: { purpose: EMAIL_CHANGE_PURPOSE, user_id: sub, status: 'active' },
+        order: [['createdAt', 'DESC']],
+        transaction: t,
+      });
+      if (!existing) {
+        state.none = true;
+        return;
+      }
+
+      const recent = await countRecentEmailChangeMints(sub, t);
+      if (recent >= EMAIL_CHANGE_HOURLY_CAP) {
+        state.rateLimited = true;
+        return;
+      }
+
+      await revokeActiveEmailChangeTokens(sub, t);
+      // The address comes from THAT ROW'S `target` — never from the request.
+      const minted = await mintEmailChangeToken(sub, existing.target, t);
+      state.target = existing.target;
+      state.code = minted.code;
+      state.tokenId = minted.row.id;
+    });
+
+    if (state.missing) return sendError(res, 'not_found');
+    if (state.none) return sendError(res, 'validation');
+    if (state.rateLimited) return sendEmailChangeRateLimited(res);
+
+    const verificationSent = await sendEmailChangeCodeMail({
+      sub,
+      address: state.target,
+      code: state.code,
+      tokenId: state.tokenId,
+    });
+    return respondEmailChange(res, sub, 'code_sent', verificationSent);
+  } catch (error) {
+    console.error('[users] email-change resend failed:', error.message);
+    return sendError(res, 'internal');
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /:user_id/email/cancel — discard a pending change
+// ---------------------------------------------------------------------------
+//
+// DECISION Phase 88.8 A11: a separate route, chosen OVER an "empty address" or
+// "same address" branch on the request handler. A branch would put a DESTRUCTIVE
+// intent behind an address-shaped body, which is the exact shape SPEC A11 already
+// rejected for resend; a route that accepts no address cannot discard the wrong
+// thing. It also gives the profile section and the phone Playwright census an
+// honest way to return the fixture to its starting state, which a client-side-only
+// "never mind" cannot do — an abandoned code stays active for its full 30 minutes
+// and re-hydrates the pending state on the next mount.
+//
+// CANCEL AND THE BUDGET, stated exactly. Cancel MINTS nothing, so it adds nothing
+// to the hourly count. It also REFUNDS nothing: the row it revokes was counted
+// because its mail was ACTUALLY SENT, and revoking a token cannot un-send a mail.
+// Do not add a `send_failed_at` stamp here — the only thing that ever takes a row
+// out of the count is a PROVEN provider refusal, and a mail the user chose to
+// abandon still reached the inbox it was addressed to, which is precisely the
+// exposure T-88.8-42 caps.
+router.post('/:user_id/email/cancel', writeOperationLimiter, async (req, res) => {
+  try {
+    const sub = await emailChangeSelfGate(req, res);
+    if (!sub) return undefined;
+
+    let missing = false;
+    await sequelize.transaction(async (t) => {
+      const locked = await lockSelfRow(sub, t);
+      if (!locked) {
+        missing = true;
+        return;
+      }
+      // This route writes NOTHING to `Users`. It cannot touch the identity column
+      // at all, which is the point.
+      await revokeActiveEmailChangeTokens(sub, t);
+    });
+
+    if (missing) return sendError(res, 'not_found');
+    // Idempotent: a cancel with nothing pending is a success, not an error.
+    return respondEmailChange(res, sub, 'cancelled', false);
+  } catch (error) {
+    console.error('[users] email-change cancel failed:', error.message);
+    return sendError(res, 'internal');
   }
 });
 

@@ -1274,6 +1274,13 @@ module.exports = {
   // the point — a report keyed on a different definition of "synthetic" than the writer
   // would list rows the writer does not consider synthetic, and miss ones it does.
   isSyntheticAddress,
+  // The ONE normalisation rule for a stored address (trim + lowercase), exported
+  // for plan 09's email-change routes. Those routes WRITE Users.email, so they are
+  // the writer half of the same agreement this function documents: friend search
+  // compares lower(email) against the stored column. A second, private copy in
+  // routes/users.js would let an address a user sets diverge from the one friend
+  // search can find. Import it; do not re-derive it.
+  normaliseEmail,
   // Exported for tests ONLY. Branch (a) of SPEC R5 is unreachable end-to-end under the
   // one-row-per-sub invariant (see the resolveRepairCollision header), so the only
   // honest way to pin it is to call the resolver against real rows. No production

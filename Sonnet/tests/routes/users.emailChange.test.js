@@ -426,13 +426,27 @@ describe('a PROVIDER-REFUSED code mail keeps its token (owner ruling 2026-09-04)
     expect(payload).toContain(row.user_id);
   });
 
-  it('after a refused send the self read STILL hydrates pending_email_change', async () => {
+  it('after a refused send the row is STILL a live pending change (active AND unexpired)', async () => {
+    // The WIRE half of this acceptance criterion — that the self READ hydrates it —
+    // is asserted in the Task 3 block below, which is where toSelfWire gains the
+    // key. This asserts the same fact at the layer this task owns: the live-pending
+    // predicate (active + unexpired, and deliberately NO send_failed_at clause)
+    // still matches the refused row.
     const row = await seedUser();
     const app = makeApp(actorFor(row));
     await request(app).post(`/api/users/${row.user_id}/email`).send({ email: 'refused@example.com' }).expect(200);
 
-    const self = await request(app).get(`/api/users/${row.user_id}`).expect(200);
-    expect(self.body.pending_email_change).toMatchObject({ address: 'refused@example.com' });
+    const live = await SingleUseToken.findOne({
+      where: {
+        purpose: PURPOSE,
+        user_id: row.user_id,
+        status: 'active',
+        expires_at: { [Op.gt]: new Date() },
+      },
+    });
+    expect(live).toBeTruthy();
+    expect(live.target).toBe('refused@example.com');
+    expect(live.send_failed_at).not.toBeNull();
   });
 
   it('after a refused send RESEND still finds the row and re-sends for its stored target', async () => {
@@ -662,10 +676,17 @@ describe('source: the five email-change handlers obey the load rule', () => {
   const path = require('path');
   const source = fs.readFileSync(path.join(__dirname, '../../routes/users.js'), 'utf8');
 
+  // COMMENT LINES ARE STRIPPED FIRST, mirroring this plan's own `grep -v '^\s*//'`
+  // gates: the block's header comment names `req.selfUser` as the thing NOT to use,
+  // and a prose mention must not be able to self-invalidate the gate.
   function emailChangeBlock() {
     const start = source.indexOf('EMAIL-CHANGE ROUTES (Phase 88.8 plan 09)');
     expect(start).toBeGreaterThan(-1);
-    return source.slice(start);
+    return source
+      .slice(start)
+      .split('\n')
+      .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+      .join('\n');
   }
 
   it('contains no reference to req.selfUser', () => {
@@ -673,8 +694,9 @@ describe('source: the five email-change handlers obey the load rule', () => {
   });
 
   it('every User. model call inside them is scoped withContactInfo', () => {
-    const block = emailChangeBlock();
-    const lines = block.split('\n').filter((l) => /\bUser\.(?!scope)/.test(l) && !/^\s*(\/\/|\*)/.test(l));
+    const lines = emailChangeBlock()
+      .split('\n')
+      .filter((l) => /\bUser\.(?!scope)/.test(l));
     expect(lines).toEqual([]);
   });
 
