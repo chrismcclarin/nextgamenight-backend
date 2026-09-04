@@ -112,6 +112,8 @@ jest.mock('../../queues', () => ({
   auth0CleanupQueue: { add: (...a) => mockQueueAdd(...a) },
 }));
 
+const { UniqueConstraintError } = require('sequelize');
+
 const { deleteAccount, classifyMissingRow } = require('../../services/accountDeletionService');
 
 const SUB = 'google-oauth2|1075';
@@ -236,6 +238,81 @@ describe('classifyMissingRow — the 410-vs-404 split (R7)', () => {
     const t = { fake: 'txn' };
     await classifyMissingRow(SUB, { transaction: t });
     expect(mockMarkerIsTombstoned).toHaveBeenCalledWith(SUB, { transaction: t });
+  });
+});
+
+// Phase 88.8 plan 07 (SPEC R8, D-21, threats T-88.8-34 / T-88.8-35) — the concurrent
+// double-delete. The loser of the race hits the marker's unique constraint on auth0_sub
+// from inside the deletion transaction; before this it escaped as an internal error.
+describe('deleteAccount — concurrent double delete (R8)', () => {
+  // Build the two shapes a Sequelize unique violation can arrive in. Plan 05's measured
+  // matrix is the reason both are covered: a plain create() carries BOTH parent.constraint
+  // and fields, but a findOrCreate-shaped error carries NO parent.constraint at all, so a
+  // constraint-name-only predicate silently fails open.
+  function markerViolation({ withConstraint = true, withFields = true } = {}) {
+    const err = new UniqueConstraintError({
+      message: 'Validation error',
+      fields: withFields ? { auth0_sub: SUB } : undefined,
+      parent: withConstraint
+        ? { constraint: 'PendingAuth0Deletions_auth0_sub_key', sql: '', name: '', message: '' }
+        : { sql: '', name: '', message: '' },
+    });
+    return err;
+  }
+
+  function failMarkerWith(err) {
+    mockMarkerCreate.mockReset();
+    mockMarkerCreate.mockRejectedValue(err);
+  }
+
+  test('a marker unique violation (constraint name) resolves { status: "not_found" } -> 410, never a throw', async () => {
+    failMarkerWith(markerViolation({ withFields: false }));
+    const res = await deleteAccount({ userId: SUB });
+    expect(res).toEqual({ status: 'not_found' });
+    // The loser committed nothing, so it must not fire the winner's post-commit work.
+    expect(mockDeleteUser).not.toHaveBeenCalled();
+    expect(mockEmailSend).not.toHaveBeenCalled();
+    expect(mockQueueAdd).not.toHaveBeenCalled();
+  });
+
+  test('a marker unique violation carrying ONLY fields (no parent.constraint) is still recognised', async () => {
+    failMarkerWith(markerViolation({ withConstraint: false }));
+    await expect(deleteAccount({ userId: SUB })).resolves.toEqual({ status: 'not_found' });
+  });
+
+  test('a unique violation on a DIFFERENT column is NOT absorbed — it rethrows as today', async () => {
+    failMarkerWith(new UniqueConstraintError({
+      message: 'Validation error',
+      fields: { email: EMAIL },
+      parent: { constraint: 'Users_email_key', sql: '', name: '', message: '' },
+    }));
+    await expect(deleteAccount({ userId: SUB })).rejects.toBeInstanceOf(UniqueConstraintError);
+    expect(mockDeleteUser).not.toHaveBeenCalled();
+    expect(mockEmailSend).not.toHaveBeenCalled();
+  });
+
+  test('a plain database failure inside the txn still rethrows (the new arm did not widen)', async () => {
+    failMarkerWith(new Error('connection reset'));
+    await expect(deleteAccount({ userId: SUB })).rejects.toThrow('connection reset');
+  });
+
+  // The owner-gate sentinel arm shares this boundary catch with the new arm, so its two
+  // dedicated tests above ('IN-TXN blocked result carries google_access_revoked' and
+  // 'pre-flight blocked result does NOT') are what prove the new arm did not shadow it.
+  // Re-asserted here so a future reader sees both arms exercised in one place.
+  test('the owner-gate sentinel arm still returns the blocked status alongside the new arm', async () => {
+    mockUGFindAll.mockReset();
+    mockUGFindAll.mockResolvedValueOnce([]); // Step 1 fast-fail gate passes
+    mockUGFindAll.mockResolvedValueOnce([{ group_id: 'g1' }]); // in-txn re-check blocks
+    mockSequelizeQuery.mockImplementation(async (sql) => {
+      if (typeof sql === 'string' && sql.includes('"UserGroups"') && sql.includes('FOR UPDATE')) {
+        return [{ user_uuid: UUID }, { user_uuid: '22222222-2222-2222-2222-222222222222' }];
+      }
+      return [];
+    });
+    const res = await deleteAccount({ userId: SUB });
+    expect(res.status).toBe('blocked');
+    expect(res.groups).toEqual([{ id: 'g1', name: 'Group One', memberCount: 2 }]);
   });
 });
 
