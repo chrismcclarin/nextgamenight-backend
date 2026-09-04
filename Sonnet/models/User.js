@@ -1,5 +1,5 @@
 // models/User.js
-const { DataTypes } = require('sequelize');
+const { DataTypes, fn, col } = require('sequelize');
 const sequelize = require('../config/database');
 
 const User = sequelize.define('User', {
@@ -201,6 +201,34 @@ const User = sequelize.define('User', {
   indexes: [
     {
       fields: ['user_id']
+    },
+    {
+      // Case-insensitive uniqueness on the identity column (Phase 88.8, owner
+      // ruling 2026-09-04). `email` above is `unique: true`, i.e. a case-SENSITIVE
+      // btree on the RAW column (`Users_email_key`), so `Alice@x.com` and
+      // `alice@x.com` could both exist. Plan 03 made friend search compare
+      // `lower(email)` against the stored column (routes/friendships.js:210), so
+      // both rows now match one query and `findOne` (LIMIT 1, no ORDER BY) picks
+      // whichever the scan reaches first — a friend request could reach the wrong
+      // account. This index removes the ambiguity at the data layer.
+      //
+      // DECLARED HERE IN LOCKSTEP WITH ITS MIGRATION, and that is a CONSEQUENCE
+      // constraint rather than tidiness: unlike the plain columns this phase adds,
+      // `migrate-cli-replay` DOES diff indexes (scripts/ci/schema-drift-diff.js
+      // Q_INDEXES), so a migration-only index — or a model-only one — is a RED
+      // drift gate. Prod counterpart:
+      // migrations/20260902000007-add-lower-email-unique-index-to-users.js
+      // (which additionally refuses to build on pre-existing case-variant
+      // duplicates rather than failing the deploy with a raw unique violation).
+      //
+      // The `fn('lower', col('email'))` form is the one plan 03's own note
+      // prescribed; Sequelize renders it as
+      // `CREATE UNIQUE INDEX "users_email_lower_unique" ON "Users" (lower("email"))`,
+      // which Postgres normalises to the same catalog entry as the migration's
+      // spelling, so the two schemas fold to one identity.
+      unique: true,
+      name: 'users_email_lower_unique',
+      fields: [fn('lower', col('email'))],
     }
   ]
 });
