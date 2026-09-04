@@ -1,7 +1,11 @@
 // routes/friendships.js
 // Friendship CRUD routes: list, search, request, accept, decline, remove
 const express = require('express');
-const { Op, UniqueConstraintError } = require('sequelize');
+// Phase 88.8 / R10: `fn`, `col` and the `where` HELPER join this existing
+// destructure (never a second require). The helper is aliased to `whereFn`
+// because the bare name `where` would shadow the Sequelize option key it is
+// assigned to.
+const { Op, UniqueConstraintError, fn, col, where: whereFn } = require('sequelize');
 const { User, Friendship } = require('../models');
 const { body, validationResult } = require('express-validator');
 const { resolveTargetUserUuidOnly } = require('../utils/resolveTargetUser');
@@ -138,12 +142,51 @@ router.get('/search', async (req, res) => {
   try {
     const { email } = req.query;
 
-    if (!email) {
+    // Phase 88.8 / R10: normalise the INPUT once — trim surrounding whitespace,
+    // then lowercase. A whitespace-only param now takes the SAME 400 branch as a
+    // missing one: it can never identify a row, and 404 would read as "no such
+    // user" when the truth is "you sent nothing". A non-string param (a repeated
+    // `?email=a&email=b` arrives as an array) also lands here rather than
+    // throwing on `.toLowerCase()` and 500ing.
+    const normalized = typeof email === 'string' ? email.trim().toLowerCase() : '';
+
+    if (!normalized) {
       return res.status(400).json({ error: 'Email query parameter is required' });
     }
 
     const user = await User.findOne({
-      where: { email: email.toLowerCase() },
+      // DECISION Phase 88.8 R10 (plan 03): compare `lower(email)` on the STORED
+      // column against the trimmed+lowercased input — chosen OVER the previous
+      // `where: { email: email.toLowerCase() }`, which lowercased only the QUERY
+      // and then compared it to the column AS STORED, so any row persisted with
+      // different case was silently unfindable. Counterpart rule: from plan 04
+      // onward the provisioning service normalises with the SAME
+      // `trim().toLowerCase()` at persistence, so new rows agree with this
+      // comparison by construction; this clause is what reaches the rows written
+      // before that.
+      //
+      // The match stays FULL-exact — `lower(email) = lower(:input)` and nothing
+      // else. Deliberately REJECTED (SPEC Edge Coverage `encoding / R10`):
+      // `Op.iLike`/`Op.like` (a PATTERN match, which would let `%` and `_` from
+      // user input widen the comparison), prefix or substring matching,
+      // Gmail-dot collapsing and plus-address stripping. Each one turns this
+      // endpoint into an email-enumeration oracle — that is why it has always
+      // been exact. Pinned by the partial/prefix/wildcard 404 cases in
+      // tests/routes/friendships.test.js.
+      //
+      // TRADE-OFF, considered rather than overlooked: `lower(email)` is not
+      // covered by the `Users_email_key` unique index, so this lookup becomes a
+      // sequential scan. Irrelevant at this app's user count. The functional
+      // index (`CREATE INDEX ... ON "Users" (lower(email))`) is deliberately NOT
+      // added in this phase; the deferral is OWNED by
+      // `.planning/deferred/phase-91.md` (Phase 88.8 plan review, 2026-09-03),
+      // with the constraint that it must be mirrored in `models/User.js`
+      // `indexes` (declared via `sequelize.fn('lower', sequelize.col('email'))`)
+      // in the SAME commit as its migration — CI's drift gate diffs indexes
+      // between the migration-built and sync-built schemas, so a migration-only
+      // index is a red `migrate-cli-replay`. If this ever matters, the fix is
+      // that index, never a return to the as-stored comparison.
+      where: whereFn(fn('lower', col('email')), normalized),
       // BSEC-01 (D-03): email removed from the projection (the WHERE filter is
       // unaffected). The searcher supplied the email; echoing it back is
       // unnecessary. Phase 87.3 PR-C (BE-12, user D1 resolution): the flat sub
