@@ -73,6 +73,23 @@ const ERROR_REGISTRY = Object.freeze({
   invalid_token:           { httpStatus: 410, message: 'This restore link is no longer valid.' },
   already_used:            { httpStatus: 410, message: 'This restore link is no longer valid.' },
   window_expired:          { httpStatus: 410, message: 'This link has expired.' },
+  // Phase 88.8 (BOPS-05, SPEC R7) — append-only per D-11. Emitted through sendError by
+  // BOTH deletion endpoints (DELETE /users/me and GET /users/me/deletion-blockers) when
+  // the caller's token is valid but there is no Users row AND no deletion tombstone.
+  //
+  // DECISION Phase 88.8 R7: a NEW code was chosen OVER reusing the existing generic
+  // `not_found` (404) above. `not_found` is registered as forward-compat and is emitted
+  // by no live chokepoint (see its comment), so reusing it would look free — but the
+  // whole point of R7 is that the frontend must tell three states apart: "you never had
+  // an account here" (this code), "your account was deleted" (account_deleted, 410), and
+  // "the thing you asked for is missing" (not_found, 404). Sharing a code with the
+  // generic 404 collapses exactly the distinction this requirement exists to create, and
+  // the FE's exhaustive message Record could no longer render different copy for them.
+  //
+  // The `message` here is the API-CONSUMER fallback, not the user-facing string: the
+  // frontend renders its OWN copy from MESSAGE_BY_CODE (plan 11). Worded so it never
+  // implies a deletion happened.
+  not_provisioned:         { httpStatus: 404, message: 'This account has no stored data yet.' },
   internal:                { httpStatus: 500, message: 'An internal error occurred' }, // 500 fallback
 });
 
