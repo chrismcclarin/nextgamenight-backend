@@ -41,7 +41,7 @@ const crypto = require('crypto');
 const request = require('supertest');
 const express = require('express');
 const googleAuthRoutes = require('../../routes/googleAuth');
-const { User, SingleUseToken, sequelize } = require('../../models');
+const { User, SingleUseToken, PendingAuth0Deletion, sequelize } = require('../../models');
 
 // App: callback is PUBLIC (no auth). Inject req.user for the authed /url mint test.
 const app = express();
@@ -188,6 +188,130 @@ describe('Google OAuth single-use nonce state (D-04 / BSEC-03)', () => {
       expect(res.status).toBe(302);
       expect(res.headers.location).not.toContain('evil.example.com');
       expect(res.headers.location.startsWith('http://localhost:3000/')).toBe(true);
+    });
+  });
+
+  // ==========================================================================
+  // Phase 88.8 plan 06 Task 3 — SPEC R9 as amended by A5, CONTEXT D-22,
+  // threat T-88.8-27 / T-88.8-29 / T-88.8-31.
+  //
+  // A deleted account signing back in with Google used to be answered with
+  // sendError(res, 'account_deleted') — a raw JSON API envelope rendered into a
+  // BROWSER WINDOW, because this callback is a public browser navigation, not an
+  // XHR. It now redirects into the shipped logout-then-goodbye idiom.
+  //
+  // The frontend session is still alive mid-OAuth, which is precisely why a direct
+  // redirect to /goodbye was rejected in favour of routing through logout.
+  // ==========================================================================
+  describe('GET /api/auth/google/callback — tombstoned account (SPEC R9 / A5, D-22)', () => {
+    const TOMBSTONED_SUB = 'auth0|gauth-tombstoned';
+    // Byte-for-byte the literal the frontend allowlist compares with `===`
+    // (periodictabletop/src/app/api/auth/[auth0]/route.js). Written out here rather
+    // than derived, so a drift on either side of the wave boundary fails loudly.
+    const RETURN_TO = '/goodbye?reason=account_deleted';
+    const EXPECTED_TAIL = `/api/auth/logout?returnTo=${encodeURIComponent(RETURN_TO)}`;
+
+    // FIXTURE CAVEAT, stated because it is a real divergence from production and a
+    // future reader will otherwise "simplify" the seeded row away:
+    //
+    // Production has NO foreign key on SingleUseToken.user_id at all —
+    // migrations/20260618000002-create-single-use-tokens.js:49-53 declares the column
+    // with no `references`, and models/index.js:295-299 records that the pinned
+    // `onDelete: 'CASCADE'` "governs the CI/test database only". So in production the
+    // oauth_state nonce outlives the Users row and this branch fires with NO row for
+    // the sub. The sync-built test database DOES carry that FK, so a nonce for a
+    // row-less sub cannot be inserted here and the fixture must seed the row. Deleting
+    // it after minting is not an option either — the test DB's FK is ON DELETE CASCADE
+    // and would take the nonce with it.
+    //
+    // The T-88.8-29 assertion below is therefore written against the privilege the
+    // threat is actually about — a still-valid nonce surviving account deletion must
+    // not let anyone re-materialise or MUTATE a Users row by connecting a calendar —
+    // rather than against row COUNT alone, which the harness cannot express.
+    async function mintTombstonedNonce(frontendUrl) {
+      await User.create({
+        user_id: TOMBSTONED_SUB,
+        username: 'Tombstoned',
+        email: 'tombstoned@example.com',
+      });
+      await PendingAuth0Deletion.create({ auth0_sub: TOMBSTONED_SUB });
+      const nonce = crypto.randomBytes(32).toString('base64url');
+      await SingleUseToken.create({
+        nonce,
+        user_id: TOMBSTONED_SUB,
+        purpose: 'oauth_state',
+        frontend_url: frontendUrl,
+        status: 'active',
+        expires_at: new Date(Date.now() + 30 * 60 * 1000),
+      });
+      return nonce;
+    }
+
+    it('302s to the allow-listed frontend origin + logout with a PERCENT-ENCODED returnTo', async () => {
+      const nonce = await mintTombstonedNonce('http://localhost:3000');
+
+      const res = await request(app)
+        .get('/api/auth/google/callback')
+        .query({ code: 'auth-code', state: nonce });
+
+      expect(res.status).toBe(302);
+      // The exact string, not just the status — the encoding is the load-bearing part.
+      expect(res.headers.location).toBe(`http://localhost:3000${EXPECTED_TAIL}`);
+      expect(res.headers.location).toBe(
+        'http://localhost:3000/api/auth/logout?returnTo=%2Fgoodbye%3Freason%3Daccount_deleted'
+      );
+      // No token exchange happens for a refused account.
+      expect(mockGetToken).not.toHaveBeenCalled();
+    });
+
+    it('the Location carries exactly ONE unencoded question mark', async () => {
+      // Unencoded, the reason's `?` starts a SECOND query parameter on the logout
+      // route; the frontend's searchParams.get('returnTo') would then return the bare
+      // '/goodbye', its exact-literal allowlist would match the OLD literal, and the
+      // reason variant would silently never render — a bug that looks like a frontend
+      // copy bug and would be debugged in the wrong repo.
+      const nonce = await mintTombstonedNonce('http://localhost:3000');
+
+      const res = await request(app)
+        .get('/api/auth/google/callback')
+        .query({ code: 'auth-code', state: nonce });
+
+      expect((res.headers.location.match(/\?/g) || []).length).toBe(1);
+    });
+
+    it('T-88.8-27: a stored frontend_url that is NOT on the allow-list falls back to the FRONTEND_URL origin', async () => {
+      // The stored value is re-resolved through the allow-list AT CALLBACK TIME.
+      // SPEC A5 corrected R9's original claim that the sibling branches already do
+      // this — they do NOT; allow-listing happens at MINT time. Without the
+      // re-resolution this assertion would be vacuous.
+      const nonce = await mintTombstonedNonce('https://evil.example.com');
+
+      const res = await request(app)
+        .get('/api/auth/google/callback')
+        .query({ code: 'auth-code', state: nonce });
+
+      expect(res.status).toBe(302);
+      expect(res.headers.location).toBe(`http://localhost:3000${EXPECTED_TAIL}`);
+      expect(res.headers.location).not.toContain('evil.example.com');
+    });
+
+    it('T-88.8-29: a tombstoned callback provisions nothing and mutates nothing', async () => {
+      const nonce = await mintTombstonedNonce('http://localhost:3000');
+      const before = await User.count();
+
+      await request(app)
+        .get('/api/auth/google/callback')
+        .query({ code: 'auth-code', state: nonce });
+
+      // No row created (the guard runs BEFORE the writer)...
+      expect(await User.count()).toBe(before);
+      // ...and no calendar grant landed on the tombstoned subject's row.
+      const row = await User.findOne({ where: { user_id: TOMBSTONED_SUB } });
+      expect(row.google_calendar_token).toBeNull();
+      expect(row.google_calendar_refresh_token).toBeNull();
+      expect(row.google_calendar_enabled).toBeFalsy();
+      // The authorization code is never exchanged for a refused account.
+      expect(mockGetToken).not.toHaveBeenCalled();
     });
   });
 
