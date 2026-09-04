@@ -167,7 +167,7 @@ jest.mock('../../services/auth0Service', () => ({
 
 const auth0Service = require('../../services/auth0Service');
 const provisioningService = require('../../services/provisioningService');
-const { isEmailUniqueViolation, EMAIL_UNIQUE_CONSTRAINTS } = provisioningService;
+const { isEmailCollision, EMAIL_UNIQUE_CONSTRAINTS } = provisioningService;
 const { User } = require('../../models');
 
 const SERVICE_PATH = path.join(__dirname, '..', '..', 'services', 'provisioningService.js');
@@ -683,7 +683,7 @@ describe('services/provisioningService — provisionOrRepair', () => {
       const recognised = {};
       for (const [label, err] of Object.entries(shapes)) {
         raised[label] = err !== null;
-        recognised[label] = isEmailUniqueViolation(err);
+        recognised[label] = isEmailCollision(err);
       }
       const allTrue = Object.fromEntries(Object.keys(shapes).map((k) => [k, true]));
       expect(raised).toEqual(allTrue);
@@ -706,9 +706,9 @@ describe('services/provisioningService — provisionOrRepair', () => {
         subErr = e;
       }
       expect(subErr.name).toBe('SequelizeUniqueConstraintError');
-      expect(isEmailUniqueViolation(subErr)).toBe(false);
-      expect(isEmailUniqueViolation(new Error('nope'))).toBe(false);
-      expect(isEmailUniqueViolation(null)).toBe(false);
+      expect(isEmailCollision(subErr)).toBe(false);
+      expect(isEmailCollision(new Error('nope'))).toBe(false);
+      expect(isEmailCollision(null)).toBe(false);
     });
 
     it('CREATE: a first-time user whose verified address is already taken provisions with the synthetic address instead of 500ing', async () => {

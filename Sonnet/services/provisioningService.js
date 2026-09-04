@@ -63,8 +63,13 @@ const PICTURE_URL_MAX_LENGTH = 255;
 // `err.parent.constraint` is `users_email_lower_unique` and `err.fields` is keyed
 // `lower(email::text)`, so `err.fields.email` is undefined. A predicate that knows only
 // one name matches NEITHER arm for that index.
-// Plan 05 promotes this predicate to an exported `isEmailCollision` and replaces the
-// placeholder handling below with the four SPEC R5 orphan branches.
+//
+// The SET is what makes the constraint arm work at all, and it is deliberately a set
+// rather than the single name CONTEXT D-15 wrote down before plan 02's index existed.
+// What proves the two names are the SAME on the migration-built and the sync-built
+// database is not assertion but CI: scripts/ci/schema-drift-diff.js compares UNIQUE
+// constraints and indexes BY NAME between the two, with an EMPTY accepted-drift
+// allowlist, so a rename on either side is a red `migrate-cli-replay`.
 const EMAIL_UNIQUE_CONSTRAINTS = Object.freeze(['Users_email_key', 'users_email_lower_unique']);
 
 // Free-form-but-FROZEN telemetry vocabulary. `outcome` is the one-line summary of what
@@ -184,19 +189,44 @@ function isEmailUniqueField(key) {
  * index-expression key, not just `email` — `err.fields.email` is undefined for the lower
  * index, which is the trap CONTEXT D-15's original one-name predicate fell into.
  *
- * ROUTED TO PLAN 05: this is the predicate plan 05 promotes to an exported
- * `isEmailCollision`, and its plan text's stated ordering rationale needs correcting
- * against the matrix above before it is written.
+ * PROMOTED BY PLAN 05 (2026-09-04) from the plan-04 internal `isEmailCollision` to
+ * this exported `isEmailCollision`, with the predicate itself UNCHANGED. The rename is
+ * the whole promotion: plan 05's plan text asked for the predicate to be re-derived with
+ * `parent.constraint` as the "primary discriminator" and `fields.email` as a fast path,
+ * and the matrix above is the measurement that says that ordering is wrong for
+ * findOrCreate — the call shape all seven provisioning writers use. Re-deriving it would
+ * have 500'd a first-time user on a collision, which is the exact failure plan 05 exists
+ * to remove. So: promote, do not re-derive.
+ *
+ * THE ONE THING THAT COULD NOT BE VERIFIED (carried forward from CONTEXT D-15's own
+ * UNVERIFIED note, and the reason both arms are kept): whether Postgres always emits the
+ * `Key (col)=(val)` DETAIL line for this application's database role. Nothing in the
+ * repo can falsify it — both local Postgres instances need passwords that live in files
+ * CLAUDE.md forbids reading. What IS proven, from the installed source, is that the
+ * no-DETAIL branch exists and what it produces: postgres/query.js `formatError` case
+ * '23505' takes a second `return` with NO `fields` argument when the DETAIL line is
+ * absent or does not match, and `UniqueConstraintError`'s constructor then makes
+ * `this.fields` an EMPTY OBJECT (`options.fields ?? {}`) — not an absent key, which is
+ * what plan 05's text said. That shape is unreachable from a real provoked collision, so
+ * it is pinned by hand-built errors in tests/unit/provisioningCollision.test.js. An
+ * untested fallback arm is decorative.
+ *
+ * Both reads are optional-chained: this runs inside a catch block, and an error object
+ * missing either shape must never make the handler itself throw.
  */
-function isEmailUniqueViolation(err) {
+function isEmailCollision(err) {
   if (!err || err.name !== 'SequelizeUniqueConstraintError') {
     return false;
   }
-  const constraint = err.parent && err.parent.constraint;
+  const constraint = err.parent?.constraint;
   if (typeof constraint === 'string' && EMAIL_UNIQUE_CONSTRAINTS.includes(constraint)) {
     return true;
   }
-  return Object.keys((err && err.fields) || {}).some(isEmailUniqueField);
+  const fields = err.fields;
+  if (!fields || typeof fields !== 'object') {
+    return false;
+  }
+  return Object.keys(fields).some(isEmailUniqueField);
 }
 
 // ---------------------------------------------------------------------------
@@ -581,7 +611,7 @@ async function createRow({
     if (raced) {
       row = raced;
       created = false;
-    } else if (isEmailUniqueViolation(createFailed)) {
+    } else if (isEmailCollision(createFailed)) {
       // PLACEHOLDER, and deliberately narrow — plan 05 replaces this with the four SPEC
       // R5 orphan branches (look up the occupant, release a dead identity's address,
       // report genuine_conflict otherwise). Until then this is the shipped graceful tail
@@ -819,7 +849,7 @@ async function repairExistingRow({
       // tests/services/provisioningService.test.js.
       console.log(`[users:provision] repaired user ${row.id} fields=${Object.keys(changes).sort().join(',')}`);
     } catch (repairFailed) {
-      if (isEmailUniqueViolation(repairFailed)) {
+      if (isEmailCollision(repairFailed)) {
         // PLACEHOLDER — plan 05 replaces this with the four SPEC R5 orphan branches.
         // Until then the difference from today is that this REPORTS rather than being
         // swallowed by a console warning (routes/users.js:472-478), so a real user whose
@@ -852,10 +882,12 @@ async function repairExistingRow({
 
 module.exports = {
   provisionOrRepair,
-  // Exported for the shape-matrix assertions in
-  // tests/services/provisioningService.test.js. Plan 05 promotes this to the public
-  // `isEmailCollision` and builds the four SPEC R5 orphan branches on top of it.
-  isEmailUniqueViolation,
+  // The PUBLIC collision predicate (plan 05 promoted it from plan 04's internal
+  // `isEmailUniqueViolation` without changing a line of its logic — see the measured
+  // matrix on the function). Pinned by the shape matrix in
+  // tests/services/provisioningService.test.js and by the no-DETAIL fallback cases in
+  // tests/unit/provisioningCollision.test.js.
+  isEmailCollision,
   EMAIL_UNIQUE_CONSTRAINTS,
   PROVISIONING_OUTCOMES,
   PROVISIONING_NOTES,
