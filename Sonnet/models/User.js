@@ -129,13 +129,71 @@ const User = sequelize.define('User', {
     allowNull: true,
     defaultValue: null,
   },
+  // Google avatar URL lifted from the Auth0 `picture` claim at provisioning
+  // (Phase 88.8, SPEC R11). Null = no avatar known. DELIBERATELY NOT in the
+  // defaultScope exclude list below — an avatar is a cross-boundary field; other
+  // members are meant to see it. Prod counterpart:
+  // migrations/20260902000001-add-picture-url-to-users.js.
+  picture_url: {
+    type: DataTypes.STRING,
+    allowNull: true,
+    defaultValue: null,
+  },
+  // Set when a collision repair releases a dead identity's address (Phase 88.8,
+  // SPEC R5 / D-14). Null on every row that can log in — it is operational state,
+  // never non-null on a live login, so it is NOT excluded by the defaultScope.
+  // Literal type-match for sms_welcome_sent_at above (D-14). Prod counterpart:
+  // migrations/20260902000002-add-orphaned-at-to-users.js.
+  orphaned_at: {
+    type: DataTypes.DATE,
+    allowNull: true,
+    defaultValue: null,
+  },
+  // Null = the address in `email` is Auth0-owned and plan 04's repair branch MAY
+  // overwrite it. A timestamp = the user set it themselves and the repair branch
+  // MUST leave it alone (Phase 88.8, SPEC R12-as-amended-by-A12).
+  //
+  // DECISION Phase 88.8 D-36: a NULLABLE DATE, chosen OVER three alternatives.
+  //   (a) A BOOLEAN flag — REJECTED. Same guard at strictly less information.
+  //       This is a security-relevant field on which "when did this change" has
+  //       audit value precisely because a notice mail fires on every change
+  //       (SPEC A13). Same reasoning as `orphaned_at` and `sms_welcome_sent_at`
+  //       above: a nullable timestamp costs a boolean and records WHEN.
+  //   (b) An `email_source` ENUM — REJECTED. CONTEXT D-07 records that a Postgres
+  //       ENUM value cannot be dropped by a migration's down(), so an ENUM buys
+  //       irreversibility for a field that only ever has two states.
+  //   (c) DISQUALIFIED (not merely rejected): deriving this marker at read time by
+  //       comparing `email` against the current Auth0 claim. That comparison
+  //       cannot distinguish "the user set it" from "the claim changed", which is
+  //       the ONLY distinction the marker exists to make — and it would refuse to
+  //       repair exactly the synthetic @auth0.local rows this phase exists to
+  //       repair (their claim never matches). It is not a cheaper version of this
+  //       column; it answers a different question.
+  // Changing this to a boolean, an ENUM, or a derived comparison is a decision,
+  // not a cleanup. Prod counterpart:
+  // migrations/20260902000003-add-email-changed-at-to-users.js.
+  email_changed_at: {
+    type: DataTypes.DATE,
+    allowNull: true,
+    defaultValue: null,
+  },
 }, {
   timestamps: true,
   // BSEC-01 / D-03: fail-closed PII default. email/phone are stripped from
   // every default read; the 18 legitimate readers opt back in via
   // .scope('withContactInfo') or .unscoped(). is_platform_admin stays
   // reachable only via .unscoped()/explicit attributes (never serialized).
-  defaultScope: { attributes: { exclude: ['email', 'phone'] } },
+  //
+  // email_changed_at joins them (Phase 88.8, T-88.8-07): WHETHER a person has
+  // changed their address is metadata ABOUT that person and has no business on
+  // another user's payload, so it is fail-closed by default exactly as email and
+  // phone are. The self read gets it back because `withContactInfo` below is an
+  // EMPTY override, which restores every attribute — plan 13's revert affordance
+  // is keyed on self.email_changed_at and dies silently if that stops being true.
+  // picture_url is DELIBERATELY absent from this list (cross-boundary avatar,
+  // R11) and so is orphaned_at (operational, never non-null on a row that can
+  // log in).
+  defaultScope: { attributes: { exclude: ['email', 'phone', 'email_changed_at'] } },
   scopes: {
     // empty override = restores all attributes (incl. email/phone)
     withContactInfo: {},
