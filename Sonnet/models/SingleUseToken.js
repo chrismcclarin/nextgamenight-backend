@@ -286,19 +286,32 @@ const SingleUseToken = sequelize.define('SingleUseToken', {
  *   The atomic single-UPDATE shape is preserved verbatim. Do NOT convert this to
  *   findOne-then-update to "make the transaction case clearer" — that reintroduces the
  *   check-then-mark race the whole function exists to avoid (T-88.2-07).
+ * @param {string} [options.purpose] - Phase 88.8 plan 09 (ADDITIVE, optional): narrow
+ *   the SAME single UPDATE to one purpose. Omitted by every pre-existing caller, so
+ *   routes/googleAuth.js:175, routes/rsvp.js:248 and
+ *   services/groupRecoveryService.js:517 behave exactly as they did.
+ * @param {string} [options.user_id] - Phase 88.8 plan 09 (ADDITIVE, optional): narrow
+ *   the SAME single UPDATE to one user. Together with `purpose` this is what makes the
+ *   email-change verify route unable to consume ANOTHER user's code, and unable to be
+ *   probed for one — a foreign nonce simply affects zero rows and is reported as
+ *   `invalid`, indistinguishable from a wrong code. Both predicates are added to the
+ *   existing WHERE; the atomic single-UPDATE shape is untouched.
  * @returns {Promise<Object|null>} The consumed row (with its pre-update field
  *   values, plus the now-'used' status) if consumption succeeded, else null.
  */
 SingleUseToken.consumeByNonce = async function consumeByNonce(nonce, options = {}) {
   if (!nonce) return null;
+  const where = {
+    nonce,
+    status: 'active',
+    expires_at: { [Op.gt]: new Date() },
+  };
+  if (options.purpose !== undefined) where.purpose = options.purpose;
+  if (options.user_id !== undefined) where.user_id = options.user_id;
   const [, rows] = await SingleUseToken.update(
     { status: 'used', used_at: new Date() },
     {
-      where: {
-        nonce,
-        status: 'active',
-        expires_at: { [Op.gt]: new Date() },
-      },
+      where,
       returning: true,
       transaction: options.transaction,
     }

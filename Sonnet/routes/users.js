@@ -1379,4 +1379,611 @@ router.post('/:user_id/email/cancel', writeOperationLimiter, async (req, res) =>
   }
 });
 
+// ---------------------------------------------------------------------------
+// The identity overwrite: shared machinery for verify and revert
+// ---------------------------------------------------------------------------
+
+/** Sentinel used to roll a managed transaction back without surfacing an error. */
+class EmailChangeRollback extends Error {
+  constructor(reason) {
+    super(`email-change rollback: ${reason}`);
+    this.name = 'EmailChangeRollback';
+    this.reason = reason;
+  }
+}
+
+/**
+ * D-41 — move this user's PENDING GroupInvite rows onto the new address, GATED on
+ * the OLD address having been proved by somebody, and skipping collisions.
+ *
+ * `GroupInvite` carries no user reference: the ADDRESS is the invite-to-person
+ * link, and it is the authorization key at FOUR sites. Without a move a legitimate
+ * invite answers 403 "This invite is not for you" — an accusation for a
+ * consequence of the user's own action.
+ *
+ * DECISION Phase 88.8 D-41 (the GATE). The invite move is an AUTHORIZATION-relevant
+ * rewrite, not a convenience, because `invited_email` is the key at FOUR sites:
+ * routes/invites.js:512-518 (the GET /pending list — a LOWER(invited_email) match
+ * against the caller's Users.email, which is what makes an invite VISIBLE at all),
+ * plus the three accept gates at :593, :664 and :757. CONTEXT D-41's own reasoning
+ * says "all three acceptance gates"; that count is WRONG and is corrected to FOUR
+ * here and everywhere else it appears.
+ *
+ * CHOSEN: gate the move on the old address having been proved by someone — either
+ * a PRE-UPDATE `email_changed_at` (a previously user-proved address) or a
+ * `previousEmail` equal to the normalised current Auth0 claim with
+ * `email_verified === true`.
+ *
+ * THE ATTACK THIS CLOSES, concretely, because the gate looks like a needless
+ * condition without it. Provisioning persists the raw token email with NO
+ * `email_verified` check on the create path, and the Management-API branch adopts
+ * `userDetails.email` under a synthetic-address filter and nothing else
+ * (services/provisioningService.js). So a row can hold `victim@x` having proved
+ * nothing. Mallory signs up on a database connection as `victim@x`, never
+ * verifies, gets provisioned; she then requests a change to `mallory@evil` and
+ * verifies THAT with the mailed code — which proves control of `mallory@evil` and
+ * says nothing whatsoever about `victim@x`. An ungated case-insensitive UPDATE
+ * would then move every pending GroupInvite addressed to `victim@x` — invites
+ * issued by group admins who have never met her — onto `mallory@evil`,
+ * permanently, and the real holder of `victim@x` could never accept them.
+ *
+ * REJECTED: (a) the ungated case-insensitive UPDATE — it launders an unverified
+ * address into a permanent redirect of a THIRD PARTY's invites, as above;
+ * (b) refusing the whole email change for such a row — it punishes the far larger
+ * population of legitimate users whose address was adopted from an unverified
+ * claim by a provisioning path they never saw, and would lock out exactly the rows
+ * plans 04/05 exist to repair; (c) moving the invites and mailing the old address
+ * a warning — the warning goes to an inbox the changer may control and the invites
+ * are already redirected by then.
+ *
+ * THE PARKED ALTERNATIVE IN CONTEXT D-41 DOES NOT DEFUSE THIS. D-41 parks
+ * "matching the UserGroup{invited} row's user_uuid first" as structurally nicer
+ * and worth a later hardening phase. It is NOT the safer mechanism and must not be
+ * reached for as one: that row is itself created by an EMAIL match —
+ * routes/invites.js:351-356 finds the existing user with a case-insensitive
+ * LOWER(email) compare against the invited address, and :435-452 then findOrCreates
+ * the UserGroup row with status 'invited' keyed on that user's id. An attacker
+ * holding an unverified `victim@x` already owns a user_uuid-keyed invited row for
+ * the victim's invites too, so keying the move on user_uuid moves exactly the same
+ * rows. The address is UPSTREAM of the surrogate key; only proving the address
+ * closes it.
+ *
+ * ACCEPTED CONSEQUENCE, written down rather than left implicit: a user whose
+ * address was adopted without verification and who changes it will NOT have their
+ * pending invites moved, and may hit exactly the 403 D-41 exists to prevent. That
+ * is the correct trade — a third party's invites must not be redirectable by
+ * someone who never proved the address they were sent to — and the remedy is that
+ * the inviter re-issues to the new address, one action by the person with the
+ * authority to take it. Do not "improve" this by moving the invites anyway.
+ *
+ * THE SKIP IS RECORDED IN TELEMETRY ONLY. It adds NO ninth `outcome` literal: the
+ * enum is a pinned 8-value contract that plan 13 keys its whole state machine on,
+ * and plan 13's classifier falls through to the shared error message for any
+ * literal it does not know — so a ninth value would render a SUCCESSFUL change as
+ * a failure in the UI. The user-visible outcome is `verified` either way. The
+ * DURABLE on-disk trace is not the telemetry: it is the unmoved GroupInvite rows
+ * themselves, still addressed to the old address, plus — for the underlying
+ * population — plan 05's class-5 hygiene listing, which keys on
+ * `extractUserDetails(u).email_verified !== true` from Auth0 and therefore still
+ * lists a row whose Auth0 identity never proved its address, whatever this app's
+ * Users.email now holds.
+ *
+ * DECISION Phase 88.8 D-41 (the COLLISION SKIP). A blanket UPDATE violates
+ * `group_invites_pending_unique` — (group_id, LOWER(invited_email)) WHERE
+ * status='pending', models/GroupInvite.js:113-118 — whenever the same group
+ * already has a pending invite to the NEW address, and that violation aborts the
+ * WHOLE transaction: the user's email change would 500 for a reason they can
+ * neither see nor fix. So the move is ONE guarded statement whose NOT EXISTS
+ * correlated subquery skips exactly those rows. Chosen OVER a read-then-write
+ * loop, which reintroduces a check-then-act race the caller's row lock does NOT
+ * cover, because the colliding row belongs to a DIFFERENT user. A skipped row is
+ * harmless: the invitee already has a pending invite to that group under the
+ * address they now hold, so they can accept that one.
+ *
+ * NO NEW INDEX, and the cost is accepted with its eyes open — say so here so a
+ * later reader does not "fix" it. The case-insensitive predicate matches neither
+ * index that looks like it should serve it: the plain btree on the raw column
+ * (models/GroupInvite.js:57-60) cannot serve LOWER(invited_email) = ?, and
+ * group_invites_pending_unique is group_id-LEADING, so it cannot serve a lookup
+ * with no group_id. The resulting scan runs inside the caller's transaction while
+ * their Users row is held FOR UPDATE. It is accepted because the operation is
+ * capped at three mints per user per hour (D-10), so the frequency is bounded by a
+ * control this plan already ships. Do NOT add an index for it in this phase.
+ */
+async function movePendingInvites({
+  t,
+  sub,
+  previousEmail,
+  previousEmailChangedAt,
+  claimEmail,
+  claimVerified,
+  newAddress,
+}) {
+  const oldNormalised = provisioningService.normaliseEmail(previousEmail);
+  const newNormalised = provisioningService.normaliseEmail(newAddress);
+  if (!oldNormalised || !newNormalised || oldNormalised === newNormalised) {
+    return { moved: false, skipped: false };
+  }
+
+  const claimNormalised = provisioningService.normaliseEmail(claimEmail);
+  // THE GATE READS THE PRE-UPDATE SNAPSHOT. `previousEmailChangedAt` is captured
+  // by the caller BEFORE the overwrite stamps `email_changed_at`. Re-reading the
+  // column here, after the write, would find it non-null for EVERY change and the
+  // gate would pass unconditionally — a gate that is always open, which is worse
+  // than no gate because it looks like a control.
+  const oldAddressWasProved =
+    previousEmailChangedAt !== null && previousEmailChangedAt !== undefined
+      ? true
+      : claimVerified === true && claimNormalised !== null && claimNormalised === oldNormalised;
+
+  if (!oldAddressWasProved) {
+    let leftBehind = 0;
+    try {
+      const [countRow] = await sequelize.query(
+        'SELECT COUNT(*)::int AS n FROM "GroupInvites" WHERE status = \'pending\' AND LOWER(invited_email) = :oldEmail',
+        { replacements: { oldEmail: oldNormalised }, type: QueryTypes.SELECT, transaction: t }
+      );
+      leftBehind = (countRow && countRow.n) || 0;
+    } catch (_countFailed) {
+      leftBehind = -1;
+    }
+    emailChangeTelemetry('invite-move-skipped', {
+      sub,
+      address: previousEmail,
+      message: 'D-41 invite move skipped: the previous address was never proved',
+      extra: { pendingInvitesLeftBehind: leftBehind },
+    });
+    return { moved: false, skipped: true, leftBehind };
+  }
+
+  await sequelize.query(
+    `UPDATE "GroupInvites" AS gi
+        SET invited_email = :newEmail, "updatedAt" = NOW()
+      WHERE gi.status = 'pending'
+        AND LOWER(gi.invited_email) = :oldEmail
+        AND NOT EXISTS (
+          SELECT 1
+            FROM "GroupInvites" AS gx
+           WHERE gx.group_id = gi.group_id
+             AND gx.status = 'pending'
+             AND LOWER(gx.invited_email) = :newEmail
+             AND gx.id <> gi.id
+        )`,
+    {
+      replacements: { newEmail: newNormalised, oldEmail: oldNormalised },
+      type: QueryTypes.UPDATE,
+      transaction: t,
+    }
+  );
+  return { moved: true, skipped: false };
+}
+
+/**
+ * D-42 — move this user's Feedback rows onto the new address, in the same
+ * transaction. This is a DELETION / PII fix, not a convenience: both feedback
+ * write paths set `user_id: null` explicitly under the 2026-07-24 owner decision
+ * (routes/feedback.js:115-116), so `user_email` is the ONLY link to a person and
+ * the `user_id` arms of the deletion scrub (services/accountDeletionService.js:292-298)
+ * match nothing on these rows. Without this, feedback submitted under a previous
+ * address survives account deletion with that address still in it.
+ *
+ * WHAT THIS UPDATE GUARANTEES, STATED HONESTLY AS A LIMIT AND NOT AS A GUARANTEE
+ * (D-42's premise was corrected 2026-09-04). `Feedback.user_email` was never
+ * `Users.email` — it is CLIENT-SUPPLIED on both writers, and today both frontend
+ * callers send the Auth0 SESSION address, which equals `Users.email` only for a row
+ * provisioned from a verified claim and never repaired. So: rows whose `user_email`
+ * equals the caller's `Users.email` at change time move with the address. This does
+ * NOT reach a row written under some other address. Two things make that boundary
+ * small rather than a hole — Task 4 of this plan makes the AUTHENTICATED writer
+ * server-derive the address from `Users.email`, so every row written from this
+ * phase onward carries the value this UPDATE matches; and plans 04/05 repair
+ * synthetic rows to the real address, after which historical rows written under the
+ * session email and the repaired `Users.email` are the SAME string.
+ *
+ * NO NOT EXISTS GUARD IS NEEDED, and that was CONFIRMED BY READING rather than
+ * assumed: models/Feedback.js:45-48 declares indexes on `type` and `created_at`
+ * only — there is no unique constraint on `user_email` to collide with. If one ever
+ * appears, this needs the same guarded shape as the invite move above.
+ *
+ * DELIBERATELY NOT TOUCHED, named so they do not read as omissions:
+ * `EventAuditLog.suppressed_email` (a historical log line, not a contact handle or
+ * a match key) and `PendingAuth0Deletion.email` (the sweep keys on `sub` only,
+ * services/pendingAuth0DeletionSweep.js:120, :47).
+ */
+async function moveFeedbackRows({ t, previousEmail, newAddress }) {
+  const oldNormalised = provisioningService.normaliseEmail(previousEmail);
+  const newNormalised = provisioningService.normaliseEmail(newAddress);
+  if (!oldNormalised || !newNormalised || oldNormalised === newNormalised) return;
+  await sequelize.query(
+    'UPDATE "feedback" SET user_email = :newEmail WHERE LOWER(user_email) = :oldEmail',
+    {
+      replacements: { newEmail: newNormalised, oldEmail: oldNormalised },
+      type: QueryTypes.UPDATE,
+      transaction: t,
+    }
+  );
+}
+
+/**
+ * The A13 / D-40 security notice, enqueued AFTER the commit on a successful verify
+ * and on a successful revert. Rules, all owner rulings and none negotiable:
+ *
+ *  - NOTHING about this notice appears in any response body or any UI state.
+ *    Telling the person performing the change that the notice failed confuses a
+ *    legitimate user about a mail they never knew existed, and tells an attacker
+ *    their tracks are covered.
+ *  - SKIPPED when the PRIOR address is SYNTHETIC — the BROAD `@auth0` test, never
+ *    `@auth0.local` alone (DECISION Phase 88.2 NIX-AUTH0). There is no inbox to
+ *    reach, and refusing here would lock out exactly the users this phase exists to
+ *    repair.
+ *  - NEVER blocks the operation. A rejected .add() reports to Sentry with the sub
+ *    and the DOMAIN only and is otherwise swallowed; the 200 body is unchanged.
+ *  - SHARES the hourly budget (D-40). VERIFY needs no extra check — its notice is
+ *    caused by a token that was already counted at mint. REVERT mints nothing, so
+ *    revert counts and skips at the cap (see the revert handler). THE RESULTING
+ *    BOUND, so a reader can check it: at most 3 mints/hour, so at most 3 verify
+ *    notices; and a revert requires a prior verify, so at most 3 revert notices —
+ *    the whole feature can send at most 6 notices per account per hour, all to
+ *    addresses that account controls.
+ *
+ * The queue module is required INSIDE this function on purpose: queues/index.js's
+ * named exports resolve through getters that construct a Redis-connected Queue on
+ * property ACCESS, so a module-top destructure would connect at import time in
+ * every environment that requires this router.
+ */
+async function enqueueEmailChangeNotice({ sub, priorAddress, action, newAddress }) {
+  if (provisioningService.isSyntheticAddress(priorAddress)) return;
+  try {
+    const { emailNoticeQueue } = require('../queues');
+    await emailNoticeQueue.add('email-change-notice', {
+      to: priorAddress,
+      sub,
+      action,
+      newAddress,
+    });
+  } catch (err) {
+    emailChangeTelemetry('notice-enqueue', { sub, address: priorAddress, error: err });
+  }
+}
+
+/**
+ * The four writes that make up an identity change, in the order the plan pins:
+ * (a) the overwrite, (b) the GATED invite move, (c) the feedback move. (d) — the
+ * commit and the notice — belongs to the caller.
+ *
+ * `previousEmail` and `previousEmailChangedAt` are CAPTURED BY THE CALLER off the
+ * locked row BEFORE this function runs, because (a) stamps `email_changed_at`.
+ */
+async function applyIdentityChange({
+  t,
+  sub,
+  lockedRow,
+  newAddress,
+  newEmailChangedAt,
+  previousEmail,
+  previousEmailChangedAt,
+  claimEmail,
+  claimVerified,
+}) {
+  await lockedRow.update(
+    { email: newAddress, email_changed_at: newEmailChangedAt },
+    { transaction: t }
+  );
+  await movePendingInvites({
+    t,
+    sub,
+    previousEmail,
+    previousEmailChangedAt,
+    claimEmail,
+    claimVerified,
+    newAddress,
+  });
+  await moveFeedbackRows({ t, previousEmail, newAddress });
+}
+
+// ---------------------------------------------------------------------------
+// POST /:user_id/email/verify — the one transaction that overwrites the identity
+// ---------------------------------------------------------------------------
+//
+// This is an ORDINARY AUTHENTICATED ROUTE. No server.js public-list entry, no
+// no-origin-list entry, no magicTokenLimiter — all three belonged to the retired
+// public-link design.
+//
+// Crockford base32 decoding: O reads as 0 and I/L read as 1. Applying that
+// substitution before validation is what the alphabet is FOR — it does not enlarge
+// the code space (those four symbols are not in it) and it stops a user who typed
+// the letter O for the digit 0 from being told "that code isn't right" about a
+// code that is right. Chosen OVER rejecting the confusable outright, which would
+// be a dead end of exactly the class this phase has been closing.
+const CROCKFORD_CONFUSABLES = { O: '0', I: '1', L: '1' };
+const EMAIL_CHANGE_CODE_PATTERN = /^[0-9A-HJKMNP-TV-Z]{8}$/;
+
+router.post('/:user_id/email/verify', writeOperationLimiter, async (req, res) => {
+  try {
+    const sub = await emailChangeSelfGate(req, res);
+    if (!sub) return undefined;
+
+    // 1. Validate. This is the ONLY non-200 the handler itself emits (besides the
+    //    shared 403 and the 429).
+    const body = req.body || {};
+    const keys = Object.keys(body);
+    if (keys.length !== 1 || keys[0] !== 'code' || typeof body.code !== 'string') {
+      return sendError(res, 'validation');
+    }
+    const typed = normaliseEmailChangeCode(body.code).replace(
+      /[OIL]/g,
+      (ch) => CROCKFORD_CONFUSABLES[ch]
+    );
+    if (!EMAIL_CHANGE_CODE_PATTERN.test(typed)) {
+      return sendError(res, 'validation');
+    }
+
+    // 2. The load rule.
+    const caller = await loadSelfWithContactInfo(sub);
+    if (!caller) return sendError(res, 'not_found');
+
+    const state = { outcome: null, priorAddress: null, newAddress: null };
+    try {
+      await sequelize.transaction(async (t) => {
+        // 3. The lock-order invariant: the caller's Users row, FIRST.
+        const locked = await lockSelfRow(sub, t);
+        if (!locked) throw new EmailChangeRollback('missing');
+
+        const row = await SingleUseToken.consumeByNonce(hashEmailChangeCode(typed), {
+          purpose: EMAIL_CHANGE_PURPOSE,
+          user_id: sub,
+          transaction: t,
+        });
+        if (!row) throw new EmailChangeRollback('no_consume');
+
+        // 4. CAPTURE BOTH VALUES BEFORE ANY WRITE. Capturing `email_changed_at`
+        //    up front is load-bearing, not tidiness: the overwrite below stamps it,
+        //    so a D-41 gate that re-read the column afterwards would find it
+        //    non-null for EVERY change and pass unconditionally.
+        const previousEmail = locked.email;
+        const previousEmailChangedAt = locked.email_changed_at;
+
+        try {
+          // The address written is ROW.TARGET. NEVER read a pending address off the
+          // user, or off a second query, to decide WHAT to write — the token row
+          // decides, which is what keeps a later request racing this verify from
+          // being able to write ITS address.
+          await applyIdentityChange({
+            t,
+            sub,
+            lockedRow: locked,
+            newAddress: row.target,
+            newEmailChangedAt: new Date(),
+            previousEmail,
+            previousEmailChangedAt,
+            claimEmail: req.user && req.user.email,
+            claimVerified: req.user && req.user.email_verified,
+          });
+        } catch (writeErr) {
+          /**
+           * DECISION Phase 88.8 T-88.8-78: the collision is detected at VERIFY
+           * time and is deliberately NOT pre-checked at request time. A pre-check
+           * on the request route would answer "that address is already registered"
+           * to any signed-in caller for any address they type — an account
+           * ENUMERATION ORACLE over the whole user base. At verify time the caller
+           * has already PROVEN control of the address, so telling them is not an
+           * oracle: they can only learn about addresses they own.
+           *
+           * The predicate is the SHIPPED `isEmailCollision`
+           * (services/provisioningService.js), which knows BOTH email unique
+           * constraints — `Users_email_key` (case-sensitive) and
+           * `users_email_lower_unique` (the LOWER(email) index plan 02 added) —
+           * and matches on the field KEY as well as the constraint NAME, because
+           * findOrCreate-shaped errors carry no `parent.constraint` at all and the
+           * lower index's `err.fields` is keyed `lower(email::text)` rather than
+           * `email`. Do NOT re-derive this predicate here; a constraint-name-only
+           * version rethrows on a case-variant collision and 500s.
+           *
+           * Resolving the conflict is NOT automated: the occupying row may be an
+           * orphan, and plan 05 ships scripts/report-account-hygiene.js, which
+           * lists orphans READ-ONLY for the owner. Auto-releasing another user's
+           * address from a request path unauthenticated to THAT row was rejected.
+           */
+          if (provisioningService.isEmailCollision(writeErr)) {
+            emailChangeTelemetry('collision', { sub, address: row.target, error: writeErr });
+            state.outcome = 'address_taken';
+            // Rolling back leaves the code row ACTIVE — do NOT burn it. The user
+            // proved control of an address that is genuinely taken; after they
+            // resolve it the same code should still work inside its 30 minutes.
+            throw new EmailChangeRollback('address_taken');
+          }
+          throw writeErr;
+        }
+
+        state.outcome = 'verified';
+        state.priorAddress = previousEmail;
+        state.newAddress = row.target;
+      });
+    } catch (err) {
+      if (!(err instanceof EmailChangeRollback)) throw err;
+      if (err.reason === 'missing') return sendError(res, 'not_found');
+      if (err.reason === 'no_consume') {
+        // 5. The consume affected zero rows. Read-only from here; no write follows.
+        //    RE-READ THE CALLER FRESH and evaluate the whole branch against THAT.
+        //    Step 2's instance was loaded BEFORE the transaction, so on the losing
+        //    side of a concurrent double-submit it predates the winner's commit and
+        //    still shows the OLD address; judged on it, the idempotent arm below
+        //    could never fire and the loser would return `invalid`, breaking the
+        //    concurrency truth DR-B was restored to satisfy.
+        const fresh = await loadSelfWithContactInfo(sub);
+        const existing = await SingleUseToken.findOne({
+          where: {
+            nonce: hashEmailChangeCode(typed),
+            purpose: EMAIL_CHANGE_PURPOSE,
+            user_id: sub,
+          },
+        });
+        /**
+         * DECISION Phase 88.8 DR-B: this FOUR-WAY branch is chosen OVER an
+         * "anything not active is invalid" collapse. That collapse contradicts
+         * this plan's own concurrency behaviour and would ship a user whose
+         * address had JUST changed into plan 13's "that code isn't right" copy
+         * while the database already held the new address. Do not re-collapse it.
+         */
+        let outcome = 'invalid';
+        if (existing) {
+          const targetNow = provisioningService.normaliseEmail(existing.target);
+          const currentNow = fresh ? provisioningService.normaliseEmail(fresh.email) : null;
+          if (existing.status === 'used' && targetNow !== null && targetNow === currentNow) {
+            // (i) The idempotent second-use arm. It is what makes the concurrency
+            //     behaviour satisfiable: the LOSER of the race consumes nothing and
+            //     answers from here. DELIBERATELY NOT GATED ON expires_at — the
+            //     address IS the caller's address now, and that is the truth being
+            //     reported; expiry governs whether a code can still be CONSUMED,
+            //     not whether a completed change stays true.
+            outcome = 'verified';
+          } else if (existing.status === 'active' && new Date(existing.expires_at) <= new Date()) {
+            // (ii) Active but past its window. Plan 13 promotes Resend on exactly
+            //      this outcome, which is why the resend predicate above carries no
+            //      expires_at clause.
+            outcome = 'expired';
+          }
+          // (iii) used but the target is no longer the current address -> invalid
+          //       (the user changed the address again afterwards; a stale code must
+          //       not re-assert it).
+        }
+        // (iv) absent, revoked, or a row belonging to another user or another
+        //      purpose — which the user_id + purpose predicates HIDE, so it can
+        //      never be probed -> invalid.
+        return respondEmailChange(res, sub, outcome, false);
+      }
+      // address_taken: state.outcome is already set; fall through to the response.
+    }
+
+    if (state.outcome === 'verified') {
+      await enqueueEmailChangeNotice({
+        sub,
+        priorAddress: state.priorAddress,
+        action: 'changed',
+        newAddress: state.newAddress,
+      });
+    }
+
+    // 6. The ONE pinned body, ALL FIVE KEYS, from a withContactInfo re-read after
+    //    the commit.
+    return respondEmailChange(res, sub, state.outcome, false);
+  } catch (error) {
+    console.error('[users] email-change verify failed:', error.message);
+    return sendError(res, 'internal');
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /:user_id/email/revert — restore the Auth0 claim
+// ---------------------------------------------------------------------------
+/**
+ * DECISION Phase 88.8 D-38: revert writes the verified Auth0 claim IMMEDIATELY,
+ * with no code round-trip, chosen OVER (a) dropping revert and making the user
+ * re-verify their own sign-in address, and (b) clearing the marker and letting the
+ * next login's repair branch do it — rejected because revert would appear not to
+ * work, and mail would keep going to the changed address in the meantime. A
+ * MALICIOUS revert is harmless by construction: it can only move the address TO
+ * the address Auth0 has already proved.
+ *
+ * (Block comment on purpose — this plan's marker gate greps with line comments
+ * stripped first, so a line-comment marker would read 0. Same as DR-F above.)
+ */
+router.post('/:user_id/email/revert', writeOperationLimiter, async (req, res) => {
+  try {
+    const sub = await emailChangeSelfGate(req, res);
+    if (!sub) return undefined;
+
+    const caller = await loadSelfWithContactInfo(sub);
+    if (!caller) return sendError(res, 'not_found');
+    // Nothing to revert.
+    if (!caller.email_changed_at) return sendError(res, 'validation');
+
+    const claim = req.user && req.user.email;
+    // The last guard is NOT optional, and here is why: `Users.email` is the
+    // IDENTITY column, and writing a synthetic value back into it would undo
+    // precisely the repair plans 01/04/05 exist to perform. The test is the BROAD
+    // `@auth0` one (provisioningService.isSyntheticAddress), never `@auth0.local`
+    // alone — DECISION Phase 88.2 NIX-AUTH0.
+    if (
+      typeof claim !== 'string' ||
+      (req.user && req.user.email_verified) !== true ||
+      provisioningService.isSyntheticAddress(claim)
+    ) {
+      return sendError(res, 'validation');
+    }
+    const claimAddress = provisioningService.normaliseEmail(claim);
+    if (!claimAddress || claimAddress.length > EMAIL_MAX_LENGTH || !EMAIL_FORMAT.test(claimAddress)) {
+      return sendError(res, 'validation');
+    }
+
+    const state = { outcome: null, priorAddress: null };
+    try {
+      await sequelize.transaction(async (t) => {
+        const locked = await lockSelfRow(sub, t);
+        if (!locked) throw new EmailChangeRollback('missing');
+        if (!locked.email_changed_at) throw new EmailChangeRollback('nothing_to_revert');
+
+        // CAPTURE BEFORE THE WRITE, exactly as verify does — this handler CLEARS
+        // `email_changed_at`, so a gate reading it afterwards would read the null it
+        // just wrote and refuse. Revert passes the D-41 gate BY CONSTRUCTION (it is
+        // reachable only when this value is non-null, which is the gate's first
+        // arm), but it calls the SAME gated helper anyway rather than branching
+        // around it: one helper, one gate, two callers, so the gate cannot be lost
+        // in a later refactor.
+        const previousEmail = locked.email;
+        const previousEmailChangedAt = locked.email_changed_at;
+
+        try {
+          await applyIdentityChange({
+            t,
+            sub,
+            lockedRow: locked,
+            newAddress: claimAddress,
+            newEmailChangedAt: null,
+            previousEmail,
+            previousEmailChangedAt,
+            claimEmail: claim,
+            claimVerified: true,
+          });
+        } catch (writeErr) {
+          if (provisioningService.isEmailCollision(writeErr)) {
+            emailChangeTelemetry('collision', { sub, address: claimAddress, error: writeErr });
+            state.outcome = 'address_taken';
+            throw new EmailChangeRollback('address_taken');
+          }
+          throw writeErr;
+        }
+
+        await revokeActiveEmailChangeTokens(sub, t);
+        state.outcome = 'reverted';
+        state.priorAddress = previousEmail;
+      });
+    } catch (err) {
+      if (!(err instanceof EmailChangeRollback)) throw err;
+      if (err.reason === 'missing') return sendError(res, 'not_found');
+      if (err.reason === 'nothing_to_revert') return sendError(res, 'validation');
+    }
+
+    if (state.outcome === 'reverted') {
+      // D-40: revert MINTS nothing, so it counts this user's email-change tokens in
+      // the last hour itself and SKIPS the notice at the cap — it never refuses the
+      // operation over a mail.
+      const recent = await countRecentEmailChangeMints(sub, null);
+      if (recent < EMAIL_CHANGE_HOURLY_CAP) {
+        await enqueueEmailChangeNotice({
+          sub,
+          priorAddress: state.priorAddress,
+          action: 'reverted',
+          newAddress: claimAddress,
+        });
+      }
+    }
+
+    return respondEmailChange(res, sub, state.outcome, false);
+  } catch (error) {
+    console.error('[users] email-change revert failed:', error.message);
+    return sendError(res, 'internal');
+  }
+});
+
 module.exports = router;
