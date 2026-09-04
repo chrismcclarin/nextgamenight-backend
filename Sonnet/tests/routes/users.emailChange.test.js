@@ -1479,3 +1479,114 @@ describe('source: verify and revert are ordinary authenticated routes', () => {
     expect(stripLineComments(usersSource)).toContain('DECISION Phase 88.8 D-38');
   });
 });
+
+// ===========================================================================
+// TASK 3 — D-39 hydration: pending_email_change on the self read, without
+// breaking the three write echoes.
+// ===========================================================================
+
+describe('D-39 — toSelfWire hydration', () => {
+  beforeEach(() => mailSucceeds());
+
+  it('the self GET returns { address, expires_at } when an active unexpired code exists', async () => {
+    const row = await seedUser({ email: 'self@example.com' });
+    const app = makeApp(actorFor(row));
+    await requestChange(app, row, 'pending@example.com');
+
+    const res = await request(app).get(`/api/users/${row.user_id}`).expect(200);
+    expect(res.body.pending_email_change).toMatchObject({ address: 'pending@example.com' });
+    expect(res.body.pending_email_change.expires_at).toBeTruthy();
+  });
+
+  it('the self read carries email AND email_changed_at — what plan 13 keys the revert affordance on', async () => {
+    const stamped = new Date();
+    const row = await seedUser({ email: 'self@example.com', email_changed_at: stamped });
+    const res = await request(makeApp(actorFor(row))).get(`/api/users/${row.user_id}`).expect(200);
+    expect(res.body.email).toBe('self@example.com');
+    expect(new Date(res.body.email_changed_at).getTime()).toBe(stamped.getTime());
+  });
+
+  it('AFTER A PROVIDER-REFUSED SEND the self read STILL hydrates the pending change', async () => {
+    // The wire half of Task 1's acceptance criterion. The live-pending predicate
+    // deliberately carries NO send_failed_at clause: a refused mail is still a live
+    // pending change, and filtering it out here would restore the dead end from the
+    // other direction.
+    mailRefused();
+    const row = await seedUser();
+    const app = makeApp(actorFor(row));
+    await request(app).post(`/api/users/${row.user_id}/email`).send({ email: 'refused@example.com' }).expect(200);
+
+    const res = await request(app).get(`/api/users/${row.user_id}`).expect(200);
+    expect(res.body.pending_email_change).toMatchObject({ address: 'refused@example.com' });
+  });
+
+  it.each([
+    ['EXPIRED', { status: 'active', expires_at: new Date(Date.now() - 1000) }],
+    ['REVOKED', { status: 'revoked', expires_at: new Date(Date.now() + 60000) }],
+    ['USED', { status: 'used', used_at: new Date(), expires_at: new Date(Date.now() + 60000) }],
+  ])('an %s code produces pending_email_change: null', async (label, attrs) => {
+    const row = await seedUser();
+    await SingleUseToken.create({
+      nonce: `hydrate-${label}-${Date.now()}`,
+      user_id: row.user_id,
+      purpose: PURPOSE,
+      target: 'nothydrated@example.com',
+      ...attrs,
+    });
+
+    const res = await request(makeApp(actorFor(row))).get(`/api/users/${row.user_id}`).expect(200);
+    expect(res.body.pending_email_change).toBeNull();
+  });
+
+  it('another user\'s pending change is NEVER visible — the lookup is keyed on the caller\'s own user_id', async () => {
+    const mine = await seedUser({ email: 'mine@example.com' });
+    const theirs = await seedUser({ email: 'theirs@example.com' });
+    await requestChange(makeApp(actorFor(theirs)), theirs, 'their-pending@example.com');
+
+    const res = await request(makeApp(actorFor(mine))).get(`/api/users/${mine.user_id}`).expect(200);
+    expect(res.body.pending_email_change).toBeNull();
+  });
+
+  it('the KEY IS ALWAYS PRESENT on the three write echoes, valued null, with NO extra query', async () => {
+    const row = await seedUser({ email: 'echo@example.com', phone: null });
+    const app = makeApp(actorFor(row));
+    // A live pending change exists — the echoes must still serialise null, and the
+    // frontend treats those three responses as PARTIAL patches for exactly that
+    // reason (userProfile/page.js:655-668, :858-866).
+    await requestChange(app, row, 'pending@example.com');
+
+    const findOne = jest.spyOn(SingleUseToken, 'findOne');
+
+    const username = await request(app)
+      .put(`/api/users/${row.user_id}/username`)
+      .send({ username: 'echoed' })
+      .expect(200);
+    const prefs = await request(app)
+      .patch(`/api/users/${row.user_id}/notification-preferences`)
+      .send({ notification_preferences: { reminder: { email: true, sms: false, window_hours: 1 } } })
+      .expect(200);
+    const phone = await request(app).delete(`/api/users/${row.user_id}/phone`).expect(200);
+
+    for (const echo of [username, prefs, phone]) {
+      expect(echo.body).toHaveProperty('pending_email_change', null);
+    }
+    expect(findOne).not.toHaveBeenCalled();
+  });
+
+  it('a self read with NOTHING pending returns the key with value null', async () => {
+    const row = await seedUser();
+    const res = await request(makeApp(actorFor(row))).get(`/api/users/${row.user_id}`).expect(200);
+    expect(res.body).toHaveProperty('pending_email_change', null);
+  });
+
+  it('source: toSelfWire stays SYNCHRONOUS and pure, and carries the D-39 marker', () => {
+    const fs = require('fs');
+    const path = require('path');
+    const source = fs.readFileSync(path.join(__dirname, '../../routes/users.js'), 'utf8');
+    expect(source).toContain('const toSelfWire = (user, pendingEmailChange = null) =>');
+    expect(source).not.toContain('const toSelfWire = async');
+    expect(
+      source.split('\n').filter((l) => !/^\s*\/\//.test(l)).join('\n')
+    ).toContain('DECISION Phase 88.8 D-39');
+  });
+});
