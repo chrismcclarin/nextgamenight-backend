@@ -195,18 +195,25 @@ router.get('/search', async (req, res) => {
       //      phase owns; a 409-on-multiple-match would be a contract change.
       //      Unrouted — needs an owner.
       //
-      // TRADE-OFF, considered rather than overlooked: `lower(email)` is not
-      // covered by the `Users_email_key` unique index, so this lookup becomes a
-      // sequential scan. Irrelevant at this app's user count. The functional
-      // index (`CREATE INDEX ... ON "Users" (lower(email))`) is deliberately NOT
-      // added in this phase; the deferral is OWNED by
-      // `.planning/deferred/phase-91.md` (Phase 88.8 plan review, 2026-09-03),
-      // with the constraint that it must be mirrored in `models/User.js`
-      // `indexes` (declared via `sequelize.fn('lower', sequelize.col('email'))`)
-      // in the SAME commit as its migration — CI's drift gate diffs indexes
-      // between the migration-built and sync-built schemas, so a migration-only
-      // index is a red `migrate-cli-replay`. If this ever matters, the fix is
-      // that index, never a return to the as-stored comparison.
+      // SUPERSEDED 2026-09-04 — read this, do not act on the struck-through text.
+      // This comment used to say the `lower(email)` functional index was
+      // "deliberately NOT added in this phase" and was deferred to Phase 91.
+      // THAT IS NO LONGER TRUE. The owner ruled mid-phase to add it, and plan 02
+      // shipped it as a UNIQUE index: `users_email_lower_unique`, in
+      // `migrations/20260902000007-add-lower-email-unique-index-to-users.js`,
+      // mirrored in `models/User.js` `indexes` in the SAME commit (the drift gate
+      // diffs indexes between the migration-built and sync-built schemas, so a
+      // migration-only index is a red `migrate-cli-replay` — that constraint was
+      // real and was honoured).
+      //
+      // So this lookup is NO LONGER a sequential scan, and the Phase 91 deferral
+      // for it is closed. It was made UNIQUE rather than plain because the
+      // case-insensitive comparison below made case-variant duplicate rows
+      // resolve non-deterministically under `findOne`'s `LIMIT 1` with no
+      // `ORDER BY` — a friend request could reach the wrong account.
+      //
+      // Still true and still the rule: the fix is never a return to the
+      // as-stored comparison.
       where: whereFn(fn('lower', col('email')), normalized),
       // BSEC-01 (D-03): email removed from the projection (the WHERE filter is
       // unaffected). The searcher supplied the email; echoing it back is
