@@ -73,9 +73,34 @@ try {
 // -> GET /user-games/user/:id — is covered by that route's self-gate accepting
 // the caller's UUID shape, extended in this same PR).
 // ============================================================================
-const toSelfWire = (user) => {
+/**
+ * DECISION Phase 88.8 D-39: a SYNCHRONOUS second parameter defaulting to null,
+ * with `pending_email_change` assigned UNCONDITIONALLY so the key is present on all
+ * four responses.
+ *
+ * REJECTED: (a) making toSelfWire async and doing the lookup inside it — that adds
+ * a query to three write echoes no consumer reads the field from, and turns a pure
+ * serializer into an I/O function; (b) omitting the key on the write echoes — an
+ * absent key and a null key are DIFFERENT on the wire and a consumer would have to
+ * distinguish them; (c) a separate GET /users/:user_id/email/pending endpoint — a
+ * new endpoint, a new client function, a loading state and a second round trip on a
+ * page that already fetched the user.
+ *
+ * THE FACT THAT MAKES (a)'s COST REAL AND (b)'s RISK ZERO: the three write echoes
+ * load their row through `req.selfUser ?? findOne(...)`, i.e. DEFAULT scope, and the
+ * frontend ALREADY treats those three responses as PARTIAL patches for exactly that
+ * reason (periodictabletop/src/app/userProfile/page.js:658-661, :860-864, whose own
+ * comment says replacing wholesale "would strip email from the cached self for the
+ * session"). So a null on a write echo cannot clobber a live pending change in the
+ * cache.
+ *
+ * @param {Object} user
+ * @param {{ address: string, expires_at: Date }|null} [pendingEmailChange]
+ */
+const toSelfWire = (user, pendingEmailChange = null) => {
   const json = user && user.toJSON ? user.toJSON() : { ...user };
   json.user_id = json.id;
+  json.pending_email_change = pendingEmailChange || null;
   return json;
 };
 
@@ -348,7 +373,34 @@ router.get('/:user_id', requireParamMatchesToken('user_id'), async (req, res) =>
     // Phase 87.3 PR-C (BE-10, A3 + locked alias decision): the self-profile
     // response aliases user_id to the Users.id UUID — the identity hook and
     // providers read `.id`; no consumer needs the sub off this response.
-    res.json(toSelfWire(user));
+    //
+    // Phase 88.8 plan 09 (D-39): ONLY this call site does the pending-change
+    // lookup; the three write echoes call toSelfWire exactly as they did and
+    // serialise null. One query, keyed on the caller's own user_id, riding the
+    // leading `purpose, user_id` prefix of
+    // single_use_tokens_purpose_user_event_status (models/SingleUseToken.js:142-143)
+    // — so NO index is added, which is D-39's stated cost basis.
+    //
+    // Returning null for an EXPIRED row is DELIBERATE, and the frontend consequence
+    // is pinned in both plans so neither side has to infer it: a hydrated
+    // awaiting-code state built on a dead code is a control the user cannot
+    // complete. At MOUNT, with no send made in this session, null maps to IDLE —
+    // the section cannot distinguish "the code expired" from "nothing was ever
+    // requested", and must not guess; the user's exit is Change, which mints a fresh
+    // code. The "your code expired, resend" copy lives on the VERIFY round trip
+    // (outcome: 'expired'), the only path that knows the difference, and Resend can
+    // serve that row because its predicate carries no expires_at clause.
+    //
+    // `verification_sent` is deliberately NOT hydrated: it describes the outcome of
+    // a mail send that happened during a MUTATION and has no meaning on a read.
+    // Keying hydration on it would leave it undefined, no arm would match, and a
+    // user with a pending change would land in the wrong state after any reload —
+    // which kills the primary flow, because the designed journey is exactly "request
+    // the change, leave to read the mail on your phone, come back."
+    const pendingEmailChange = req.user && req.user.user_id
+      ? projectPendingEmailChange(await loadPendingEmailChange(req.user.user_id))
+      : null;
+    res.json(toSelfWire(user, pendingEmailChange));
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

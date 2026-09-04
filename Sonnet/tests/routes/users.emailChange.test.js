@@ -1563,7 +1563,7 @@ describe('D-39 — toSelfWire hydration', () => {
       .expect(200);
     const prefs = await request(app)
       .patch(`/api/users/${row.user_id}/notification-preferences`)
-      .send({ notification_preferences: { reminder: { email: true, sms: false, window_hours: 1 } } })
+      .send({ preferences: { reminder: { email: true, sms: false } } })
       .expect(200);
     const phone = await request(app).delete(`/api/users/${row.user_id}/phone`).expect(200);
 
