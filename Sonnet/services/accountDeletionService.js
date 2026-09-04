@@ -543,6 +543,52 @@ async function runGoogleCleanup(captured, budgetMs) {
 }
 
 /**
+ * The two ways a `Users` row can be absent for an authenticated caller. These are the
+ * `deleteAccount` STATUS tokens, not wire codes — routes/users.js maps them to envelopes
+ * (`not_found` -> 410 account_deleted, `not_provisioned` -> 404 not_provisioned).
+ *
+ * `not_found` keeps its historical name deliberately: it is the shipped status Phase 87.2
+ * mapped to the 410, and renaming it would ripple through every caller and test for no
+ * behavioural gain. Only the SECOND token is new.
+ */
+const MISSING_ROW_STATUS = Object.freeze({
+  ALREADY_DELETED: 'not_found',
+  NEVER_PROVISIONED: 'not_provisioned',
+});
+
+/**
+ * DECISION Phase 88.8 plan 07 (SPEC R7, D-19 backend half): ONE shared classifier for
+ * "there is no Users row for this sub", used by BOTH deletion endpoints, was chosen OVER
+ * letting each endpoint decide for itself. Before this, `deleteAccount` Step 0 and the
+ * `GET /users/me/deletion-blockers` pre-flight each hard-coded the tombstone answer, and
+ * two independent copies of a security-relevant rule is exactly how the two endpoints
+ * come to disagree. Sharing the classifier makes disagreement structurally impossible.
+ *
+ * THE TOMBSTONE CHECK RUNS FIRST, AND THAT ORDERING IS THE MITIGATION (threat T-88.8-33).
+ * A tombstoned sub with no row must still get 410 — never the softer 404 — because a 404
+ * tells the frontend "you never had an account", which invites it to offer provisioning
+ * for an account that was deliberately deleted. Do not reorder this.
+ *
+ * ORDERING WITH THE PRIMARY GATE — do NOT "consolidate" the two. `middleware/auth0.js`
+ * (`callerIsTombstoned`, ~:68-84) is the PRIMARY tombstone gate: it 410s a tombstoned
+ * caller before any route in this file runs, and it deliberately FAILS OPEN on a database
+ * error so auth availability is never coupled to DB availability. This classifier is the
+ * BACKSTOP that catches the fail-open case. Deleting either one silently removes a layer.
+ *
+ * @param {string} sub - the caller's Auth0 subject (req.user.user_id). Never a param.
+ * @param {{ transaction?: import('sequelize').Transaction }} [options]
+ * @returns {Promise<'not_found' | 'not_provisioned'>}
+ */
+async function classifyMissingRow(sub, options) {
+  const tombstoned = options
+    ? await PendingAuth0Deletion.isTombstoned(sub, options)
+    : await PendingAuth0Deletion.isTombstoned(sub);
+  return tombstoned
+    ? MISSING_ROW_STATUS.ALREADY_DELETED
+    : MISSING_ROW_STATUS.NEVER_PROVISIONED;
+}
+
+/**
  * The self-serve deletion pipeline (SPEC Req 1-8). Orchestrates, in the FIXED order,
  * capture -> Google cleanup -> DB transaction -> post-commit Auth0 delete -> notice
  * email. Every external lane is budgeted so the whole call resolves in <30s worst case
@@ -552,7 +598,10 @@ async function runGoogleCleanup(captured, budgetMs) {
  *   trusted identity, never a param — SPEC Req 1).
  * @param {{ budgets?: { googleMs?: number, auth0Ms?: number, emailMs?: number } }} [overrides]
  *   Budget overrides for deterministic fast tests only; production uses DEFAULT_BUDGETS.
- * @returns {Promise<{ status: 'deleted' } | { status: 'not_found' } | { status: 'blocked', groups: Array }>}
+ * @returns {Promise<{ status: 'deleted' }
+ *   | { status: 'not_found' }        // row gone AND a deletion tombstone exists -> 410
+ *   | { status: 'not_provisioned' }  // row never existed, no tombstone (R7) -> 404
+ *   | { status: 'blocked', groups: Array }>}
  */
 async function deleteAccount({ userId }, overrides = {}) {
   const sub = userId;
@@ -565,7 +614,11 @@ async function deleteAccount({ userId }, overrides = {}) {
   // + email in memory NOW (Pitfall 2 — they are gone after User.destroy).
   const user = await User.scope('withContactInfo').findOne({ where: { user_id: sub } });
   if (!user) {
-    return { status: 'not_found' }; // repeat-delete is 404/410, not an error (REQ-6c)
+    // Phase 88.8 plan 07 (R7): a missing row is no longer unconditionally "already
+    // deleted". Ask the shared classifier — a repeat delete (tombstone present) still
+    // resolves not_found -> 410 (REQ-6c, unchanged), while a sub that never had a row
+    // resolves not_provisioned -> 404. Neither path touches any external service.
+    return { status: await classifyMissingRow(sub) };
   }
   const captured = {
     id: user.id,
@@ -693,4 +746,6 @@ module.exports = {
   getDeletionBlockers,
   applyDispositions,
   deleteAccount,
+  classifyMissingRow,
+  MISSING_ROW_STATUS,
 };

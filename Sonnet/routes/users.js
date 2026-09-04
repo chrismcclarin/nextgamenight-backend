@@ -18,6 +18,17 @@ const smsService = require('../services/smsService');
 const accountDeletionService = require('../services/accountDeletionService');
 const { sendError } = require('../utils/errors');
 
+// Phase 88.8 plan 07 (SPEC R7, D-19 backend half): the two "no Users row" statuses the
+// deletion service can hand back, mapped to their wire codes. Both deletion endpoints
+// read THIS map, so the pre-flight and the DELETE can never put different codes on the
+// wire for the same underlying state.
+//   not_found       -> 410 account_deleted   (a tombstone exists: the account WAS deleted)
+//   not_provisioned -> 404 not_provisioned   (no row, no tombstone: it never existed)
+const MISSING_ROW_ENVELOPE = Object.freeze({
+  not_found: 'account_deleted',
+  not_provisioned: 'not_provisioned',
+});
+
 // Sentry SDK is initialized in server.js when SENTRY_DSN is set. Use a defensive
 // require so dev / test envs without the DSN don't blow up — addBreadcrumb /
 // captureException become no-ops there. Pattern mirrors workers/*.js.
@@ -80,9 +91,15 @@ router.get('/me/deletion-blockers', async (req, res) => {
     // surrogate PK, not the Auth0 sub. A stale session whose row is already gone
     // (still inside the token-TTL window) must return the 410 account_deleted
     // envelope, NEVER a 500 from feeding a null row into getDeletionBlockers.
+    //
+    // Phase 88.8 plan 07 (R7): that reasoning is unchanged — a null row still never
+    // reaches getDeletionBlockers. What changed is only the CODE emitted: the service's
+    // shared classifier decides between the 410 (tombstone present) and the new 404
+    // (never provisioned), so this endpoint and DELETE /users/me answer identically.
     const user = await User.findOne({ where: { user_id: sub } });
     if (!user) {
-      return sendError(res, 'account_deleted');
+      const status = await accountDeletionService.classifyMissingRow(sub);
+      return sendError(res, MISSING_ROW_ENVELOPE[status] || 'account_deleted');
     }
     const groups = await accountDeletionService.getDeletionBlockers(user.id);
     return res.json({ groups });
@@ -117,12 +134,18 @@ router.delete('/me', writeOperationLimiter, async (req, res) => {
       }
       return sendError(res, 'owner_of_active_groups', details);
     }
-    if (result.status === 'not_found') {
-      // Repeat DELETE inside the retention window → HTTP 410 with code
+    if (result.status === 'not_found' || result.status === 'not_provisioned') {
+      // not_found: repeat DELETE inside the retention window → HTTP 410 with code
       // account_deleted on the envelope. Never a bare 401 (a still-valid token must
       // not be bounced by a generic auth guard) and never a raw non-envelope 410
       // (the FE maps a raw 410 to 'unknown' and default-retries it).
-      return sendError(res, 'account_deleted');
+      //
+      // not_provisioned (Phase 88.8 plan 07, R7): the caller's token is valid but no row
+      // was ever created and no tombstone exists → HTTP 404 with the new code, which says
+      // "you have no stored data" rather than falsely claiming a deletion happened. The
+      // service, not this handler, decides which of the two applies — see
+      // classifyMissingRow and its tombstone-FIRST ordering note.
+      return sendError(res, MISSING_ROW_ENVELOPE[result.status]);
     }
     // status === 'deleted'
     return res.json({ message: 'Your account and associated data have been deleted.' });
