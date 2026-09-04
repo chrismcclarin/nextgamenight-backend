@@ -215,40 +215,91 @@ router.get('/:user_id', requireParamMatchesToken('user_id'), async (req, res) =>
         || 'User';
       let userEmail = req.user.email;
 
-      // ALWAYS try to fetch from Auth0 Management API if we have credentials
-      // This ensures we get the username they entered during signup (for email/password users)
-      // Even if email is in token, username might not be, so we need Management API
-      try {
-        const auth0User = await auth0Service.getUserById(req.params.user_id);
-        if (auth0User === null) {
-          // SPEC Req 6: getUserById returns null ONLY on a 404 — the Auth0 identity is
-          // GONE (deleted). Refuse to re-provision from token claims; a deleted identity
-          // must never re-materialize email/username as a fresh Users row. (Management-API
-          // *errors* throw and are handled by the catch below as the optional-lookup path.)
-          return sendError(res, 'account_deleted');
-        }
-        if (auth0User) {
-          // User exists in Auth0 (verified), safe to use their details
-          const userDetails = auth0Service.extractUserDetails(auth0User);
-          
-          // Always use email from Management API if available and valid
-          if (userDetails.email && !userDetails.email.includes('@auth0.local') && !userDetails.email.includes('@auth0')) {
-            userEmail = userDetails.email;
+      // ---------------------------------------------------------------------
+      // Phase 88.8 / BOPS-05 (SPEC R2) — CLAIMS-FIRST provisioning.
+      //
+      // The Auth0 post-login Action (auth0/actions/post-login-claims.js) now puts the
+      // email and its verification state on the access token itself, so the Management
+      // API is consulted ONLY when those claims are absent. That Management call is
+      // what has been 403ing since 2026-04 (the audience was built from the CUSTOM
+      // login domain — see .planning/.../88.8-CONFIG-FINDING.md), which is why every
+      // account provisioned between 2026-04 and 2026-09 was given a synthetic
+      // <sub>@auth0.local address instead of the person's real one. Getting that call
+      // off the first-login critical path is the whole point of BOPS-05.
+      //
+      // The three-way rule (plan 04 lifts this into services/provisioningService.js;
+      // the assertions in tests/routes/users.claimsFirst.test.js pin all three arms and
+      // are written to survive that move unchanged):
+      //   1. claim present AND verified  -> adopt it; ZERO Management calls
+      //   2. claim present, NOT verified -> adopt NOTHING, so the synthetic mint below
+      //      fires; still ZERO Management calls. A present-but-unverified claim is not
+      //      a reason to phone the vendor, and must never land in Users.email.
+      //   3. claim absent                -> the Management lookup runs, unchanged.
+      //
+      // DECISION Phase 88.8: claims-first, chosen OVER keeping a Management call on the
+      // first-login critical path purely to preserve the Phase 87.2 SPEC Req 6
+      // identity-gone 410 in arm 3 below. That guard fires when getUserById returns
+      // null (a hard 404 = the Auth0 identity was DELETED from the dashboard) and
+      // refuses to re-materialise the row; on arms 1 and 2 it cannot run, because the
+      // Management API is never called.
+      // The residual is bounded, and is recorded here rather than glossed: a token
+      // carrying claims proves the identity existed at mint time, so the only exposure
+      // is an identity deleted from the dashboard AFTER its token was minted and within
+      // that token's remaining lifetime. Such a row is created with its own real
+      // verified address (no privilege gain; the unverified arm yields the synthetic
+      // address, which is LESS exposure than today) and is listed by the R6 hygiene
+      // script's "Auth0 identity gone" class. The rejected alternative is named because
+      // it re-introduces exactly the vendor dependency BOPS-05 exists to remove.
+      // The tombstone check (PendingAuth0Deletion.isTombstoned, above) still runs on
+      // BOTH paths and is untouched. Changing this is a decision, not a cleanup.
+      // ---------------------------------------------------------------------
+      const claimEmailPresent =
+        typeof req.user.email === 'string' &&
+        req.user.email.trim().length > 0 &&
+        !req.user.email.includes('@auth0.local') &&
+        !req.user.email.includes('@auth0');
+
+      if (claimEmailPresent) {
+        // Arms 1 and 2. `=== true` is deliberate: the middleware defaults an ABSENT
+        // verification claim to false, and no other truthy shape counts as proof.
+        userEmail = req.user.email_verified === true ? req.user.email : null;
+      } else {
+        // Arm 3 — byte-for-byte the pre-88.8 path.
+        // ALWAYS try to fetch from Auth0 Management API if we have credentials
+        // This ensures we get the username they entered during signup (for email/password users)
+        // Even if email is in token, username might not be, so we need Management API
+        try {
+          const auth0User = await auth0Service.getUserById(req.params.user_id);
+          if (auth0User === null) {
+            // SPEC Req 6: getUserById returns null ONLY on a 404 — the Auth0 identity is
+            // GONE (deleted). Refuse to re-provision from token claims; a deleted identity
+            // must never re-materialize email/username as a fresh Users row. (Management-API
+            // *errors* throw and are handled by the catch below as the optional-lookup path.)
+            return sendError(res, 'account_deleted');
           }
-          
-          // Always use username from Management API if available and not generic
-          // This is critical for email/password users who entered a username during signup
-          const mgmtUsername = clampProvisionedUsername(userDetails.username);
-          if (mgmtUsername && mgmtUsername !== 'User') {
-            userName = mgmtUsername;
+          if (auth0User) {
+            // User exists in Auth0 (verified), safe to use their details
+            const userDetails = auth0Service.extractUserDetails(auth0User);
+
+            // Always use email from Management API if available and valid
+            if (userDetails.email && !userDetails.email.includes('@auth0.local') && !userDetails.email.includes('@auth0')) {
+              userEmail = userDetails.email;
+            }
+
+            // Always use username from Management API if available and not generic
+            // This is critical for email/password users who entered a username during signup
+            const mgmtUsername = clampProvisionedUsername(userDetails.username);
+            if (mgmtUsername && mgmtUsername !== 'User') {
+              userName = mgmtUsername;
+            }
           }
-        }
-      } catch (auth0Error) {
-        // If Management API is not configured or fails, log and continue with token data
-        // This allows the system to work without Management API (with reduced functionality)
-        console.warn('Auth0 Management API lookup failed during user creation (this is optional):', auth0Error.message);
-        if (process.env.NODE_ENV === 'development') {
-          console.log('Falling back to token data. Make sure AUTH0_MANAGEMENT_CLIENT_ID and AUTH0_MANAGEMENT_CLIENT_SECRET are set for full functionality.');
+        } catch (auth0Error) {
+          // If Management API is not configured or fails, log and continue with token data
+          // This allows the system to work without Management API (with reduced functionality)
+          console.warn('Auth0 Management API lookup failed during user creation (this is optional):', auth0Error.message);
+          if (process.env.NODE_ENV === 'development') {
+            console.log('Falling back to token data. Make sure AUTH0_MANAGEMENT_CLIENT_ID and AUTH0_MANAGEMENT_CLIENT_SECRET are set for full functionality.');
+          }
         }
       }
       
