@@ -228,6 +228,14 @@ describe('Phase 88-34 Task 4 — provisioning clamps the Auth0-derived username 
       await request(makeAppWithClaims({
         user_id: sub,
         email: 'generic-updated@example.com',
+        // Phase 88.8 (SPEC R3): the claim email is adopted ONLY when the token says it is
+        // verified. This fixture predates that rule and left email_verified unset, which
+        // now reads as UNVERIFIED and mints the synthetic address instead — so the email
+        // assertion below (a Rule-1 pin on the withContactInfo scope, not on verification)
+        // could no longer be reached. Marking the fixture verified is what a real
+        // Google / verified email-password login looks like and preserves this test's
+        // intent exactly; the clamp assertions are untouched.
+        email_verified: true,
         given_name: givenName,
         family_name: familyName,
       }))

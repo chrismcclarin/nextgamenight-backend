@@ -380,13 +380,29 @@ router.get('/:user_id', requireParamMatchesToken('user_id'), async (req, res) =>
         
         // If user already existed but has wrong email/username, update them
         if (!created) {
+          // Rule 1 (Phase 88.8 plan 01, found by tests/routes/users.test.js:248):
+          // `userEmail` may legitimately be the SYNTHETIC <sub>@auth0.local address by
+          // the time we get here — the claims-first rule mints it for a present-but-
+          // unverified claim, and the pre-88.8 path already minted it whenever the
+          // Management lookup failed. Writing that over a row that already holds a REAL
+          // address is data loss: it replaces a usable email with a placeholder, and
+          // friend-search-by-email then cannot find the person. The old condition guarded
+          // the SOURCE row (`newUser.email` not synthetic) but never the VALUE being
+          // written, so this branch could downgrade a good address to a synthetic one.
+          // Only ever write a real address; a synthetic one is a no-op for the email arm.
+          const emailIsReal =
+            typeof userEmail === 'string' &&
+            userEmail.length > 0 &&
+            !userEmail.includes('@auth0.local') &&
+            !userEmail.includes('@auth0');
+
           const needsUpdate =
-            (newUser.email !== userEmail && !newUser.email.includes('@auth0.local') && !newUser.email.includes('@auth0')) ||
+            (emailIsReal && newUser.email !== userEmail && !newUser.email.includes('@auth0.local') && !newUser.email.includes('@auth0')) ||
             (newUser.username === 'User' && clampedUserName !== 'User');
 
           if (needsUpdate) {
             await newUser.update({
-              email: userEmail,
+              ...(emailIsReal ? { email: userEmail } : {}),
               username: clampedUserName
             });
             // Phase 88-34 (r3 triage #7): log the row ID, never the identity.

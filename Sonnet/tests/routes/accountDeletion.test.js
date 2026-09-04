@@ -80,6 +80,18 @@ function makeApp(userId) {
   return a;
 }
 
+// Phase 88.8 (BOPS-05): an authenticated actor whose token carries NO email claim.
+// This is the shape the REQ-6 identity-gone guard still runs on — see the note on that
+// test. makeApp() above injects an email claim, which under the claims-first rule skips
+// the Auth0 Management lookup entirely.
+function makeAppNoEmailClaim(userId) {
+  const a = express();
+  a.use(express.json());
+  a.use(stubAuth({ user_id: userId }));
+  a.use('/api/users', userRoutes);
+  return a;
+}
+
 // App WITHOUT any actor (unauthenticated) — req.user is undefined.
 function makeAnonApp() {
   const a = express();
@@ -226,18 +238,53 @@ describe('REQ-6 orphaned-token re-provision guard (JIT + search)', () => {
     expect(mockUserCreate).not.toHaveBeenCalled();
   });
 
-  it('JIT: Auth0 identity lookup returns null (deleted in Auth0) → 410, NO token-claims fallback create', async () => {
+  // AMENDED Phase 88.8 plan 01 (BOPS-05, claims-first provisioning). This guard fires
+  // inside the Auth0 Management lookup, and that lookup now runs ONLY when the access
+  // token carries no email claim (SPEC R2). So the actor here must be claim-less — with
+  // an email claim the Management API is never called and this guard cannot run. The
+  // claims-path residual is pinned by the test immediately below; it is not erased.
+  it('JIT (no email claim): Auth0 identity lookup returns null (deleted in Auth0) → 410, NO token-claims fallback create', async () => {
     mockUserScopeFindOne.mockResolvedValueOnce(null); // no existing row
     mockIsTombstoned.mockResolvedValueOnce(false); // no marker yet, but Auth0 is gone
     mockGetUserById.mockResolvedValueOnce(null); // Auth0 identity deleted
 
-    const res = await request(makeApp('auth0|authgone'))
+    const res = await request(makeAppNoEmailClaim('auth0|authgone'))
       .get('/api/users/auth0|authgone')
       .expect(410);
 
     expect(res.body.code).toBe('account_deleted');
     expect(mockUserFindOrCreate).not.toHaveBeenCalled();
     expect(mockUserCreate).not.toHaveBeenCalled();
+  });
+
+  // NAMED RESIDUAL of Phase 88.8 BOPS-05, pinned here on purpose so it is visible in the
+  // security suite rather than only in a plan document. Plan 01 threat register T-88.8-02
+  // records it as ACCEPTED, and routes/users.js carries the matching DECISION marker.
+  //
+  // What changed: when the token carries an email claim, provisioning no longer calls the
+  // Auth0 Management API at all — which is the entire point of BOPS-05 (that call had been
+  // 403ing since 2026-04 and was minting synthetic @auth0.local addresses). The Phase 87.2
+  // SPEC Req 6 "identity deleted from the Auth0 dashboard → 410" guard lives inside that
+  // call, so it cannot fire on the claims path.
+  //
+  // Why the exposure is bounded: a token carrying claims proves the identity existed when
+  // the token was minted, so the only window is an identity deleted from the dashboard
+  // AFTER its token was minted and within that token's remaining lifetime. The row created
+  // carries the caller's own real verified address (no privilege gain), the tombstone guard
+  // (PendingAuth0Deletion.isTombstoned — the test above this one) still runs on BOTH paths,
+  // and the R6 account-hygiene script lists such rows under "Auth0 identity gone".
+  //
+  // If a future phase restores a Management check on the claims path, this test SHOULD
+  // fail — that is the signal, not a regression. Do not delete it to keep the suite quiet.
+  it('JIT (email claim present): the Management lookup is skipped, so the identity-gone 410 does NOT fire — accepted residual T-88.8-02', async () => {
+    mockUserScopeFindOne.mockResolvedValueOnce(null); // no existing row
+    mockIsTombstoned.mockResolvedValueOnce(false);
+    mockGetUserById.mockResolvedValueOnce(null); // would have meant "deleted in Auth0"
+
+    await request(makeApp('auth0|authgone-with-claim')).get('/api/users/auth0|authgone-with-claim');
+
+    // The vendor was never consulted — that is the change BOPS-05 exists to make.
+    expect(mockGetUserById).not.toHaveBeenCalled();
   });
 
   // GET /api/users/search/email/:email DELETED — Phase 87.6 (users-search-email,
