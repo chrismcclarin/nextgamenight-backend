@@ -6,7 +6,7 @@ const { google } = require('googleapis');
 const { User, SingleUseToken, PendingAuth0Deletion } = require('../models');
 const { sendError, AppError } = require('../utils/errors');
 const { clampProvisionedUsername } = require('../utils/provisionedUsername');
-const { resolveAllowedFrontendUrl } = require('../config/allowedOrigins');
+const { resolveAllowedFrontendUrl, normalizeOrigin } = require('../config/allowedOrigins');
 // Phase 88.8 plan 06 (SPEC A1 / D-13): the single home of the provisioning policy.
 const provisioningService = require('../services/provisioningService');
 const { matchesSelf } = require('../middleware/objectAuth');
@@ -14,6 +14,80 @@ const router = express.Router();
 
 // OAuth state nonce lifetime: the consent round-trip is short; 30 min is generous.
 const OAUTH_STATE_TTL_MS = 30 * 60 * 1000;
+
+// ---------------------------------------------------------------------------
+// Phase 88.8 plan 06 Task 3 — SPEC R9 as amended by SPEC Amendment A5, CONTEXT D-22.
+//
+// Where a deleted account is sent when it comes back through the PUBLIC Google OAuth
+// callback. The path and the reason are ONE frozen literal because the frontend
+// allowlist compares it with `===`:
+// periodictabletop/src/app/api/auth/[auth0]/route.js matches exactly '/goodbye' and
+// exactly '/goodbye?reason=account_deleted'. Deriving either side from the other is
+// impossible across two repos, so both are written out; the backend test asserts the
+// whole emitted string so a drift fails loudly rather than degrading silently.
+//
+// The PATH is copied from the shipped logout-goodbye constant
+// (periodictabletop/src/app/components/DangerZoneDeleteAccount.tsx:61) but NOT the
+// value: that constant's returnTo is unencoded because it has no query string of its
+// own. Ours does.
+// ---------------------------------------------------------------------------
+const GOODBYE_RETURN_TO = '/goodbye?reason=account_deleted';
+const FRONTEND_LOGOUT_PATH = '/api/auth/logout';
+
+/**
+ * Build the browser-facing refusal for an app-deleted account arriving at the OAuth
+ * callback: log the still-live frontend session out through Auth0, then land on the
+ * goodbye page with the account-deleted explanation.
+ *
+ * WHY A REDIRECT THROUGH LOGOUT rather than straight to /goodbye: mid-OAuth the
+ * frontend session is still ALIVE. Sending the browser to /goodbye directly would leave
+ * a logged-in session belonging to an account that no longer exists. Routing through
+ * logout is the shipped idiom for exactly this.
+ *
+ * TWO FACTS, written here so nobody re-opens them:
+ *  1. Auth0's logout documentation states that query-string and hash information in a
+ *     `returnTo` value is NOT taken into account when validating against Allowed Logout
+ *     URLs, so the already-allow-listed goodbye URL covers the reason variant and NO
+ *     Auth0 dashboard change is required (owner confirmed the goodbye URL is on that
+ *     list, 2026-09-02). 88.8-RESEARCH.md, Vendor Answers V3.
+ *  2. The installed @auth0/nextjs-auth0 short-circuits to the return URL for a
+ *     sessionless caller, so the branch is robust whether or not the session survived.
+ *     88.8-RESEARCH.md, Code Examples E4.
+ *
+ * THE ENCODING IS LOAD-BEARING and is the single most likely thing to ship broken.
+ * Unencoded, the reason's `?` starts a SECOND query parameter on the logout route; the
+ * frontend's `searchParams.get('returnTo')` then returns the bare '/goodbye', its
+ * exact-literal allowlist matches the OLD literal, and the reason variant silently
+ * never renders — a bug that presents as a frontend copy bug and gets debugged in the
+ * wrong repo. Pinned by an exact-string assertion plus a one-question-mark assertion.
+ *
+ * @param {{ frontend_url?: string|null }|null} consumedToken - the consumed oauth_state row.
+ * @returns {string} an absolute URL on an ALLOW-LISTED origin.
+ */
+function buildDeletedAccountRedirect(consumedToken) {
+  // T-88.8-27: RE-RESOLVE the stored value through the allow-list AT CALLBACK TIME,
+  // never reflect it. SPEC R9's original text said the sibling branches already do
+  // this; SPEC Amendment A5 corrected that — they do NOT. Allow-listing happens at
+  // MINT time (see the resolveAllowedFrontendUrl block in generateGoogleAuthUrl), which
+  // is why the siblings trust `consumedToken.frontend_url` directly. Do NOT "simplify"
+  // this branch to match them: re-resolving here is what makes the open-redirect test
+  // real rather than vacuous, and it is the only defence if a stored row is ever
+  // tampered with or was written by an older, laxer mint.
+  const resolved =
+    resolveAllowedFrontendUrl(consumedToken && consumedToken.frontend_url) ||
+    resolveAllowedFrontendUrl(process.env.FRONTEND_URL) ||
+    process.env.FRONTEND_URL ||
+    'http://localhost:3000';
+
+  // resolveAllowedFrontendUrl allow-lists by ORIGIN but returns the caller's value,
+  // which may carry a path. The logout route is mounted at the site ROOT, so normalise
+  // to the bare origin — `${resolved}/api/auth/logout` on a path-carrying stored value
+  // would 404. normalizeOrigin returns null for an unparseable value; fall back rather
+  // than emit nothing.
+  const origin = normalizeOrigin(resolved) || resolved;
+
+  return `${origin}${FRONTEND_LOGOUT_PATH}?returnTo=${encodeURIComponent(GOODBYE_RETURN_TO)}`;
+}
 
 // Initialize OAuth2 client
 const getOAuth2Client = () => {
@@ -229,11 +303,18 @@ router.get('/google/callback', async (req, res) => {
     const frontendUrl = consumedToken.frontend_url || process.env.FRONTEND_URL || 'http://localhost:3000';
 
     // SPEC Req 6 (Phase 87.2 tombstone guard, self-keyed): the sub was resolved from
-    // the nonce minted by the same (now-deleted) user. Refuse before the findOrCreate
-    // below can re-materialize the Users row mid-OAuth-flow. Pinned refusal shape:
-    // 410 account_deleted envelope.
+    // the nonce minted by the same (now-deleted) user. Refuse before the writer below
+    // can re-materialize the Users row mid-OAuth-flow.
+    //
+    // Phase 88.8 plan 06 (SPEC R9 as amended by A5, D-22, T-88.8-31): the refusal is a
+    // REDIRECT now, not `sendError(res, 'account_deleted')`. This handler is reached by
+    // a BROWSER NAVIGATION from Google, so the 410 API envelope rendered as raw JSON in
+    // the user's window. The two raw-JSON 400s above for a missing code/state stay as
+    // they are — the SPEC boundaries record them as accepted-forever, because Google
+    // always sends both and turning them into redirects would hide a genuinely broken
+    // integration rather than help anyone.
     if (await PendingAuth0Deletion.isTombstoned(user_id)) {
-      return sendError(res, 'account_deleted');
+      return res.redirect(buildDeletedAccountRedirect(consumedToken));
     }
 
     // -----------------------------------------------------------------------
@@ -264,9 +345,9 @@ router.get('/google/callback', async (req, res) => {
     });
 
     if (provisioned.status === 'identity_gone') {
-      // Phase 87.2 SPEC Req 6. Same refusal as the tombstone branch above; Task 3 of
-      // this plan converts BOTH to the browser-facing logout-then-goodbye redirect.
-      return sendError(res, 'account_deleted');
+      // Phase 87.2 SPEC Req 6. Same browser-facing refusal as the tombstone branch
+      // above — a browser navigation must never be answered with an API envelope.
+      return res.redirect(buildDeletedAccountRedirect(consumedToken));
     }
 
     const user = provisioned.user;
