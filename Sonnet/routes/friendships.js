@@ -174,6 +174,27 @@ router.get('/search', async (req, res) => {
       // been exact. Pinned by the partial/prefix/wildcard 404 cases in
       // tests/routes/friendships.test.js.
       //
+      // KNOWN GAPS this clause does NOT close — named here so a future phase can
+      // find them rather than rediscover them (neither is a widening; both are
+      // residue of `Users_email_key` being a case-SENSITIVE btree on the RAW
+      // column, verified 2026-09-04):
+      //   1. Only the INPUT is trimmed, not the stored column. A legacy row
+      //      persisted as `'a@b.com '` stays unfindable — `lower('a@b.com ')`
+      //      is not `'a@b.com'`. Plan 04 normalises at persistence so no NEW row
+      //      can be written that way, but nothing in Phase 88.8 backfills the
+      //      rows written before it. Adding `btrim` here would close it; it was
+      //      NOT done because it is beyond this plan's pinned clause and it
+      //      widens case 2 below. Unrouted — needs an owner.
+      //   2. Because uniqueness is case-sensitive, `'A@b.com'` and `'a@b.com'`
+      //      can both exist. Both now match, and `findOne` takes LIMIT 1 with no
+      //      ORDER BY, so the winner is whichever row the scan reaches first —
+      //      a friend request could reach the wrong account. Pre-88.8 this was
+      //      deterministic (only the exactly-lowercase row could match), so this
+      //      non-determinism is NEW. The real fix is a case-insensitive unique
+      //      constraint on Users.email, which is a migration nobody in this
+      //      phase owns; a 409-on-multiple-match would be a contract change.
+      //      Unrouted — needs an owner.
+      //
       // TRADE-OFF, considered rather than overlooked: `lower(email)` is not
       // covered by the `Users_email_key` unique index, so this lookup becomes a
       // sequential scan. Irrelevant at this app's user count. The functional
