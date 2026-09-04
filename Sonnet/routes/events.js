@@ -6,11 +6,11 @@ const { sendError } = require('../utils/errors');
 // Phase 87.4 Plan 02 (KEYMISS mitigation): resolve a self-param that may be the
 // caller's own Users.id UUID (post-PR-2) to the sub-keyed Users row.
 const { isUuid } = require('../utils/resolveTargetUser');
-const { clampProvisionedUsername } = require('../utils/provisionedUsername');
+// Phase 88.8 plan 06 (SPEC A1 / D-13): the single home of the JIT provisioning policy.
+const provisioningService = require('../services/provisioningService');
 const { Op } = require('sequelize');
 const sequelize = require('../config/database');
 const router = express.Router();
-const auth0Service = require('../services/auth0Service');
 const googleCalendarService = require('../services/googleCalendarService');
 const emailService = require('../services/emailService');
 const icsService = require('../services/icsService');
@@ -211,87 +211,42 @@ router.get('/user/:user_id', requireParamMatchesToken('user_id'), async (req, re
       if (await PendingAuth0Deletion.isTombstoned(req.params.user_id)) {
         return sendError(res, 'account_deleted');
       }
-      let userEmail = req.user.email;
-      // Wave-12 review HIGH #2: clamp per-candidate so a >50-char (or
-      // whitespace-only) identity-provider name can't throw the User.username
-      // len[1,50] backstop and 500 first-login JIT provisioning.
-      let userName = clampProvisionedUsername(req.user.name)
-        || clampProvisionedUsername(req.user.nickname)
-        || clampProvisionedUsername(req.user.given_name)
-        || clampProvisionedUsername(req.user.email?.split('@')[0])
-        || 'User';
-      
-      // If email is missing from token, try to fetch from Auth0 Management API
-      if (!userEmail || userEmail.includes('@auth0.local') || userEmail.includes('@auth0')) {
-        try {
-          const auth0User = await auth0Service.getUserById(req.params.user_id);
-          if (auth0User) {
-            const userDetails = auth0Service.extractUserDetails(auth0User);
-            userEmail = userDetails.email;
-            userName = clampProvisionedUsername(userDetails.username) || userName;
-          }
-        } catch (auth0Error) {
-          // If Management API fails, continue with fallback
-          console.warn('Auth0 Management API lookup failed during user creation:', auth0Error.message);
-        }
-      }
-      
-      // Improve username extraction for email/password users
-      if (!userEmail || userEmail.includes('@auth0.local') || userEmail.includes('@auth0')) {
-        userEmail = `${req.params.user_id.replace(/[|:]/g, '-')}@auth0.local`;
-      }
-      
-      // If username is still generic, try to extract from email
-      if (userName === 'User' && userEmail && !userEmail.includes('@auth0.local') && !userEmail.includes('@auth0')) {
-        userName = clampProvisionedUsername(userEmail.split('@')[0]) || userName;
+      // -------------------------------------------------------------------
+      // Phase 88.8 plan 06 (SPEC Amendment A1; D-13). The ~80 lines of inline
+      // provisioning policy that used to live here — the Auth0 Management
+      // fallback, the per-candidate username chain, the hand-written synthetic
+      // @auth0.local mint, the dead repair branch and the
+      // findOne-then-rethrow degrade — were a self-described copy of the
+      // routes/users.js writer. They now live in ONE place:
+      // services/provisioningService.js. Read the `DECISION Phase 88.8 D-13`
+      // marker at the top of that file before changing anything here; every
+      // DECISION that explained the old code MOVED WITH IT.
+      //
+      // KEY ON THE TOKEN SUB, never req.params.user_id — the enclosing guard
+      // has already proved they are equal, and the service keys
+      // Users.user_id, which holds SUBS.
+      //
+      // This surface stays CREATE-ONLY: the enclosing `if (!user ...)` guard
+      // above is deliberate and must NOT be dropped. Every dashboard/list load
+      // hits this route, and moving it inside the guard-less repair chain
+      // would triple the Sentry and Auth0 vendor cadence for no gain — the
+      // repair path already runs on the users.js self-fetch. This route also
+      // accepts no detected timezone, so none is passed.
+      // -------------------------------------------------------------------
+      const provisioned = await provisioningService.provisionOrRepair({
+        sub: req.user.user_id,
+        claims: req.user,
+      });
+
+      if (provisioned.status === 'identity_gone') {
+        // Phase 87.2 SPEC Req 6: the Auth0 identity was deleted from the
+        // dashboard (a hard 404 from the Management API). Refuse with the SAME
+        // 410 account_deleted envelope routes/users.js and routes/groups.js
+        // use, so all three JIT surfaces answer a deleted identity identically.
+        return sendError(res, 'account_deleted');
       }
 
-      // Combine given_name and family_name if available
-      if (req.user.given_name || req.user.family_name) {
-        const fullName = [req.user.given_name, req.user.family_name].filter(Boolean).join(' ').trim();
-        if (fullName) {
-          userName = clampProvisionedUsername(fullName) || userName;
-        }
-      }
-      
-      try {
-        // Wave-12 review MED #11 (mirrors the 88-34 Rule-1 fix in users.js):
-        // a bare findOrCreate returns the instance under the DEFAULT SCOPE,
-        // which EXCLUDES email (models/User.js defaultScope, BSEC-01 D-03) —
-        // so the !created repair branch below evaluated `.includes` on
-        // undefined, threw, and has been dead since it was written. Scoping to
-        // withContactInfo loads email and makes the branch real.
-        const [newUser, created] = await User.scope('withContactInfo').findOrCreate({
-          where: { user_id: req.params.user_id },
-          defaults: {
-            user_id: req.params.user_id,
-            email: userEmail,
-            username: userName,
-          }
-        });
-
-        // If user already existed but has wrong email/username, update them
-        if (!created) {
-          const needsUpdate =
-            (newUser.email !== userEmail && !newUser.email.includes('@auth0.local') && !newUser.email.includes('@auth0')) ||
-            (newUser.username === 'User' && userName !== 'User');
-          
-          if (needsUpdate) {
-            await newUser.update({
-              email: userEmail,
-              username: userName
-            });
-          }
-        }
-        
-        user = newUser;
-      } catch (error) {
-        console.error('Error auto-creating user:', error.message);
-        user = await User.findOne({ where: { user_id: req.params.user_id } });
-        if (!user) {
-          throw error;
-        }
-      }
+      user = provisioned.user;
     }
     
     if (!user) {

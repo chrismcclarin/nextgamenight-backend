@@ -21,7 +21,8 @@ const { sendError, ERROR_REGISTRY } = require('../utils/errors');
 // resolveTargetUser (dual-key) removed with POST /:group_id/users (Phase 87.6
 // groups-add-user); the UUID-only resolver remains for the role/transfer routes.
 const { resolveTargetUserUuidOnly } = require('../utils/resolveTargetUser');
-const { clampProvisionedUsername } = require('../utils/provisionedUsername');
+// Phase 88.8 plan 06 (SPEC A1 / D-13): the single home of the JIT provisioning policy.
+const provisioningService = require('../services/provisioningService');
 const { lockGroupRow } = require('../utils/groupRowLock');
 const { matchesSelf } = require('../middleware/objectAuth');
 const { Op } = require('sequelize');
@@ -167,51 +168,44 @@ router.get('/user/:user_id', async (req, res) => {
       if (await PendingAuth0Deletion.isTombstoned(userId)) {
         return sendError(res, 'account_deleted');
       }
-      // For Google sign-in, email should be available in the token
-      const userEmail = req.user.email;
-      if (!userEmail) {
-        console.warn(`No email found in token for user ${userId}. Available fields:`, {
-          name: req.user.name,
-          nickname: req.user.nickname,
-          given_name: req.user.given_name,
-          family_name: req.user.family_name,
-        });
+      // -------------------------------------------------------------------
+      // Phase 88.8 plan 06 (SPEC Amendment A1; D-13). The inline provisioning
+      // policy that used to live here now lives in ONE place:
+      // services/provisioningService.js — read the `DECISION Phase 88.8 D-13`
+      // marker there before changing anything at this call site.
+      //
+      // Three defects died with the inline copy, all of them real:
+      //  * it adopted `req.user.email` with NO email_verified check at all, so
+      //    an unverified (attacker-settable) token address landed straight in
+      //    the UNIQUE identity column — the service adopts only a VERIFIED one;
+      //  * its bare `User.findOrCreate` returned a DEFAULT-SCOPE instance whose
+      //    `email` is undefined (models/User.js defaultScope, BSEC-01 D-03),
+      //    the same 88-34 Rule-1 dead-branch defect events.js recorded;
+      //  * its catch degraded an email UNIQUE collision to a findOne-then-
+      //    rethrow, i.e. a 500 for a first-time user — the service owns the
+      //    four SPEC R5 collision branches now.
+      // It also logged the provisioned address to stdout, which the service
+      // deliberately does not (utils/provisioningReport.js reports the domain
+      // only, D-17).
+      //
+      // CREATE-ONLY, deliberately: the enclosing `if (!user)` guard above
+      // stays. Widening this to the repair chain would put every group-list
+      // load into the Sentry/vendor cadence for no gain — the users.js
+      // self-fetch already runs repair. No detected timezone is accepted here,
+      // so none is passed.
+      // -------------------------------------------------------------------
+      const provisioned = await provisioningService.provisionOrRepair({
+        sub: userId,
+        claims: req.user,
+      });
+
+      if (provisioned.status === 'identity_gone') {
+        // Phase 87.2 SPEC Req 6: same 410 account_deleted envelope the
+        // tombstone guard above and the users.js/events.js JIT surfaces use.
+        return sendError(res, 'account_deleted');
       }
 
-      // Email is required, so use a valid email format if not provided
-      // This should rarely happen with Google sign-in
-      const finalEmail = userEmail || `${userId.replace(/[|:]/g, '-')}@auth0.local`;
-      // Wave-12 review HIGH #2: clamp per-candidate against the User.username
-      // len[1,50] backstop — this JIT provisioner races users.js/events.js on
-      // first load, and an unclamped >50-char name 500s whichever wins.
-      const userName = clampProvisionedUsername(req.user.name)
-        || clampProvisionedUsername(req.user.nickname)
-        || clampProvisionedUsername(req.user.given_name)
-        || clampProvisionedUsername(req.user.email?.split('@')[0])
-        || 'User';
-
-      try {
-        const [newUser, created] = await User.findOrCreate({
-          where: { user_id: userId },
-          defaults: {
-            user_id: userId,
-            email: finalEmail,
-            username: userName,
-          }
-        });
-        user = newUser;
-
-        if (created) {
-          console.log(`Auto-created user: ${user.user_id} (${user.username}) with email: ${user.email}`);
-        }
-      } catch (error) {
-        // If creation fails (e.g., email already exists), try to find the user
-        console.error('Error auto-creating user:', error.message);
-        user = await User.findOne({ where: { user_id: userId } });
-        if (!user) {
-          throw error; // Re-throw if we still can't find/create the user
-        }
-      }
+      user = provisioned.user;
     }
     
     // Get all groups for this user using UserGroup join
@@ -797,54 +791,52 @@ router.post('/join-by-token', async (req, res) => {
     // auto-provision (mirrors the GET /user/:user_id auto-create) to preserve that
     // flow rather than 404 a legitimate first-time joiner.
     //
-    // Only persist the token's email if Auth0 has VERIFIED it. An unverified email in
-    // the token can be attacker-controlled — persisting it on a first-time row could
-    // claim another person's address or trip the Users.email UNIQUE constraint. When
-    // unverified, provision with a synthetic, collision-resistant fallback derived from
-    // the (sanitized) Auth0 sub.
-    const syntheticEmail = `${userId.replace(/[|:]/g, '-')}@auth0.local`;
-    const joinerEmail = req.user.email_verified === true && req.user.email
-      ? req.user.email
-      : syntheticEmail;
-    // Wave-12 review HIGH #2: clamp per-candidate at the assignment so BOTH
-    // findOrCreate defaults below (primary + unique-collision retry) inherit a
-    // len[1,50]-safe value — the catch below retries ONLY unique-constraint
-    // errors, so an unclamped >50-char name would 500 the join (a primary
-    // onboarding path, Phase 36 two-QR model).
-    const joinerName = clampProvisionedUsername(req.user.name)
-      || clampProvisionedUsername(req.user.nickname)
-      || clampProvisionedUsername(req.user.given_name)
-      || clampProvisionedUsername(req.user.email?.split('@')[0])
-      || 'User';
-
-    // SPEC Req 6 (Phase 87.2 tombstone guard, self-keyed): covers BOTH findOrCreate
-    // calls below (primary + unique-collision retry — same sub). A still-valid token
-    // surviving account deletion must not re-provision the Users row by joining a
-    // group. Pinned refusal shape: 410 account_deleted on the Phase 85 envelope.
+    // SPEC Req 6 (Phase 87.2 tombstone guard, self-keyed): covers the single
+    // provisionOrRepair call below. A still-valid token surviving account deletion must
+    // not re-provision the Users row by joining a group. Pinned refusal shape: 410
+    // account_deleted on the Phase 85 envelope. Phase 88.8 plan 06 collapsed the two
+    // findOrCreate calls this comment used to name (primary + unique-collision retry,
+    // same sub) into that one call; the guard's position and behaviour are unchanged and
+    // it still runs BEFORE any write.
     if (await PendingAuth0Deletion.isTombstoned(userId)) {
       return sendError(res, 'account_deleted');
     }
 
-    let user;
-    try {
-      [user] = await User.findOrCreate({
-        where: { user_id: userId },
-        defaults: { user_id: userId, email: joinerEmail, username: joinerName },
-      });
-    } catch (error) {
-      // Email UNIQUE collision on a first-time create (the verified token email is
-      // already owned by another Users row). Retry with the synthetic fallback so a
-      // legitimate first-time joiner still provisions instead of hitting a raw 500 —
-      // mirrors the events.js auto-create fallback pattern.
-      if (error.name === 'SequelizeUniqueConstraintError') {
-        [user] = await User.findOrCreate({
-          where: { user_id: userId },
-          defaults: { user_id: userId, email: syntheticEmail, username: joinerName },
-        });
-      } else {
-        throw error;
-      }
+    // -----------------------------------------------------------------------
+    // Phase 88.8 plan 06 (SPEC Amendment A1; D-13). This site is the ORIGIN of the
+    // policy the service now owns: it was the only shipped writer that checked
+    // `email_verified` before persisting a token address, and its unique-collision
+    // retry with the synthetic fallback is the exact shape plan 04 generalised into the
+    // service's create-path tail. Both behaviours are preserved — they are just no
+    // longer written here. The single home is services/provisioningService.js; read the
+    // `DECISION Phase 88.8 D-13` marker there before changing this call site.
+    //
+    // What the collapse BUYS this path, beyond de-duplication: the old catch retried
+    // ONLY on `error.name === 'SequelizeUniqueConstraintError'` and only ever produced
+    // the synthetic address. The service classifies the collision instead (SPEC R5) —
+    // it can release a dead Auth0 identity's address to its rightful new owner, and it
+    // recognises the SECOND email constraint `users_email_lower_unique` (plan 02), whose
+    // error the old name-only test would have caught but whose `lower(email::text)`
+    // field shape nothing here understood.
+    //
+    // Unlike the GET /user/:user_id JIT provisioner above, this call is NOT wrapped in a
+    // create-only guard, because the shipped code was not either — the join path has
+    // always run findOrCreate for every joiner. An EXISTING joiner therefore takes the
+    // service's repair path, which makes ZERO Auth0 Management calls for a row that
+    // already holds a real address.
+    // -----------------------------------------------------------------------
+    const provisioned = await provisioningService.provisionOrRepair({
+      sub: userId,
+      claims: req.user,
+    });
+
+    if (provisioned.status === 'identity_gone') {
+      // Phase 87.2 SPEC Req 6: same 410 account_deleted envelope as the tombstone guard
+      // above and the other two JIT surfaces.
+      return sendError(res, 'account_deleted');
     }
+
+    const user = provisioned.user;
 
     // DECISION Phase 88.2 AF-3: the membership write below runs inside a transaction
     // that takes the SAME `FOR UPDATE` row lock on Groups the other writers use, and
@@ -862,7 +854,7 @@ router.post('/join-by-token', async (req, res) => {
     // The lock is what makes the re-read meaningful: without it the same gap simply
     // reopens between the re-read and the insert. The plain `Group.findOne` above is
     // paranoid-filtered too, but it runs several round-trips earlier (auto-provision,
-    // tombstone check, User.findOrCreate) with no transaction of its own, so a QR
+    // tombstone check, provisionOrRepair) with no transaction of its own, so a QR
     // scan landing while an owner deletes passes it against a still-live group and
     // would commit its membership AFTER the delete stamped everything.
     //
