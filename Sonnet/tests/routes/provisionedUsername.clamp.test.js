@@ -111,6 +111,66 @@ describe('wave-12 HIGH #2 — machine-derived username writers clamp to len[1,50
       const row = await User.findOne({ where: { user_id: sub } });
       expect(row.username).toBe(CLAMPED);
     });
+
+    // --------------------------------------------------------------------
+    // Phase 88.8 plan 06, DECISION R3 (SPEC A1). Before this plan, GET
+    // /google/url resolved `email` as `req.user?.email || req.query.email` and
+    // the existing-user branch wrote it with NO email_verified check anywhere in
+    // the file — so any authenticated caller could set their own UNIQUE identity
+    // column, which routes/invites.js:593/:664/:757 treat as an authorization
+    // gate, from a query string. The query-string fallbacks are deleted and
+    // email adoption belongs to the service's verified-only repair.
+    //
+    // These live in THIS suite, not googleAuth.test.js, because this file already
+    // mocks services/auth0Service (:36-40) — an unmocked absent/unverified claim
+    // path would make a real 10-second Management call.
+    // --------------------------------------------------------------------
+    describe('email adoption on the OAuth-URL mint (Phase 88.8 R3)', () => {
+      it('a ?email= query param cannot touch Users.email — verified req.user for the ORIGINAL address', async () => {
+        const sub = 'auth0|gauth-qs-verified';
+        await User.create({ user_id: sub, username: 'QS Verified', email: 'gauth-qs-v@example.com' });
+
+        await request(makeApp('/api/auth', googleAuthRoutes,
+          { user_id: sub, email: 'gauth-qs-v@example.com', email_verified: true, name: 'QS Verified' }))
+          .get('/api/auth/google/url')
+          .query({ email: 'attacker@evil.example' })
+          .expect(200);
+
+        const row = await User.scope('withContactInfo').findOne({ where: { user_id: sub } });
+        expect(row.email).toBe('gauth-qs-v@example.com');
+      });
+
+      it('a ?email= query param cannot touch Users.email — UNVERIFIED req.user.email of a DIFFERENT address', async () => {
+        const sub = 'auth0|gauth-qs-unverified';
+        await User.create({ user_id: sub, username: 'QS Unverified', email: 'gauth-qs-u@example.com' });
+
+        await request(makeApp('/api/auth', googleAuthRoutes,
+          { user_id: sub, email: 'someone-else@example.com', email_verified: false, name: 'QS Unverified' }))
+          .get('/api/auth/google/url')
+          .query({ email: 'attacker@evil.example' })
+          .expect(200);
+
+        const row = await User.scope('withContactInfo').findOne({ where: { user_id: sub } });
+        expect(row.email).toBe('gauth-qs-u@example.com');
+      });
+
+      // T-88.8-30. The defaults this plan replaced passed `email: email || null`
+      // into Users.email, declared allowNull:false — a latent 500 on any Google
+      // connect whose token carried no address. The service's last resort is the
+      // synthetic address, never null, so the INSERT cannot violate NOT NULL.
+      it('a brand-new sub whose token carries NO email provisions a synthetic address, not a NOT NULL violation', async () => {
+        const sub = 'auth0|gauth-no-email';
+
+        await request(makeApp('/api/auth', googleAuthRoutes,
+          { user_id: sub, name: 'No Email Person' }))
+          .get('/api/auth/google/url')
+          .expect(200); // NOT 500
+
+        const row = await User.scope('withContactInfo').findOne({ where: { user_id: sub } });
+        expect(row).not.toBeNull();
+        expect(row.email).toBe('auth0-gauth-no-email@auth0.local');
+      });
+    });
   });
 
   describe('routes/events.js GET /user/:user_id JIT provisioning', () => {
