@@ -25,6 +25,7 @@
         "db:migrate:feedback": "node migrations/20260226000001-create-feedback-table.js",
         "audit:migrations": "node scripts/audit-migrations.js",
         "audit:tz": "node scripts/audit-event-timezones.js",
+        "report:account-hygiene": "node scripts/report-account-hygiene.js",
         "census:group-colours": "node scripts/census-group-colours.js"
     },
     "dependencies": {

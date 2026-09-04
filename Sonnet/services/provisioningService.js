@@ -1267,6 +1267,13 @@ module.exports = {
   // tests/unit/provisioningCollision.test.js.
   isEmailCollision,
   EMAIL_UNIQUE_CONSTRAINTS,
+  // The broad at-auth0 guard, exported so scripts/report-account-hygiene.js's class 1
+  // asks the SAME question the provisioner asks rather than carrying a tenth copy of a
+  // predicate that already exists at nine sites. If this guard is ever narrowed (see
+  // DECISION Phase 88.2 NIX-AUTH0 on the function), the report narrows with it, which is
+  // the point — a report keyed on a different definition of "synthetic" than the writer
+  // would list rows the writer does not consider synthetic, and miss ones it does.
+  isSyntheticAddress,
   // Exported for tests ONLY. Branch (a) of SPEC R5 is unreachable end-to-end under the
   // one-row-per-sub invariant (see the resolveRepairCollision header), so the only
   // honest way to pin it is to call the resolver against real rows. No production
