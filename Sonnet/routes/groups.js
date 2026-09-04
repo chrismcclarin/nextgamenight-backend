@@ -178,7 +178,7 @@ router.get('/user/:user_id', async (req, res) => {
       //  * it adopted `req.user.email` with NO email_verified check at all, so
       //    an unverified (attacker-settable) token address landed straight in
       //    the UNIQUE identity column — the service adopts only a VERIFIED one;
-      //  * its bare `User.findOrCreate` returned a DEFAULT-SCOPE instance whose
+      //  * its bare create-or-find returned a DEFAULT-SCOPE instance whose
       //    `email` is undefined (models/User.js defaultScope, BSEC-01 D-03),
       //    the same 88-34 Rule-1 dead-branch defect events.js recorded;
       //  * its catch degraded an email UNIQUE collision to a findOne-then-
