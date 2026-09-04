@@ -361,6 +361,45 @@ Review suggestions: ${dashboardUrl}
   }
 
   /**
+   * Mask an email address for DISPLAY inside mail copy: first character of the
+   * local part, then `***`, then the full domain. `gregory@chris.com` ->
+   * `g***@chris.com` (Phase 88.8 / SPEC A13, T-88.8-74).
+   *
+   * Purpose: the security notice tells the real account holder that their
+   * address changed and roughly WHERE to, without handing a full third-party
+   * address to whoever now reads the prior inbox.
+   *
+   * DECISION Phase 88.8 T-88.8-74: this is a DISPLAY mask for mail copy, and is
+   * deliberately separate from the two other maskers in this repo. It is NOT
+   * plan 04's `emailDomain` in `utils/provisioningReport.js`, which is a
+   * TELEMETRY scrubber for Sentry and drops the local part ENTIRELY — telemetry
+   * to a third party gets less than mail copy to the account holder does, so
+   * merging them would either leak an initial into Sentry or make the notice
+   * useless. It is also NOT the module-local `maskEmail` in `routes/webhooks.js`
+   * (`:184`), a LOG scrubber that also masks the domain (`e***e@d***.com`) —
+   * masking the domain here would delete the only fact the notice exists to
+   * convey. Three jobs, three outputs; consolidating them is a decision, not a
+   * cleanup.
+   *
+   * Never throws: a bad value returns a fixed placeholder, because a mail
+   * template must not be the thing that 500s a request.
+   *
+   * @param {string} value - Address to mask
+   * @returns {string} Masked address, or a fixed human-readable placeholder.
+   */
+  maskEmail(value) {
+    if (typeof value !== 'string') return 'an address we could not display';
+    const at = value.lastIndexOf('@'); // LAST @ — a quoted local part cannot smuggle a domain
+    if (at <= 0) return 'an address we could not display';
+    const local = value.slice(0, at);
+    const domain = value.slice(at + 1);
+    if (!local || !domain) return 'an address we could not display';
+    // A one-character local part becomes a bare asterisk — never itself.
+    const maskedLocal = local.length > 1 ? `${local[0]}***` : '*';
+    return `${maskedLocal}@${domain}`;
+  }
+
+  /**
    * Generate the close-notification email sent when an AvailabilityPrompt
    * transitions to status='closed' (Phase 71.2 / D-ADAPT-04).
    *
@@ -784,6 +823,249 @@ This is an automated notification from Next Game Night.
       text,
       groupName: templateParams.groupName,
     });
+  }
+
+  // ============================================
+  // Email-change mails (Phase 88.8 / SPEC A9 + A13, CONTEXT D-09 amended, D-43)
+  //
+  // These two are the COMPLETE set for the email-change feature (D-43). There is
+  // deliberately NO confirmation mail to the new address after a successful
+  // change: the user typed that code out of that inbox seconds earlier, so the
+  // round-trip IS the confirmation. Adding a third template is a decision.
+  // ============================================
+
+  /**
+   * Send the SPEC A9 email-change verification CODE to a candidate address.
+   *
+   * Copy contract: the app name, the code rendered `XXXX-XXXX`, the 30-minute
+   * expiry, and the ignore-this line. Nothing else.
+   *
+   * DECISION Phase 88.8 D-09 (amended 2026-09-03): this mail deliberately
+   * contains NO link — no URL, no anchor, no href — chosen OVER the originally
+   * ruled design of an emailed link to a frontend page that verified on load.
+   * Corporate mail security (Microsoft Safe Links, Proofpoint, Mimecast) fetches
+   * every inbound link, and current scanners RENDER the landing page and run its
+   * JavaScript, so a page that verifies on load is exactly the auto-submit shape
+   * they complete. Combined with a set endpoint that accepts any address, that
+   * would let a STRANGER's own scanner finish an attacker's verification of the
+   * stranger's address, with no recourse for the stranger. Also rejected: a
+   * public link landing on a Confirm button — it defeats most scanners but is
+   * not airtight. Notion (secondary emails) and Google (recovery email) both use
+   * a typed code. ADDING A LINK TO THIS MAIL IS A DECISION, NOT A CONVENIENCE,
+   * and it removes the entire mitigation for T-88.8-72.
+   *
+   * DECISION Phase 88.8 T-88.8-73: the template takes exactly TWO arguments —
+   * an address and a code — over the house convention of a templateParams bag,
+   * because this mail can land in an inbox the account holder does not control.
+   * There is no parameter for a username, a current address or a group name, so
+   * no future caller can leak one. `this.frontendUrl` (`:9`) is deliberately
+   * UNUSED here; it is the base every other emailed link is built from, and its
+   * absence is the point.
+   *
+   * @param {string} address - The candidate address the code is mailed to
+   * @param {string} code - The 8-symbol Crockford-base32 code (D-09 amended)
+   * @returns {Promise<{success: boolean, id?: string, error?: string}>} The
+   *   `send` result unchanged — plan 09 puts its `success` in `verification_sent`.
+   */
+  async sendEmailChangeCode(address, code) {
+    const { html, text, subject } = this.generateEmailChangeCodeTemplate(code);
+    return this.send({
+      to: address,
+      subject,
+      html,
+      text,
+      emailType: 'email_change_code',
+    });
+  }
+
+  /**
+   * Send the SPEC A13 / DR-E security NOTICE.
+   *
+   * DECISION Phase 88.8 DR-E: this notice goes to the PRIOR address — the one
+   * the real account holder still controls once a redirect is in place — and
+   * carries NO code, NO link and NO token, so it can never itself be a
+   * capability. The rejected alternative was shipping the email-change feature
+   * with no out-of-band signal at all: this phase creates the first mechanism
+   * that can redirect a user's mail off the Auth0-controlled address, and that
+   * redirect carries RSVP magic links, availability tokens and the
+   * ownership-offer restore link — all consumable with no session and all
+   * surviving a password reset. The typed code is a no-op against someone who
+   * already holds the session, because they receive it themselves. This mail is
+   * the only warning the real account holder ever gets; Notion and Google both
+   * notify the primary address for the same reason. Removing it is a decision.
+   *
+   * DECISION Phase 88.8 A13: `action` accepts only the two fixed literals
+   * `'changed'` and `'reverted'`, each mapped to fixed copy here, over accepting
+   * caller-supplied prose. A security warning whose wording a caller can supply
+   * is a phishing template with our From header on it. An unrecognised value
+   * falls back to the generic 'changed' copy rather than throwing or rendering
+   * blank — a caller typo must still deliver a warning.
+   *
+   * @param {string} address - The PRIOR address (never the new one)
+   * @param {Object} params
+   * @param {'changed'|'reverted'} params.action - Which fixed copy to render
+   * @param {string} params.newAddress - Masked before it reaches the body
+   * @returns {Promise<{success: boolean, id?: string, error?: string}>}
+   */
+  async sendEmailChangeNotice(address, { action, newAddress } = {}) {
+    const { html, text, subject } = this.generateEmailChangeNoticeTemplate({ action, newAddress });
+    return this.send({
+      to: address,
+      subject,
+      html,
+      text,
+      emailType: 'email_change_notice',
+    });
+  }
+
+  /**
+   * Render the A9 code mail. Split from its sender so the body is testable as a
+   * pure function, matching `generateGroupInviteEmailTemplate`'s shape, and — as
+   * `generateGroupOwnershipOfferTemplate` established in Phase 88.2 — the
+   * SUBJECT is produced here already stripCrlf'd so a future caller cannot
+   * forget the header strip.
+   *
+   * @param {string} code - The verification code
+   * @returns {{html: string, text: string, subject: string}}
+   */
+  generateEmailChangeCodeTemplate(code) {
+    // Render an 8-symbol code as XXXX-XXXX for legibility when it is typed back
+    // by hand. Any other length renders verbatim rather than being mangled.
+    const raw = code === null || code === undefined ? '' : String(code);
+    const grouped = raw.length === 8 ? `${raw.slice(0, 4)}-${raw.slice(4)}` : raw;
+    const safeCode = this.escapeHtml(grouped);
+
+    const html = `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+    .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+    .header { background-color: #28a745; color: white; padding: 20px; text-align: center; border-radius: 5px 5px 0 0; }
+    .content { background-color: #f9fafb; padding: 30px; border-radius: 0 0 5px 5px; }
+    .code { font-family: monospace; font-size: 28px; letter-spacing: 4px; font-weight: bold; text-align: center; margin: 30px 0; color: #111; }
+    .footer { text-align: center; color: #6B7280; font-size: 12px; margin-top: 30px; padding-top: 20px; border-top: 1px solid #E5E7EB; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>Next Game Night</h1>
+    </div>
+    <div class="content">
+      <p>Here is your verification code:</p>
+
+      <div class="code">${safeCode}</div>
+
+      <p>Type it into Next Game Night to confirm this email address. It expires in 30 minutes.</p>
+
+      <p>If you didn't ask for this, ignore this email &mdash; nothing will happen.</p>
+
+      <div class="footer">
+        <p>This is an automated message from Next Game Night.</p>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
+    `.trim();
+
+    const text = `
+Next Game Night
+
+Here is your verification code:
+
+${grouped}
+
+Type it into Next Game Night to confirm this email address. It expires in 30 minutes.
+
+If you didn't ask for this, ignore this email - nothing will happen.
+
+---
+This is an automated message from Next Game Night.
+    `.trim();
+
+    return { html, text, subject: this.stripCrlf('Your Next Game Night verification code') };
+  }
+
+  /**
+   * Render the A13 / DR-E notice mail. Fixed copy only; the only interpolated
+   * value is the MASKED new address.
+   *
+   * @param {Object} params
+   * @param {'changed'|'reverted'} params.action
+   * @param {string} params.newAddress
+   * @returns {{html: string, text: string, subject: string}}
+   */
+  generateEmailChangeNoticeTemplate({ action, newAddress } = {}) {
+    // Fixed copy per action. Nothing the caller passes reaches the body except
+    // `newAddress`, and that goes through maskEmail + escapeHtml first.
+    const COPY = {
+      changed: {
+        subject: 'Your Next Game Night email address was changed',
+        headline: 'Your email address was changed',
+        sentence: 'The email address on your Next Game Night account was changed to',
+      },
+      reverted: {
+        subject: 'Your Next Game Night email address was changed back',
+        headline: 'Your email address was changed back',
+        sentence: 'The email address on your Next Game Night account was changed back to',
+      },
+    };
+    const copy = COPY[action] || COPY.changed;
+    const safeMasked = this.escapeHtml(this.maskEmail(newAddress));
+
+    const html = `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+    .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+    .header { background-color: #b45309; color: white; padding: 20px; text-align: center; border-radius: 5px 5px 0 0; }
+    .content { background-color: #f9fafb; padding: 30px; border-radius: 0 0 5px 5px; }
+    .address { font-family: monospace; font-size: 18px; font-weight: bold; }
+    .footer { text-align: center; color: #6B7280; font-size: 12px; margin-top: 30px; padding-top: 20px; border-top: 1px solid #E5E7EB; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>${this.escapeHtml(copy.headline)}</h1>
+    </div>
+    <div class="content">
+      <p>${this.escapeHtml(copy.sentence)} <span class="address">${safeMasked}</span>.</p>
+
+      <p>If that was you, nothing further is needed.</p>
+
+      <p>If this wasn't you, open Next Game Night, change it back in your profile, and sign out everywhere.</p>
+
+      <div class="footer">
+        <p>This is an automated security message from Next Game Night. We will never ask you for a password or a code by reply.</p>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
+    `.trim();
+
+    const text = `
+${copy.headline}
+
+${copy.sentence} ${this.maskEmail(newAddress)}.
+
+If that was you, nothing further is needed.
+
+If this wasn't you, open Next Game Night, change it back in your profile, and sign out everywhere.
+
+---
+This is an automated security message from Next Game Night. We will never ask you for a password or a code by reply.
+    `.trim();
+
+    return { html, text, subject: this.stripCrlf(copy.subject) };
   }
 
   // ============================================
