@@ -58,6 +58,13 @@ const PROVISIONING_REASONS = Object.freeze({
   CLAIMS_MISSING: 'claims_missing',
   MGMT_API_FAILED: 'mgmt_api_failed',
   EMAIL_UNVERIFIED: 'email_unverified',
+  // NO LONGER EMITTED by any production path as of Phase 88.8 plan 05, and that is
+  // deliberate, not rot: SPEC R5's four branches resolve every collision into one of the
+  // three finer reasons below (orphan_released / genuine_conflict / mgmt_api_failed), so
+  // a bare "there was a collision" event would be strictly less actionable than the one
+  // that replaced it. Kept because it is SPEC R4's own wording and because removing a
+  // member of a FROZEN vocabulary is a contract change no plan in this phase owns —
+  // deleting it is a decision, not a cleanup.
   UNIQUE_EMAIL_COLLISION: 'unique_email_collision',
   ORPHAN_RELEASED: 'orphan_released',
   GENUINE_CONFLICT: 'genuine_conflict',
