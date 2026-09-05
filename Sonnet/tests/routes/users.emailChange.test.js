@@ -1148,8 +1148,15 @@ describe('D-41 — the pending-invite move, and the gate on it', () => {
 
     await request(app).post(`/api/users/${row.user_id}/email/verify`).send({ code }).expect(200);
 
-    expect(Sentry.captureMessage).toHaveBeenCalledTimes(1);
-    const [, context] = Sentry.captureMessage.mock.calls[0];
+    // Selects its OWN event rather than counting every capture: since 2026-09-05 the
+    // D-42 feedback move shares this gate, so an unproved old address closes BOTH and
+    // emits two skip events. A bare toHaveBeenCalledTimes(1) here would fail for the
+    // right reason and read as a regression.
+    const skips = Sentry.captureMessage.mock.calls.filter(
+      ([, ctx]) => ctx && ctx.tags && ctx.tags.op === 'invite-move-skipped'
+    );
+    expect(skips).toHaveLength(1);
+    const [, context] = skips[0];
     expect(context.tags).toMatchObject({ feature: 'email-change', op: 'invite-move-skipped' });
     expect(context.extra).toMatchObject({ sub: row.user_id, pendingInvitesLeftBehind: 1 });
     const payload = JSON.stringify(context);
@@ -1254,17 +1261,67 @@ describe('D-42 — the feedback move', () => {
     expect(someoneElse.user_email).toBe('stranger@example.com');
   });
 
-  it('runs even when the D-41 invite move is GATED OFF — the two are independent', async () => {
+  // INVERTED 2026-09-05 (code review HIGH-4, owner ruling). This test previously
+  // asserted that the feedback move runs even when the D-41 invite gate is CLOSED —
+  // i.e. that the two were independent. They are not, and being independent was the
+  // defect: both columns are keyed on the same address, and `user_email` is
+  // CLIENT-SUPPLIED on both writers (the public one takes no bearer at all), so an
+  // ungated move let an account holding an unproven address drag a stranger's
+  // feedback rows onto its own new address — and out of the victim's deletion scrub.
+  it('is GATED OFF with the invite move when the old address was never proved — a stranger\'s rows cannot be dragged along', async () => {
     const row = await seedUser({ email: 'gated@example.com', email_changed_at: null });
     const fb = await Feedback.create({
       type: 'bug', subject: 'S', description: 'D', user_email: 'gated@example.com', user_id: null,
     });
+    // The claim is Mallory's OWN address; the row holds gated@ she never proved.
     const app = makeApp({ user_id: row.user_id, email: 'elsewhere@evil.test', email_verified: true });
     const { code } = await requestChange(app, row, 'elsewhere@evil.test');
+
+    const res = await request(app).post(`/api/users/${row.user_id}/email/verify`).send({ code }).expect(200);
+
+    // The change itself still completes normally — the gate never changes the outcome.
+    expect(res.body.outcome).toBe('verified');
+    expect(res.body.email).toBe('elsewhere@evil.test');
+
+    await fb.reload();
+    expect(fb.user_email).toBe('gated@example.com');
+  });
+
+  it('still runs when the old address WAS proved — the gate is not simply always closed', async () => {
+    const row = await seedUser({ email: 'proved@example.com', email_changed_at: null });
+    const fb = await Feedback.create({
+      type: 'bug', subject: 'S', description: 'D', user_email: 'proved@example.com', user_id: null,
+    });
+    // A VERIFIED claim equal to the stored address is exactly what "proved" means.
+    const app = makeApp({ user_id: row.user_id, email: 'proved@example.com', email_verified: true });
+    const { code } = await requestChange(app, row, 'movedon@example.com');
     await request(app).post(`/api/users/${row.user_id}/email/verify`).send({ code }).expect(200);
 
     await fb.reload();
-    expect(fb.user_email).toBe('elsewhere@evil.test');
+    expect(fb.user_email).toBe('movedon@example.com');
+  });
+
+  it('a SKIP emits telemetry tagged feedback-move-skipped with the sub, the DOMAIN only and the count left behind', async () => {
+    const row = await seedUser({ email: 'writer@fb-skip-domain.test', email_changed_at: null });
+    await Feedback.create({
+      type: 'bug', subject: 'S', description: 'D', user_email: 'writer@fb-skip-domain.test', user_id: null,
+    });
+    const app = makeApp({ user_id: row.user_id, email: 'other@evil.test', email_verified: true });
+    const { code } = await requestChange(app, row, 'other@evil.test');
+    Sentry.captureMessage.mockClear();
+
+    await request(app).post(`/api/users/${row.user_id}/email/verify`).send({ code }).expect(200);
+
+    const skips = Sentry.captureMessage.mock.calls.filter(
+      ([, context]) => context && context.tags && context.tags.op === 'feedback-move-skipped'
+    );
+    expect(skips).toHaveLength(1);
+    const [, context] = skips[0];
+    expect(context.tags).toMatchObject({ feature: 'email-change', op: 'feedback-move-skipped' });
+    expect(context.extra).toMatchObject({ sub: row.user_id, feedbackRowsLeftBehind: 1 });
+    const payload = JSON.stringify(context);
+    expect(payload).toContain('fb-skip-domain.test');
+    expect(payload).not.toContain('writer@');
   });
 });
 

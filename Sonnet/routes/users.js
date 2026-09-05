@@ -1445,6 +1445,29 @@ class EmailChangeRollback extends Error {
 }
 
 /**
+ * THE SHARED "was the old address ever proved?" TEST — D-41's gate, used by BOTH
+ * movers below. One function, two callers, deliberately: the invite move and the
+ * feedback move rewrite two different columns keyed on the SAME address, so a gate
+ * that lived in only one of them was an inconsistency, not a design (found by the
+ * 2026-09-05 code review, ruled by the owner the same day).
+ *
+ * IT READS THE PRE-UPDATE SNAPSHOT. `previousEmailChangedAt` is captured by the
+ * caller BEFORE the overwrite stamps `email_changed_at`. Re-reading the column here,
+ * after the write, would find it non-null for EVERY change and the gate would pass
+ * unconditionally — a gate that is always open, which is worse than no gate because
+ * it looks like a control.
+ *
+ * Proved means either: the user has changed this address before (a non-null
+ * `email_changed_at` — they held a verified code sent to it), or the Auth0 token
+ * carries a VERIFIED claim equal to it.
+ */
+function wasOldAddressProved({ previousEmailChangedAt, oldNormalised, claimEmail, claimVerified }) {
+  if (previousEmailChangedAt !== null && previousEmailChangedAt !== undefined) return true;
+  const claimNormalised = provisioningService.normaliseEmail(claimEmail);
+  return claimVerified === true && claimNormalised !== null && claimNormalised === oldNormalised;
+}
+
+/**
  * D-41 — move this user's PENDING GroupInvite rows onto the new address, GATED on
  * the OLD address having been proved by somebody, and skipping collisions.
  *
@@ -1557,18 +1580,9 @@ async function movePendingInvites({
     return { moved: false, skipped: false };
   }
 
-  const claimNormalised = provisioningService.normaliseEmail(claimEmail);
-  // THE GATE READS THE PRE-UPDATE SNAPSHOT. `previousEmailChangedAt` is captured
-  // by the caller BEFORE the overwrite stamps `email_changed_at`. Re-reading the
-  // column here, after the write, would find it non-null for EVERY change and the
-  // gate would pass unconditionally — a gate that is always open, which is worse
-  // than no gate because it looks like a control.
-  const oldAddressWasProved =
-    previousEmailChangedAt !== null && previousEmailChangedAt !== undefined
-      ? true
-      : claimVerified === true && claimNormalised !== null && claimNormalised === oldNormalised;
-
-  if (!oldAddressWasProved) {
+  // The gate itself lives in wasOldAddressProved() above — shared with the feedback
+  // move, so the two can never drift apart again.
+  if (!wasOldAddressProved({ previousEmailChangedAt, oldNormalised, claimEmail, claimVerified })) {
     let leftBehind = 0;
     try {
       const [countRow] = await sequelize.query(
@@ -1642,10 +1656,62 @@ async function movePendingInvites({
  * a match key) and `PendingAuth0Deletion.email` (the sweep keys on `sub` only,
  * services/pendingAuth0DeletionSweep.js:120, :47).
  */
-async function moveFeedbackRows({ t, previousEmail, newAddress }) {
+async function moveFeedbackRows({
+  t,
+  sub,
+  previousEmail,
+  previousEmailChangedAt,
+  claimEmail,
+  claimVerified,
+  newAddress,
+}) {
   const oldNormalised = provisioningService.normaliseEmail(previousEmail);
   const newNormalised = provisioningService.normaliseEmail(newAddress);
   if (!oldNormalised || !newNormalised || oldNormalised === newNormalised) return;
+
+  // DECISION Phase 88.8 (code review 2026-09-05, owner ruling): this move is GATED
+  // on the same wasOldAddressProved() test as the D-41 invite move. Chosen OVER the
+  // ungated form this plan originally shipped, and over extending the deletion scrub
+  // instead (the strictly better but strictly more expensive option 3 — it belongs to
+  // whichever phase owns account deletion, not to this phase's close).
+  //
+  // The attack the gate closes, verified end to end at review time: BOTH feedback
+  // writers store a CLIENT-SUPPLIED `user_email`, and the public one
+  // (routes/feedback.js:198-238) takes no bearer at all, so anyone can seed rows
+  // under any address. Meanwhile the shipped population can hold addresses their
+  // owner never proved — routes/users.js:216 persisted the raw token email with no
+  // `email_verified` check on every JIT provision. Ungated, an account holding an
+  // unproven address equal to a victim's could change its own email and drag the
+  // VICTIM's genuine feedback rows onto the attacker's address; the victim's own
+  // account deletion would then no longer scrub them, because the scrub keys on
+  // `user_email` (services/accountDeletionService.js:295-298).
+  //
+  // THE RESIDUAL, STATED PLAINLY BECAUSE THE GATE CREATES IT: when the old address
+  // was never proved, this user's feedback rows now STAY under the old address and
+  // therefore survive their account deletion with that address still in them — which
+  // is the exact harm D-42 was written to prevent. That is the same trade-off D-41
+  // already accepted for invites, applied evenly rather than to one column only. It
+  // is logged below rather than left silent.
+  if (!wasOldAddressProved({ previousEmailChangedAt, oldNormalised, claimEmail, claimVerified })) {
+    let leftBehind = 0;
+    try {
+      const [countRow] = await sequelize.query(
+        'SELECT COUNT(*)::int AS n FROM "feedback" WHERE LOWER(user_email) = :oldEmail',
+        { replacements: { oldEmail: oldNormalised }, type: QueryTypes.SELECT, transaction: t }
+      );
+      leftBehind = (countRow && countRow.n) || 0;
+    } catch (_countFailed) {
+      leftBehind = -1;
+    }
+    emailChangeTelemetry('feedback-move-skipped', {
+      sub,
+      address: previousEmail,
+      message: 'D-42 feedback move skipped: the previous address was never proved',
+      extra: { feedbackRowsLeftBehind: leftBehind },
+    });
+    return;
+  }
+
   await sequelize.query(
     'UPDATE "feedback" SET user_email = :newEmail WHERE LOWER(user_email) = :oldEmail',
     {
@@ -1700,8 +1766,9 @@ async function enqueueEmailChangeNotice({ sub, priorAddress, action, newAddress 
 
 /**
  * The four writes that make up an identity change, in the order the plan pins:
- * (a) the overwrite, (b) the GATED invite move, (c) the feedback move. (d) — the
- * commit and the notice — belongs to the caller.
+ * (a) the overwrite, (b) the GATED invite move, (c) the GATED feedback move — both
+ * gated on the same wasOldAddressProved() test since the 2026-09-05 code review.
+ * (d) — the commit and the notice — belongs to the caller.
  *
  * `previousEmail` and `previousEmailChangedAt` are CAPTURED BY THE CALLER off the
  * locked row BEFORE this function runs, because (a) stamps `email_changed_at`.
@@ -1730,7 +1797,15 @@ async function applyIdentityChange({
     claimVerified,
     newAddress,
   });
-  await moveFeedbackRows({ t, previousEmail, newAddress });
+  await moveFeedbackRows({
+    t,
+    sub,
+    previousEmail,
+    previousEmailChangedAt,
+    claimEmail,
+    claimVerified,
+    newAddress,
+  });
 }
 
 // ---------------------------------------------------------------------------
