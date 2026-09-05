@@ -105,10 +105,13 @@ describe('DELETE /api/users/me — concurrent double delete on real Postgres (R8
     const winner = settled.find((s) => s.value.status === 200).value;
     expect(winner.body).toHaveProperty('message');
 
-    // Exactly ONE durable tombstone for the sub — the unique constraint is what
-    // guarantees this, and asserting it is what proves the constraint was actually
-    // exercised rather than the second request having merely arrived after the first
-    // finished cleanly.
+    // Exactly ONE durable tombstone for the sub. This pins the OUTCOME invariant
+    // (one 200, one 410, one marker, no row) — it does NOT prove the race arm ran: a
+    // second request that merely arrived after the first finished takes the
+    // classifyMissingRow path and satisfies every assertion here identically (round 3
+    // #32 corrected the earlier claim). The unique-violation catch arm itself is pinned
+    // DETERMINISTICALLY in tests/services/accountDeletionService.test.js ("concurrent
+    // double delete (R8)"); this file is the end-to-end shape, not the guard.
     const markers = await PendingAuth0Deletion.findAll({ where: { auth0_sub: sub } });
     expect(markers).toHaveLength(1);
 

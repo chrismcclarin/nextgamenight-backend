@@ -404,6 +404,11 @@ function buildProvisionedUsername({ claims, rejectedAddresses, managementUsernam
  *
  * The protocol-allowlist precedent is src/lib/safeBgImageStyle.ts:6-20.
  */
+// Round 3 #11 — the hosts a social avatar may come from. Suffix match with a leading
+// dot, so `evil-googleusercontent.com` does not pass. Google's avatar CDN is
+// lh3/lh4/... .googleusercontent.com; the bare domain is allowed for completeness.
+const PICTURE_URL_ALLOWED_HOST_SUFFIXES = Object.freeze(['.googleusercontent.com', '.google.com']);
+
 function resolvePictureClaim(claims) {
   if (!SOCIAL_CONNECTION_STRATEGIES.includes(claims.connection_strategy)) {
     return undefined;
@@ -416,7 +421,16 @@ function resolvePictureClaim(claims) {
     return null;
   }
   try {
-    if (new URL(raw).protocol !== 'https:') {
+    const url = new URL(raw);
+    if (url.protocol !== 'https:') {
+      return null;
+    }
+    // Round 3 #11: a HOST allow-list, not protocol alone. The value is published on
+    // twelve payloads to every co-member and will be rendered as an <img src> by the
+    // avatar phase, so every viewer's browser would fetch a URL the profile owner chose.
+    // Google serves avatars from *.googleusercontent.com; anything else stores null.
+    const host = url.hostname.toLowerCase();
+    if (!PICTURE_URL_ALLOWED_HOST_SUFFIXES.some((sfx) => host === sfx.slice(1) || host.endsWith(sfx))) {
       return null;
     }
   } catch (_notAUrl) {
@@ -1015,10 +1029,16 @@ async function createRow({
   if (!created) {
     // We lost the race. Hand the row to the repair rules rather than re-deriving the
     // create-path answer onto a row somebody else already populated.
+    // Round 3 #6: the create-path `reason` / `fallbackError` / `notes` are SEEDED into
+    // the repair, not dropped — before this, a Management failure on the concurrent
+    // first-login path (three routes provision on one dashboard load) was never
+    // reported, which is exactly the five-month silence SPEC R4 exists to end.
     return repairExistingRow({
       row, sub, claimBag, rawClaimEmail,
       claimEmailIsPresent, claimEmailIsVerified, picture, auth0,
-      notes: [PROVISIONING_NOTES.RACED_TO_EXISTING_ROW],
+      notes: [...notes, PROVISIONING_NOTES.RACED_TO_EXISTING_ROW],
+      seedReason: reason,
+      seedError: fallbackError,
     });
   }
 
@@ -1046,14 +1066,31 @@ async function createRow({
 // REPAIR path
 // ---------------------------------------------------------------------------
 
+// Round 3 #25 — the repair-path vendor-outage report throttle. Module-level on
+// purpose (a Management outage is process-wide, not per user).
+const REPAIR_MGMT_FAILURE_REPORT_INTERVAL_MS = 15 * 60 * 1000;
+let lastRepairMgmtFailureReportAt = 0;
+function repairMgmtFailureReportDue() {
+  const now = Date.now();
+  if (now - lastRepairMgmtFailureReportAt < REPAIR_MGMT_FAILURE_REPORT_INTERVAL_MS) return false;
+  lastRepairMgmtFailureReportAt = now;
+  return true;
+}
+/** Tests only — every suite case must see a fresh throttle. */
+function _resetRepairReportThrottle() {
+  lastRepairMgmtFailureReportAt = 0;
+}
+
 async function repairExistingRow({
   row, sub, claimBag, rawClaimEmail, claimEmailIsPresent, claimEmailIsVerified,
-  picture, auth0, notes,
+  picture, auth0, notes, seedReason = null, seedError = null,
 }) {
   const changes = {};
   const rejectedAddresses = [rawClaimEmail];
-  let reason = null;
-  let fallbackError = null;
+  // Seeded by createRow when it lost the create race (round 3 #6); a more specific
+  // reason found below still wins.
+  let reason = seedReason;
+  let fallbackError = seedError;
   let managementUsername = null;
 
   // -------------------------------------------------------------------------
@@ -1269,9 +1306,27 @@ async function repairExistingRow({
         // memory after a failed save, so the caller must never be handed it unreloaded.
         notes.push(PROVISIONING_NOTES.EMAIL_REPAIR_COLLIDED);
         const resolved = await resolveRepairCollision({ row, sub, changes, auth0, notes });
-        reason = resolved.reason;
+        // Round 3 #7: `||`, mirroring fallbackError — SAME_SUB / ALREADY_RELEASED
+        // resolve with reason null, and that must not erase a Management failure
+        // recorded above.
+        reason = resolved.reason || reason;
         changed = resolved.changed;
         fallbackError = resolved.error || fallbackError;
+        /* Round 3 #4: only the EMAIL arm can collide (username and picture_url carry no
+           unique constraint), so when the resolver could not land the batch, the other
+           arms are applied on their own rather than abandoned with it. Before this, a
+           real user whose verified address is held by a LIVE occupant kept the generic
+           username and no avatar permanently — the same batch was rebuilt and collided
+           again on every self fetch, and `outcome: unchanged` looked like a healthy row. */
+        if (!changed) {
+          const nonEmail = { ...changes };
+          delete nonEmail.email;
+          if (Object.keys(nonEmail).length > 0) {
+            await row.update(nonEmail);
+            changed = true;
+            console.log(`[users:provision] repaired user ${row.id} fields=${Object.keys(nonEmail).sort().join(',')} (email arm collided)`);
+          }
+        }
       } else {
         throw repairFailed;
       }
@@ -1279,7 +1334,17 @@ async function repairExistingRow({
   }
 
   if (reason) {
-    reportProvisioning({ sub, reason, email: row.email, err: fallbackError });
+    /* Round 3 #25 (round 1 #24): the REPAIR path runs on every self fetch, and during a
+       Management outage the gate above opens for the whole synthetic-address cohort —
+       so an unthrottled capture here is one Sentry event per fetch per user (two, with
+       the token-level capture). Bounded by TIME for the vendor-outage reason only: a
+       vendor outage is not per-user, so one report per interval per process says
+       everything the next hundred would. Row-specific reasons (collision, orphan
+       release) stay unthrottled — they fire once per row by construction. The CREATE
+       path's report (createRow) is untouched: once per user. */
+    if (reason !== PROVISIONING_REASONS.MGMT_API_FAILED || repairMgmtFailureReportDue()) {
+      reportProvisioning({ sub, reason, email: row.email, err: fallbackError });
+    }
   }
 
   return {
@@ -1305,6 +1370,10 @@ module.exports = {
   // "DISPLAY usernames only" (rejected alternative (a) on makeUsernamePicker) and this
   // module is the single home of provisioning policy (D-13). One filter, two callers.
   makeUsernamePicker,
+  // Tests only (round 3 #25): the repair-path vendor-outage report is throttled per
+  // process; a suite asserting a capture per case has to reset it between cases.
+  _resetRepairReportThrottle,
+  PICTURE_URL_ALLOWED_HOST_SUFFIXES,
   // The PUBLIC collision predicate (plan 05 promoted it from plan 04's internal
   // `isEmailUniqueViolation` without changing a line of its logic — see the measured
   // matrix on the function). Pinned by the shape matrix in

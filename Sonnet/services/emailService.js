@@ -44,7 +44,9 @@ class EmailService {
   async send({ to, subject, html, text, replyTo, groupName, promptId, emailType, attachments }) {
     if (!this.isConfigured()) {
       console.warn('Email service not configured. Skipping email.');
-      return { success: false, error: 'Email service not configured' };
+      // `refused: true` = DEFINITELY not delivered (round 3 #2, additive — every other
+      // consumer keeps reading `success`/`error` unchanged).
+      return { success: false, error: 'Email service not configured', refused: true };
     }
 
     try {
@@ -84,13 +86,17 @@ class EmailService {
 
       if (error) {
         console.error(`Email send failed: ${error.message}`);
-        return { success: false, error: error.message };
+        // A STRUCTURED provider rejection: the mail definitely did not go out.
+        return { success: false, error: error.message, refused: true };
       }
 
       console.log(`Email sent successfully. ID: ${data.id}`);
       return { success: true, id: data.id };
     } catch (error) {
       console.error(`Email send failed: ${error.message}`);
+      // NO `refused` flag on purpose (round 3 #2): a thrown call (timeout, socket) is
+      // AMBIGUOUS — the provider may have accepted and delivered the mail before the
+      // response was lost. routes/users.js keys its cap refund on `refused`.
       return { success: false, error: error.message };
     }
   }

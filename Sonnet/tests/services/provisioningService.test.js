@@ -208,6 +208,9 @@ describe('services/provisioningService — provisionOrRepair', () => {
     updateCount = 0;
     jest.clearAllMocks();
     mockSentryCaptureException.mockClear();
+    // Round 3 #25: the repair-path vendor-outage report is throttled per process; every
+    // case that asserts a capture must start with the throttle open.
+    provisioningService._resetRepairReportThrottle();
     auth0Service.getUserById.mockRejectedValue(
       new Error('Auth0 Management API credentials not configured')
     );
@@ -607,6 +610,10 @@ describe('services/provisioningService — provisionOrRepair', () => {
     it.each([
       ['an empty string', ''],
       ['a non-https URL', 'http://lh3.googleusercontent.com/a/AAA'],
+      // Round 3 #11: HOST allow-list, not protocol alone — the value is rendered by every
+      // co-member's browser, so a profile owner must not be able to point it anywhere.
+      ['an https URL on a foreign host', 'https://attacker.example/pixel.png'],
+      ['an https URL on a look-alike host (suffix without the dot)', 'https://evil-googleusercontent.com/a/AAA'],
       ['a javascript: URL', 'javascript:alert(1)'],
       ['an unparseable value', 'not-a-url'],
       ['a value longer than the varchar(255) column', `https://example.com/${'a'.repeat(260)}`],
@@ -916,8 +923,14 @@ describe('services/provisioningService — provisionOrRepair', () => {
 
       const result = await provision({ sub, claims: { email: SHARED, email_verified: true } });
 
-      expect(result.changed).toBe(false);
+      // Round 3 #4 AMENDED this pin: "neither row changes" was about the ADDRESS. The
+      // EMAIL arm still cannot land (the occupant holds it; nothing is released on a
+      // conflict) — but the username arm no longer dies with it: the generic 'User' is
+      // repaired from the claim in the same call, so `changed` is true and the user is not
+      // stuck nameless forever behind somebody else's address.
       expect(result.user.email).toBe(syntheticFor(sub));
+      expect(result.user.username).not.toBe('User');
+      expect(result.changed).toBe(true);
       expect(result.reason).toBe('genuine_conflict');
       expect(result.notes).toContain('collision_genuine_conflict');
 
@@ -936,8 +949,10 @@ describe('services/provisioningService — provisionOrRepair', () => {
 
       const result = await provision({ sub, claims: { email: SHARED, email_verified: true } });
 
-      expect(result.changed).toBe(false);
+      // Round 3 #4 (see branch (c)): the address is NOT adopted, the username IS repaired.
       expect(result.user.email).toBe(syntheticFor(sub));
+      expect(result.user.username).not.toBe('User');
+      expect(result.changed).toBe(true);
       expect(result.reason).toBe('mgmt_api_failed');
       expect(result.notes).toContain('collision_management_unavailable');
       // An address is NEVER released on a guess.
@@ -1080,6 +1095,8 @@ describe('services/provisioningService — provisionOrRepair', () => {
         'row.id',
         'user.id',
         "Object.keys(changes).sort().join(',')",
+        // Round 3 #4: the non-email retry logs its own FIELD-NAME list, same rule.
+        "Object.keys(nonEmail).sort().join(',')",
       ];
       const BANNED_ARGUMENT = /,\s*(changes|updateData|userDetails|claims|claimBag|defaults|row|user|result)\s*\)/;
 

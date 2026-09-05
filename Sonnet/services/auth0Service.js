@@ -36,6 +36,10 @@ function captureManagementFailure(error, tags) {
   });
 }
 
+// Round 3 #26 — how long a failed Management token exchange is memoised before the
+// next request is allowed to try the vendor again.
+const TOKEN_FAILURE_MEMO_MS = 60 * 1000;
+
 class Auth0Service {
   constructor() {
     this.domain = process.env.AUTH0_DOMAIN;
@@ -98,6 +102,20 @@ class Auth0Service {
       return this.accessToken;
     }
 
+    /* Round 3 #26 — the FAILURE memo. This method sits on the self-fetch request path
+       (provisioningService's repair gate) with a 10 s axios timeout and, until now, cached
+       only SUCCESS: during an outage every request re-ran the token POST, blocked up to
+       10 s, threw, and the next request did it again. The offline hygiene script already
+       has a stop-rule for exactly this; the request path did not. For TOKEN_FAILURE_MEMO_MS
+       after a failed exchange this throws immediately, with the SAME wrapped shape and
+       `sentryReported` flag, so every caller's catch arm behaves identically — a slow
+       throw becomes a fast throw, nothing else changes. Reset on the first success. */
+    if (this.tokenFailureUntil && Date.now() < this.tokenFailureUntil) {
+      const memo = new Error(`Failed to get Auth0 Management API token: ${this.tokenFailureMessage || 'recent failure (memoised)'}`);
+      memo.sentryReported = true;
+      throw memo;
+    }
+
     if (!this.clientId || !this.clientSecret || !this.mgmtDomain) {
       throw new Error('Auth0 Management API credentials not configured. Set AUTH0_MANAGEMENT_CLIENT_ID, AUTH0_MANAGEMENT_CLIENT_SECRET, and AUTH0_TENANT_DOMAIN (preferred; falls back to AUTH0_DOMAIN) environment variables.');
     }
@@ -118,9 +136,15 @@ class Auth0Service {
       this.accessToken = response.data.access_token;
       // Token expires in 24 hours (86400000 ms), cache for 23 hours to be safe
       this.tokenExpiry = Date.now() + (23 * 60 * 60 * 1000);
+      this.tokenFailureUntil = 0;
+      this.tokenFailureMessage = null;
 
       return this.accessToken;
     } catch (error) {
+      // Round 3 #26: memoise the failure (see above). Sixty seconds bounds an outage to
+      // roughly one vendor call per minute per instance instead of one per request.
+      this.tokenFailureUntil = Date.now() + TOKEN_FAILURE_MEMO_MS;
+      this.tokenFailureMessage = error.message;
       console.error('Error fetching Auth0 Management API token:', error.message);
       if (error.response) {
         console.error('Auth0 response:', error.response.data);

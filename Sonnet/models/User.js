@@ -181,8 +181,17 @@ const User = sequelize.define('User', {
   timestamps: true,
   // BSEC-01 / D-03: fail-closed PII default. email/phone are stripped from
   // every default read; the 18 legitimate readers opt back in via
-  // .scope('withContactInfo') or .unscoped(). is_platform_admin stays
-  // reachable only via .unscoped()/explicit attributes (never serialized).
+  // .scope('withContactInfo') or .unscoped().
+  //
+  // is_platform_admin, google_calendar_token and google_calendar_refresh_token are
+  // NOT in this exclude list and ARE restored by `withContactInfo` (an empty override
+  // restores every attribute) — a previous version of this comment claimed the admin
+  // flag was "never serialized", which was false (Phase 88.8 code review round 3
+  // HIGH-D). They are kept OUT of every self response by routes/users.js
+  // `toSelfWire`, which strips them explicitly and is pinned by the self KEY-SET
+  // assertion in tests/routes/wire-sweep.test.js. They cannot be excluded here: the
+  // account-deletion service reads both Google tokens off a withContactInfo row to
+  // revoke them at Google.
   //
   // email_changed_at joins them (Phase 88.8, T-88.8-07): WHETHER a person has
   // changed their address is metadata ABOUT that person and has no business on

@@ -115,7 +115,9 @@ function mailSucceeds() {
 }
 /** Mock the CODE mail to be REFUSED by the provider (the shipped no-key shape). */
 function mailRefused() {
-  emailService.sendEmailChangeCode.mockResolvedValue({ success: false, error: 'refused' });
+  // `refused: true` is emailService.send's shape for a STRUCTURED provider rejection
+  // (round 3 #2); a plain `{ success:false }` is the AMBIGUOUS thrown-call shape.
+  emailService.sendEmailChangeCode.mockResolvedValue({ success: false, error: 'refused', refused: true });
 }
 
 async function tokensFor(sub) {

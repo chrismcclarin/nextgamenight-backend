@@ -65,6 +65,9 @@ describe('auth0Service — Sentry reporting on Management API failures (R4 / A2)
     // the not-configured error before any axios call.
     auth0Service.accessToken = null;
     auth0Service.tokenExpiry = null;
+    // Round 3 #26: the token-failure memo is per process; each case starts fresh.
+    auth0Service.tokenFailureUntil = 0;
+    auth0Service.tokenFailureMessage = null;
     auth0Service.clientId = 'test-client-id';
     auth0Service.clientSecret = 'test-client-secret';
     auth0Service.mgmtDomain = 'tenant.us.auth0.com';

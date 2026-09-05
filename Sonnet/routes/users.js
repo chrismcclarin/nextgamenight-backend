@@ -113,9 +113,12 @@ try {
  * `revertClaimAddress` predicate — one rule, two callers, so they cannot drift.
  *
  * THREE-VALUED ON PURPOSE. `true` / `false` are the answer for a row loaded with
- * `withContactInfo` (the self GET and every email-change body). `null` means "this
- * response did not load the field": the three write echoes ride the DEFAULT scope,
- * where `email_changed_at` is EXCLUDED, so no truthful boolean exists there. That is
+ * `withContactInfo` (the self GET, every email-change body, AND the PATCH
+ * notification-preferences echo — that handler loads withContactInfo, a fact the
+ * round-3 key-set pin surfaced; D-39's "three default-scope echoes" is two). `null`
+ * means "this response did not load the field": PUT username and DELETE phone ride
+ * the DEFAULT scope, where `email_changed_at` is EXCLUDED, so no truthful boolean
+ * exists there. That is
  * the same posture D-39 records for `pending_email_change` on those echoes, and it
  * is safe for the same reason — the frontend treats those three responses as PARTIAL
  * patches (see D-39 above). The FRONTEND gate is `revert_available === true`, so
@@ -127,6 +130,21 @@ try {
  */
 const toSelfWire = (user, pendingEmailChange = null, reqUser = null) => {
   const json = user && user.toJSON ? user.toJSON() : { ...user };
+  /* DECISION Phase 88.8 code review round 3 HIGH-D (owner ruling 2026-09-05): the
+     three SECRET / privileged columns are stripped HERE, in the wire shaper — chosen
+     OVER excluding them in models/User.js `withContactInfo`. That scope is an EMPTY
+     override (restores every attribute) and it is the row
+     services/accountDeletionService.js loads to read BOTH Google tokens off and revoke
+     them at Google on account deletion; narrowing it would silently end token
+     revocation, a worse bug than the leak this closes. Before this, every self read
+     shipped the user's long-lived Google REFRESH token to the browser (zero frontend
+     consumers of any of the three keys). Remove keys, never rebuild the object — an
+     allow-list sourced from the FE schema would silently drop real fields nothing pins.
+     The KEY-SET pin in tests/routes/wire-sweep.test.js is what stops the NEXT
+     sensitive column from riding this response by default. */
+  delete json.google_calendar_token;
+  delete json.google_calendar_refresh_token;
+  delete json.is_platform_admin;
   json.user_id = json.id;
   json.pending_email_change = pendingEmailChange || null;
   json.revert_available = revertAvailability(user, reqUser);
@@ -1246,12 +1264,25 @@ async function sendEmailChangeCodeMail({ sub, address, code, tokenId }) {
   }
   if (result && result.success === true) return true;
 
-  try {
-    // ONE narrow UPDATE. `status` is untouched, so the row stays consumable by
-    // consumeByNonce and still hydrates `pending_email_change`.
-    await SingleUseToken.update({ send_failed_at: new Date() }, { where: { id: tokenId } });
-  } catch (stampFailed) {
-    emailChangeTelemetry('code-mail-stamp', { sub, address, error: stampFailed });
+  /* Round 3 #2: the D-10 cap is refunded ONLY for a PROVEN refusal. emailService.send
+     answers `{ success:false }` for two different things — the provider REFUSED the mail
+     (structured error, or the service is not configured: nothing left) and the CALL
+     THREW (a timeout or socket error after the request may already have been accepted
+     and delivered). Stamping `send_failed_at` on the second kind refunded the hourly
+     budget for a mail that may well have arrived, and the cap is "the SOLE control
+     behind T-88.8-42". So: `refused: true` (set by emailService on its two definite
+     branches) -> stamp and refund; anything else -> ambiguous, the row keeps counting,
+     and it is reported as such. The row itself is kept in both cases (owner ruling
+     2026-09-04) so Resend, Verify and hydration all still work. */
+  const refused = Boolean(result && result.refused === true);
+  if (refused) {
+    try {
+      // ONE narrow UPDATE. `status` is untouched, so the row stays consumable by
+      // consumeByNonce and still hydrates `pending_email_change`.
+      await SingleUseToken.update({ send_failed_at: new Date() }, { where: { id: tokenId } });
+    } catch (stampFailed) {
+      emailChangeTelemetry('code-mail-stamp', { sub, address, error: stampFailed });
+    }
   }
   // A console.warn-only failure here would be the exact warn-only class SPEC R4
   // eliminates one file over.
@@ -1262,8 +1293,10 @@ async function sendEmailChangeCodeMail({ sub, address, code, tokenId }) {
   emailChangeTelemetry('code-mail', {
     sub,
     address,
-    error: new Error('Email-change code mail refused by the provider'),
-    extra: { providerRefused: true },
+    error: new Error(refused
+      ? 'Email-change code mail refused by the provider'
+      : 'Email-change code mail failed ambiguously (call threw); budget NOT refunded'),
+    extra: { providerRefused: refused, ambiguous: !refused },
   });
   return false;
 }
@@ -1394,7 +1427,10 @@ router.post('/:user_id/email', writeOperationLimiter, async (req, res) => {
     }
     return respondEmailChange(req, res, sub, state.outcome, verificationSent);
   } catch (error) {
-    console.error('[users] email-change request failed:', error.message);
+    // Round 3 #12/#20: the 500 path reports through the SAME seam as every other
+    // failure arm — wrapped (name only, never .message, which can embed an address)
+    // and to Sentry — instead of a raw console.error that reached stdout alone.
+    emailChangeTelemetry('request-failed', { sub: req.user && req.user.user_id, address: req.body && req.body.email, error });
     return sendError(res, 'internal');
   }
 });
@@ -1486,7 +1522,10 @@ router.post('/:user_id/email/resend', writeOperationLimiter, async (req, res) =>
     });
     return respondEmailChange(req, res, sub, 'code_sent', verificationSent);
   } catch (error) {
-    console.error('[users] email-change resend failed:', error.message);
+    // Round 3 #12/#20: the 500 path reports through the SAME seam as every other
+    // failure arm — wrapped (name only, never .message, which can embed an address)
+    // and to Sentry — instead of a raw console.error that reached stdout alone.
+    emailChangeTelemetry('resend-failed', { sub: req.user && req.user.user_id, address: null, error });
     return sendError(res, 'internal');
   }
 });
@@ -1532,7 +1571,10 @@ router.post('/:user_id/email/cancel', writeOperationLimiter, async (req, res) =>
     // Idempotent: a cancel with nothing pending is a success, not an error.
     return respondEmailChange(req, res, sub, 'cancelled', false);
   } catch (error) {
-    console.error('[users] email-change cancel failed:', error.message);
+    // Round 3 #12/#20: the 500 path reports through the SAME seam as every other
+    // failure arm — wrapped (name only, never .message, which can embed an address)
+    // and to Sentry — instead of a raw console.error that reached stdout alone.
+    emailChangeTelemetry('cancel-failed', { sub: req.user && req.user.user_id, address: null, error });
     return sendError(res, 'internal');
   }
 });
@@ -1689,23 +1731,11 @@ async function movePendingInvites({
   // The gate itself lives in wasOldAddressProved() above — shared with the feedback
   // move, so the two can never drift apart again.
   if (!wasOldAddressProved({ previousEmailChangedAt, oldNormalised, claimEmail, claimVerified })) {
-    let leftBehind = 0;
-    try {
-      const [countRow] = await sequelize.query(
-        'SELECT COUNT(*)::int AS n FROM "GroupInvites" WHERE status = \'pending\' AND LOWER(invited_email) = :oldEmail',
-        { replacements: { oldEmail: oldNormalised }, type: QueryTypes.SELECT, transaction: t }
-      );
-      leftBehind = (countRow && countRow.n) || 0;
-    } catch (_countFailed) {
-      leftBehind = -1;
-    }
-    emailChangeTelemetry('invite-move-skipped', {
-      sub,
-      address: previousEmail,
-      message: 'D-41 invite move skipped: the previous address was never proved',
-      extra: { pendingInvitesLeftBehind: leftBehind },
-    });
-    return { moved: false, skipped: true, leftBehind };
+    // Round 3 #28: the left-behind COUNT used to run HERE, inside the caller's FOR
+    // UPDATE transaction — a second unindexable LOWER(invited_email) scan under the row
+    // lock, purely to populate a telemetry number. It is descriptive, not a control, so
+    // the caller now reports it AFTER commit via reportSkippedMoves().
+    return { moved: false, skipped: true };
   }
 
   await sequelize.query(
@@ -1799,23 +1829,9 @@ async function moveFeedbackRows({
   // already accepted for invites, applied evenly rather than to one column only. It
   // is logged below rather than left silent.
   if (!wasOldAddressProved({ previousEmailChangedAt, oldNormalised, claimEmail, claimVerified })) {
-    let leftBehind = 0;
-    try {
-      const [countRow] = await sequelize.query(
-        'SELECT COUNT(*)::int AS n FROM "feedback" WHERE LOWER(user_email) = :oldEmail',
-        { replacements: { oldEmail: oldNormalised }, type: QueryTypes.SELECT, transaction: t }
-      );
-      leftBehind = (countRow && countRow.n) || 0;
-    } catch (_countFailed) {
-      leftBehind = -1;
-    }
-    emailChangeTelemetry('feedback-move-skipped', {
-      sub,
-      address: previousEmail,
-      message: 'D-42 feedback move skipped: the previous address was never proved',
-      extra: { feedbackRowsLeftBehind: leftBehind },
-    });
-    return;
+    // Round 3 #28: no COUNT under the lock — see movePendingInvites; the caller reports
+    // the skip after commit via reportSkippedMoves().
+    return { moved: false, skipped: true };
   }
 
   await sequelize.query(
@@ -1826,6 +1842,7 @@ async function moveFeedbackRows({
       transaction: t,
     }
   );
+  return { moved: true, skipped: false };
 }
 
 /**
@@ -1894,7 +1911,7 @@ async function applyIdentityChange({
     { email: newAddress, email_changed_at: newEmailChangedAt },
     { transaction: t }
   );
-  await movePendingInvites({
+  const invites = await movePendingInvites({
     t,
     sub,
     previousEmail,
@@ -1903,7 +1920,7 @@ async function applyIdentityChange({
     claimVerified,
     newAddress,
   });
-  await moveFeedbackRows({
+  const feedback = await moveFeedbackRows({
     t,
     sub,
     previousEmail,
@@ -1912,6 +1929,60 @@ async function applyIdentityChange({
     claimVerified,
     newAddress,
   });
+  // Handed back so the CALLER can report the skips AFTER commit (round 3 #28); the
+  // report carries `claimPresent` (round 3 #3) so an "unproved address" skip can be
+  // told apart from "the Auth0 Action's claims are not on this token" in telemetry.
+  return { invitesSkipped: invites.skipped === true, feedbackSkipped: feedback.skipped === true };
+}
+
+/**
+ * The D-41 / D-42 SKIP telemetry, emitted after the caller's transaction has
+ * committed (round 3 #28). The two left-behind COUNTs run on their own connection
+ * with no lock held — they are descriptive numbers for triage, not controls, and
+ * were the only reason the skip path paid a second full scan inside the locked
+ * window. Payload shape is unchanged from the in-transaction version, plus
+ * `claimPresent` (round 3 #3): during the wave-8 window the access token carries no
+ * namespaced claim at all, so arm (b) of wasOldAddressProved is inert for every
+ * first change — that is a DEPLOY-ORDER state, not a gate defect, and this flag is
+ * what lets the two be distinguished when the skip rate reads as near-100%.
+ */
+async function reportSkippedMoves({ sub, previousEmail, claimEmail, skipped }) {
+  if (!skipped || (!skipped.invitesSkipped && !skipped.feedbackSkipped)) return;
+  const oldNormalised = provisioningService.normaliseEmail(previousEmail);
+  const claimPresent = typeof claimEmail === 'string';
+  const countRows = async (sql) => {
+    try {
+      const [countRow] = await sequelize.query(sql, {
+        replacements: { oldEmail: oldNormalised },
+        type: QueryTypes.SELECT,
+      });
+      return (countRow && countRow.n) || 0;
+    } catch (_countFailed) {
+      return -1;
+    }
+  };
+  if (skipped.invitesSkipped) {
+    const leftBehind = await countRows(
+      'SELECT COUNT(*)::int AS n FROM "GroupInvites" WHERE status = \'pending\' AND LOWER(invited_email) = :oldEmail'
+    );
+    emailChangeTelemetry('invite-move-skipped', {
+      sub,
+      address: previousEmail,
+      message: 'D-41 invite move skipped: the previous address was never proved',
+      extra: { pendingInvitesLeftBehind: leftBehind, claimPresent },
+    });
+  }
+  if (skipped.feedbackSkipped) {
+    const leftBehind = await countRows(
+      'SELECT COUNT(*)::int AS n FROM "feedback" WHERE LOWER(user_email) = :oldEmail'
+    );
+    emailChangeTelemetry('feedback-move-skipped', {
+      sub,
+      address: previousEmail,
+      message: 'D-42 feedback move skipped: the previous address was never proved',
+      extra: { feedbackRowsLeftBehind: leftBehind, claimPresent },
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1955,7 +2026,7 @@ router.post('/:user_id/email/verify', writeOperationLimiter, async (req, res) =>
     const caller = await loadSelfWithContactInfo(sub);
     if (!caller) return sendError(res, 'not_found');
 
-    const state = { outcome: null, priorAddress: null, newAddress: null };
+    const state = { outcome: null, priorAddress: null, newAddress: null, skippedMoves: null };
     try {
       await sequelize.transaction(async (t) => {
         // 3. The lock-order invariant: the caller's Users row, FIRST.
@@ -1981,7 +2052,7 @@ router.post('/:user_id/email/verify', writeOperationLimiter, async (req, res) =>
           // user, or off a second query, to decide WHAT to write — the token row
           // decides, which is what keeps a later request racing this verify from
           // being able to write ITS address.
-          await applyIdentityChange({
+          state.skippedMoves = await applyIdentityChange({
             t,
             sub,
             lockedRow: locked,
@@ -2089,6 +2160,12 @@ router.post('/:user_id/email/verify', writeOperationLimiter, async (req, res) =>
     }
 
     if (state.outcome === 'verified') {
+      await reportSkippedMoves({
+        sub,
+        previousEmail: state.priorAddress,
+        claimEmail: req.user && req.user.email,
+        skipped: state.skippedMoves,
+      });
       await enqueueEmailChangeNotice({
         sub,
         priorAddress: state.priorAddress,
@@ -2101,7 +2178,10 @@ router.post('/:user_id/email/verify', writeOperationLimiter, async (req, res) =>
     //    the commit.
     return respondEmailChange(req, res, sub, state.outcome, false);
   } catch (error) {
-    console.error('[users] email-change verify failed:', error.message);
+    // Round 3 #12/#20: the 500 path reports through the SAME seam as every other
+    // failure arm — wrapped (name only, never .message, which can embed an address)
+    // and to Sentry — instead of a raw console.error that reached stdout alone.
+    emailChangeTelemetry('verify-failed', { sub: req.user && req.user.user_id, address: null, error });
     return sendError(res, 'internal');
   }
 });
@@ -2138,7 +2218,7 @@ router.post('/:user_id/email/revert', writeOperationLimiter, async (req, res) =>
     const claimAddress = revertClaimAddress(req.user);
     if (!claimAddress) return sendError(res, 'validation');
 
-    const state = { outcome: null, priorAddress: null };
+    const state = { outcome: null, priorAddress: null, skippedMoves: null };
     try {
       await sequelize.transaction(async (t) => {
         const locked = await lockSelfRow(sub, t);
@@ -2156,7 +2236,7 @@ router.post('/:user_id/email/revert', writeOperationLimiter, async (req, res) =>
         const previousEmailChangedAt = locked.email_changed_at;
 
         try {
-          await applyIdentityChange({
+          state.skippedMoves = await applyIdentityChange({
             t,
             sub,
             lockedRow: locked,
@@ -2187,6 +2267,7 @@ router.post('/:user_id/email/revert', writeOperationLimiter, async (req, res) =>
     }
 
     if (state.outcome === 'reverted') {
+      await reportSkippedMoves({ sub, previousEmail: state.priorAddress, claimEmail: claim, skipped: state.skippedMoves });
       // D-40: revert MINTS nothing, so it counts this user's email-change tokens in
       // the last hour itself and SKIPS the notice at the cap — it never refuses the
       // operation over a mail.
@@ -2203,7 +2284,10 @@ router.post('/:user_id/email/revert', writeOperationLimiter, async (req, res) =>
 
     return respondEmailChange(req, res, sub, state.outcome, false);
   } catch (error) {
-    console.error('[users] email-change revert failed:', error.message);
+    // Round 3 #12/#20: the 500 path reports through the SAME seam as every other
+    // failure arm — wrapped (name only, never .message, which can embed an address)
+    // and to Sentry — instead of a raw console.error that reached stdout alone.
+    emailChangeTelemetry('revert-failed', { sub: req.user && req.user.user_id, address: null, error });
     return sendError(res, 'internal');
   }
 });

@@ -169,6 +169,25 @@ function expectSubFree(res, label) {
 
 // Harness: inject a verified req.user ahead of every router (mirrors the real
 // verifyAuth0Token middleware server.js mounts).
+// HIGH-D (round 3): the EXACT key set of the self read and of the three write echoes.
+// Sorted. `Groups` is the self GET's include; the echoes are default-scope rows, so
+// email / phone / email_changed_at are absent there by the model's defaultScope.
+const SELF_WIRE_STRIPPED = ['google_calendar_token', 'google_calendar_refresh_token', 'is_platform_admin'];
+const SELF_WIRE_KEYS = [
+  'Groups', 'createdAt', 'email', 'email_changed_at', 'email_notifications_enabled',
+  'google_calendar_enabled', 'id', 'notification_preferences', 'orphaned_at',
+  'pending_email_change', 'phone', 'phone_verified', 'picture_url', 'revert_available',
+  'sms_enabled', 'sms_welcome_sent_at', 'timezone', 'tutorial_version', 'updatedAt',
+  'user_id', 'username',
+];
+// PUT username and DELETE phone load their row through `req.selfUser ?? findOne` — the
+// DEFAULT scope, so the three excluded columns are absent. PATCH notification-preferences
+// loads `User.scope('withContactInfo')` (routes/users.js, its own handler), so its echo
+// carries them — and therefore a BOOLEAN revert_available, not the null the other two
+// answer. Pinned per echo so the pin says what actually ships.
+const SELF_ECHO_KEYS = SELF_WIRE_KEYS.filter((k) => !['Groups', 'email', 'phone', 'email_changed_at'].includes(k));
+const SELF_ECHO_KEYS_WITH_CONTACT = SELF_WIRE_KEYS.filter((k) => k !== 'Groups');
+
 let currentActor = null;
 const app = express();
 app.use(express.json());
@@ -423,6 +442,20 @@ describe('Wire sweep (87.3-09 Req 1): no Auth0 sub crosses the wire outside the 
     expectSubFree(self, 'GET /users/:user_id (self)');
     expect(self.body.user_id).toBe(owner.id); // alias — name stable, UUID value
 
+    /* Phase 88.8 code review round 3 HIGH-D — THE SELF KEY-SET PIN, deliberately EXACT.
+       toSelfWire is a bare toJSON() of a withContactInfo row (an EMPTY scope override
+       that restores EVERY column), so before round 3 the self read shipped
+       `google_calendar_token`, `google_calendar_refresh_token` and `is_platform_admin`
+       to the browser — and every gate stayed green, because the sweeps above pin
+       OTHER-user payloads only. A deny-list of those three would catch those three; this
+       pin catches the NEXT sensitive column: a new Users attribute reaching the self
+       wire must red here and be reviewed. Updating this list IS the review. */
+    expect(Object.keys(self.body).sort()).toEqual(SELF_WIRE_KEYS);
+    for (const secret of SELF_WIRE_STRIPPED) {
+      // Object idiom so the failure names the key (jest's expect takes one argument).
+      expect({ secret, hits: collectKeyHits(self.body, [secret]) }).toEqual({ secret, hits: [] });
+    }
+
     // GET /users/search/email/:email DELETED — Phase 87.6 (users-search-email,
     // Tier 1). A deleted route 404s and cannot be sub-free-probed (expectSubFree
     // requires a 2xx), so it is dropped from this sweep. Resurrection guards:
@@ -450,6 +483,20 @@ describe('Wire sweep (87.3-09 Req 1): no Auth0 sub crosses the wire outside the 
     );
     expectSubFree(phoneGone, 'DELETE /users/:user_id/phone');
     expect(phoneGone.body.user_id).toBe(owner.id);
+
+    // HIGH-D: the three write echoes ride toSelfWire on a DEFAULT-scope row, so their
+    // key set is the self set minus the defaultScope exclusions and the Groups include —
+    // and never the stripped secrets. Pinned EXACTLY for the same reason as the GET.
+    for (const [label, echo, expected] of [
+      ['PUT username', rename, SELF_ECHO_KEYS],
+      ['PATCH notification-preferences', prefs, SELF_ECHO_KEYS_WITH_CONTACT],
+      ['DELETE phone', phoneGone, SELF_ECHO_KEYS],
+    ]) {
+      expect({ label, keys: Object.keys(echo.body).sort() }).toEqual({ label, keys: expected });
+      for (const secret of SELF_WIRE_STRIPPED) {
+        expect({ label, secret, hits: collectKeyHits(echo.body, [secret]) }).toEqual({ label, secret, hits: [] });
+      }
+    }
 
     // POST /users/:user_id/refresh echo REMOVED — route DELETED (Phase 87.6
     // users-refresh, Tier 3). A deleted route 404s and cannot be sub-free-probed.
@@ -779,11 +826,14 @@ describe('Wire sweep (87.4-11 PR-2): availability + prompt-settings — allowlis
 // the same walk shape the sub matcher above already uses — a top-level
 // `not.toHaveProperty` would miss a nested User include, which is precisely
 // where these leak.
-// `revert_available` (Phase 88.8 round 2 HIGH-B) is a self-only DERIVED key assigned
-// by toSelfWire / emailChangeBody alone; it says whether THIS caller may revert their
-// address and has no business on anyone else's payload. Forbidden at any depth for
-// the same reason as `email_changed_at`.
-const FORBIDDEN_USER_PII = ['email', 'phone', 'email_changed_at', 'revert_available'];
+// `revert_available` (Phase 88.8 round 2 HIGH-B) and `pending_email_change` (round 3
+// DR2 — omitted by mistake when its boolean sibling was added; it carries an actual
+// ADDRESS, so it is the more sensitive of the two) are self-only DERIVED keys assigned
+// by toSelfWire / emailChangeBody alone and have no business on anyone else's payload.
+// Forbidden at any depth for the same reason as `email_changed_at`. This list is the
+// backend half of the FE pin in identity.contract.test.ts `neverOnOtherUsers`; the
+// two must name the SAME five fields.
+const FORBIDDEN_USER_PII = ['email', 'phone', 'email_changed_at', 'pending_email_change', 'revert_available'];
 
 function collectKeyHits(node, keys, path = '$', hits = []) {
   if (Array.isArray(node)) {

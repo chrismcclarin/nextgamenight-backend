@@ -15,6 +15,40 @@ const { sendError } = require('../utils/errors');
 // config/auth0Claims.js and keep the diff test. Changing this is a decision, not a cleanup.
 const { CLAIMS } = require('../config/auth0Claims');
 
+// Sentry is initialised in server.js when SENTRY_DSN is set; defensive require so
+// dev/test without the DSN is a no-op (same idiom as routes/users.js).
+let Sentry = null;
+try {
+  Sentry = require('@sentry/node');
+} catch (_e) {
+  Sentry = null;
+}
+
+/* Round 3 #3 (round 1 #12): the ONE runtime detector for "the post-login Action is not
+   deployed". The whole verified-email posture — email adoption, the D-41/D-42 move gate,
+   revert — reads namespaced claims that exist only once the Action is pasted into the
+   Auth0 dashboard by hand (auth0/actions/README.md). Nothing in CI can see that, and
+   without this every symptom (near-100% move skips, every revert refused, every repair
+   deferred) looks like a bug in the gate rather than a missing deploy step. Throttled to
+   one warning per process per hour, production only, and it never touches the request. */
+const CLAIMS_ABSENT_REPORT_INTERVAL_MS = 60 * 60 * 1000;
+let lastClaimsAbsentReportAt = 0;
+function reportClaimsAbsentOnce(decoded) {
+  if (process.env.NODE_ENV !== 'production') return;
+  const now = Date.now();
+  if (now - lastClaimsAbsentReportAt < CLAIMS_ABSENT_REPORT_INTERVAL_MS) return;
+  lastClaimsAbsentReportAt = now;
+  const line = '[auth0] post-login Action claims ABSENT from the access token — is the Action deployed and bound to the Login flow? (auth0/actions/README.md)';
+  console.warn(line);
+  if (Sentry && typeof Sentry.captureMessage === 'function') {
+    Sentry.captureMessage(line, {
+      level: 'warning',
+      tags: { feature: 'auth0-claims', op: 'claims-absent' },
+      extra: { hasBareEmail: typeof decoded.email === 'string' },
+    });
+  }
+}
+
 // Check for required environment variables
 if (!process.env.AUTH0_DOMAIN) {
   console.warn('⚠️  WARNING: AUTH0_DOMAIN not set. JWT verification will fail.');
@@ -157,6 +191,7 @@ const verifyAuth0Token = (req, res, next) => {
         family_name: decoded.family_name,
         // Include any other claims you need
       };
+      if (decoded[CLAIMS.email] === undefined) reportClaimsAbsentOnce(decoded);
 
       // Log available token claims in development for debugging
       if (process.env.NODE_ENV === 'development' && !req.user.email) {
