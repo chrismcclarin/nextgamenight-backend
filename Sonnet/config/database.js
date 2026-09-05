@@ -76,8 +76,37 @@ if (databaseUrl) {
       idle: 10000,
       evict: 10000, // Check for idle connections
     },
+    /* DECISION Phase 88.8 (code review wave-8 CI, 2026-09-05): the query retry is
+       RESTRICTED to connection-level errors — chosen OVER the bare `{ max: 3 }` that
+       shipped here, and OVER removing the block.
+
+       WHAT THE BARE BLOCK DID, verified in the library source: Sequelize's default is
+       `retry: { max: 5, match: ['SQLITE_BUSY: database is locked'] }`; a user-supplied
+       `retry` object REPLACES it wholesale (lib/sequelize.js constructor), and
+       retry-as-promised treats an EMPTY `match` as "retry on every error"
+       (retry-as-promised/dist/index.js `shouldRetry = options.match.length === 0 || ...`).
+       So on THIS branch — Railway production and CI, both of which set DATABASE_URL — every
+       failing statement was re-run up to three times. Inside a transaction the first
+       failure (e.g. a unique violation, SQLSTATE 23505) aborts the transaction, the two
+       retries answer 25P02 "current transaction is aborted", and the error that finally
+       propagates is a generic SequelizeDatabaseError — so every handler that maps a
+       unique violation to a designed outcome (email-change `address_taken`, the account-
+       deletion tombstone race → 410, the provisioning collision branches inside a
+       transaction) answered 500 in production, while passing locally on the DB_* branch,
+       which has no retry block. Found by the FIRST CI run of Phase 88.8 (five
+       deterministic failures, all of this class). Blind retry also re-executes WRITES
+       whose first attempt failed after the server acted (e.g. on a lost response).
+
+       KEPT, narrowed: the comment's stated intent was connection resilience, and
+       `Sequelize.ConnectionError` is the base class of every connection-time failure
+       (refused, host not found / unreachable, invalid connection, timed out) — those are
+       raised BEFORE a statement executes, so retrying them cannot double-execute a write.
+       retry-as-promised matches a function entry by `instanceof`. Anything else — query
+       errors, constraint violations, timeouts — surfaces on the first attempt exactly as
+       it does on the local branch. Widening this list is a decision, not a cleanup. */
     retry: {
-      max: 3, // Retry connection up to 3 times
+      max: 3,
+      match: [Sequelize.ConnectionError],
     },
     // Add query timeout
     query: {
