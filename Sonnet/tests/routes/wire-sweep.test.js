@@ -779,7 +779,11 @@ describe('Wire sweep (87.4-11 PR-2): availability + prompt-settings — allowlis
 // the same walk shape the sub matcher above already uses — a top-level
 // `not.toHaveProperty` would miss a nested User include, which is precisely
 // where these leak.
-const FORBIDDEN_USER_PII = ['email', 'phone', 'email_changed_at'];
+// `revert_available` (Phase 88.8 round 2 HIGH-B) is a self-only DERIVED key assigned
+// by toSelfWire / emailChangeBody alone; it says whether THIS caller may revert their
+// address and has no business on anyone else's payload. Forbidden at any depth for
+// the same reason as `email_changed_at`.
+const FORBIDDEN_USER_PII = ['email', 'phone', 'email_changed_at', 'revert_available'];
 
 function collectKeyHits(node, keys, path = '$', hits = []) {
   if (Array.isArray(node)) {

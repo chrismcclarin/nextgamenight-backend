@@ -1542,6 +1542,60 @@ describe('source: verify and revert are ordinary authenticated routes', () => {
 // breaking the three write echoes.
 // ===========================================================================
 
+describe('round 2 HIGH-B — revert_available is SERVER-computed and asks the revert route\'s own question', () => {
+  beforeEach(() => mailSucceeds());
+
+  it('TRUE on the self read when email_changed_at is set AND the claim is verified and real', async () => {
+    const row = await seedUser({ email: 'changed@example.com', email_changed_at: new Date() });
+    const res = await request(makeApp(actorFor(row, { email: 'signin@example.com' })))
+      .get(`/api/users/${row.user_id}`).expect(200);
+    expect(res.body.revert_available).toBe(true);
+  });
+
+  it('FALSE when email_changed_at is null — nothing to revert to', async () => {
+    const row = await seedUser({ email: 'never@example.com', email_changed_at: null });
+    const res = await request(makeApp(actorFor(row))).get(`/api/users/${row.user_id}`).expect(200);
+    expect(res.body.revert_available).toBe(false);
+  });
+
+  it.each([
+    ['the claim is UNVERIFIED', { email: 'signin@example.com', email_verified: false }],
+    ['the claim is SYNTHETIC', { email: 'auth0-x@auth0.local', email_verified: true }],
+    ['there is NO email claim', { email: undefined, email_verified: true }],
+    ['the claim is not a valid address', { email: 'not-an-address', email_verified: true }],
+  ])('FALSE when %s — exactly the refusal the revert route would answer with', async (_label, claimOverrides) => {
+    const row = await seedUser({ email: 'changed@example.com', email_changed_at: new Date() });
+    const app = makeApp(actorFor(row, claimOverrides));
+    const res = await request(app).get(`/api/users/${row.user_id}`).expect(200);
+    expect(res.body.revert_available).toBe(false);
+    // The wire and the route agree: the same actor is refused by the route.
+    await request(app).post(`/api/users/${row.user_id}/email/revert`).send().expect(400);
+  });
+
+  it('the key is PRESENT on a default-scope write echo and is null there (the column is not loaded)', async () => {
+    const row = await seedUser({ email: 'echo@example.com', email_changed_at: new Date() });
+    const res = await request(makeApp(actorFor(row)))
+      .put(`/api/users/${row.user_id}/username`).send({ username: 'echoed' }).expect(200);
+    expect(Object.prototype.hasOwnProperty.call(res.body, 'revert_available')).toBe(true);
+    expect(res.body.revert_available).toBeNull();
+  });
+
+  it('the email-change body carries it: TRUE after a verify stamps email_changed_at, FALSE after a revert clears it', async () => {
+    const row = await seedUser({ email: 'before@example.com' });
+    const app = makeApp(actorFor(row));
+    await requestChange(app, row, 'after@example.com');
+    const verified = await request(app)
+      .post(`/api/users/${row.user_id}/email/verify`).send({ code: sentCodes()[0] }).expect(200);
+    expect(verified.body.outcome).toBe('verified');
+    expect(verified.body.revert_available).toBe(true);
+
+    const reverted = await request(app).post(`/api/users/${row.user_id}/email/revert`).send().expect(200);
+    expect(reverted.body.outcome).toBe('reverted');
+    expect(reverted.body.email_changed_at).toBeNull();
+    expect(reverted.body.revert_available).toBe(false);
+  });
+});
+
 describe('D-39 — toSelfWire hydration', () => {
   beforeEach(() => mailSucceeds());
 
@@ -1640,8 +1694,16 @@ describe('D-39 — toSelfWire hydration', () => {
     const fs = require('fs');
     const path = require('path');
     const source = fs.readFileSync(path.join(__dirname, '../../routes/users.js'), 'utf8');
-    expect(source).toContain('const toSelfWire = (user, pendingEmailChange = null) =>');
+    // AMENDED round 2 HIGH-B (2026-09-05): a third parameter, `reqUser`, carries the
+    // caller's claims so `revert_available` can be computed WITHOUT a lookup. The
+    // property this test protects is unchanged — synchronous and pure — so the pin
+    // now also proves the body awaits nothing.
+    expect(source).toContain('const toSelfWire = (user, pendingEmailChange = null, reqUser = null) =>');
     expect(source).not.toContain('const toSelfWire = async');
+    const start = source.indexOf('const toSelfWire = (');
+    const body = source.slice(start, source.indexOf('return json;\n};', start));
+    expect(body).not.toMatch(/\bawait\b/);
+    expect(body).toContain('json.revert_available = revertAvailability(user, reqUser);');
     expect(
       source.split('\n').filter((l) => !/^\s*\/\//.test(l)).join('\n')
     ).toContain('DECISION Phase 88.8 D-39');

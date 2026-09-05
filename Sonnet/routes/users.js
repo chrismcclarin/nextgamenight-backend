@@ -97,10 +97,39 @@ try {
  * @param {Object} user
  * @param {{ address: string, expires_at: Date }|null} [pendingEmailChange]
  */
-const toSelfWire = (user, pendingEmailChange = null) => {
+/*
+ * DECISION Phase 88.8 code review round 2 HIGH-B (owner ruling 2026-09-05): the self
+ * wire carries a SERVER-COMPUTED `revert_available`, assigned UNCONDITIONALLY so the
+ * key is present on all four toSelfWire responses AND on every emailChangeBody.
+ *
+ * WHY THE SERVER, and why no client-side gate can be correct: the revert route below
+ * additionally demands a VERIFIED, NON-SYNTHETIC claim on the ACCESS token, and the
+ * frontend cannot read that value — `useUser()` exposes the SESSION token, a different
+ * source that disagrees precisely during the wave-8 window, when no access token yet
+ * carries the namespaced claims. Rendering the control on `email_changed_at` alone
+ * therefore advertised an action the route would refuse (D-38 says a permanently
+ * inert control is worse than none). The value is computed by `revertAvailability`,
+ * which asks EXACTLY the question the revert handler asks, through the same
+ * `revertClaimAddress` predicate — one rule, two callers, so they cannot drift.
+ *
+ * THREE-VALUED ON PURPOSE. `true` / `false` are the answer for a row loaded with
+ * `withContactInfo` (the self GET and every email-change body). `null` means "this
+ * response did not load the field": the three write echoes ride the DEFAULT scope,
+ * where `email_changed_at` is EXCLUDED, so no truthful boolean exists there. That is
+ * the same posture D-39 records for `pending_email_change` on those echoes, and it
+ * is safe for the same reason — the frontend treats those three responses as PARTIAL
+ * patches (see D-39 above). The FRONTEND gate is `revert_available === true`, so
+ * `null`, `false` AND an absent key ALL fail CLOSED (cross-finding C4: the engine's
+ * own remedy let the key be omitted and then rendered the button on the omission).
+ * REJECTED: re-loading the three echoes with contact info to compute a boolean —
+ * a query on three responses no consumer reads the field from, D-39's exact
+ * rejected alternative (a).
+ */
+const toSelfWire = (user, pendingEmailChange = null, reqUser = null) => {
   const json = user && user.toJSON ? user.toJSON() : { ...user };
   json.user_id = json.id;
   json.pending_email_change = pendingEmailChange || null;
+  json.revert_available = revertAvailability(user, reqUser);
   return json;
 };
 
@@ -400,7 +429,7 @@ router.get('/:user_id', requireParamMatchesToken('user_id'), async (req, res) =>
     const pendingEmailChange = req.user && req.user.user_id
       ? projectPendingEmailChange(await loadPendingEmailChange(req.user.user_id))
       : null;
-    res.json(toSelfWire(user, pendingEmailChange));
+    res.json(toSelfWire(user, pendingEmailChange, req.user));
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -500,7 +529,7 @@ router.put('/:user_id/username', async (req, res) => {
     
     await user.update({ username: username.trim() });
 
-    res.json(toSelfWire(user)); // PR-C: user_id aliased to the UUID
+    res.json(toSelfWire(user, null, req.user)); // PR-C: user_id aliased to the UUID
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -595,7 +624,7 @@ router.patch('/:user_id/notification-preferences', async (req, res) => {
       }
     }
 
-    res.json(toSelfWire(user)); // PR-C: user_id aliased to the UUID
+    res.json(toSelfWire(user, null, req.user)); // PR-C: user_id aliased to the UUID
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -809,7 +838,7 @@ router.delete('/:user_id/phone', async (req, res) => {
 
     // Re-read to return the post-cascade state to the client.
     await user.reload();
-    res.json(toSelfWire(user)); // PR-C: user_id aliased to the UUID
+    res.json(toSelfWire(user, null, req.user)); // PR-C: user_id aliased to the UUID
   } catch (error) {
     console.error('[users] Phone removal cascade failed:', error.message);
     res.status(500).json({ error: error.message });
@@ -874,6 +903,46 @@ const EMAIL_CHANGE_WINDOW_MS = 60 * 60 * 1000;
 // the sync-built database.
 const EMAIL_MAX_LENGTH = 255;
 const EMAIL_FORMAT = /^[^\s@]+@[^\s@.]+(?:\.[^\s@.]+)+$/;
+
+/**
+ * THE revert precondition on the CLAIM side, in one place (round 2 HIGH-B): the
+ * normalised address the revert route would write back, or `null` when the token
+ * cannot authorise a revert. Both `POST /:user_id/email/revert` and the wire's
+ * `revert_available` call THIS, so the affordance and the refusal cannot disagree.
+ *
+ * The synthetic test is the BROAD `@auth0` one (provisioningService.isSyntheticAddress),
+ * never `@auth0.local` alone — DECISION Phase 88.2 NIX-AUTH0. It is not optional:
+ * `Users.email` is the IDENTITY column, and writing a synthetic value back into it
+ * would undo precisely the repair plans 01/04/05 exist to perform.
+ */
+function revertClaimAddress(reqUser) {
+  const claim = reqUser && reqUser.email;
+  if (
+    typeof claim !== 'string' ||
+    (reqUser && reqUser.email_verified) !== true ||
+    provisioningService.isSyntheticAddress(claim)
+  ) {
+    return null;
+  }
+  const claimAddress = provisioningService.normaliseEmail(claim);
+  if (!claimAddress || claimAddress.length > EMAIL_MAX_LENGTH || !EMAIL_FORMAT.test(claimAddress)) {
+    return null;
+  }
+  return claimAddress;
+}
+
+/**
+ * `revert_available` for the wire: `true`/`false` when the row was loaded WITH
+ * `email_changed_at` (withContactInfo), `null` when it was not (a default-scope row
+ * excludes the column, so `user.email_changed_at` is `undefined`, not `null`) or
+ * when there is no caller. See the toSelfWire marker for why null, not false.
+ */
+function revertAvailability(user, reqUser) {
+  if (!user || !reqUser) return null;
+  const changedAt = typeof user.get === 'function' ? user.get('email_changed_at') : user.email_changed_at;
+  if (changedAt === undefined) return null;
+  return Boolean(changedAt) && revertClaimAddress(reqUser) !== null;
+}
 
 // Crockford base32: 0-9 and A-Z without I, L, O and U — the four that are misread
 // as 1, 1, 0 and V when a person copies a code off a screen. 32 symbols.
@@ -1017,7 +1086,7 @@ function projectPendingEmailChange(row) {
  * so dropping it would make the revert affordance unreachable in the UI. Removing
  * it is a decision, not a cleanup.
  */
-function emailChangeBody(user, pendingRow, outcome, verificationSent) {
+function emailChangeBody(user, pendingRow, outcome, verificationSent, reqUser) {
   return {
     outcome,
     email: user ? user.email : null,
@@ -1025,13 +1094,20 @@ function emailChangeBody(user, pendingRow, outcome, verificationSent) {
     verification_sent: verificationSent === true,
     email_changed_at:
       user && user.email_changed_at ? new Date(user.email_changed_at).toISOString() : null,
+    // Round 2 HIGH-B: the SIXTH key. Rides here for the same MECHANICAL reason as
+    // `email_changed_at` above — the section patches the immortal self cache from
+    // this body, so a verify that stamps `email_changed_at` must also say whether
+    // revert is now available, and a revert that clears it must say it is not.
+    // `null` only when the row could not be re-read (`email: null`, the contract
+    // error the section already treats as a failure). See the toSelfWire marker.
+    revert_available: revertAvailability(user, reqUser),
   };
 }
 
-async function respondEmailChange(res, sub, outcome, verificationSent) {
+async function respondEmailChange(req, res, sub, outcome, verificationSent) {
   const fresh = await loadSelfWithContactInfo(sub);
   const pending = await loadPendingEmailChange(sub);
-  return res.json(emailChangeBody(fresh, pending, outcome, verificationSent));
+  return res.json(emailChangeBody(fresh, pending, outcome, verificationSent, req.user));
 }
 
 /**
@@ -1316,7 +1392,7 @@ router.post('/:user_id/email', writeOperationLimiter, async (req, res) => {
         tokenId: state.minted.id,
       });
     }
-    return respondEmailChange(res, sub, state.outcome, verificationSent);
+    return respondEmailChange(req, res, sub, state.outcome, verificationSent);
   } catch (error) {
     console.error('[users] email-change request failed:', error.message);
     return sendError(res, 'internal');
@@ -1408,7 +1484,7 @@ router.post('/:user_id/email/resend', writeOperationLimiter, async (req, res) =>
       code: state.code,
       tokenId: state.tokenId,
     });
-    return respondEmailChange(res, sub, 'code_sent', verificationSent);
+    return respondEmailChange(req, res, sub, 'code_sent', verificationSent);
   } catch (error) {
     console.error('[users] email-change resend failed:', error.message);
     return sendError(res, 'internal');
@@ -1454,7 +1530,7 @@ router.post('/:user_id/email/cancel', writeOperationLimiter, async (req, res) =>
 
     if (missing) return sendError(res, 'not_found');
     // Idempotent: a cancel with nothing pending is a success, not an error.
-    return respondEmailChange(res, sub, 'cancelled', false);
+    return respondEmailChange(req, res, sub, 'cancelled', false);
   } catch (error) {
     console.error('[users] email-change cancel failed:', error.message);
     return sendError(res, 'internal');
@@ -2007,7 +2083,7 @@ router.post('/:user_id/email/verify', writeOperationLimiter, async (req, res) =>
         // (iv) absent, revoked, or a row belonging to another user or another
         //      purpose — which the user_id + purpose predicates HIDE, so it can
         //      never be probed -> invalid.
-        return respondEmailChange(res, sub, outcome, false);
+        return respondEmailChange(req, res, sub, outcome, false);
       }
       // address_taken: state.outcome is already set; fall through to the response.
     }
@@ -2023,7 +2099,7 @@ router.post('/:user_id/email/verify', writeOperationLimiter, async (req, res) =>
 
     // 6. The ONE pinned body, ALL FIVE KEYS, from a withContactInfo re-read after
     //    the commit.
-    return respondEmailChange(res, sub, state.outcome, false);
+    return respondEmailChange(req, res, sub, state.outcome, false);
   } catch (error) {
     console.error('[users] email-change verify failed:', error.message);
     return sendError(res, 'internal');
@@ -2055,23 +2131,12 @@ router.post('/:user_id/email/revert', writeOperationLimiter, async (req, res) =>
     // Nothing to revert.
     if (!caller.email_changed_at) return sendError(res, 'validation');
 
+    // The claim-side precondition lives in `revertClaimAddress` (round 2 HIGH-B) so
+    // that the wire's `revert_available` asks the SAME question this handler asks —
+    // the broad synthetic guard and its NIX-AUTH0 rationale are documented there.
     const claim = req.user && req.user.email;
-    // The last guard is NOT optional, and here is why: `Users.email` is the
-    // IDENTITY column, and writing a synthetic value back into it would undo
-    // precisely the repair plans 01/04/05 exist to perform. The test is the BROAD
-    // `@auth0` one (provisioningService.isSyntheticAddress), never `@auth0.local`
-    // alone — DECISION Phase 88.2 NIX-AUTH0.
-    if (
-      typeof claim !== 'string' ||
-      (req.user && req.user.email_verified) !== true ||
-      provisioningService.isSyntheticAddress(claim)
-    ) {
-      return sendError(res, 'validation');
-    }
-    const claimAddress = provisioningService.normaliseEmail(claim);
-    if (!claimAddress || claimAddress.length > EMAIL_MAX_LENGTH || !EMAIL_FORMAT.test(claimAddress)) {
-      return sendError(res, 'validation');
-    }
+    const claimAddress = revertClaimAddress(req.user);
+    if (!claimAddress) return sendError(res, 'validation');
 
     const state = { outcome: null, priorAddress: null };
     try {
@@ -2136,7 +2201,7 @@ router.post('/:user_id/email/revert', writeOperationLimiter, async (req, res) =>
       }
     }
 
-    return respondEmailChange(res, sub, state.outcome, false);
+    return respondEmailChange(req, res, sub, state.outcome, false);
   } catch (error) {
     console.error('[users] email-change revert failed:', error.message);
     return sendError(res, 'internal');
