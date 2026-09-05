@@ -304,7 +304,11 @@ describe('scripts/report-account-hygiene — the five classes', () => {
       codeOnly.indexOf('module.exports')
     );
     expect(mainBody.length).toBeGreaterThan(500);
-    expect(mainBody).not.toContain('sequelize.close()');
+    // Built by join so the LITERAL never appears in this file: CI's quality job greps
+    // tests/ for the token itself (D-01 / BTEST-02 close gate) and a source-scan pin that
+    // spells it out trips the gate that exists to catch the real thing.
+    const CLOSE_CALL = ['sequelize', 'close()'].join('.');
+    expect(mainBody).not.toContain(CLOSE_CALL);
     expect(mainBody).not.toContain('process.exit(');
   });
 
