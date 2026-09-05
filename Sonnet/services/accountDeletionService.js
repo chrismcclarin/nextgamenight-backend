@@ -49,7 +49,9 @@
 // new Event.winner_id/picked_by_id SET NULL FKs from plan 87.2-01) fire automatically
 // on User.destroy via the 87.1 CASCADE / SET NULL graph — no explicit code needed here.
 
-const { Op, UniqueConstraintError } = require('sequelize');
+const { Op, UniqueConstraintError, fn, col, where } = require('sequelize');
+// Round 4 #8: THE normalisation rule for a stored address — imported, never re-derived.
+const { normaliseEmail } = require('./provisioningService');
 const {
   User,
   Group,
@@ -292,10 +294,33 @@ async function applyDispositions(user, t) {
   //    FeedbackForm.js to send self.id. Match sub OR uuid OR email so a deleted user's
   //    post-Plan-11 feedback is anonymized too — a sub-only predicate would leave those
   //    UUID-keyed rows un-scrubbed. Both id arms are intentional (see keyspace block).
+  // Round 4 #8: the address arm is CASE-INSENSITIVE, matching the D-42 move
+  // (`LOWER(user_email)`) and friend search — a byte-exact match left rows written under
+  // a case variant un-scrubbed.
+  const normalisedEmail = normaliseEmail(email);
   await Feedback.update(
     { user_id: null, user_email: null },
-    { where: { [Op.or]: [{ user_id: sub }, { user_id: uuid }, { user_email: email }] }, transaction: t }
+    {
+      where: {
+        [Op.or]: [
+          { user_id: sub },
+          { user_id: uuid },
+          ...(normalisedEmail ? [where(fn('lower', col('user_email')), normalisedEmail)] : []),
+        ],
+      },
+      transaction: t,
+    }
   );
+  // Round 4 #16: D-42's argument applies verbatim to GroupInvite — the ADDRESS is the
+  // invite-to-person link (no user column), and this phase's D-41 move actively rewrites
+  // it onto the user's current address. Pending invites addressed to the deleted user
+  // are removed (owned groups' invites were already purged above).
+  if (normalisedEmail) {
+    await GroupInvite.destroy({
+      where: { status: 'pending', [Op.and]: [where(fn('lower', col('invited_email')), normalisedEmail)] },
+      transaction: t,
+    });
+  }
 
   // 4. EventBallotOption.created_by_uuid -> NULL (Users.id UUID; Phase 87.5 PR-1 rekey).
   //    Keep the explicit update for clarity — the new SET NULL FK is the safety net; both

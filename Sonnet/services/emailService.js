@@ -1047,7 +1047,7 @@ This is an automated message from Next Game Night.
 
       <p>If that was you, nothing further is needed.</p>
 
-      <p>If this wasn't you, open Next Game Night, change it back in your profile, and sign out everywhere.</p>
+      <p>If this wasn't you, open Next Game Night, change it back in your profile, and change your sign-in password if you use one.</p>
 
       <div class="footer">
         <p>This is an automated security message from Next Game Night. We will never ask you for a password or a code by reply.</p>
@@ -1065,7 +1065,7 @@ ${copy.sentence} ${this.maskEmail(newAddress)}.
 
 If that was you, nothing further is needed.
 
-If this wasn't you, open Next Game Night, change it back in your profile, and sign out everywhere.
+If this wasn't you, open Next Game Night, change it back in your profile, and change your sign-in password if you use one.
 
 ---
 This is an automated security message from Next Game Night. We will never ask you for a password or a code by reply.

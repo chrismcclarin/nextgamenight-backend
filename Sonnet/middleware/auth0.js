@@ -191,7 +191,10 @@ const verifyAuth0Token = (req, res, next) => {
         family_name: decoded.family_name,
         // Include any other claims you need
       };
-      if (decoded[CLAIMS.email] === undefined) reportClaimsAbsentOnce(decoded);
+      // Round 4 #18: fire only when NO namespaced claim is present. A deployed Action
+      // omits the email claim for a user whose Auth0 profile has no email, but it ALWAYS
+      // sets the connection claim — so "none present" is the deploy-state signal.
+      if (!Object.values(CLAIMS).some((key) => decoded[key] !== undefined)) reportClaimsAbsentOnce(decoded);
 
       // Log available token claims in development for debugging
       if (process.env.NODE_ENV === 'development' && !req.user.email) {

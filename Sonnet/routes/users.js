@@ -456,7 +456,16 @@ router.get('/:user_id', requireParamMatchesToken('user_id'), async (req, res) =>
       : null;
     res.json(toSelfWire(user, pendingEmailChange, req.user));
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    // Round 4 #10/#17: this handler now runs the whole provisioning/repair pipeline
+    // (Management errors, collision text) — never echo the raw message to the browser,
+    // and report it (wrapped, class only) instead of stdout alone.
+    console.error('[users] self read failed:', error && error.name, error && error.parent && error.parent.code);
+    if (Sentry && typeof Sentry.captureException === 'function') {
+      Sentry.captureException(new Error(`self-read failed: ${(error && error.name) || 'Error'}`), {
+        tags: { feature: 'self-read' },
+      });
+    }
+    return sendError(res, 'internal');
   }
 });
 
@@ -1006,9 +1015,15 @@ function normaliseEmailChangeCode(value) {
 }
 
 /**
- * The code is stored ONLY as its sha256 hash, so a database read exposure yields
- * no live code. consumeByNonce's single atomic UPDATE is untouched — the route
- * hashes first, then looks the hash up.
+ * The code is stored as its sha256 hash — a LOOKUP KEY, not a one-way protection
+ * (round 4 #9 corrected the claim that used to stand here): the code space is 32^8 =
+ * 2^40 and the hash is unsalted, so a database read exposure DOES let an attacker
+ * recover every live code (30-minute lifetime) by brute force. What the hash buys is
+ * that a casual read or log line never shows a code in the clear. Hardening to an
+ * HMAC with a server pepper (a new Railway variable; in-flight codes would stop
+ * verifying for up to 30 minutes at the switch) is recorded against Phase 91.
+ * consumeByNonce's single atomic UPDATE is untouched — the route hashes first, then
+ * looks the hash up.
  */
 function hashEmailChangeCode(normalisedCode) {
   return crypto.createHash('sha256').update(normalisedCode).digest('hex');
@@ -1369,6 +1384,13 @@ router.post('/:user_id/email', writeOperationLimiter, async (req, res) => {
     }
     const normalised = provisioningService.normaliseEmail(body.email);
     if (!normalised || normalised.length > EMAIL_MAX_LENGTH || !EMAIL_FORMAT.test(normalised)) {
+      return sendError(res, 'validation');
+    }
+    // Round 4 #6: an address the app's OWN sentinel predicate matches (`me@auth0.com` —
+    // any host containing "auth0", the deliberately BROAD NIX-AUTH0 test) cannot be
+    // stored: seventeen sites would read the stored value as a provisioning sentinel.
+    // The shared predicate is reused, never re-spelled or narrowed.
+    if (provisioningService.isSyntheticAddress(normalised)) {
       return sendError(res, 'validation');
     }
 

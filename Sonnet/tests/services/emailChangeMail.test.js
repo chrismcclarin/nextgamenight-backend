@@ -218,7 +218,9 @@ describe('emailService.sendEmailChangeNotice (SPEC A13 / DR-E — a warning, nev
     });
     const body = renderedBody(sentPayload());
     expect(body).toMatch(/wasn't you|was not you/i);
-    expect(body).toMatch(/sign out everywhere/i);
+    // Round 4 #7: the copy names only steps the app actually supports.
+    expect(body).toMatch(/change your sign-in password/i);
+    expect(body).not.toMatch(/sign out everywhere/i);
   });
 
   it('subject is single-line (stripCrlf applied)', async () => {
