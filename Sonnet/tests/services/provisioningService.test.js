@@ -471,13 +471,22 @@ describe('services/provisioningService — provisionOrRepair', () => {
       expect(result.changed).toBe(true);
     });
 
-    it('a real-email row plus a verified claim for a DIFFERENT address is repaired to the claim address', async () => {
+    // INVERTED 2026-09-05 (code review HIGH-1, owner ruling). This test previously
+    // asserted the opposite — that a REAL stored address is rewritten to a differing
+    // verified claim. That behaviour was ungated where the Management half of the same
+    // arm is gated, was broader than SPEC R3's acceptance line ("repairs a SYNTHETIC
+    // row"), and carried none of the invite/feedback/notice companion work that the
+    // user-initiated change path does. The guard is now the assertion.
+    it('a REAL-email row plus a verified claim for a DIFFERENT address is LEFT ALONE — the repair is synthetic-only', async () => {
       const sub = 'auth0|svc-repair-real';
       await User.create({ user_id: sub, username: 'Someone', email: 'old@example.com' });
 
       const result = await provision({ sub, claims: { email: 'new@example.com', email_verified: true } });
 
-      expect(result.user.email).toBe('new@example.com');
+      const row = await User.scope('withContactInfo').findOne({ where: { user_id: sub } });
+      expect(row.email).toBe('old@example.com');
+      expect(result.user.email).toBe('old@example.com');
+      expect(result.changed).toBe(false);
       expect(auth0Service.getUserById).not.toHaveBeenCalled();
     });
 

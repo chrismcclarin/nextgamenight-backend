@@ -96,6 +96,7 @@ const PROVISIONING_NOTES = Object.freeze({
   EMAIL_REPAIRED_FROM_CLAIM: 'email_repaired_from_claim',
   EMAIL_REPAIRED_FROM_MANAGEMENT: 'email_repaired_from_management',
   EMAIL_LEFT_CLAIM_UNVERIFIED: 'email_left_claim_unverified',
+  EMAIL_LEFT_STORED_REAL: 'email_left_stored_real',
   EMAIL_LEFT_MANAGEMENT_UNVERIFIED: 'email_left_management_unverified',
   EMAIL_REPAIR_COLLIDED: 'email_repair_collided',
   // The five SPEC R5 collision outcomes. EMAIL_REPAIR_COLLIDED above still fires on
@@ -1097,13 +1098,43 @@ async function repairExistingRow({
   // --- EMAIL arm, claims half -------------------------------------------------
   if (emailIsRepairable && claimEmailIsPresent) {
     if (claimEmailIsVerified) {
-      // Repair whenever the normalised claim differs from the normalised stored value —
-      // a synthetic stored value, OR a real one that differs (SPEC Edge Coverage
-      // `adjacency / R3`, the verify-after-signup upgrade). Zero Management calls.
+      // Repair a SYNTHETIC stored address from the verified claim. Zero Management calls.
+      //
+      // DECISION Phase 88.8 (code review 2026-09-05, owner ruling): this is gated on
+      // `storedEmailIsSynthetic` — the SAME gate the Management half below uses. Chosen
+      // OVER the ungated form that ALSO rewrote a REAL stored address to a different
+      // REAL one whenever a verified claim differed. Why that form was rejected:
+      //
+      //   - It was broader than SPEC R3's own acceptance line, which reads "a later
+      //     verified claim repairs a SYNTHETIC row" (88.8-SPEC.md:136), and broader
+      //     than the pre-88.8 gate it replaced (`user.email.includes('@auth0')`, old
+      //     routes/users.js:367) — so it silently widened the blast radius of the
+      //     identity column on a path that runs on EVERY self fetch (six call sites).
+      //   - `Users.email` is an AUTHORIZATION key, not just contact data: the three
+      //     invite handlers refuse unless it matches `invited_email` (routes/invites.js
+      //     :593, :664, :757), and the account-deletion scrub keys on it
+      //     (services/accountDeletionService.js:295-298). Rewriting it therefore
+      //     orphans pending invites and strands feedback rows.
+      //   - The user-initiated change path does that companion work properly — the
+      //     gated invite move, the feedback move and the A13 notice to the PRIOR
+      //     address (routes/users.js:1733). THIS path does none of it, and nothing
+      //     here can: this module imports no GroupInvite, no Feedback and no queue.
+      //
+      // Widening this gate without also moving invites, moving feedback rows and
+      // notifying the prior address is a decision, not a cleanup.
+      //
+      // The verify-after-signup edge is UNAFFECTED: an unverified claim is never
+      // adopted at create time, so that row is stored synthetic (:945-951 falls
+      // through to syntheticEmailFor) and a later verified claim still passes here.
       const candidate = normaliseEmail(rawClaimEmail);
-      if (candidate !== normaliseEmail(row.email)) {
+      if (storedEmailIsSynthetic && candidate !== normaliseEmail(row.email)) {
         changes.email = candidate;
         notes.push(PROVISIONING_NOTES.EMAIL_REPAIRED_FROM_CLAIM);
+      } else if (!storedEmailIsSynthetic) {
+        // A real stored address plus a verified claim for a DIFFERENT real address.
+        // Left alone deliberately; the user changes it themselves through the flow
+        // that carries the companion moves.
+        notes.push(PROVISIONING_NOTES.EMAIL_LEFT_STORED_REAL);
       }
     } else {
       // Leave the stored address alone. Never overwrite a real stored address with a
