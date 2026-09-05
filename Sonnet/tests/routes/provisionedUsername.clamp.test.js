@@ -171,6 +171,83 @@ describe('wave-12 HIGH #2 — machine-derived username writers clamp to len[1,50
         expect(row.email).toBe('auth0-gauth-no-email@auth0.local');
       });
     });
+
+    // --------------------------------------------------------------------
+    // Phase 88.8 code review round 2 HIGH-C (2026-09-05). For an Auth0 database
+    // (username-password) connection the `name` claim defaults to the user's EMAIL
+    // ADDRESS. Before this fix the existing-row refresh above ran
+    // `clampProvisionedUsername(claims.name)` directly, with no address filter, so a
+    // Calendar connect published the address as the PUBLIC username. The route now
+    // runs its candidates through the service's `makeUsernamePicker`, against both the
+    // token address and the stored row address.
+    // --------------------------------------------------------------------
+    describe('existing-row username refresh never publishes an address (round 2 HIGH-C)', () => {
+      it('a `name` claim equal to the token email is refused; the stored username survives', async () => {
+        const sub = 'auth0|gauth-name-is-email';
+        await User.create({ user_id: sub, username: 'Real Name', email: 'name-is-email@example.com' });
+
+        await request(makeApp('/api/auth', googleAuthRoutes, {
+          user_id: sub, email: 'name-is-email@example.com', email_verified: true,
+          name: 'name-is-email@example.com',
+        })).get('/api/auth/google/url').expect(200);
+
+        const row = await User.findOne({ where: { user_id: sub } });
+        expect(row.username).toBe('Real Name');
+      });
+
+      it('the compare is normalised: a case- and whitespace-variant of the address is still refused', async () => {
+        const sub = 'auth0|gauth-name-is-email-variant';
+        await User.create({ user_id: sub, username: 'Real Name', email: 'variant@example.com' });
+
+        await request(makeApp('/api/auth', googleAuthRoutes, {
+          user_id: sub, email: 'variant@example.com', email_verified: true,
+          name: '  VARIANT@Example.COM  ',
+        })).get('/api/auth/google/url').expect(200);
+
+        const row = await User.findOne({ where: { user_id: sub } });
+        expect(row.username).toBe('Real Name');
+      });
+
+      it('a refused `name` falls through to `nickname` (the chain is filtered per candidate, not abandoned)', async () => {
+        const sub = 'auth0|gauth-name-is-email-nick';
+        await User.create({ user_id: sub, username: 'Old Name', email: 'with-nick@example.com' });
+
+        await request(makeApp('/api/auth', googleAuthRoutes, {
+          user_id: sub, email: 'with-nick@example.com', email_verified: true,
+          name: 'with-nick@example.com', nickname: 'nicky',
+        })).get('/api/auth/google/url').expect(200);
+
+        const row = await User.findOne({ where: { user_id: sub } });
+        expect(row.username).toBe('nicky');
+      });
+
+      it('the STORED row address is refused too, when it differs from the token address', async () => {
+        // After an in-app email change the row holds the new address while the token
+        // still carries the old one. Neither may become the public name.
+        const sub = 'auth0|gauth-name-is-stored-email';
+        await User.create({ user_id: sub, username: 'Real Name', email: 'stored-new@example.com' });
+
+        await request(makeApp('/api/auth', googleAuthRoutes, {
+          user_id: sub, email: 'token-old@example.com', email_verified: true,
+          name: 'stored-new@example.com',
+        })).get('/api/auth/google/url').expect(200);
+
+        const row = await User.findOne({ where: { user_id: sub } });
+        expect(row.username).toBe('Real Name');
+      });
+
+      it('an ordinary display name still refreshes (the filter does not over-reach)', async () => {
+        const sub = 'auth0|gauth-ordinary-refresh';
+        await User.create({ user_id: sub, username: 'Old Name', email: 'ordinary@example.com' });
+
+        await request(makeApp('/api/auth', googleAuthRoutes, {
+          user_id: sub, email: 'ordinary@example.com', email_verified: true, name: 'New Name',
+        })).get('/api/auth/google/url').expect(200);
+
+        const row = await User.findOne({ where: { user_id: sub } });
+        expect(row.username).toBe('New Name');
+      });
+    });
   });
 
   describe('routes/events.js GET /user/:user_id JIT provisioning', () => {

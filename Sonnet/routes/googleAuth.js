@@ -5,7 +5,6 @@ const crypto = require('crypto');
 const { google } = require('googleapis');
 const { User, SingleUseToken, PendingAuth0Deletion } = require('../models');
 const { sendError, AppError } = require('../utils/errors');
-const { clampProvisionedUsername } = require('../utils/provisionedUsername');
 const { resolveAllowedFrontendUrl, normalizeOrigin } = require('../config/allowedOrigins');
 // Phase 88.8 plan 06 (SPEC A1 / D-13): the single home of the provisioning policy.
 const provisioningService = require('../services/provisioningService');
@@ -193,11 +192,29 @@ const generateGoogleAuthUrl = async (user_id, claims = {}, frontendUrl = null) =
   // `username` claim differing from `name` — and it is left in place deliberately
   // because converging it would change a shipped behaviour this plan did not scope.
   // Converging it is a decision for a later phase, not a cleanup.
+  //
+  // DECISION Phase 88.8 code review round 2 HIGH-C (2026-09-05): the candidates run
+  // through the SERVICE's per-candidate picker, not through `clampProvisionedUsername`
+  // directly. The ORDER trade-off above is unchanged; what changed is the FILTER. For
+  // an Auth0 database (username-password) connection the `name` claim defaults to the
+  // user's EMAIL ADDRESS, and `Users.username` is PUBLIC (PUBLIC_USER_ATTRS, twelve
+  // projections) — so the direct clamp published a user's address as their display
+  // name on every Calendar connect. The service's `pick()` refuses any candidate that
+  // normalises to one of the user's own addresses; this route now asks that same
+  // question, against BOTH the address on the live token and the address stored on
+  // the row (they differ after an in-app email change, and neither may become the
+  // public name). Chosen over a second local copy of the compare (duplication is not
+  // a peer option here) and over lifting the picker into utils/provisionedUsername.js
+  // (that helper is pinned to "DISPLAY usernames only" — see rejected alternative (a)
+  // on makeUsernamePicker). When every candidate is refused, the stored username is
+  // left as it is — a refused refresh is not a blank name.
   // -------------------------------------------------------------------------
-  const clampedUsername = clampProvisionedUsername(claims.name)
-    || clampProvisionedUsername(claims.nickname);
-  if (!created && clampedUsername) {
-    await user.update({ username: clampedUsername });
+  if (!created) {
+    const pick = provisioningService.makeUsernamePicker([claims.email, user.email]);
+    const refreshedUsername = pick(claims.name) || pick(claims.nickname);
+    if (refreshedUsername) {
+      await user.update({ username: refreshedUsername });
+    }
   }
 
   const oauth2Client = getOAuth2Client();

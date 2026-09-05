@@ -1295,6 +1295,16 @@ async function repairExistingRow({
 
 module.exports = {
   provisionOrRepair,
+  // The per-candidate username filter (clamp + refuse-own-address), exported for
+  // routes/googleAuth.js's existing-row username refresh — code review round 2 HIGH-C
+  // (2026-09-05). That route ran `clampProvisionedUsername(claims.name)` DIRECTLY, with
+  // no address filter, so an Auth0 database-connection user (whose `name` claim
+  // defaults to their EMAIL) could have their address published as their PUBLIC
+  // username on every Google-Calendar connect. Exported from HERE rather than lifted
+  // into utils/provisionedUsername.js because that helper's scope is pinned to
+  // "DISPLAY usernames only" (rejected alternative (a) on makeUsernamePicker) and this
+  // module is the single home of provisioning policy (D-13). One filter, two callers.
+  makeUsernamePicker,
   // The PUBLIC collision predicate (plan 05 promoted it from plan 04's internal
   // `isEmailUniqueViolation` without changing a line of its logic — see the measured
   // matrix on the function). Pinned by the shape matrix in
