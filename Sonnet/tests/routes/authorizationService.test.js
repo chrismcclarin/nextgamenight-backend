@@ -217,7 +217,7 @@ describe('stripMemberPII', () => {
       google_calendar_refresh_token: 'secret-refresh',
       google_calendar_email: 'alice@gmail.com',
       notification_preferences: { reminder: true },
-      profile_picture_url: 'https://example.com/avatar.png',
+      picture_url: 'https://lh3.googleusercontent.com/a/avatar.png',
     };
 
     const result = stripMemberPII(input);
@@ -231,15 +231,26 @@ describe('stripMemberPII', () => {
     expect(result).not.toHaveProperty('notification_preferences');
   });
 
+  // Phase 88.8 plan 08 (D-23): retargeted onto REAL models/User.js columns.
+  // This test previously asserted `display_name`, `profile_picture_url` and
+  // `avatar_url` survived the strip — three names that are not columns on the
+  // User model, so it was asserting the allow-list against a hand-built stub
+  // rather than against anything a caller can actually produce. It passed
+  // while proving nothing. `picture_url` (plan 02/04) IS a real column and is
+  // the field the game-only roster branch must keep.
   it('preserves identity and display fields', () => {
     const input = {
       id: 'uuid-1',
       user_id: 'auth0|abc',
       username: 'alice',
+      picture_url: 'https://lh3.googleusercontent.com/a/avatar.png',
+      email: 'alice@example.com', // strip
+      // The three retired phantoms, fed in DELIBERATELY so the negative
+      // assertions below are non-vacuous: if any is re-added to the allow-list
+      // this test reds.
       display_name: 'Alice A.',
       profile_picture_url: 'https://example.com/avatar.png',
       avatar_url: 'https://example.com/avatar2.png',
-      email: 'alice@example.com', // strip
     };
 
     const result = stripMemberPII(input);
@@ -247,9 +258,12 @@ describe('stripMemberPII', () => {
     expect(result.id).toBe('uuid-1');
     expect(result.user_id).toBe('auth0|abc');
     expect(result.username).toBe('alice');
-    expect(result.display_name).toBe('Alice A.');
-    expect(result.profile_picture_url).toBe('https://example.com/avatar.png');
-    expect(result.avatar_url).toBe('https://example.com/avatar2.png');
+    expect(result.picture_url).toBe('https://lh3.googleusercontent.com/a/avatar.png');
+    // An allow-list entry with no backing column protects nothing and makes the
+    // list read as an aspirational superset — retired, and pinned as retired.
+    expect(result).not.toHaveProperty('display_name');
+    expect(result).not.toHaveProperty('profile_picture_url');
+    expect(result).not.toHaveProperty('avatar_url');
   });
 
   it('preserves UserGroup association (with role/joined_at)', () => {

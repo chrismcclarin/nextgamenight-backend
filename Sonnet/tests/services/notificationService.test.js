@@ -623,9 +623,9 @@ describe('BSEC-01 User PII defaultScope', () => {
       id: 'uuid-x',
       user_id: 'auth0|x',
       username: 'x',
-      display_name: 'X',
-      profile_picture_url: 'https://example.com/a.png',
-      avatar_url: 'https://example.com/b.png',
+      // Phase 88.8 plan 08 (D-23): picture_url is a REAL models/User.js column
+      // and is allow-listed — the game-only roster branch must keep the avatar.
+      picture_url: 'https://lh3.googleusercontent.com/a/x.png',
       UserGroup: { role: 'member', joined_at: '2026-01-01T00:00:00Z' },
       // PII + a brand-new field that must default to STRIPPED:
       email: 'x@example.com',
@@ -633,6 +633,14 @@ describe('BSEC-01 User PII defaultScope', () => {
       notification_preferences: { reminder: true },
       is_platform_admin: true, // future field — must be stripped by the allow-list
       some_future_secret: 'leak-me-if-omit-list',
+      // Phase 88.8 plan 08: the three RETIRED phantom entries. None is a column
+      // on models/User.js (verified against the model and migrations/), so the
+      // previous version of this test asserted the allow-list against names no
+      // caller can produce. Fed in here so the negative assertions below red if
+      // any is ever re-added.
+      display_name: 'X',
+      profile_picture_url: 'https://example.com/a.png',
+      avatar_url: 'https://example.com/b.png',
     };
 
     const result = stripMemberPII(input);
@@ -641,9 +649,7 @@ describe('BSEC-01 User PII defaultScope', () => {
     expect(result.id).toBe('uuid-x');
     expect(result.user_id).toBe('auth0|x');
     expect(result.username).toBe('x');
-    expect(result.display_name).toBe('X');
-    expect(result.profile_picture_url).toBe('https://example.com/a.png');
-    expect(result.avatar_url).toBe('https://example.com/b.png');
+    expect(result.picture_url).toBe('https://lh3.googleusercontent.com/a/x.png');
     expect(result.UserGroup).toEqual({ role: 'member', joined_at: '2026-01-01T00:00:00Z' });
 
     // everything else stripped — INCLUDING fields not previously in the omit-list
@@ -652,6 +658,10 @@ describe('BSEC-01 User PII defaultScope', () => {
     expect(result).not.toHaveProperty('notification_preferences');
     expect(result).not.toHaveProperty('is_platform_admin');
     expect(result).not.toHaveProperty('some_future_secret');
+    // retired phantoms — stripped, and pinned as stripped
+    expect(result).not.toHaveProperty('display_name');
+    expect(result).not.toHaveProperty('profile_picture_url');
+    expect(result).not.toHaveProperty('avatar_url');
   });
 
   it('Test 3b: stripMemberPII preserves UserGroup even when explicitly null (game-only signal)', () => {
