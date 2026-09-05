@@ -936,7 +936,23 @@ function emailChangeTelemetry(op, { sub, address, error = null, message = null, 
   if (!Sentry) return;
   const context = { tags: { feature: 'email-change', op }, extra: payload };
   if (error && typeof Sentry.captureException === 'function') {
-    Sentry.captureException(error, context);
+    /* WRAPPED, NEVER CAPTURED RAW (code review #3, 2026-09-05). Mirrors
+       captureManagementFailure (services/auth0Service.js:31-37), which this same
+       phase added for exactly this reason, and obeys the rule written in
+       utils/provisioningReport.js: "never hand this function an error whose
+       message embeds an address (wrap it first)".
+       The raw objects that used to arrive here carry addresses in places a
+       serializer change would expose without warning: a SequelizeUniqueConstraintError
+       holds the colliding address at `err.errors[].value` and the UPDATE's bind
+       values at `err.parent.parameters`. Sentry's default node serializer takes
+       only name/message/stack today — which is precisely the conditional the
+       auth0Service fix refused to rely on, because "one common integration line
+       added later would silently turn every one of these events into a leak".
+       `name` ONLY, never `.message`: unlike the Management errors, the messages on
+       this seam (Sequelize validation text, a provider refusal) routinely embed the
+       address itself. The domain still travels in `extra.emailDomain`. */
+    const wrapped = new Error(`email-change ${op} failed: ${error.name || 'Error'}`);
+    Sentry.captureException(wrapped, context);
   } else if (typeof Sentry.captureMessage === 'function') {
     Sentry.captureMessage(message || `email-change: ${op}`, { level: 'warning', ...context });
   }
@@ -1163,12 +1179,15 @@ async function sendEmailChangeCodeMail({ sub, address, code, tokenId }) {
   }
   // A console.warn-only failure here would be the exact warn-only class SPEC R4
   // eliminates one file over.
+  /* The provider's own message is NOT interpolated (code review #3): Resend echoes
+     the rejected recipient in its refusal text, so `${result.error}` put a full
+     address into an exception message. The wrap above would now strip it anyway —
+     this drops it at the source as well, so neither layer is the only guard. */
   emailChangeTelemetry('code-mail', {
     sub,
     address,
-    error: new Error(
-      `Email-change code mail refused by the provider: ${(result && result.error) || 'unknown'}`
-    ),
+    error: new Error('Email-change code mail refused by the provider'),
+    extra: { providerRefused: true },
   });
   return false;
 }
@@ -1248,6 +1267,17 @@ router.post('/:user_id/email', writeOperationLimiter, async (req, res) => {
         // but the dedicated resend route STAYS, because A11 is a locked amendment
         // and because a resend that accepted an address would be a second request
         // endpoint wearing the first one's name.
+        /* THE PENDING CHANGE IS DELIBERATELY LEFT ALONE — and the frontend, not
+           this branch, is what was out of step (code review #5, 2026-09-05).
+           Revoking here was considered and REJECTED: saving the address you
+           already have is a no-op, and reading "therefore cancel my pending change
+           to some other address" into it invents an intent the user never
+           expressed — it would destroy a live verification and spend one of the
+           three hourly mints to recover. `88.8-09-PLAN.md:202` pins this as an
+           acceptance criterion and it is right on the merits, so the desync it
+           caused is fixed on the client, which is the half that was lying: the
+           section used to drop to idle while the echo still carried a live
+           `pending_email_change`. */
         state.outcome = 'unchanged';
         return;
       }
