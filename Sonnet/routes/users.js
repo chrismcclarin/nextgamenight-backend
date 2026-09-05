@@ -1014,7 +1014,12 @@ function hashEmailChangeCode(normalisedCode) {
  * this file.
  */
 function emailChangeTelemetry(op, { sub, address, error = null, message = null, extra = {} } = {}) {
-  const payload = { sub, emailDomain: emailDomain(address), ...extra };
+  // The error CLASS and the Postgres SQLSTATE are safe to log (neither can carry an
+  // address) and are what triage needs first — the first CI run of this branch answered
+  // 500 on four collision tests with nothing in the log but the op name.
+  const errorName = error && error.name ? String(error.name) : undefined;
+  const pgCode = error && error.parent && error.parent.code ? String(error.parent.code) : undefined;
+  const payload = { sub, emailDomain: emailDomain(address), ...(errorName ? { errorName } : {}), ...(pgCode ? { pgCode } : {}), ...extra };
   try {
     console.warn(`[users] email-change ${op}:`, JSON.stringify(payload));
   } catch (_e) {
