@@ -1815,7 +1815,13 @@ async function moveFeedbackRows({
 }) {
   const oldNormalised = provisioningService.normaliseEmail(previousEmail);
   const newNormalised = provisioningService.normaliseEmail(newAddress);
-  if (!oldNormalised || !newNormalised || oldNormalised === newNormalised) return;
+  if (!oldNormalised || !newNormalised || oldNormalised === newNormalised) {
+    // Round 4 HIGH: MUST match movePendingInvites' contract on every exit. A bare `return`
+    // here made applyIdentityChange dereference undefined and 500 the verify and revert
+    // routes whenever the old address equals the new one (a revert back to the sign-in
+    // address; a synthetic row repaired to the token's target mid-window).
+    return { moved: false, skipped: false };
+  }
 
   // DECISION Phase 88.8 (code review 2026-09-05, owner ruling): this move is GATED
   // on the same wasOldAddressProved() test as the D-41 invite move. Chosen OVER the
@@ -1944,7 +1950,8 @@ async function applyIdentityChange({
   // Handed back so the CALLER can report the skips AFTER commit (round 3 #28); the
   // report carries `claimPresent` (round 3 #3) so an "unproved address" skip can be
   // told apart from "the Auth0 Action's claims are not on this token" in telemetry.
-  return { invitesSkipped: invites.skipped === true, feedbackSkipped: feedback.skipped === true };
+  // Optional-chained so a future third mover with a bare exit cannot reintroduce the 500.
+  return { invitesSkipped: invites?.skipped === true, feedbackSkipped: feedback?.skipped === true };
 }
 
 /**

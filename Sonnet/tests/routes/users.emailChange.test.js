@@ -1598,6 +1598,30 @@ describe('round 2 HIGH-B — revert_available is SERVER-computed and asks the re
   });
 });
 
+describe('round 4 HIGH — the identity overwrite when the OLD address equals the NEW one answers 200, never 500', () => {
+  beforeEach(() => mailSucceeds());
+
+  it('REVERT when Users.email already equals the verified claim → reverted, not 500', async () => {
+    const row = await seedUser({ email: 'claim@example.com', email_changed_at: new Date() });
+    const res = await request(makeApp(actorFor(row, { email: 'claim@example.com' })))
+      .post(`/api/users/${row.user_id}/email/revert`).send().expect(200);
+    expect(res.body.outcome).toBe('reverted');
+    expect(res.body.email_changed_at).toBeNull();
+    expect(res.body.revert_available).toBe(false);
+  });
+
+  it('VERIFY when the row was repaired to the token target between mint and verify → verified, not 500', async () => {
+    const row = await seedUser({ email: 'synthetic-x@auth0.local' });
+    const app = makeApp(actorFor(row, { email: 'real@example.com' }));
+    await requestChange(app, row, 'real@example.com');
+    await row.update({ email: 'real@example.com' }); // the claims-half repair landed mid-window
+    const res = await request(app)
+      .post(`/api/users/${row.user_id}/email/verify`).send({ code: sentCodes()[0] }).expect(200);
+    expect(res.body.outcome).toBe('verified');
+    expect(res.body.email).toBe('real@example.com');
+  });
+});
+
 describe('D-39 — toSelfWire hydration', () => {
   beforeEach(() => mailSucceeds());
 
