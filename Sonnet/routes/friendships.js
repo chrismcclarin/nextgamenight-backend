@@ -9,6 +9,11 @@ const { Op, UniqueConstraintError, fn, col, where: whereFn } = require('sequeliz
 const { User, Friendship } = require('../models');
 const { body, validationResult } = require('express-validator');
 const { resolveTargetUserUuidOnly } = require('../utils/resolveTargetUser');
+// Phase 88.8 plan 08 (D-23): the ONE definition of the chip projection. Read
+// its header before adding a use. In THIS file ONLY the two shared
+// Requester/Addressee roster includes below qualify. GET /search MUST NOT
+// adopt it — see the comment at that projection.
+const { PUBLIC_USER_ATTRS } = require('../utils/publicUserAttrs');
 
 const router = express.Router();
 
@@ -22,12 +27,18 @@ const USER_INCLUDES = [
     // users' email addresses. Phase 87.3 PR-C (plan 09, Req 1): the sub
     // `user_id` is removed from the nested include too — id + username are
     // the FE's read surface (PR-B cut every nested-sub reader to `.id`).
-    attributes: ['id', 'username'],
+    // Phase 88.8 plan 08 (D-23, SPEC R11/A6): widened to the shared chip
+    // projection. `picture_url` is the ONLY user field Phase 88.8 adds to this
+    // payload — `email`, `phone` and `email_changed_at` remain excluded
+    // (models/User.js defaultScope) and this widening is not permission to add
+    // more. It applies to the friends LIST only; GET /search below is a lookup
+    // and is untouched.
+    attributes: [...PUBLIC_USER_ATTRS],
   },
   {
     model: User,
     as: 'Addressee',
-    attributes: ['id', 'username'],
+    attributes: [...PUBLIC_USER_ATTRS],
   },
 ];
 
@@ -221,6 +232,18 @@ router.get('/search', async (req, res) => {
       // `user_id` is DROPPED — the sole sanctioned drop of this phase. The only
       // FE consumer (the friends page) reads `foundUser.id` (plan 06) and the
       // friend-request send is UUID-only post-PR-C.
+      //
+      // DECISION Phase 88.8 plan 08 (D-23, T-88.8-38): this projection stays a
+      // LITERAL id-and-username pair and MUST NOT adopt PUBLIC_USER_ATTRS,
+      // even though the two roster includes ten lines up in this same file
+      // just did. This is a LOOKUP, not a roster: you supply one email address
+      // and it returns the one person behind it. Adding a face turns an
+      // identity oracle into an enumeration surface (R10). Rejected: widening
+      // it "for consistency with the friends list" — the friends list shows
+      // people you are already connected to; this shows a stranger you guessed
+      // the address of. Pinned by an EXACT toEqual(['id','username']) in
+      // tests/routes/friendships.test.js and by the frontend identity contract
+      // test, and asserted picture_url-free in tests/routes/wire-sweep.test.js.
       attributes: ['id', 'username'],
     });
 

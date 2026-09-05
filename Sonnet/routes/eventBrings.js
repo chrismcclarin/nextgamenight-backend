@@ -4,6 +4,10 @@ const express = require('express');
 const { EventBring, EventRsvp, Event, User, UserGame, Game, sequelize } = require('../models');
 const { verifyAuth0Token } = require('../middleware/auth0');
 const { canReadEventScopedSurface } = require('../services/authorizationService');
+// Phase 88.8 plan 08 (D-23): the ONE definition of the chip projection. Read
+// its header before adding a use. The brings roster User include is the only
+// site in this file that qualifies.
+const { PUBLIC_USER_ATTRS } = require('../utils/publicUserAttrs');
 const router = express.Router();
 
 // GET /event/:event_id -- Fetch all brings for an event
@@ -24,10 +28,16 @@ router.get('/event/:event_id', verifyAuth0Token, async (req, res) => {
 
     // Phase 87.3 PR-C (plan 09, Req 1): nested User include no longer carries
     // the sub — id/username only (PR-B cut every nested-sub reader to `.id`).
+    // Phase 88.8 plan 08 (D-23, SPEC R11/A6): widened to the shared chip
+    // projection. `picture_url` is the ONLY user field Phase 88.8 adds to this
+    // payload — `email`, `phone` and `email_changed_at` remain excluded
+    // (models/User.js defaultScope) and this widening is not permission to add
+    // more. NOTE the `order: [[User, 'username', 'ASC']]` below is unaffected:
+    // ordering is by username, not by the widened select list.
     const brings = await EventBring.findAll({
       where: { event_id },
       include: [
-        { model: User, attributes: ['id', 'username'] },
+        { model: User, attributes: [...PUBLIC_USER_ATTRS] },
         { model: Game, attributes: ['id', 'name', 'thumbnail_url'] },
       ],
       order: [

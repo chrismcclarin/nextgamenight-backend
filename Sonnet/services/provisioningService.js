@@ -265,8 +265,12 @@ function isEmailCollision(err) {
  * auth0Service.extractUserDetails, whose chain rejects an email-valued candidate with a
  * strict `!==` at services/auth0Service.js:176 — and claims-first deliberately STOPS
  * CALLING that function. Consequence if this filter is removed: `username` is PUBLIC —
- * routes/friendships.js:21/:26 project ['id','username'] as the entire non-id payload,
- * and that projection pair appears 30 times across routes/.
+ * the shared Requester/Addressee includes in routes/friendships.js project it as
+ * essentially the entire non-id payload, and the same id+username projection pair
+ * appears at 32 code sites across routes/ and services/.
+ * (Citation refreshed by Phase 88.8 plan 08, 2026-09-04: those two includes moved to
+ * :36/:41 and now project PUBLIC_USER_ATTRS = id + username + picture_url. The claim
+ * above is UNCHANGED and unweakened — username is still public at every one of them.)
  *
  * Rejected alternatives, all three:
  *  (a) Putting the check inside clampProvisionedUsername. That helper carries

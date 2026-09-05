@@ -6,6 +6,12 @@ const { sendError } = require('../utils/errors');
 // Phase 87.4 Plan 02 (KEYMISS mitigation): resolve a self-param that may be the
 // caller's own Users.id UUID (post-PR-2) to the sub-keyed Users row.
 const { isUuid } = require('../utils/resolveTargetUser');
+// Phase 88.8 plan 08 (D-23): the ONE definition of the chip projection. Read
+// its header before adding a use. In THIS file only the five EventParticipation
+// -> User includes qualify; the `Winner` / `PickedBy` aliased includes sitting
+// on the very next line at each of those sites are attribution labels, not
+// people-chips, and stay literal id-and-username pairs on purpose.
+const { PUBLIC_USER_ATTRS } = require('../utils/publicUserAttrs');
 // Phase 88.8 plan 06 (SPEC A1 / D-13): the single home of the JIT provisioning policy.
 const provisioningService = require('../services/provisioningService');
 const { Op } = require('sequelize');
@@ -30,6 +36,12 @@ const formatEventWithCustomParticipants = (event) => {
   const regularParticipants = (eventData.EventParticipations || []).map(ep => ({
     user_id: ep.User?.id,
     username: ep.User?.username,
+    // Phase 88.8 plan 08 (D-23, SPEC R11/A6): this serializer HAND-COPIES onto
+    // a fresh object, so widening the five EventParticipation -> User includes
+    // changes nothing on the wire without this line. `picture_url` is the ONLY
+    // user field Phase 88.8 adds here — `email`, `phone` and `email_changed_at`
+    // stay excluded and this is not permission to add more.
+    picture_url: ep.User?.picture_url ?? null,
     // BSEC-01 (D-03): email removed from the participant roster serializer —
     // it was leaking PII into every event response and serves no display use.
     score: ep.score,
@@ -43,6 +55,15 @@ const formatEventWithCustomParticipants = (event) => {
   const customParticipants = (eventData.custom_participants || []).map(cp => ({
     user_id: null,
     username: cp.username,
+    // DECISION Phase 88.8 plan 08 (D-23): an EXPLICIT null, not an omitted key.
+    // These are name-only rows with no user row behind them, so there is no
+    // avatar to emit — but an absent key and a null key are different on the
+    // wire, the frontend schema declares the field nullable, and this row
+    // already emits an explicit `user_id: null` for exactly the same reason.
+    // Rejected: leaving the key off — it would make a custom participant and a
+    // real participant with no stored avatar structurally different for no
+    // reason, and force every consumer to handle two shapes.
+    picture_url: null,
     score: cp.score,
     faction: cp.faction,
     is_new_player: cp.is_new_player || false,
@@ -318,7 +339,14 @@ router.get('/user/:user_id', requireParamMatchesToken('user_id'), async (req, re
           model: EventParticipation,
           // PR-C (87.3-09 Task 2b): the nested EP.User include is sub-free —
           // the flat participant field is already user_id: ep.User?.id (UUID).
-          include: [{ model: User, attributes: ['id', 'username'] }]
+          // Phase 88.8 plan 08 (D-23, SPEC R11/A6): widened to the shared chip
+          // projection. `picture_url` is the ONLY user field Phase 88.8 adds to
+          // this payload — `email`, `phone` and `email_changed_at` remain
+          // excluded (models/User.js defaultScope) and this widening is not
+          // permission to add more. NOTE: the include alone puts NOTHING on the
+          // wire here — formatEventWithCustomParticipants hand-copies fields
+          // onto a fresh object, so the copy there is the load-bearing half.
+          include: [{ model: User, attributes: [...PUBLIC_USER_ATTRS] }]
         }
       ],
       order: [['start_date', 'DESC']]
@@ -373,7 +401,14 @@ router.get('/group/:group_id', async (req, res) => {
           // BSEC-01 / BE-040: drop `email` from the participation roster (PII leak).
           // PR-C (87.3-09 Task 2b): the nested EP.User include is sub-free —
           // the flat participant field is already user_id: ep.User?.id (UUID).
-          include: [{ model: User, attributes: ['id', 'username'] }]
+          // Phase 88.8 plan 08 (D-23, SPEC R11/A6): widened to the shared chip
+          // projection. `picture_url` is the ONLY user field Phase 88.8 adds to
+          // this payload — `email`, `phone` and `email_changed_at` remain
+          // excluded (models/User.js defaultScope) and this widening is not
+          // permission to add more. NOTE: the include alone puts NOTHING on the
+          // wire here — formatEventWithCustomParticipants hand-copies fields
+          // onto a fresh object, so the copy there is the load-bearing half.
+          include: [{ model: User, attributes: [...PUBLIC_USER_ATTRS] }]
         }
       ],
       order: [['start_date', 'DESC']]
@@ -435,7 +470,14 @@ router.get('/:event_id', async (req, res) => {
           model: EventParticipation,
           // PR-C (87.3-09 Task 2b): the nested EP.User include is sub-free —
           // the flat participant field is already user_id: ep.User?.id (UUID).
-          include: [{ model: User, attributes: ['id', 'username'] }]
+          // Phase 88.8 plan 08 (D-23, SPEC R11/A6): widened to the shared chip
+          // projection. `picture_url` is the ONLY user field Phase 88.8 adds to
+          // this payload — `email`, `phone` and `email_changed_at` remain
+          // excluded (models/User.js defaultScope) and this widening is not
+          // permission to add more. NOTE: the include alone puts NOTHING on the
+          // wire here — formatEventWithCustomParticipants hand-copies fields
+          // onto a fresh object, so the copy there is the load-bearing half.
+          include: [{ model: User, attributes: [...PUBLIC_USER_ATTRS] }]
         }
       ]
     });
@@ -624,7 +666,14 @@ router.post('/', validateEventCreate, async (req, res) => {
           model: EventParticipation,
           // PR-C (87.3-09 Task 2b): the nested EP.User include is sub-free —
           // the flat participant field is already user_id: ep.User?.id (UUID).
-          include: [{ model: User, attributes: ['id', 'username'] }]
+          // Phase 88.8 plan 08 (D-23, SPEC R11/A6): widened to the shared chip
+          // projection. `picture_url` is the ONLY user field Phase 88.8 adds to
+          // this payload — `email`, `phone` and `email_changed_at` remain
+          // excluded (models/User.js defaultScope) and this widening is not
+          // permission to add more. NOTE: the include alone puts NOTHING on the
+          // wire here — formatEventWithCustomParticipants hand-copies fields
+          // onto a fresh object, so the copy there is the load-bearing half.
+          include: [{ model: User, attributes: [...PUBLIC_USER_ATTRS] }]
         }
       ]
     });
@@ -1041,7 +1090,14 @@ router.put('/:id', validateUUID('id'), validateEventUpdate, async (req, res) => 
           model: EventParticipation,
           // PR-C (87.3-09 Task 2b): the nested EP.User include is sub-free —
           // the flat participant field is already user_id: ep.User?.id (UUID).
-          include: [{ model: User, attributes: ['id', 'username'] }]
+          // Phase 88.8 plan 08 (D-23, SPEC R11/A6): widened to the shared chip
+          // projection. `picture_url` is the ONLY user field Phase 88.8 adds to
+          // this payload — `email`, `phone` and `email_changed_at` remain
+          // excluded (models/User.js defaultScope) and this widening is not
+          // permission to add more. NOTE: the include alone puts NOTHING on the
+          // wire here — formatEventWithCustomParticipants hand-copies fields
+          // onto a fresh object, so the copy there is the load-bearing half.
+          include: [{ model: User, attributes: [...PUBLIC_USER_ATTRS] }]
         }
       ]
     });

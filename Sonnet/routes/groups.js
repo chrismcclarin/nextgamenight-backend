@@ -24,6 +24,11 @@ const { resolveTargetUserUuidOnly } = require('../utils/resolveTargetUser');
 // Phase 88.8 plan 06 (SPEC A1 / D-13): the single home of the JIT provisioning policy.
 const provisioningService = require('../services/provisioningService');
 const { lockGroupRow } = require('../utils/groupRowLock');
+// Phase 88.8 plan 08 (D-23): the ONE definition of the chip projection. Read
+// its header before adding a use — it is for chip surfaces only, and the two
+// group ROSTER includes below are the only two sites in this file that qualify
+// (the group-games member lookup deliberately stays a literal pair).
+const { PUBLIC_USER_ATTRS } = require('../utils/publicUserAttrs');
 const { matchesSelf } = require('../middleware/objectAuth');
 const { Op } = require('sequelize');
 const { body, validationResult } = require('express-validator');
@@ -227,7 +232,12 @@ router.get('/user/:user_id', async (req, res) => {
           // The durable safe-by-default fix is the User defaultScope (D-03 / 83-06).
           // Phase 87.3 PR-C: the sub column is no longer selected — the roster
           // user_id field is ALIASED to the UUID below (locked decision).
-          attributes: ['id', 'username'],
+          // Phase 88.8 plan 08 (D-23, SPEC R11/A6): widened to the shared chip
+          // projection. `picture_url` is the ONLY user field Phase 88.8 adds to
+          // this payload — `email`, `phone` and `email_changed_at` remain
+          // excluded (models/User.js defaultScope) and this widening is not
+          // permission to add more.
+          attributes: [...PUBLIC_USER_ATTRS],
           through: { where: { status: 'active' }, attributes: ['role', 'joined_at'] }
         },
         {
@@ -394,7 +404,14 @@ router.get('/:group_id/users', async (req, res) => {
         // The game-only branch already strips PII via stripMemberPII.
         // Phase 87.3 PR-C: the sub column is no longer selected — the roster
         // user_id field is ALIASED to the UUID below (locked decision).
-        attributes: ['id', 'username'],
+        // Phase 88.8 plan 08 (D-23, SPEC R11/A6): widened to the shared chip
+        // projection. `picture_url` is the ONLY user field Phase 88.8 adds to
+        // this payload — `email`, `phone` and `email_changed_at` remain
+        // excluded (models/User.js defaultScope) and this widening is not
+        // permission to add more. BOTH branches below emit it: the member
+        // branch raw, the game-only branch through stripMemberPII, whose
+        // fail-closed allow-list was corrected in the same plan (Task 1).
+        attributes: [...PUBLIC_USER_ATTRS],
         through: { where: { status: 'active' }, attributes: ['role', 'joined_at'] },
       }],
     });
@@ -1599,6 +1616,17 @@ router.get('/:group_id/library', async (req, res) => {
     // 4. Load the member Users directly by UUID.
     // Phase 87.3 PR-C (Task 2b): the sub column is no longer selected — the
     // owners[]/members[] object literals below ALIAS user_id to the UUID.
+    //
+    // DECISION Phase 88.8 plan 08 (D-23): this projection stays a LITERAL
+    // id-and-username pair — deliberately NOT widened to PUBLIC_USER_ATTRS,
+    // unlike the two group ROSTER includes above. This is a hydration lookup,
+    // not a chip surface: the rows are collapsed into the username-only
+    // `uuidToUser` map immediately below and nothing else survives to the
+    // response, so selecting picture_url would put nothing on the wire and
+    // would only make the chip-surface census harder to read. Rejected:
+    // widening it "for consistency" — the literal pair IS the statement that
+    // this surface shows no avatar. If a future phase renders faces in the
+    // group-games owner list, widen it THEN, together with the map below.
     const users = await User.findAll({
       where: { id: { [Op.in]: memberUuids } },
       attributes: ['id', 'username'],
