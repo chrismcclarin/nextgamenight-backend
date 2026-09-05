@@ -243,7 +243,14 @@ router.delete('/me', writeOperationLimiter, async (req, res) => {
     // status === 'deleted'
     return res.json({ message: 'Your account and associated data have been deleted.' });
   } catch (error) {
-    console.error('[users] account deletion failed:', error.message);
+    // Class + SQLSTATE alongside the message (neither carries PII): the first CI run of
+    // 88.8 surfaced a 25P02 here with no way to tell which statement failed first.
+    console.error(
+      '[users] account deletion failed:',
+      error && error.name,
+      error && error.parent && error.parent.code,
+      error.message
+    );
     return sendError(res, 'internal');
   }
 });
