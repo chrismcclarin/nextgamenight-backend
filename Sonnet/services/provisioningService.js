@@ -111,6 +111,9 @@ const PROVISIONING_NOTES = Object.freeze({
   MANAGEMENT_LOOKUP_FAILED: 'management_lookup_failed',
   USERNAME_REPAIRED: 'username_repaired',
   PICTURE_URL_UPDATED: 'picture_url_updated',
+  // Round 4 DR (owner ruling 2026-09-05, D-27 AMENDED): a parseable https avatar URL on a
+  // non-allow-listed host stored null — distinguishable from "no avatar" by this note.
+  PICTURE_URL_REJECTED_HOST: 'picture_url_rejected_host',
   RACED_TO_EXISTING_ROW: 'raced_to_existing_row',
 });
 
@@ -392,8 +395,16 @@ function buildProvisionedUsername({ claims, rejectedAddresses, managementUsernam
  * imported from config/auth0Claims.js, never inlined — if the tenant ever renames or
  * replaces the Google connection, the social-only rules fail visibly in ONE place
  * instead of silently degrading at each call site. Database/password logins keep null
- * and get the app's own initials fallback (src/components/ui/UserChip.tsx:67). No
- * hostname allowlist by design — D-27 rejected it as brittle.
+ * and get the app's own initials fallback (src/components/ui/UserChip.tsx:67).
+ *
+ * DECISION D-27 AMENDED (owner ruling 2026-09-05, code review round 3 #11 → round 4 DR):
+ * a HOST allow-list (`PICTURE_URL_ALLOWED_HOST_SUFFIXES`) IS applied — D-27 originally
+ * rejected one as "brittle". Re-ruled because the value is published to every co-member
+ * and rendered as <img src> by 88.6, so without it a profile owner points every viewer's
+ * browser at a host of their choosing; `referrerPolicy="no-referrer"` (D-28) hides the
+ * Referer, not the fetch. Brittleness is bounded: a Google CDN host change degrades to
+ * the initials fallback (null + PICTURE_URL_REJECTED_HOST in the notes), never to a
+ * breach. Widening or removing the list is a decision, not a cleanup.
  *
  * D-26 cadence: an ABSENT picture claim leaves the stored value ALONE, because a
  * Management-fallback login (which carries no claims at all) must never wipe an avatar.
@@ -409,7 +420,7 @@ function buildProvisionedUsername({ claims, rejectedAddresses, managementUsernam
 // lh3/lh4/... .googleusercontent.com; the bare domain is allowed for completeness.
 const PICTURE_URL_ALLOWED_HOST_SUFFIXES = Object.freeze(['.googleusercontent.com', '.google.com']);
 
-function resolvePictureClaim(claims) {
+function resolvePictureClaim(claims, notes = []) {
   if (!SOCIAL_CONNECTION_STRATEGIES.includes(claims.connection_strategy)) {
     return undefined;
   }
@@ -431,6 +442,7 @@ function resolvePictureClaim(claims) {
     // Google serves avatars from *.googleusercontent.com; anything else stores null.
     const host = url.hostname.toLowerCase();
     if (!PICTURE_URL_ALLOWED_HOST_SUFFIXES.some((sfx) => host === sfx.slice(1) || host.endsWith(sfx))) {
+      notes.push(PROVISIONING_NOTES.PICTURE_URL_REJECTED_HOST);
       return null;
     }
   } catch (_notAUrl) {
@@ -837,7 +849,7 @@ async function provisionOrRepair({ sub, claims, detectedTimezone } = {}, overrid
   // proof. The middleware already defaults the claim to false, so this is belt and braces.
   const claimEmailIsVerified = claimEmailIsPresent && claimBag.email_verified === true;
 
-  const picture = resolvePictureClaim(claimBag);
+  const picture = resolvePictureClaim(claimBag, notes);
 
   const existing = await User.scope('withContactInfo').findOne({ where: { user_id: sub } });
   if (existing) {
