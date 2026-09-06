@@ -849,19 +849,22 @@ async function provisionOrRepair({ sub, claims, detectedTimezone } = {}, overrid
   // proof. The middleware already defaults the claim to false, so this is belt and braces.
   const claimEmailIsVerified = claimEmailIsPresent && claimBag.email_verified === true;
 
-  const picture = resolvePictureClaim(claimBag, notes);
+  // Round 4 DR: the picture resolver records a rejected host here; the note is threaded
+  // into whichever path (repair or create) the row takes.
+  const pictureNotes = [];
+  const picture = resolvePictureClaim(claimBag, pictureNotes);
 
   const existing = await User.scope('withContactInfo').findOne({ where: { user_id: sub } });
   if (existing) {
     return repairExistingRow({
       row: existing, sub, claimBag, rawClaimEmail,
-      claimEmailIsPresent, claimEmailIsVerified, picture, auth0, notes: [],
+      claimEmailIsPresent, claimEmailIsVerified, picture, auth0, notes: [...pictureNotes],
     });
   }
 
   return createRow({
     sub, claimBag, rawClaimEmail, claimEmailIsPresent, claimEmailIsVerified,
-    picture, detectedTimezone, auth0,
+    picture, detectedTimezone, auth0, seedNotes: pictureNotes,
   });
 }
 
@@ -871,9 +874,9 @@ async function provisionOrRepair({ sub, claims, detectedTimezone } = {}, overrid
 
 async function createRow({
   sub, claimBag, rawClaimEmail, claimEmailIsPresent, claimEmailIsVerified,
-  picture, detectedTimezone, auth0,
+  picture, detectedTimezone, auth0, seedNotes = [],
 }) {
-  const notes = [];
+  const notes = [...seedNotes];
   // Read live by the username picker, so an address the Management API returns can be
   // added to the reject set after the fact.
   const rejectedAddresses = [rawClaimEmail];
