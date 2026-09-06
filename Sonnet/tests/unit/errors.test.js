@@ -54,6 +54,13 @@ const EXPECTED_STATUS = {
   // 409 that is not classified terminal is silently retried.
   already_member: 409,
   invite_pending: 409,
+  // Phase 88.8 (BOPS-05, SPEC R7): "you never had an account here". Emitted by BOTH
+  // deletion endpoints — DELETE /users/me and GET /users/me/deletion-blockers — when the
+  // caller's token is valid but no Users row exists AND no deletion tombstone exists.
+  // DELIBERATELY DISTINCT from `account_deleted` (410) above: a tombstoned caller still
+  // gets 410, and this map is where the two would silently collapse into one another.
+  // Also distinct from the generic `not_found` (404) — see the registry comment.
+  not_provisioned: 404,
 };
 
 describe('utils/errors — exports', () => {

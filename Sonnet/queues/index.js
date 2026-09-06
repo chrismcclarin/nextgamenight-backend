@@ -26,7 +26,9 @@ const queueExports = [
   ['promptQueue', './promptQueue'],
   ['deadlineQueue', './deadlineQueue'],
   ['gcalSyncQueue', './gcalSyncQueue'],
-  ['auth0CleanupQueue', './auth0CleanupQueue']
+  ['auth0CleanupQueue', './auth0CleanupQueue'],
+  // Phase 88.8 / D-40: durable lane for the A13 email-change security notice.
+  ['emailNoticeQueue', './emailNoticeQueue']
 ];
 
 for (const [name, mod] of queueExports) {

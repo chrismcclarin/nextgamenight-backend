@@ -13,8 +13,13 @@ async function getOctokit() {
 const { validateFeedback } = require('../middleware/validators');
 const { verifyAuth0Token } = require('../middleware/auth0');
 const { requirePlatformAdmin } = require('../middleware/adminAuth');
-const { Feedback } = require('../models');
+const { Feedback, User } = require('../models');
 const emailService = require('../services/emailService');
+// Phase 88.8 plan 09 Task 4: the ONE broad `@auth0` synthetic-address guard this
+// app owns, imported rather than re-implemented. Narrowing it (e.g. to
+// `@auth0.local` alone) is a decision, not a cleanup — DECISION Phase 88.2
+// NIX-AUTH0, services/groupOwnershipOfferService.js:97-115.
+const { isSyntheticAddress } = require('../services/provisioningService');
 
 // [87.8-05 Task 4, round-3 security] pageUrl credential scrub — BE half,
 // defence-in-depth (the FE scrubs at the source in
@@ -61,7 +66,15 @@ function scrubPageUrl(pageUrl) {
 // Submit feedback as a GitHub Issue (with DB fallback)
 router.post('/github', verifyAuth0Token, async (req, res) => {
   try {
-    const { category, text, pageUrl, userName, userEmail, label, userAgent } = req.body;
+    // [88.8-09 Task 4] `userEmail` is DELIBERATELY NOT DESTRUCTURED HERE ANY MORE.
+    // This route runs behind verifyAuth0Token, so the server already knows who the
+    // caller is; reading an address off the body let any signed-in caller file
+    // feedback under someone else's address (T-88.8-84). A body that still carries
+    // the key is simply IGNORED, which is what makes the frontend and backend merge
+    // orders independent of each other (plan 13 Task 3 stops the client sending it).
+    // `userName` is a DISPLAY NAME, not an address, and stays body-supplied — out of
+    // scope for this correction and recorded here rather than silently left.
+    const { category, text, pageUrl, userName, label, userAgent } = req.body;
 
     // Inline validation
     if (!category || typeof category !== 'string' || !category.trim()) {
@@ -78,6 +91,55 @@ router.post('/github', verifyAuth0Token, async (req, res) => {
     // DB fallback below) — never interpolate the raw pageUrl past this point.
     const safePageUrl = scrubPageUrl(pageUrl);
 
+    /**
+     * DECISION Phase 88.8 D-42: the feedback address on THIS route is SERVER-DERIVED
+     * from the caller's `Users.email`, chosen OVER three alternatives.
+     *
+     * WHY IT MATTERS: D-42 moves `Feedback` rows by matching `user_email` against the
+     * user's `Users.email`, and `services/accountDeletionService.js:292-298` scrubs on
+     * that same column — while both writers set `user_id: null` under the 2026-07-24
+     * owner decision below, so `user_email` is the ONLY link to a person. Review round
+     * 4 verified the column was CLIENT-SUPPLIED and that both frontend writers send the
+     * Auth0 SESSION address, which equals `Users.email` only for a row provisioned from
+     * a verified claim and never repaired. This is what makes D-42's
+     * `WHERE user_email = <previousEmail>` match rows this app wrote.
+     *
+     * REJECTED: (a) keeping the client value and having the frontend send `self.email`
+     * instead — a downstream catch on a route where the server already knows the
+     * answer, and it leaves the endpoint accepting an address any signed-in caller can
+     * assert; (b) normalising or validating the client value — same problem, more code;
+     * (c) DERIVING the address on the public `POST /` path the same way — it carries no
+     * bearer, so there is nothing to derive from, and its comment at :139-144 already
+     * records why the row is unattributed.
+     *
+     * (c) REJECTS THE DERIVATION ONLY, AND NOT THE SYNTHETIC GUARD BELOW. The two are
+     * different changes, and conflating them is exactly how the guard gets dropped in a
+     * later tidy-up.
+     *
+     * THE SCOPE IS NOT OPTIONAL: `models/User.js:133-143`'s defaultScope excludes
+     * `email`, so a bare `User.findOne` returns a row whose `email` is `undefined` and
+     * every caller would silently persist null — the same Phase 88-34 Rule 1 trap
+     * `routes/users.js` records.
+     *
+     * ONE derived binding feeds BOTH sinks, mirroring `safePageUrl` above: the issue
+     * body's Email line and `Feedback.create`'s `user_email`. A missing row and a
+     * SYNTHETIC address both resolve to null — a `<sub>@auth0.local` sentinel is not a
+     * contact handle and must never be published into a GitHub issue.
+     *
+     * THE TWO FEEDBACK SINKS NOW SHARE ONE RULE: this writer DERIVES the address and
+     * drops it when synthetic; the public writer below ACCEPTS the address and drops it
+     * when synthetic. The frontend half is `88.8-13-PLAN.md` Task 1's shared
+     * `isSyntheticAddress` helper — named here because neither repo's CI can see the
+     * other, so the rule has to be written down on both sides.
+     */
+    let safeUserEmail = null;
+    const caller = req.user && req.user.user_id
+      ? await User.scope('withContactInfo').findOne({ where: { user_id: req.user.user_id } })
+      : null;
+    if (caller && caller.email && !isSyntheticAddress(caller.email)) {
+      safeUserEmail = caller.email;
+    }
+
     const title = `[Feedback] ${category}: ${text.substring(0, 50)}${text.length > 50 ? '...' : ''}`;
     const body = [
       '## Feedback',
@@ -87,7 +149,7 @@ router.post('/github', verifyAuth0Token, async (req, res) => {
       '---',
       `**Page:** ${safePageUrl}`,
       `**User:** ${userName || 'Unknown'}`,
-      `**Email:** ${userEmail || 'Not provided'}`,
+      `**Email:** ${safeUserEmail || 'Not provided'}`,
       `**Category:** ${category}`,
       `**Submitted:** ${new Date().toISOString()}`,
       '',
@@ -118,7 +180,7 @@ router.post('/github', verifyAuth0Token, async (req, res) => {
         type: 'feedback',
         subject: title,
         description: text,
-        user_email: userEmail || null,
+        user_email: safeUserEmail,
         user_id: null,
         page_context: safePageUrl,
       });
@@ -136,6 +198,34 @@ router.post('/', validateFeedback, async (req, res) => {
   try {
     const { type, subject, description, user_email, screenshot_base64, screenshot_filename } = req.body;
 
+    /**
+     * [88.8-09 Task 4] BELT AND BRACES — the SAME broad `@auth0` guard as the
+     * authenticated writer above, applied to this path's CLIENT-SUPPLIED address.
+     *
+     * The derivation above fixes the authenticated writer, but it would leave the
+     * synthetic-address rule living in ONE place while `Feedback.user_email` has TWO
+     * writers. Plan 13 Task 3 stops the public CLIENT from sending a synthetic value —
+     * and that is a client fix on an UNAUTHENTICATED endpoint, which anyone can post to
+     * directly and which a future client edit can silently regress with nothing
+     * downstream to catch it. So the rule lives server-side as well.
+     *
+     * THE ADDRESS ON THIS PATH STAYS CLIENT-SUPPLIED. The guard DROPS a sentinel; it
+     * does not DERIVE a replacement. There is no bearer here, so there is no
+     * server-side identity to derive from — see the owner-decision comment below.
+     *
+     * ONE derived binding feeds BOTH sinks (the `Feedback` row and the admin mail),
+     * mirroring `safePageUrl`'s shape at :90-92.
+     *
+     * EVERYTHING DOWNSTREAM ALREADY HANDLES null CORRECTLY — confirmed by reading
+     * rather than by adding branches: the two From lines are `... || 'Anonymous'`, so
+     * the mail falls back on its own, and the `replyTo` spread is conditional, so a null
+     * OMITS the key entirely rather than sending an empty one. The consequence, stated
+     * plainly: a submitter whose address is synthetic loses the reply-to affordance,
+     * which is correct — there is no inbox behind a `<sub>@auth0.local` sentinel to
+     * reply to.
+     */
+    const safeSubmitterEmail = user_email && !isSyntheticAddress(user_email) ? user_email : null;
+
     // [87.6, owner decision 2026-07-24, review WR-01] Feedback is NOT attributed
     // to a user account: this route rides the public transport (no bearer), so
     // any user_id would be client-asserted and unverifiable. user_email is the
@@ -145,7 +235,7 @@ router.post('/', validateFeedback, async (req, res) => {
       type,
       subject,
       description,
-      user_email: user_email || null,
+      user_email: safeSubmitterEmail,
       user_id: null,
     });
 
@@ -159,7 +249,7 @@ router.post('/', validateFeedback, async (req, res) => {
       const safeType = emailService.escapeHtml(type);
       const safeSubject = emailService.escapeHtml(subject);
       const safeDescription = emailService.escapeHtml(description);
-      const safeFrom = emailService.escapeHtml(user_email || 'Anonymous');
+      const safeFrom = emailService.escapeHtml(safeSubmitterEmail || 'Anonymous');
       const html = `
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
           <div style="background-color: #064e3b; color: white; padding: 16px 20px; border-radius: 6px 6px 0 0;">
@@ -180,7 +270,7 @@ router.post('/', validateFeedback, async (req, res) => {
         </div>
       `.trim();
 
-      const text = `New Feedback — Next Game Night\n\nType: ${type}\nSubject: ${subject}\nFrom: ${user_email || 'Anonymous'}\nTime: ${new Date(entry.created_at).toLocaleString()}\n\n${description}`;
+      const text = `New Feedback — Next Game Night\n\nType: ${type}\nSubject: ${subject}\nFrom: ${safeSubmitterEmail || 'Anonymous'}\nTime: ${new Date(entry.created_at).toLocaleString()}\n\n${description}`;
 
       // Build attachments array if screenshot provided
       const attachments = [];
@@ -201,7 +291,7 @@ router.post('/', validateFeedback, async (req, res) => {
         subject: emailService.stripCrlf(`[Feedback] ${type}: ${subject}`),
         html,
         text,
-        ...(user_email && { replyTo: user_email }),
+        ...(safeSubmitterEmail && { replyTo: safeSubmitterEmail }),
         ...(attachments.length > 0 && { attachments }),
       });
     }

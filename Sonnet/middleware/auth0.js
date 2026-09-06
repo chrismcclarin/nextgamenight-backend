@@ -3,6 +3,51 @@
 const jwt = require('jsonwebtoken');
 const jwksClient = require('jwks-rsa');
 const { sendError } = require('../utils/errors');
+// DECISION Phase 88.8 D-02: runtime code loads a module whose body is ALSO pasted
+// verbatim into the Auth0 dashboard as a post-login Action
+// (auth0/actions/post-login-claims.js, re-exported through config/auth0Claims.js).
+// That is surprising, and it is deliberate: the emitter of these claims and the reader
+// of them share ONE table, so a claim-name change is impossible to make in only one
+// half. Chosen OVER the obvious alternative — declaring the names a second time in a
+// plain constants module and adding a key-set diff test — which only DETECTS drift
+// after it happens. If the Actions editor ever refuses the extra exports (A1, unproven
+// until the first owner paste), the fallback is mechanical: inline the table here in
+// config/auth0Claims.js and keep the diff test. Changing this is a decision, not a cleanup.
+const { CLAIMS } = require('../config/auth0Claims');
+
+// Sentry is initialised in server.js when SENTRY_DSN is set; defensive require so
+// dev/test without the DSN is a no-op (same idiom as routes/users.js).
+let Sentry = null;
+try {
+  Sentry = require('@sentry/node');
+} catch (_e) {
+  Sentry = null;
+}
+
+/* Round 3 #3 (round 1 #12): the ONE runtime detector for "the post-login Action is not
+   deployed". The whole verified-email posture — email adoption, the D-41/D-42 move gate,
+   revert — reads namespaced claims that exist only once the Action is pasted into the
+   Auth0 dashboard by hand (auth0/actions/README.md). Nothing in CI can see that, and
+   without this every symptom (near-100% move skips, every revert refused, every repair
+   deferred) looks like a bug in the gate rather than a missing deploy step. Throttled to
+   one warning per process per hour, production only, and it never touches the request. */
+const CLAIMS_ABSENT_REPORT_INTERVAL_MS = 60 * 60 * 1000;
+let lastClaimsAbsentReportAt = 0;
+function reportClaimsAbsentOnce(decoded) {
+  if (process.env.NODE_ENV !== 'production') return;
+  const now = Date.now();
+  if (now - lastClaimsAbsentReportAt < CLAIMS_ABSENT_REPORT_INTERVAL_MS) return;
+  lastClaimsAbsentReportAt = now;
+  const line = '[auth0] post-login Action claims ABSENT from the access token — is the Action deployed and bound to the Login flow? (auth0/actions/README.md)';
+  console.warn(line);
+  if (Sentry && typeof Sentry.captureMessage === 'function') {
+    Sentry.captureMessage(line, {
+      level: 'warning',
+      tags: { feature: 'auth0-claims', op: 'claims-absent' },
+      extra: { hasBareEmail: typeof decoded.email === 'string' },
+    });
+  }
+}
 
 // Check for required environment variables
 if (!process.env.AUTH0_DOMAIN) {
@@ -122,22 +167,34 @@ const verifyAuth0Token = (req, res, next) => {
         return sendError(res, 'unauthorized');
       }
 
-      // Attach user info to request object
-      // Extract all available user information from the token
-      // For email/password users: username field contains what they entered during signup
-      // For Google OAuth users: name field contains their Google name
+      // Attach user info to request object.
+      //
+      // Phase 88.8 / BOPS-05 (R1): the NAMESPACED claim written by the post-login
+      // Action wins over the bare OIDC claim when both are present — the Action's
+      // value comes from event.user at login time and is the one we can reason about.
+      // `??` (not `||`) so a legitimately false/empty claim value is not silently
+      // skipped over in favour of a bare claim. email_verified keeps its `false`
+      // default: an ABSENT verification claim must read as unverified, never verified.
+      //
+      // For email/password users: username field contains what they entered during signup.
+      // For Google OAuth users: name field contains their Google name.
       req.user = {
         user_id: decoded.sub, // Auth0 user ID (sub claim) - this proves they exist in Auth0
-        email: decoded.email || decoded['https://your-api-identifier/email'], // Standard email or custom claim
-        email_verified: decoded.email_verified || false,
-        username: decoded.username, // For email/password users, this is what they entered during signup
-        name: decoded.name || decoded.nickname || decoded.given_name || decoded.family_name,
-        nickname: decoded.nickname,
-        picture: decoded.picture,
+        email: decoded[CLAIMS.email] ?? decoded.email,
+        email_verified: decoded[CLAIMS.emailVerified] ?? decoded.email_verified ?? false,
+        username: decoded[CLAIMS.username] ?? decoded.username,
+        name: decoded[CLAIMS.name] ?? (decoded.name || decoded.nickname || decoded.given_name || decoded.family_name),
+        nickname: decoded[CLAIMS.nickname] ?? decoded.nickname,
+        picture: decoded[CLAIMS.picture] ?? decoded.picture,
+        connection_strategy: decoded[CLAIMS.connection],
         given_name: decoded.given_name,
         family_name: decoded.family_name,
         // Include any other claims you need
       };
+      // Round 4 #18: fire only when NO namespaced claim is present. A deployed Action
+      // omits the email claim for a user whose Auth0 profile has no email, but it ALWAYS
+      // sets the connection claim — so "none present" is the deploy-state signal.
+      if (!Object.values(CLAIMS).some((key) => decoded[key] !== undefined)) reportClaimsAbsentOnce(decoded);
 
       // Log available token claims in development for debugging
       if (process.env.NODE_ENV === 'development' && !req.user.email) {
@@ -207,13 +264,19 @@ const optionalAuth = (req, res, next) => {
         return next();
       }
 
+      // Phase 88.8 / BOPS-05 (R1): kept field-for-field identical to the
+      // verifyAuth0Token mapping above — these two blocks are copies and both must
+      // change together. optionalAuth additionally gains `username` and
+      // `connection_strategy`, which it did not carry before.
       req.user = {
         user_id: decoded.sub,
-        email: decoded.email || decoded['https://your-api-identifier/email'],
-        email_verified: decoded.email_verified || false,
-        name: decoded.name || decoded.nickname || decoded.given_name || decoded.family_name,
-        nickname: decoded.nickname,
-        picture: decoded.picture,
+        email: decoded[CLAIMS.email] ?? decoded.email,
+        email_verified: decoded[CLAIMS.emailVerified] ?? decoded.email_verified ?? false,
+        username: decoded[CLAIMS.username] ?? decoded.username,
+        name: decoded[CLAIMS.name] ?? (decoded.name || decoded.nickname || decoded.given_name || decoded.family_name),
+        nickname: decoded[CLAIMS.nickname] ?? decoded.nickname,
+        picture: decoded[CLAIMS.picture] ?? decoded.picture,
+        connection_strategy: decoded[CLAIMS.connection],
         given_name: decoded.given_name,
         family_name: decoded.family_name,
       };

@@ -9,6 +9,10 @@ const { verifyAuth0Token } = require('../middleware/auth0');
 // (87.6) matchesSelf import removed with the deleted GET /user/:user_id route —
 // it was the only consumer in this file.
 const { enqueueCleanupJobForAttendee } = require('../services/gcalCleanupService');
+// Phase 88.8 plan 08 (D-23): the ONE definition of the chip projection. Read
+// its header before adding a use. Both User includes in this file qualify —
+// the POST write echo and the GET roster.
+const { PUBLIC_USER_ATTRS } = require('../utils/publicUserAttrs');
 const router = express.Router();
 
 // ============================================
@@ -509,8 +513,14 @@ router.post('/', verifyAuth0Token, validateRsvpCreate, async (req, res) => {
 
     // Re-fetch with User include for response. Phase 87.3 PR-C (plan 09, Req 1):
     // the nested include no longer carries the sub — id/username only.
+    // Phase 88.8 plan 08 (D-23, SPEC R11/A6): the WRITE ECHO widened to the
+    // shared chip projection. `picture_url` is the ONLY user field Phase 88.8
+    // adds to this payload — `email`, `phone` and `email_changed_at` remain
+    // excluded (models/User.js defaultScope) and this is not permission to add
+    // more. The echo is widened alongside the GET roster below so the two never
+    // disagree about the shape of an RSVP row.
     const result = await EventRsvp.findByPk(rsvp.id, {
-      include: [{ model: User, attributes: ['id', 'username'] }],
+      include: [{ model: User, attributes: [...PUBLIC_USER_ATTRS] }],
     });
 
     // PR-C (Req 2 carry-UUID lock): the flat user_id field NAME is retained but
@@ -546,9 +556,13 @@ router.get('/event/:event_id', verifyAuth0Token, async (req, res) => {
     // Fetch all RSVPs for this event. Phase 87.3 PR-C (Req 1): the nested User
     // include no longer carries the sub — id/username only (PR-B cut every
     // nested-sub reader to `.id`).
+    // Phase 88.8 plan 08 (D-23, SPEC R11/A6): the ROSTER widened to the shared
+    // chip projection. `picture_url` is the ONLY user field Phase 88.8 adds to
+    // this payload — `email`, `phone` and `email_changed_at` remain excluded
+    // (models/User.js defaultScope) and this is not permission to add more.
     const rsvps = await EventRsvp.findAll({
       where: { event_id },
-      include: [{ model: User, attributes: ['id', 'username'] }],
+      include: [{ model: User, attributes: [...PUBLIC_USER_ATTRS] }],
       order: [
         // Custom order: yes first, maybe second, no third
         [EventRsvp.sequelize.literal(`CASE WHEN "EventRsvp"."status" = 'yes' THEN 0 WHEN "EventRsvp"."status" = 'maybe' THEN 1 WHEN "EventRsvp"."status" = 'no' THEN 2 END`), 'ASC'],

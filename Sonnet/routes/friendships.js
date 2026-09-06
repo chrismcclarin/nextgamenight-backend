@@ -1,10 +1,19 @@
 // routes/friendships.js
 // Friendship CRUD routes: list, search, request, accept, decline, remove
 const express = require('express');
-const { Op, UniqueConstraintError } = require('sequelize');
+// Phase 88.8 / R10: `fn`, `col` and the `where` HELPER join this existing
+// destructure (never a second require). The helper is aliased to `whereFn`
+// because the bare name `where` would shadow the Sequelize option key it is
+// assigned to.
+const { Op, UniqueConstraintError, fn, col, where: whereFn } = require('sequelize');
 const { User, Friendship } = require('../models');
 const { body, validationResult } = require('express-validator');
 const { resolveTargetUserUuidOnly } = require('../utils/resolveTargetUser');
+// Phase 88.8 plan 08 (D-23): the ONE definition of the chip projection. Read
+// its header before adding a use. In THIS file ONLY the two shared
+// Requester/Addressee roster includes below qualify. GET /search MUST NOT
+// adopt it — see the comment at that projection.
+const { PUBLIC_USER_ATTRS } = require('../utils/publicUserAttrs');
 
 const router = express.Router();
 
@@ -18,12 +27,18 @@ const USER_INCLUDES = [
     // users' email addresses. Phase 87.3 PR-C (plan 09, Req 1): the sub
     // `user_id` is removed from the nested include too — id + username are
     // the FE's read surface (PR-B cut every nested-sub reader to `.id`).
-    attributes: ['id', 'username'],
+    // Phase 88.8 plan 08 (D-23, SPEC R11/A6): widened to the shared chip
+    // projection. `picture_url` is the ONLY user field Phase 88.8 adds to this
+    // payload — `email`, `phone` and `email_changed_at` remain excluded
+    // (models/User.js defaultScope) and this widening is not permission to add
+    // more. It applies to the friends LIST only; GET /search below is a lookup
+    // and is untouched.
+    attributes: [...PUBLIC_USER_ATTRS],
   },
   {
     model: User,
     as: 'Addressee',
-    attributes: ['id', 'username'],
+    attributes: [...PUBLIC_USER_ATTRS],
   },
 ];
 
@@ -138,18 +153,97 @@ router.get('/search', async (req, res) => {
   try {
     const { email } = req.query;
 
-    if (!email) {
+    // Phase 88.8 / R10: normalise the INPUT once — trim surrounding whitespace,
+    // then lowercase. A whitespace-only param now takes the SAME 400 branch as a
+    // missing one: it can never identify a row, and 404 would read as "no such
+    // user" when the truth is "you sent nothing". A non-string param (a repeated
+    // `?email=a&email=b` arrives as an array) also lands here rather than
+    // throwing on `.toLowerCase()` and 500ing.
+    const normalized = typeof email === 'string' ? email.trim().toLowerCase() : '';
+
+    if (!normalized) {
       return res.status(400).json({ error: 'Email query parameter is required' });
     }
 
     const user = await User.findOne({
-      where: { email: email.toLowerCase() },
+      // DECISION Phase 88.8 R10 (plan 03): compare `lower(email)` on the STORED
+      // column against the trimmed+lowercased input — chosen OVER the previous
+      // `where: { email: email.toLowerCase() }`, which lowercased only the QUERY
+      // and then compared it to the column AS STORED, so any row persisted with
+      // different case was silently unfindable. Counterpart rule: from plan 04
+      // onward the provisioning service normalises with the SAME
+      // `trim().toLowerCase()` at persistence, so new rows agree with this
+      // comparison by construction; this clause is what reaches the rows written
+      // before that.
+      //
+      // The match stays FULL-exact — `lower(email) = lower(:input)` and nothing
+      // else. Deliberately REJECTED (SPEC Edge Coverage `encoding / R10`):
+      // `Op.iLike`/`Op.like` (a PATTERN match, which would let `%` and `_` from
+      // user input widen the comparison), prefix or substring matching,
+      // Gmail-dot collapsing and plus-address stripping. Each one turns this
+      // endpoint into an email-enumeration oracle — that is why it has always
+      // been exact. Pinned by the partial/prefix/wildcard 404 cases in
+      // tests/routes/friendships.test.js.
+      //
+      // KNOWN GAPS this clause does NOT close — named here so a future phase can
+      // find them rather than rediscover them (neither is a widening; both are
+      // residue of `Users_email_key` being a case-SENSITIVE btree on the RAW
+      // column, verified 2026-09-04):
+      //   1. Only the INPUT is trimmed, not the stored column. A legacy row
+      //      persisted as `'a@b.com '` stays unfindable — `lower('a@b.com ')`
+      //      is not `'a@b.com'`. Plan 04 normalises at persistence so no NEW row
+      //      can be written that way, but nothing in Phase 88.8 backfills the
+      //      rows written before it. Adding `btrim` here would close it; it was
+      //      NOT done because it is beyond this plan's pinned clause and it
+      //      widens case 2 below. Unrouted — needs an owner.
+      //   2. Because uniqueness is case-sensitive, `'A@b.com'` and `'a@b.com'`
+      //      can both exist. Both now match, and `findOne` takes LIMIT 1 with no
+      //      ORDER BY, so the winner is whichever row the scan reaches first —
+      //      a friend request could reach the wrong account. Pre-88.8 this was
+      //      deterministic (only the exactly-lowercase row could match), so this
+      //      non-determinism is NEW. The real fix is a case-insensitive unique
+      //      constraint on Users.email, which is a migration nobody in this
+      //      phase owns; a 409-on-multiple-match would be a contract change.
+      //      Unrouted — needs an owner.
+      //
+      // SUPERSEDED 2026-09-04 — read this, do not act on the struck-through text.
+      // This comment used to say the `lower(email)` functional index was
+      // "deliberately NOT added in this phase" and was deferred to Phase 91.
+      // THAT IS NO LONGER TRUE. The owner ruled mid-phase to add it, and plan 02
+      // shipped it as a UNIQUE index: `users_email_lower_unique`, in
+      // `migrations/20260902000007-add-lower-email-unique-index-to-users.js`,
+      // mirrored in `models/User.js` `indexes` in the SAME commit (the drift gate
+      // diffs indexes between the migration-built and sync-built schemas, so a
+      // migration-only index is a red `migrate-cli-replay` — that constraint was
+      // real and was honoured).
+      //
+      // So this lookup is NO LONGER a sequential scan, and the Phase 91 deferral
+      // for it is closed. It was made UNIQUE rather than plain because the
+      // case-insensitive comparison below made case-variant duplicate rows
+      // resolve non-deterministically under `findOne`'s `LIMIT 1` with no
+      // `ORDER BY` — a friend request could reach the wrong account.
+      //
+      // Still true and still the rule: the fix is never a return to the
+      // as-stored comparison.
+      where: whereFn(fn('lower', col('email')), normalized),
       // BSEC-01 (D-03): email removed from the projection (the WHERE filter is
       // unaffected). The searcher supplied the email; echoing it back is
       // unnecessary. Phase 87.3 PR-C (BE-12, user D1 resolution): the flat sub
       // `user_id` is DROPPED — the sole sanctioned drop of this phase. The only
       // FE consumer (the friends page) reads `foundUser.id` (plan 06) and the
       // friend-request send is UUID-only post-PR-C.
+      //
+      // DECISION Phase 88.8 plan 08 (D-23, T-88.8-38): this projection stays a
+      // LITERAL id-and-username pair and MUST NOT adopt PUBLIC_USER_ATTRS,
+      // even though the two roster includes ten lines up in this same file
+      // just did. This is a LOOKUP, not a roster: you supply one email address
+      // and it returns the one person behind it. Adding a face turns an
+      // identity oracle into an enumeration surface (R10). Rejected: widening
+      // it "for consistency with the friends list" — the friends list shows
+      // people you are already connected to; this shows a stranger you guessed
+      // the address of. Pinned by an EXACT toEqual(['id','username']) in
+      // tests/routes/friendships.test.js and by the frontend identity contract
+      // test, and asserted picture_url-free in tests/routes/wire-sweep.test.js.
       attributes: ['id', 'username'],
     });
 

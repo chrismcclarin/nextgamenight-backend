@@ -5,13 +5,88 @@ const crypto = require('crypto');
 const { google } = require('googleapis');
 const { User, SingleUseToken, PendingAuth0Deletion } = require('../models');
 const { sendError, AppError } = require('../utils/errors');
-const { clampProvisionedUsername } = require('../utils/provisionedUsername');
-const { resolveAllowedFrontendUrl } = require('../config/allowedOrigins');
+const { resolveAllowedFrontendUrl, normalizeOrigin } = require('../config/allowedOrigins');
+// Phase 88.8 plan 06 (SPEC A1 / D-13): the single home of the provisioning policy.
+const provisioningService = require('../services/provisioningService');
 const { matchesSelf } = require('../middleware/objectAuth');
 const router = express.Router();
 
 // OAuth state nonce lifetime: the consent round-trip is short; 30 min is generous.
 const OAUTH_STATE_TTL_MS = 30 * 60 * 1000;
+
+// ---------------------------------------------------------------------------
+// Phase 88.8 plan 06 Task 3 — SPEC R9 as amended by SPEC Amendment A5, CONTEXT D-22.
+//
+// Where a deleted account is sent when it comes back through the PUBLIC Google OAuth
+// callback. The path and the reason are ONE frozen literal because the frontend
+// allowlist compares it with `===`:
+// periodictabletop/src/app/api/auth/[auth0]/route.js matches exactly '/goodbye' and
+// exactly '/goodbye?reason=account_deleted'. Deriving either side from the other is
+// impossible across two repos, so both are written out; the backend test asserts the
+// whole emitted string so a drift fails loudly rather than degrading silently.
+//
+// The PATH is copied from the shipped logout-goodbye constant
+// (periodictabletop/src/app/components/DangerZoneDeleteAccount.tsx:61) but NOT the
+// value: that constant's returnTo is unencoded because it has no query string of its
+// own. Ours does.
+// ---------------------------------------------------------------------------
+const GOODBYE_RETURN_TO = '/goodbye?reason=account_deleted';
+const FRONTEND_LOGOUT_PATH = '/api/auth/logout';
+
+/**
+ * Build the browser-facing refusal for an app-deleted account arriving at the OAuth
+ * callback: log the still-live frontend session out through Auth0, then land on the
+ * goodbye page with the account-deleted explanation.
+ *
+ * WHY A REDIRECT THROUGH LOGOUT rather than straight to /goodbye: mid-OAuth the
+ * frontend session is still ALIVE. Sending the browser to /goodbye directly would leave
+ * a logged-in session belonging to an account that no longer exists. Routing through
+ * logout is the shipped idiom for exactly this.
+ *
+ * TWO FACTS, written here so nobody re-opens them:
+ *  1. Auth0's logout documentation states that query-string and hash information in a
+ *     `returnTo` value is NOT taken into account when validating against Allowed Logout
+ *     URLs, so the already-allow-listed goodbye URL covers the reason variant and NO
+ *     Auth0 dashboard change is required (owner confirmed the goodbye URL is on that
+ *     list, 2026-09-02). 88.8-RESEARCH.md, Vendor Answers V3.
+ *  2. The installed @auth0/nextjs-auth0 short-circuits to the return URL for a
+ *     sessionless caller, so the branch is robust whether or not the session survived.
+ *     88.8-RESEARCH.md, Code Examples E4.
+ *
+ * THE ENCODING IS LOAD-BEARING and is the single most likely thing to ship broken.
+ * Unencoded, the reason's `?` starts a SECOND query parameter on the logout route; the
+ * frontend's `searchParams.get('returnTo')` then returns the bare '/goodbye', its
+ * exact-literal allowlist matches the OLD literal, and the reason variant silently
+ * never renders — a bug that presents as a frontend copy bug and gets debugged in the
+ * wrong repo. Pinned by an exact-string assertion plus a one-question-mark assertion.
+ *
+ * @param {{ frontend_url?: string|null }|null} consumedToken - the consumed oauth_state row.
+ * @returns {string} an absolute URL on an ALLOW-LISTED origin.
+ */
+function buildDeletedAccountRedirect(consumedToken) {
+  // T-88.8-27: RE-RESOLVE the stored value through the allow-list AT CALLBACK TIME,
+  // never reflect it. SPEC R9's original text said the sibling branches already do
+  // this; SPEC Amendment A5 corrected that — they do NOT. Allow-listing happens at
+  // MINT time (see the resolveAllowedFrontendUrl block in generateGoogleAuthUrl), which
+  // is why the siblings trust `consumedToken.frontend_url` directly. Do NOT "simplify"
+  // this branch to match them: re-resolving here is what makes the open-redirect test
+  // real rather than vacuous, and it is the only defence if a stored row is ever
+  // tampered with or was written by an older, laxer mint.
+  const resolved =
+    resolveAllowedFrontendUrl(consumedToken && consumedToken.frontend_url) ||
+    resolveAllowedFrontendUrl(process.env.FRONTEND_URL) ||
+    process.env.FRONTEND_URL ||
+    'http://localhost:3000';
+
+  // resolveAllowedFrontendUrl allow-lists by ORIGIN but returns the caller's value,
+  // which may carry a path. The logout route is mounted at the site ROOT, so normalise
+  // to the bare origin — `${resolved}/api/auth/logout` on a path-carrying stored value
+  // would 404. normalizeOrigin returns null for an unparseable value; fall back rather
+  // than emit nothing.
+  const origin = normalizeOrigin(resolved) || resolved;
+
+  return `${origin}${FRONTEND_LOGOUT_PATH}?returnTo=${encodeURIComponent(GOODBYE_RETURN_TO)}`;
+}
 
 // Initialize OAuth2 client
 const getOAuth2Client = () => {
@@ -45,8 +120,14 @@ const getOAuth2Client = () => {
   return new google.auth.OAuth2(clientId, clientSecret, redirectUri);
 };
 
-// Helper function to generate Google OAuth URL
-const generateGoogleAuthUrl = async (user_id, email = null, username = null, frontendUrl = null) => {
+// Helper function to generate Google OAuth URL.
+//
+// Phase 88.8 plan 06: takes the CLAIMS BAG (req.user) rather than pre-extracted
+// email/username strings, because provisioning policy now reads the whole bag —
+// plan 01 widened req.user with `email_verified` and `connection_strategy`, and both
+// are load-bearing (SPEC R3 verified-email adoption, D-27 social-only avatars). One
+// caller, below.
+const generateGoogleAuthUrl = async (user_id, claims = {}, frontendUrl = null) => {
   // SPEC Req 6 (Phase 87.2 tombstone guard, self-keyed): both callers pass the
   // verified token sub. A still-valid token surviving account deletion must not
   // re-provision the Users row via the OAuth-URL mint. Throw the registered
@@ -55,28 +136,85 @@ const generateGoogleAuthUrl = async (user_id, email = null, username = null, fro
     throw new AppError('account_deleted');
   }
 
-  // Create or find user (auto-create if doesn't exist).
-  // Wave-12 review HIGH #2: clamp per-candidate — the token `name` claim is a
-  // full name that can exceed the User.username len[1,50] backstop; unclamped,
-  // this save throws and the whole Connect-Google-Calendar flow 500s.
-  const clampedUsername = clampProvisionedUsername(username);
-  const [user, created] = await User.findOrCreate({
-    where: { user_id },
-    defaults: {
-      user_id,
-      email: email || null,
-      username: clampedUsername || clampProvisionedUsername(email?.split('@')[0]) || 'User',
-    }
+  // -------------------------------------------------------------------------
+  // Phase 88.8 plan 06 (SPEC Amendment A1; D-13). Provision through the single
+  // home. This ALSO fixes a latent NOT NULL violation, which is why it is a fix
+  // and not churn: the defaults this replaced passed `email: email || null` into
+  // `Users.email`, declared `allowNull: false` (models/User.js). Any Google connect
+  // whose token carried no email address 500'd on the INSERT; it has survived only
+  // because Google sign-in almost always supplies one. The service can never produce
+  // a null address — its last resort is the synthetic one.
+  // -------------------------------------------------------------------------
+  const provisioned = await provisioningService.provisionOrRepair({
+    sub: user_id,
+    claims,
   });
 
-  // Update user info if provided and user already existed. This runs for
-  // EXISTING users on every OAuth-URL mint, so the clamp above is what keeps a
-  // >50-char Google display name from 500ing a previously-working connect.
-  if (!created && (email || clampedUsername)) {
-    const updateData = {};
-    if (email) updateData.email = email;
-    if (clampedUsername) updateData.username = clampedUsername;
-    await user.update(updateData);
+  if (provisioned.status === 'identity_gone') {
+    // Phase 87.2 SPEC Req 6: the Auth0 identity was deleted from the dashboard.
+    // Same refusal the tombstone guard above uses, so this handler answers a
+    // deleted identity with ONE shape.
+    throw new AppError('account_deleted');
+  }
+
+  const user = provisioned.user;
+  const created = provisioned.created;
+
+  // -------------------------------------------------------------------------
+  // DECISION Phase 88.8 R3: this block keeps the USERNAME refresh and no longer
+  // writes EMAIL. Chosen OVER deleting the block outright, and OVER leaving it as
+  // shipped.
+  //
+  // The email half was a security defect, not a cleanup target. `email` was
+  // `req.user?.email || req.query.email || null` and the branch did
+  // `if (email) updateData.email = email` with NO `email_verified` check anywhere
+  // in this file — so ANY authenticated caller could write an arbitrary,
+  // QUERY-STRING-sourced address into their own UNIQUE identity column just by
+  // hitting `GET /google/url?email=...`. That column is an AUTHORIZATION gate here,
+  // not contact data: routes/invites.js:593/:664/:757 accept an invite only when the
+  // addresses match. Email adoption now belongs solely to the service's
+  // verified-only repair, and the `req.query.email` / `req.query.username`
+  // fallbacks are deleted outright (the only frontend caller,
+  // periodictabletop/src/app/api/auth/google-connect/route.js:41, sends
+  // `frontend_url` alone).
+  //
+  // The username half is KEPT rather than dropped because
+  // tests/routes/provisionedUsername.clamp.test.js:94-104 pins it: an existing
+  // 'Old Name' row must become the clamped token name on the next mint. The
+  // service repairs a username only when the stored one is GENERIC or blank, so
+  // dropping this block would weaken that pin. This is a display-name refresh from
+  // the live token, which is a different rule from the service's repair rule.
+  //
+  // NAMED TRADE-OFF, recorded rather than glossed: the candidate order here
+  // (`name || nickname`) is NOT the service's chain
+  // (`username || name || nickname || given_name || email-local`). The divergence
+  // is narrow — it can only differ for an EXISTING row whose caller carries a
+  // `username` claim differing from `name` — and it is left in place deliberately
+  // because converging it would change a shipped behaviour this plan did not scope.
+  // Converging it is a decision for a later phase, not a cleanup.
+  //
+  // DECISION Phase 88.8 code review round 2 HIGH-C (2026-09-05): the candidates run
+  // through the SERVICE's per-candidate picker, not through `clampProvisionedUsername`
+  // directly. The ORDER trade-off above is unchanged; what changed is the FILTER. For
+  // an Auth0 database (username-password) connection the `name` claim defaults to the
+  // user's EMAIL ADDRESS, and `Users.username` is PUBLIC (PUBLIC_USER_ATTRS, twelve
+  // projections) — so the direct clamp published a user's address as their display
+  // name on every Calendar connect. The service's `pick()` refuses any candidate that
+  // normalises to one of the user's own addresses; this route now asks that same
+  // question, against BOTH the address on the live token and the address stored on
+  // the row (they differ after an in-app email change, and neither may become the
+  // public name). Chosen over a second local copy of the compare (duplication is not
+  // a peer option here) and over lifting the picker into utils/provisionedUsername.js
+  // (that helper is pinned to "DISPLAY usernames only" — see rejected alternative (a)
+  // on makeUsernamePicker). When every candidate is refused, the stored username is
+  // left as it is — a refused refresh is not a blank name.
+  // -------------------------------------------------------------------------
+  if (!created) {
+    const pick = provisioningService.makeUsernamePicker([claims.email, user.email]);
+    const refreshedUsername = pick(claims.name) || pick(claims.nickname);
+    if (refreshedUsername) {
+      await user.update({ username: refreshedUsername });
+    }
   }
 
   const oauth2Client = getOAuth2Client();
@@ -127,10 +265,6 @@ router.get('/google/url', async (req, res) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
-    // Get user info from token (preferred) or query params (fallback for backwards compatibility)
-    const email = req.user?.email || req.query.email || null;
-    const username = req.user?.name || req.user?.nickname || req.query.username || null;
-
     // Get frontend URL from request origin, query param, or environment variable
     // This ensures the callback redirects to the correct frontend URL
     const frontendUrl = req.query.frontend_url ||
@@ -138,7 +272,9 @@ router.get('/google/url', async (req, res) => {
                        process.env.FRONTEND_URL ||
                        'http://localhost:3000';
 
-    const authUrl = await generateGoogleAuthUrl(userId, email, username, frontendUrl);
+    // Pass req.user ITSELF as the claims bag — never re-extracted local strings, and
+    // never anything from req.query (Phase 88.8 plan 06, the DECISION R3 marker above).
+    const authUrl = await generateGoogleAuthUrl(userId, req.user || {}, frontendUrl);
 
     // Return URL as JSON
     res.json({ authUrl });
@@ -184,22 +320,54 @@ router.get('/google/callback', async (req, res) => {
     const frontendUrl = consumedToken.frontend_url || process.env.FRONTEND_URL || 'http://localhost:3000';
 
     // SPEC Req 6 (Phase 87.2 tombstone guard, self-keyed): the sub was resolved from
-    // the nonce minted by the same (now-deleted) user. Refuse before the findOrCreate
-    // below can re-materialize the Users row mid-OAuth-flow. Pinned refusal shape:
-    // 410 account_deleted envelope.
+    // the nonce minted by the same (now-deleted) user. Refuse before the writer below
+    // can re-materialize the Users row mid-OAuth-flow.
+    //
+    // Phase 88.8 plan 06 (SPEC R9 as amended by A5, D-22, T-88.8-31): the refusal is a
+    // REDIRECT now, not `sendError(res, 'account_deleted')`. This handler is reached by
+    // a BROWSER NAVIGATION from Google, so the 410 API envelope rendered as raw JSON in
+    // the user's window. The two raw-JSON 400s above for a missing code/state stay as
+    // they are — the SPEC boundaries record them as accepted-forever, because Google
+    // always sends both and turning them into redirects would hide a genuinely broken
+    // integration rather than help anyone.
     if (await PendingAuth0Deletion.isTombstoned(user_id)) {
-      return sendError(res, 'account_deleted');
+      return res.redirect(buildDeletedAccountRedirect(consumedToken));
     }
 
-    // Find or create user (should exist from step 1, but create if needed)
-    const [user] = await User.findOrCreate({
-      where: { user_id },
-      defaults: {
-        user_id,
-        username: 'User',
-        email: null,
-      }
+    // -----------------------------------------------------------------------
+    // Phase 88.8 plan 06 (SPEC Amendment A1; D-13). Should exist from step 1, but
+    // provision if needed — through the single home, like every other writer. The
+    // defaults this replaced were the literal generic username and a NULL email into
+    // a NOT NULL column.
+    //
+    // CLAIMS ARE DELIBERATELY EMPTY, and this is the whole reason the site needs a
+    // comment. This handler is a PUBLIC browser navigation (see the route
+    // registration above) with NO `req.user` — its subject comes from
+    // `consumedToken.user_id`. There IS a Google-userinfo address available on this
+    // flow, and passing it here would adopt an address the IDENTITY PROVIDER never
+    // asserted: Google told us who authorised a CALENDAR scope, not that Auth0 has
+    // verified that address for this Auth0 sub. Passing `undefined` is not the same
+    // thing as `{}` at the call boundary either — `{}` is what makes the service read
+    // the claims as ABSENT and take its Management-then-synthetic create rule.
+    //
+    // Cost check, because "absent claims" sounds expensive: on the REPAIR path (the
+    // overwhelmingly common case here, since /google/url provisioned this row
+    // moments ago) the service makes ZERO Management calls for a row that already
+    // holds a real address and a non-generic username. Connecting a calendar costs
+    // no vendor round-trip, exactly as before.
+    // -----------------------------------------------------------------------
+    const provisioned = await provisioningService.provisionOrRepair({
+      sub: user_id,
+      claims: {},
     });
+
+    if (provisioned.status === 'identity_gone') {
+      // Phase 87.2 SPEC Req 6. Same browser-facing refusal as the tombstone branch
+      // above — a browser navigation must never be answered with an API envelope.
+      return res.redirect(buildDeletedAccountRedirect(consumedToken));
+    }
+
+    const user = provisioned.user;
 
     const oauth2Client = getOAuth2Client();
 

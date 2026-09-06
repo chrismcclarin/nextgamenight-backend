@@ -228,6 +228,14 @@ describe('Phase 88-34 Task 4 — provisioning clamps the Auth0-derived username 
       await request(makeAppWithClaims({
         user_id: sub,
         email: 'generic-updated@example.com',
+        // Phase 88.8 (SPEC R3): the claim email is adopted ONLY when the token says it is
+        // verified. This fixture predates that rule and left email_verified unset, which
+        // now reads as UNVERIFIED and mints the synthetic address instead — so the email
+        // assertion below (a Rule-1 pin on the withContactInfo scope, not on verification)
+        // could no longer be reached. Marking the fixture verified is what a real
+        // Google / verified email-password login looks like and preserves this test's
+        // intent exactly; the clamp assertions are untouched.
+        email_verified: true,
         given_name: givenName,
         family_name: familyName,
       }))
@@ -245,7 +253,17 @@ describe('Phase 88-34 Task 4 — provisioning clamps the Auth0-derived username 
     // DEFAULT-SCOPED instance with no `email`, so the whole repair path was dead
     // and silently swallowed by the catch. If this assertion regresses, the
     // findOrCreate lost its withContactInfo scope.
-    expect(updated.email).toBe('generic-updated@example.com');
+    //
+    // POLARITY INVERTED 2026-09-05 (code review HIGH-1, owner ruling): the claims
+    // repair is now gated on the STORED value being synthetic, so a verified claim no
+    // longer overwrites this row's REAL `generic@example.com`. The pin is UNCHANGED IN
+    // PURPOSE and in fact stronger: `isSyntheticAddress(undefined)` returns TRUE
+    // (services/provisioningService.js:139-141 — a blank or missing value counts as
+    // synthetic), so a default-scoped instance would take the repair branch and WRITE
+    // the claim address here. "The stored address survived" therefore still fails
+    // loudly the moment findOrCreate loses its withContactInfo scope — it just now
+    // asserts the surviving value instead of the overwritten one.
+    expect(updated.email).toBe('generic@example.com');
   });
 
   it('a normal-length name is untouched by the clamp', async () => {

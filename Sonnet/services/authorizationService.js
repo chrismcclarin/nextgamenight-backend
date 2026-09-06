@@ -157,7 +157,7 @@ const canReadEventScopedSurface = async (auth0UserId, eventId) => {
  * else (incl. email, phone, calendar_connected, google_calendar_*,
  * notification_preferences, and any future field such as is_platform_admin)
  * is stripped by default:
- *   id, user_id, username, display_name, profile_picture_url, avatar_url,
+ *   id, user_id, username, picture_url,
  *   UserGroup association (role, joined_at) — INCLUDING when UserGroup is
  *   explicitly null (the Phase 71.1 game-only signal for the frontend; the
  *   allow-list preserves the key even when its value is null).
@@ -175,13 +175,43 @@ const canReadEventScopedSurface = async (auth0UserId, eventId) => {
 // allow-listed and preserved even when explicitly null (the Phase 71.1
 // game-only signal). Adding a field a future caller needs is a deliberate
 // edit here, fail-closed by design.
+//
+/*
+ * DECISION Phase 88.8 plan 08 (D-23, SPEC R11/A6) — TWO changes here, and the
+ * second one is why the first is not enough on its own.
+ *
+ * 1. ADDED `picture_url`. This edit is LOAD-BEARING, not cosmetic. This list is
+ *    a fail-CLOSED allow-list, so a new User column defaults to STRIPPED. The
+ *    game-only branch of GET /groups/:group_id/users runs every roster row
+ *    through stripMemberPII (routes/groups.js), so without this line the avatar
+ *    would appear for group members and silently VANISH for game-only
+ *    participants — one branch of one endpoint, no error, no log.
+ *    Pinned by tests/routes/wire-sweep.test.js, which exercises BOTH branches.
+ *
+ * 2. REMOVED three PHANTOM entries — `display_name`, `profile_picture_url` and
+ *    `avatar_url`. None of them is a column on models/User.js (verified against
+ *    the model AND migrations/, 2026-09-04); `profile_picture_url` exists only
+ *    on models/Group.js, and `display_name` only as a value SYNTHESIZED at
+ *    routes/groupPromptSettings.js:215, on a path that never reaches this
+ *    function. They were removed rather than left with a fourth appended,
+ *    because a stale allow-list reads as an aspirational superset and that is
+ *    exactly how the next reader concludes the real avatar column is already
+ *    covered. Rejected: keeping them "just in case" — an allow-list entry with
+ *    no backing column protects nothing and costs the list its credibility.
+ *    (Plan 08 named two phantoms; the census found three. Recorded in
+ *    88.8-08-SUMMARY.md.)
+ *
+ * This list stays a LITERAL array and deliberately does NOT import
+ * PUBLIC_USER_ATTRS from utils/publicUserAttrs.js. They govern different
+ * things — that constant is which fields a chip projection SELECTS, this is
+ * which User fields survive a PII strip — and coupling them would mean a future
+ * chip-projection change silently altered a security gate.
+ */
 const STRIP_MEMBER_PII_ALLOWLIST = [
   'id',
   'user_id',
   'username',
-  'display_name',
-  'profile_picture_url',
-  'avatar_url',
+  'picture_url',
   'UserGroup',
 ];
 

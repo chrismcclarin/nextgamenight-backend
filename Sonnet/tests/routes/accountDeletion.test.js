@@ -25,9 +25,18 @@ const express = require('express');
 // ---- accountDeletionService (service boundary) ----
 const mockDeleteAccount = jest.fn();
 const mockGetDeletionBlockers = jest.fn();
+// Phase 88.8 plan 07 (R7): the pre-flight route no longer emits the tombstone envelope
+// unconditionally for a null row — it asks the SERVICE's shared classifier, so the two
+// deletion endpoints can never disagree about a missing row. That means the route-grain
+// tests drive the 410-vs-404 split through THIS mock, not through mockIsTombstoned
+// below: the model mock is never reached once the service boundary is stubbed. The real
+// tombstone-first ordering inside classifyMissingRow is pinned in
+// tests/services/accountDeletionService.test.js, where the service is NOT mocked.
+const mockClassifyMissingRow = jest.fn();
 jest.mock('../../services/accountDeletionService', () => ({
   deleteAccount: (...a) => mockDeleteAccount(...a),
   getDeletionBlockers: (...a) => mockGetDeletionBlockers(...a),
+  classifyMissingRow: (...a) => mockClassifyMissingRow(...a),
   applyDispositions: jest.fn(),
 }));
 
@@ -80,6 +89,18 @@ function makeApp(userId) {
   return a;
 }
 
+// Phase 88.8 (BOPS-05): an authenticated actor whose token carries NO email claim.
+// This is the shape the REQ-6 identity-gone guard still runs on — see the note on that
+// test. makeApp() above injects an email claim, which under the claims-first rule skips
+// the Auth0 Management lookup entirely.
+function makeAppNoEmailClaim(userId) {
+  const a = express();
+  a.use(express.json());
+  a.use(stubAuth({ user_id: userId }));
+  a.use('/api/users', userRoutes);
+  return a;
+}
+
 // App WITHOUT any actor (unauthenticated) — req.user is undefined.
 function makeAnonApp() {
   const a = express();
@@ -92,6 +113,10 @@ beforeEach(() => {
   jest.clearAllMocks();
   // Default: no tombstone unless a test opts in.
   mockIsTombstoned.mockResolvedValue(false);
+  // Phase 88.8 plan 07 (R7): steady-state default matches mockIsTombstoned(false) — a
+  // missing row with no tombstone is the never-provisioned case. Tests that mean "this
+  // account really was deleted" opt into 'not_found' explicitly.
+  mockClassifyMissingRow.mockResolvedValue('not_provisioned');
 });
 
 describe('GET /api/users/me/deletion-blockers (pre-flight)', () => {
@@ -134,6 +159,12 @@ describe('GET /api/users/me/deletion-blockers (pre-flight)', () => {
 
   it('authenticated caller whose Users row is gone (stale session) → 410 account_deleted, never 500', async () => {
     mockUserFindOne.mockResolvedValueOnce(null); // row already deleted
+    // AMENDED Phase 88.8 plan 07 (R7): this test's NAME is about a genuinely DELETED
+    // account, so it must opt into the tombstone classification explicitly. Without this
+    // line the steady-state default (never-provisioned) would silently turn it into the
+    // 404 case and it would stop asserting what it says it asserts. The 404 case has its
+    // own sibling test immediately below.
+    mockClassifyMissingRow.mockResolvedValueOnce('not_found');
 
     const res = await request(makeApp('auth0|ghost'))
       .get('/api/users/me/deletion-blockers')
@@ -141,6 +172,25 @@ describe('GET /api/users/me/deletion-blockers (pre-flight)', () => {
 
     expect(res.body.code).toBe('account_deleted');
     // Never fed a null row into getDeletionBlockers.
+    expect(mockGetDeletionBlockers).not.toHaveBeenCalled();
+    expect(mockClassifyMissingRow).toHaveBeenCalledWith('auth0|ghost');
+  });
+
+  // Phase 88.8 plan 07 (SPEC R7, D-19 backend half) — the never-provisioned split.
+  it('authenticated caller with no row AND no tombstone → 404 not_provisioned, never 410', async () => {
+    mockUserFindOne.mockResolvedValueOnce(null); // no row was ever created
+    // mockClassifyMissingRow defaults to 'not_provisioned' (no tombstone).
+
+    const res = await request(makeApp('auth0|never-had-one'))
+      .get('/api/users/me/deletion-blockers')
+      .expect(404);
+
+    expect(res.body.code).toBe('not_provisioned');
+    // The user is NOT told their account was deleted — that is the whole point of R7.
+    expect(res.body.code).not.toBe('account_deleted');
+    expect(res.body).toHaveProperty('message');
+    // The reason the pre-flight short-circuits at all survives unchanged: a null row
+    // must never reach the blockers query.
     expect(mockGetDeletionBlockers).not.toHaveBeenCalled();
   });
 });
@@ -210,6 +260,22 @@ describe('DELETE /api/users/me (REQ-1 / REQ-2 / REQ-6)', () => {
     // Never a bare 401 and never a raw non-envelope 410.
     expect(res.body).toHaveProperty('message');
   });
+
+  // Phase 88.8 plan 07 (SPEC R7) — the DELETE half of the same split. The service
+  // resolves the 410-vs-404 question via classifyMissingRow and hands the route a
+  // distinct status; the route only maps status -> envelope code.
+  it('R7: a sub that never had a row (service not_provisioned) → HTTP 404 + code not_provisioned', async () => {
+    mockDeleteAccount.mockResolvedValueOnce({ status: 'not_provisioned' });
+
+    const res = await request(makeApp('auth0|never-had-one'))
+      .delete('/api/users/me')
+      .expect(404);
+
+    expect(res.body.code).toBe('not_provisioned');
+    // Must NOT claim a deletion happened.
+    expect(res.body.code).not.toBe('account_deleted');
+    expect(res.body).toHaveProperty('message');
+  });
 });
 
 describe('REQ-6 orphaned-token re-provision guard (JIT + search)', () => {
@@ -226,18 +292,53 @@ describe('REQ-6 orphaned-token re-provision guard (JIT + search)', () => {
     expect(mockUserCreate).not.toHaveBeenCalled();
   });
 
-  it('JIT: Auth0 identity lookup returns null (deleted in Auth0) → 410, NO token-claims fallback create', async () => {
+  // AMENDED Phase 88.8 plan 01 (BOPS-05, claims-first provisioning). This guard fires
+  // inside the Auth0 Management lookup, and that lookup now runs ONLY when the access
+  // token carries no email claim (SPEC R2). So the actor here must be claim-less — with
+  // an email claim the Management API is never called and this guard cannot run. The
+  // claims-path residual is pinned by the test immediately below; it is not erased.
+  it('JIT (no email claim): Auth0 identity lookup returns null (deleted in Auth0) → 410, NO token-claims fallback create', async () => {
     mockUserScopeFindOne.mockResolvedValueOnce(null); // no existing row
     mockIsTombstoned.mockResolvedValueOnce(false); // no marker yet, but Auth0 is gone
     mockGetUserById.mockResolvedValueOnce(null); // Auth0 identity deleted
 
-    const res = await request(makeApp('auth0|authgone'))
+    const res = await request(makeAppNoEmailClaim('auth0|authgone'))
       .get('/api/users/auth0|authgone')
       .expect(410);
 
     expect(res.body.code).toBe('account_deleted');
     expect(mockUserFindOrCreate).not.toHaveBeenCalled();
     expect(mockUserCreate).not.toHaveBeenCalled();
+  });
+
+  // NAMED RESIDUAL of Phase 88.8 BOPS-05, pinned here on purpose so it is visible in the
+  // security suite rather than only in a plan document. Plan 01 threat register T-88.8-02
+  // records it as ACCEPTED, and routes/users.js carries the matching DECISION marker.
+  //
+  // What changed: when the token carries an email claim, provisioning no longer calls the
+  // Auth0 Management API at all — which is the entire point of BOPS-05 (that call had been
+  // 403ing since 2026-04 and was minting synthetic @auth0.local addresses). The Phase 87.2
+  // SPEC Req 6 "identity deleted from the Auth0 dashboard → 410" guard lives inside that
+  // call, so it cannot fire on the claims path.
+  //
+  // Why the exposure is bounded: a token carrying claims proves the identity existed when
+  // the token was minted, so the only window is an identity deleted from the dashboard
+  // AFTER its token was minted and within that token's remaining lifetime. The row created
+  // carries the caller's own real verified address (no privilege gain), the tombstone guard
+  // (PendingAuth0Deletion.isTombstoned — the test above this one) still runs on BOTH paths,
+  // and the R6 account-hygiene script lists such rows under "Auth0 identity gone".
+  //
+  // If a future phase restores a Management check on the claims path, this test SHOULD
+  // fail — that is the signal, not a regression. Do not delete it to keep the suite quiet.
+  it('JIT (email claim present): the Management lookup is skipped, so the identity-gone 410 does NOT fire — accepted residual T-88.8-02', async () => {
+    mockUserScopeFindOne.mockResolvedValueOnce(null); // no existing row
+    mockIsTombstoned.mockResolvedValueOnce(false);
+    mockGetUserById.mockResolvedValueOnce(null); // would have meant "deleted in Auth0"
+
+    await request(makeApp('auth0|authgone-with-claim')).get('/api/users/auth0|authgone-with-claim');
+
+    // The vendor was never consulted — that is the change BOPS-05 exists to make.
+    expect(mockGetUserById).not.toHaveBeenCalled();
   });
 
   // GET /api/users/search/email/:email DELETED — Phase 87.6 (users-search-email,

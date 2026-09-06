@@ -49,7 +49,9 @@
 // new Event.winner_id/picked_by_id SET NULL FKs from plan 87.2-01) fire automatically
 // on User.destroy via the 87.1 CASCADE / SET NULL graph — no explicit code needed here.
 
-const { Op } = require('sequelize');
+const { Op, UniqueConstraintError, fn, col, where } = require('sequelize');
+// Round 4 #8: THE normalisation rule for a stored address — imported, never re-derived.
+const { normaliseEmail } = require('./provisioningService');
 const {
   User,
   Group,
@@ -292,10 +294,33 @@ async function applyDispositions(user, t) {
   //    FeedbackForm.js to send self.id. Match sub OR uuid OR email so a deleted user's
   //    post-Plan-11 feedback is anonymized too — a sub-only predicate would leave those
   //    UUID-keyed rows un-scrubbed. Both id arms are intentional (see keyspace block).
+  // Round 4 #8: the address arm is CASE-INSENSITIVE, matching the D-42 move
+  // (`LOWER(user_email)`) and friend search — a byte-exact match left rows written under
+  // a case variant un-scrubbed.
+  const normalisedEmail = normaliseEmail(email);
   await Feedback.update(
     { user_id: null, user_email: null },
-    { where: { [Op.or]: [{ user_id: sub }, { user_id: uuid }, { user_email: email }] }, transaction: t }
+    {
+      where: {
+        [Op.or]: [
+          { user_id: sub },
+          { user_id: uuid },
+          ...(normalisedEmail ? [where(fn('lower', col('user_email')), normalisedEmail)] : []),
+        ],
+      },
+      transaction: t,
+    }
   );
+  // Round 4 #16: D-42's argument applies verbatim to GroupInvite — the ADDRESS is the
+  // invite-to-person link (no user column), and this phase's D-41 move actively rewrites
+  // it onto the user's current address. Pending invites addressed to the deleted user
+  // are removed (owned groups' invites were already purged above).
+  if (normalisedEmail) {
+    await GroupInvite.destroy({
+      where: { status: 'pending', [Op.and]: [where(fn('lower', col('invited_email')), normalisedEmail)] },
+      transaction: t,
+    });
+  }
 
   // 4. EventBallotOption.created_by_uuid -> NULL (Users.id UUID; Phase 87.5 PR-1 rekey).
   //    Keep the explicit update for clarity — the new SET NULL FK is the safety net; both
@@ -542,6 +567,96 @@ async function runGoogleCleanup(captured, budgetMs) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Concurrent double-delete discriminator (Phase 88.8 plan 07, SPEC R8 / D-21)
+// ---------------------------------------------------------------------------
+
+// Verified empirically against the test Postgres on 2026-09-04, not assumed: a duplicate
+// PendingAuth0Deletion.create raises name 'SequelizeUniqueConstraintError' with
+// parent.constraint === 'PendingAuth0Deletions_auth0_sub_key' and fields
+// { auth0_sub: '<sub>' }.
+const MARKER_SUB_UNIQUE_CONSTRAINT = 'PendingAuth0Deletions_auth0_sub_key';
+const MARKER_SUB_COLUMN = 'auth0_sub';
+
+/**
+ * DECISION Phase 88.8 plan 07 (R8): a SIBLING discriminator for the marker constraint was
+ * chosen OVER reusing `isEmailCollision` / `isEmailUniqueViolation` from
+ * services/provisioningService.js. The two share a SHAPE, deliberately not a function: one
+ * predicate keyed on two unrelated constraints would make BOTH callers' intent unreadable
+ * at the call site ("is this an email collision or a marker collision?") and would silently
+ * widen either one the next time the other gained a constraint. Copying ten lines is the
+ * cheaper mistake here.
+ *
+ * TWO ARMS, and the second is not redundant. Plan 05 measured that a `findOrCreate`-shaped
+ * error carries NO `parent.constraint` at all (sequelize sets `options.exception = true`,
+ * and the postgres driver rebuilds the error with only `code` and `detail`), so a
+ * constraint-name-only predicate fails OPEN. The `fields` arm is the backstop.
+ *
+ * The `fields` arm is safe from over-matching HERE specifically: `auth0_sub` exists on
+ * exactly one model in this repo (PendingAuth0Deletion — grep-verified 2026-09-04), and the
+ * only INSERT inside the deletion transaction is the marker's. Every other statement in the
+ * transaction is an UPDATE or a DELETE, neither of which can raise this constraint.
+ *
+ * @param {unknown} err
+ * @returns {boolean}
+ */
+function isMarkerSubUniqueViolation(err) {
+  if (!err || err.name !== 'SequelizeUniqueConstraintError') {
+    return false;
+  }
+  const constraint = err.parent && err.parent.constraint;
+  if (constraint === MARKER_SUB_UNIQUE_CONSTRAINT) {
+    return true;
+  }
+  return Object.prototype.hasOwnProperty.call((err && err.fields) || {}, MARKER_SUB_COLUMN);
+}
+
+/**
+ * The two ways a `Users` row can be absent for an authenticated caller. These are the
+ * `deleteAccount` STATUS tokens, not wire codes — routes/users.js maps them to envelopes
+ * (`not_found` -> 410 account_deleted, `not_provisioned` -> 404 not_provisioned).
+ *
+ * `not_found` keeps its historical name deliberately: it is the shipped status Phase 87.2
+ * mapped to the 410, and renaming it would ripple through every caller and test for no
+ * behavioural gain. Only the SECOND token is new.
+ */
+const MISSING_ROW_STATUS = Object.freeze({
+  ALREADY_DELETED: 'not_found',
+  NEVER_PROVISIONED: 'not_provisioned',
+});
+
+/**
+ * DECISION Phase 88.8 plan 07 (SPEC R7, D-19 backend half): ONE shared classifier for
+ * "there is no Users row for this sub", used by BOTH deletion endpoints, was chosen OVER
+ * letting each endpoint decide for itself. Before this, `deleteAccount` Step 0 and the
+ * `GET /users/me/deletion-blockers` pre-flight each hard-coded the tombstone answer, and
+ * two independent copies of a security-relevant rule is exactly how the two endpoints
+ * come to disagree. Sharing the classifier makes disagreement structurally impossible.
+ *
+ * THE TOMBSTONE CHECK RUNS FIRST, AND THAT ORDERING IS THE MITIGATION (threat T-88.8-33).
+ * A tombstoned sub with no row must still get 410 — never the softer 404 — because a 404
+ * tells the frontend "you never had an account", which invites it to offer provisioning
+ * for an account that was deliberately deleted. Do not reorder this.
+ *
+ * ORDERING WITH THE PRIMARY GATE — do NOT "consolidate" the two. `middleware/auth0.js`
+ * (`callerIsTombstoned`, ~:68-84) is the PRIMARY tombstone gate: it 410s a tombstoned
+ * caller before any route in this file runs, and it deliberately FAILS OPEN on a database
+ * error so auth availability is never coupled to DB availability. This classifier is the
+ * BACKSTOP that catches the fail-open case. Deleting either one silently removes a layer.
+ *
+ * @param {string} sub - the caller's Auth0 subject (req.user.user_id). Never a param.
+ * @param {{ transaction?: import('sequelize').Transaction }} [options]
+ * @returns {Promise<'not_found' | 'not_provisioned'>}
+ */
+async function classifyMissingRow(sub, options) {
+  const tombstoned = options
+    ? await PendingAuth0Deletion.isTombstoned(sub, options)
+    : await PendingAuth0Deletion.isTombstoned(sub);
+  return tombstoned
+    ? MISSING_ROW_STATUS.ALREADY_DELETED
+    : MISSING_ROW_STATUS.NEVER_PROVISIONED;
+}
+
 /**
  * The self-serve deletion pipeline (SPEC Req 1-8). Orchestrates, in the FIXED order,
  * capture -> Google cleanup -> DB transaction -> post-commit Auth0 delete -> notice
@@ -552,7 +667,10 @@ async function runGoogleCleanup(captured, budgetMs) {
  *   trusted identity, never a param — SPEC Req 1).
  * @param {{ budgets?: { googleMs?: number, auth0Ms?: number, emailMs?: number } }} [overrides]
  *   Budget overrides for deterministic fast tests only; production uses DEFAULT_BUDGETS.
- * @returns {Promise<{ status: 'deleted' } | { status: 'not_found' } | { status: 'blocked', groups: Array }>}
+ * @returns {Promise<{ status: 'deleted' }
+ *   | { status: 'not_found' }        // row gone AND a deletion tombstone exists -> 410
+ *   | { status: 'not_provisioned' }  // row never existed, no tombstone (R7) -> 404
+ *   | { status: 'blocked', groups: Array }>}
  */
 async function deleteAccount({ userId }, overrides = {}) {
   const sub = userId;
@@ -565,7 +683,11 @@ async function deleteAccount({ userId }, overrides = {}) {
   // + email in memory NOW (Pitfall 2 — they are gone after User.destroy).
   const user = await User.scope('withContactInfo').findOne({ where: { user_id: sub } });
   if (!user) {
-    return { status: 'not_found' }; // repeat-delete is 404/410, not an error (REQ-6c)
+    // Phase 88.8 plan 07 (R7): a missing row is no longer unconditionally "already
+    // deleted". Ask the shared classifier — a repeat delete (tombstone present) still
+    // resolves not_found -> 410 (REQ-6c, unchanged), while a sub that never had a row
+    // resolves not_provisioned -> 404. Neither path touches any external service.
+    return { status: await classifyMissingRow(sub) };
   }
   const captured = {
     id: user.id,
@@ -626,6 +748,39 @@ async function deleteAccount({ userId }, overrides = {}) {
         groups: err._blockedGroups,
         ...(googleAccessRevoked ? { google_access_revoked: true } : {}),
       };
+    }
+    // Phase 88.8 plan 07 (SPEC R8, D-21, threats T-88.8-34 / T-88.8-35) — the loser of a
+    // concurrent double delete. Two overlapping DELETE /users/me for one sub both reach
+    // applyDispositions Step 6 and both try to INSERT the durable marker; the second hits
+    // the unique constraint on auth0_sub. Before this arm that surfaced as a 500, which a
+    // client would then RETRY against an account that is already gone.
+    //
+    // CAUGHT AT THE TRANSACTION BOUNDARY, NOT AT THE `create` CALL (this placement IS
+    // D-21). By the time this catch runs the MANAGED transaction has already rolled back,
+    // so the loser committed nothing and the winner is untouched. Catching at the `create`
+    // would leave the loser executing inside a half-finished transaction and it would go
+    // on to destroy the user row the winner is also destroying.
+    //
+    // KNOWN, ACCEPTED CONSEQUENCE (threat T-88.8-36): the loser's Step 2 Google cleanup has
+    // already run by now. It is best-effort and idempotent, so it simply re-runs against
+    // an already-cleaned grant. That is recorded and accepted, not an oversight. What the
+    // marker DOES prevent is a second Auth0 delete and a second deletion-notice email,
+    // because Step 4 and Step 5 are past this return.
+    //
+    // REJECTED ALTERNATIVES, recorded so they are not re-proposed:
+    //   (a) `PendingAuth0Deletion.findOrCreate` for the marker instead of `create`. The
+    //       loser would then NOT fail: it would proceed through Step 7, destroy zero rows,
+    //       return 200 "your account was deleted", and send a SECOND deletion notice plus a
+    //       second Auth0 delete. Absorbing the violation is the point; swallowing it is not.
+    //   (b) Taking a `FOR UPDATE` lock on the Users row before the marker insert. That
+    //       changes the documented in-transaction owner-re-check lock ordering (Step 3's
+    //       comment above) that the Phase 87.2 threat model depends on, to buy a
+    //       serialization the unique constraint already provides for free.
+    if (isMarkerSubUniqueViolation(err)) {
+      console.warn(
+        `[accountDeletion] Concurrent delete lost the marker race for ${captured.sub}; the winning request owns the deletion. Returning the already-deleted status.`
+      );
+      return { status: MISSING_ROW_STATUS.ALREADY_DELETED };
     }
     // Real DB failure: nothing was committed; surface a retryable (500-mappable) error.
     throw err;
@@ -693,4 +848,6 @@ module.exports = {
   getDeletionBlockers,
   applyDispositions,
   deleteAccount,
+  classifyMissingRow,
+  MISSING_ROW_STATUS,
 };

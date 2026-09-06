@@ -1,5 +1,12 @@
 # Ensuring Email is Available in Auth0 Access Tokens
 
+> **SUPERSEDED (Phase 88.8, 2026-09).** The live procedure is
+> [`auth0/actions/README.md`](../auth0/actions/README.md), and the Action's source of truth is
+> `auth0/actions/post-login-claims.js`. The placeholder namespace used below
+> (`https://your-api-identifier/`) is **no longer read by the backend** — the middleware now
+> reads only the real `https://nextgamenight.app/...` claims. This file is kept for history;
+> do not follow its Step 3 paste procedure.
+
 ## The Issue
 
 When users log in with Google, their email should be available in the Auth0 token. However, by default, Auth0 includes email in the **ID token** but may not include it in the **access token** (which we use for API authentication).

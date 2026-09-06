@@ -1,4 +1,28 @@
 // tests/routes/groups.test.js
+
+// Phase 88.8 plan 06: routes/groups.js no longer imports auth0Service directly, but both
+// of its provisioning writers now delegate to services/provisioningService, which reaches
+// the Auth0 Management API on two paths — an ABSENT email claim, and classifying an email
+// UNIQUE collision (SPEC R5). Without this mock the F2 collision case below issues a REAL
+// Management request from the test suite: it did, and Auth0 answered 404 for the fictional
+// `auth0|f2-victim` sub, so the service correctly took SPEC R5 branch (b) — "the occupant's
+// identity is gone, release the address" — and handed the victim's address to the joiner.
+// The fixture is a bare DB row that never had an Auth0 identity, so that verdict was right
+// about the fixture and wrong about what the test means by "an existing user".
+//
+// The rejection shape is the SHIPPED idiom in ~20 sibling suites (users.claimsFirst,
+// provisionedUsername.clamp, users.test, accountDeletion, ...) and it is also the state
+// production has actually been in since 2026-04 (88.8-CONFIG-FINDING.md: every Management
+// token exchange 403s). It puts the collision on branch (d) — MANAGEMENT_UNAVAILABLE, which
+// FAILS SAFE and never releases an address it cannot prove is orphaned. The F2 expectations
+// below are therefore unchanged, byte for byte. The branch matrix itself is pinned in
+// tests/services/provisioningService.test.js, not here.
+jest.mock('../../services/auth0Service', () => ({
+  getUserById: jest.fn().mockRejectedValue(new Error('Auth0 Management API credentials not configured')),
+  searchUsersByEmail: jest.fn().mockResolvedValue([]),
+  extractUserDetails: jest.fn(() => ({ email: null, username: null, user_id: null })),
+}));
+
 const request = require('supertest');
 const express = require('express');
 const groupRoutes = require('../../routes/groups');

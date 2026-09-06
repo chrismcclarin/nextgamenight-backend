@@ -40,6 +40,10 @@ const mockSequelizeQuery = jest.fn();
 const mockSequelizeTransaction = jest.fn();
 const mockMarkerFindOne = jest.fn();
 const mockMarkerCreate = jest.fn();
+// Phase 88.8 plan 07 (R7): deleteAccount Step 0 now asks the tombstone guard before it
+// concludes anything about a missing Users row. Without this handle EVERY test in this
+// file would throw the moment Step 0 ran.
+const mockMarkerIsTombstoned = jest.fn();
 const mockGPSFindAll = jest.fn();
 
 const mockDeleteCalEvent = jest.fn();
@@ -84,6 +88,7 @@ jest.mock('../../models', () => ({
   PendingAuth0Deletion: {
     findOne: (...a) => mockMarkerFindOne(...a),
     create: (...a) => mockMarkerCreate(...a),
+    isTombstoned: (...a) => mockMarkerIsTombstoned(...a),
   },
   sequelize: {
     transaction: (...a) => mockSequelizeTransaction(...a),
@@ -107,7 +112,9 @@ jest.mock('../../queues', () => ({
   auth0CleanupQueue: { add: (...a) => mockQueueAdd(...a) },
 }));
 
-const { deleteAccount } = require('../../services/accountDeletionService');
+const { UniqueConstraintError } = require('sequelize');
+
+const { deleteAccount, classifyMissingRow } = require('../../services/accountDeletionService');
 
 const SUB = 'google-oauth2|1075';
 const EMAIL = 'player@example.com';
@@ -142,6 +149,9 @@ beforeEach(() => {
   mockSequelizeQuery.mockResolvedValue([]);
   mockMarkerFindOne.mockResolvedValue({ update: jest.fn().mockResolvedValue(undefined) });
   mockMarkerCreate.mockResolvedValue({ id: 'marker-1' });
+  // Phase 88.8 plan 07 (R7): steady state is NO tombstone. Tests that mean "this account
+  // really was deleted" opt in explicitly — see the Step 0 describe block below.
+  mockMarkerIsTombstoned.mockResolvedValue(false);
   mockGPSFindAll.mockResolvedValue([]); // no prompt-settings rows -> 5c scrub no-ops
 
   mockDeleteCalEvent.mockResolvedValue({ deleted: true });
@@ -165,10 +175,27 @@ beforeEach(() => {
 });
 
 describe('deleteAccount — Step 0 / repeat-delete (REQ-6c)', () => {
-  test('missing user resolves { status: "not_found" } without touching externals', async () => {
+  test('missing user WITH a tombstone resolves { status: "not_found" } without touching externals', async () => {
     mockUserFindOne.mockResolvedValue(null);
+    // AMENDED Phase 88.8 plan 07 (R7): a missing row is no longer unconditionally
+    // "already deleted". This test's subject is the REPEAT DELETE (REQ-6c), which by
+    // definition has a tombstone, so it opts in explicitly. The never-provisioned case
+    // is the sibling test below — a deliberate split, not a weakened assertion.
+    mockMarkerIsTombstoned.mockResolvedValue(true);
     const res = await deleteAccount({ userId: SUB });
     expect(res).toEqual({ status: 'not_found' });
+    expect(mockSequelizeTransaction).not.toHaveBeenCalled();
+    expect(mockDeleteUser).not.toHaveBeenCalled();
+    expect(mockEmailSend).not.toHaveBeenCalled();
+  });
+
+  // Phase 88.8 plan 07 (SPEC R7, D-19 backend half).
+  test('missing user with NO tombstone resolves { status: "not_provisioned" } without touching externals', async () => {
+    mockUserFindOne.mockResolvedValue(null);
+    // mockMarkerIsTombstoned defaults to false.
+    const res = await deleteAccount({ userId: SUB });
+    expect(res).toEqual({ status: 'not_provisioned' });
+    expect(mockMarkerIsTombstoned).toHaveBeenCalledWith(SUB);
     expect(mockSequelizeTransaction).not.toHaveBeenCalled();
     expect(mockDeleteUser).not.toHaveBeenCalled();
     expect(mockEmailSend).not.toHaveBeenCalled();
@@ -178,6 +205,114 @@ describe('deleteAccount — Step 0 / repeat-delete (REQ-6c)', () => {
     await deleteAccount({ userId: SUB });
     expect(mockUserScope).toHaveBeenCalledWith('withContactInfo');
     expect(mockUserFindOne).toHaveBeenCalledWith({ where: { user_id: SUB } });
+  });
+});
+
+// Phase 88.8 plan 07 (SPEC R7 / D-19 backend half, threat T-88.8-33) — the ONE classifier
+// both deletion endpoints share, tested directly so the tombstone-first ordering is pinned
+// here rather than only implied by the two deleteAccount cases above.
+describe('classifyMissingRow — the 410-vs-404 split (R7)', () => {
+  test('a tombstoned sub classifies as already-deleted (not_found), never the softer 404', async () => {
+    mockMarkerIsTombstoned.mockResolvedValue(true);
+    await expect(classifyMissingRow(SUB)).resolves.toBe('not_found');
+  });
+
+  test('a sub with no tombstone classifies as never-provisioned (not_provisioned)', async () => {
+    mockMarkerIsTombstoned.mockResolvedValue(false);
+    await expect(classifyMissingRow(SUB)).resolves.toBe('not_provisioned');
+  });
+
+  test('the tombstone check runs FIRST — a tombstoned sub with no row can never be softened to 404', async () => {
+    // T-88.8-33 (elevation of privilege): the ordering IS the mitigation. If a future
+    // refactor ever concluded "never provisioned" before consulting the tombstone, a
+    // deleted account would be told it never existed and the FE would offer to create
+    // one. This asserts the guard is consulted, and that its `true` wins.
+    mockMarkerIsTombstoned.mockResolvedValue(true);
+    const result = await classifyMissingRow(SUB);
+    expect(mockMarkerIsTombstoned).toHaveBeenCalledWith(SUB);
+    expect(result).toBe('not_found');
+  });
+
+  test('passes a transaction option straight through to the tombstone guard', async () => {
+    mockMarkerIsTombstoned.mockResolvedValue(false);
+    const t = { fake: 'txn' };
+    await classifyMissingRow(SUB, { transaction: t });
+    expect(mockMarkerIsTombstoned).toHaveBeenCalledWith(SUB, { transaction: t });
+  });
+});
+
+// Phase 88.8 plan 07 (SPEC R8, D-21, threats T-88.8-34 / T-88.8-35) — the concurrent
+// double-delete. The loser of the race hits the marker's unique constraint on auth0_sub
+// from inside the deletion transaction; before this it escaped as an internal error.
+describe('deleteAccount — concurrent double delete (R8)', () => {
+  // Build the two shapes a Sequelize unique violation can arrive in. Plan 05's measured
+  // matrix is the reason both are covered: a plain create() carries BOTH parent.constraint
+  // and fields, but a findOrCreate-shaped error carries NO parent.constraint at all, so a
+  // constraint-name-only predicate silently fails open.
+  function markerViolation({ withConstraint = true, withFields = true } = {}) {
+    const err = new UniqueConstraintError({
+      message: 'Validation error',
+      fields: withFields ? { auth0_sub: SUB } : undefined,
+      parent: withConstraint
+        ? { constraint: 'PendingAuth0Deletions_auth0_sub_key', sql: '', name: '', message: '' }
+        : { sql: '', name: '', message: '' },
+    });
+    return err;
+  }
+
+  function failMarkerWith(err) {
+    mockMarkerCreate.mockReset();
+    mockMarkerCreate.mockRejectedValue(err);
+  }
+
+  test('a marker unique violation (constraint name) resolves { status: "not_found" } -> 410, never a throw', async () => {
+    failMarkerWith(markerViolation({ withFields: false }));
+    const res = await deleteAccount({ userId: SUB });
+    expect(res).toEqual({ status: 'not_found' });
+    // The loser committed nothing, so it must not fire the winner's post-commit work.
+    expect(mockDeleteUser).not.toHaveBeenCalled();
+    expect(mockEmailSend).not.toHaveBeenCalled();
+    expect(mockQueueAdd).not.toHaveBeenCalled();
+  });
+
+  test('a marker unique violation carrying ONLY fields (no parent.constraint) is still recognised', async () => {
+    failMarkerWith(markerViolation({ withConstraint: false }));
+    await expect(deleteAccount({ userId: SUB })).resolves.toEqual({ status: 'not_found' });
+  });
+
+  test('a unique violation on a DIFFERENT column is NOT absorbed — it rethrows as today', async () => {
+    failMarkerWith(new UniqueConstraintError({
+      message: 'Validation error',
+      fields: { email: EMAIL },
+      parent: { constraint: 'Users_email_key', sql: '', name: '', message: '' },
+    }));
+    await expect(deleteAccount({ userId: SUB })).rejects.toBeInstanceOf(UniqueConstraintError);
+    expect(mockDeleteUser).not.toHaveBeenCalled();
+    expect(mockEmailSend).not.toHaveBeenCalled();
+  });
+
+  test('a plain database failure inside the txn still rethrows (the new arm did not widen)', async () => {
+    failMarkerWith(new Error('connection reset'));
+    await expect(deleteAccount({ userId: SUB })).rejects.toThrow('connection reset');
+  });
+
+  // The owner-gate sentinel arm shares this boundary catch with the new arm, so its two
+  // dedicated tests above ('IN-TXN blocked result carries google_access_revoked' and
+  // 'pre-flight blocked result does NOT') are what prove the new arm did not shadow it.
+  // Re-asserted here so a future reader sees both arms exercised in one place.
+  test('the owner-gate sentinel arm still returns the blocked status alongside the new arm', async () => {
+    mockUGFindAll.mockReset();
+    mockUGFindAll.mockResolvedValueOnce([]); // Step 1 fast-fail gate passes
+    mockUGFindAll.mockResolvedValueOnce([{ group_id: 'g1' }]); // in-txn re-check blocks
+    mockSequelizeQuery.mockImplementation(async (sql) => {
+      if (typeof sql === 'string' && sql.includes('"UserGroups"') && sql.includes('FOR UPDATE')) {
+        return [{ user_uuid: UUID }, { user_uuid: '22222222-2222-2222-2222-222222222222' }];
+      }
+      return [];
+    });
+    const res = await deleteAccount({ userId: SUB });
+    expect(res.status).toBe('blocked');
+    expect(res.groups).toEqual([{ id: 'g1', name: 'Group One', memberCount: 2 }]);
   });
 });
 

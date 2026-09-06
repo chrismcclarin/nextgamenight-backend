@@ -13,6 +13,13 @@
 // A red on any nested `user_id` is a missed nested-include strip to fix at its
 // owning task — NEVER an allowlist addition.
 //
+// Phase 88.8 plan 08 adds a THIRD describe block at the foot of this file with
+// its own, separate and narrower coverage claim: on the six payloads that phase
+// widened, `picture_url` is PRESENT (key present even when null) and `email`,
+// `phone` and `email_changed_at` are ABSENT at any depth; plus friend search
+// carries no `picture_url`. It claims nothing about any other endpoint or any
+// other field, and it does NOT widen the Req 1 claim above.
+//
 // ============================================================================
 // ALLOWLIST NOW EMPTY (Phase 87.4 Plan 11, PR-2).
 //
@@ -96,6 +103,9 @@ const {
   Event,
   EventParticipation,
   Game,
+  // Phase 88.8 plan 08: the avatar block re-reads a seeded row unscoped to get
+  // its email for the friend-search probe (defaultScope excludes email).
+  User,
   Friendship,
   AvailabilityPrompt,
   AvailabilityResponse,
@@ -159,6 +169,25 @@ function expectSubFree(res, label) {
 
 // Harness: inject a verified req.user ahead of every router (mirrors the real
 // verifyAuth0Token middleware server.js mounts).
+// HIGH-D (round 3): the EXACT key set of the self read and of the three write echoes.
+// Sorted. `Groups` is the self GET's include; the echoes are default-scope rows, so
+// email / phone / email_changed_at are absent there by the model's defaultScope.
+const SELF_WIRE_STRIPPED = ['google_calendar_token', 'google_calendar_refresh_token', 'is_platform_admin'];
+const SELF_WIRE_KEYS = [
+  'Groups', 'createdAt', 'email', 'email_changed_at', 'email_notifications_enabled',
+  'google_calendar_enabled', 'id', 'notification_preferences', 'orphaned_at',
+  'pending_email_change', 'phone', 'phone_verified', 'picture_url', 'revert_available',
+  'sms_enabled', 'sms_welcome_sent_at', 'timezone', 'tutorial_version', 'updatedAt',
+  'user_id', 'username',
+];
+// PUT username and DELETE phone load their row through `req.selfUser ?? findOne` — the
+// DEFAULT scope, so the three excluded columns are absent. PATCH notification-preferences
+// loads `User.scope('withContactInfo')` (routes/users.js, its own handler), so its echo
+// carries them — and therefore a BOOLEAN revert_available, not the null the other two
+// answer. Pinned per echo so the pin says what actually ships.
+const SELF_ECHO_KEYS = SELF_WIRE_KEYS.filter((k) => !['Groups', 'email', 'phone', 'email_changed_at'].includes(k));
+const SELF_ECHO_KEYS_WITH_CONTACT = SELF_WIRE_KEYS.filter((k) => k !== 'Groups');
+
 let currentActor = null;
 const app = express();
 app.use(express.json());
@@ -413,6 +442,20 @@ describe('Wire sweep (87.3-09 Req 1): no Auth0 sub crosses the wire outside the 
     expectSubFree(self, 'GET /users/:user_id (self)');
     expect(self.body.user_id).toBe(owner.id); // alias — name stable, UUID value
 
+    /* Phase 88.8 code review round 3 HIGH-D — THE SELF KEY-SET PIN, deliberately EXACT.
+       toSelfWire is a bare toJSON() of a withContactInfo row (an EMPTY scope override
+       that restores EVERY column), so before round 3 the self read shipped
+       `google_calendar_token`, `google_calendar_refresh_token` and `is_platform_admin`
+       to the browser — and every gate stayed green, because the sweeps above pin
+       OTHER-user payloads only. A deny-list of those three would catch those three; this
+       pin catches the NEXT sensitive column: a new Users attribute reaching the self
+       wire must red here and be reviewed. Updating this list IS the review. */
+    expect(Object.keys(self.body).sort()).toEqual(SELF_WIRE_KEYS);
+    for (const secret of SELF_WIRE_STRIPPED) {
+      // Object idiom so the failure names the key (jest's expect takes one argument).
+      expect({ secret, hits: collectKeyHits(self.body, [secret]) }).toEqual({ secret, hits: [] });
+    }
+
     // GET /users/search/email/:email DELETED — Phase 87.6 (users-search-email,
     // Tier 1). A deleted route 404s and cannot be sub-free-probed (expectSubFree
     // requires a 2xx), so it is dropped from this sweep. Resurrection guards:
@@ -440,6 +483,20 @@ describe('Wire sweep (87.3-09 Req 1): no Auth0 sub crosses the wire outside the 
     );
     expectSubFree(phoneGone, 'DELETE /users/:user_id/phone');
     expect(phoneGone.body.user_id).toBe(owner.id);
+
+    // HIGH-D: the three write echoes ride toSelfWire on a DEFAULT-scope row, so their
+    // key set is the self set minus the defaultScope exclusions and the Groups include —
+    // and never the stripped secrets. Pinned EXACTLY for the same reason as the GET.
+    for (const [label, echo, expected] of [
+      ['PUT username', rename, SELF_ECHO_KEYS],
+      ['PATCH notification-preferences', prefs, SELF_ECHO_KEYS_WITH_CONTACT],
+      ['DELETE phone', phoneGone, SELF_ECHO_KEYS],
+    ]) {
+      expect({ label, keys: Object.keys(echo.body).sort() }).toEqual({ label, keys: expected });
+      for (const secret of SELF_WIRE_STRIPPED) {
+        expect({ label, secret, hits: collectKeyHits(echo.body, [secret]) }).toEqual({ label, secret, hits: [] });
+      }
+    }
 
     // POST /users/:user_id/refresh echo REMOVED — route DELETED (Phase 87.6
     // users-refresh, Tier 3). A deleted route 404s and cannot be sub-free-probed.
@@ -732,5 +789,289 @@ describe('Wire sweep (87.4-11 PR-2): availability + prompt-settings — allowlis
       .post('/api/availability-prefill/gcal')
       .send({ magic_token: token, start_date: '2026-08-01', num_days: 7, timezone: 'UTC' });
     expectBodySubFree(gcal, 'POST /availability-prefill/gcal (magic token)');
+  });
+});
+
+// ===========================================================================
+// Phase 88.8 plan 08 (D-23, SPEC R11 as amended by A6) — the avatar sweep.
+//
+// COVERAGE CLAIM (stated precisely — NOT widened by accident, and NOT a claim
+// about the whole API): for the SIX payloads the phase widened — the group
+// roster (BOTH branches of GET /groups/:group_id/users), the event participant
+// list, the RSVP roster, the RSVP write echo, the friends list and the brings
+// list — this block claims exactly two things:
+//   (+) `picture_url` is PRESENT as a key on the user-shaped objects, including
+//       when the stored value is null. An absent key and a null key are
+//       different on the wire and the frontend schema declares the field
+//       optional-and-nullable, so only the PRESENT-KEY assertion proves the
+//       projection actually landed.
+//   (-) `email`, `phone` and `email_changed_at` are ABSENT at ANY nesting
+//       depth. THREE fields, not two: SPEC A12 withdrew the second address
+//       column an earlier draft of this truth named, and `email_changed_at`
+//       (plan 02, D-36) took its place in the models/User.js defaultScope
+//       exclude list and therefore in this assertion.
+// Plus one negative surface: GET /friendships/search carries NO `picture_url`
+// — it is a LOOKUP, one line away in the same route file from the two widened
+// friendship includes, which is exactly why it needs an assertion and not a
+// convention (T-88.8-38 / R10).
+//
+// The allowlist above stays EMPTY. A red here is a regression to fix at its
+// owning task, NEVER an allowlist addition.
+//
+// Run ALONE (Pitfall 6 — shared-Postgres suite), same as the blocks above.
+// ===========================================================================
+
+// The three fields that must never cross the user boundary. Kept as ONE
+// constant so a future addition is a single edit, and asserted RECURSIVELY via
+// the same walk shape the sub matcher above already uses — a top-level
+// `not.toHaveProperty` would miss a nested User include, which is precisely
+// where these leak.
+// `revert_available` (Phase 88.8 round 2 HIGH-B) and `pending_email_change` (round 3
+// DR2 — omitted by mistake when its boolean sibling was added; it carries an actual
+// ADDRESS, so it is the more sensitive of the two) are self-only DERIVED keys assigned
+// by toSelfWire / emailChangeBody alone and have no business on anyone else's payload.
+// Forbidden at any depth for the same reason as `email_changed_at`. This list is the
+// backend half of the FE pin in identity.contract.test.ts `neverOnOtherUsers`; the
+// two must name the SAME five fields.
+const FORBIDDEN_USER_PII = ['email', 'phone', 'email_changed_at', 'pending_email_change', 'revert_available'];
+
+function collectKeyHits(node, keys, path = '$', hits = []) {
+  if (Array.isArray(node)) {
+    node.forEach((v, i) => collectKeyHits(v, keys, `${path}[${i}]`, hits));
+    return hits;
+  }
+  if (node && typeof node === 'object') {
+    for (const [k, v] of Object.entries(node)) {
+      if (keys.includes(k)) hits.push(`${path}.${k} = ${JSON.stringify(v)}`);
+      collectKeyHits(v, keys, `${path}.${k}`, hits);
+    }
+    return hits;
+  }
+  return hits;
+}
+
+function expectNoUserPII(body, label) {
+  const hits = collectKeyHits(body, FORBIDDEN_USER_PII);
+  if (hits.length > 0) {
+    throw new Error(
+      `Forbidden user PII on the wire from ${label} (T-88.8-37 — picture_url is the ONLY user field 88.8 adds; fix at the owning projection, never allowlist):\n  ${hits.join('\n  ')}`
+    );
+  }
+}
+
+// Assert the key is PRESENT (even when null) on every element, and report which
+// element failed. `rows` must already have been guarded as non-empty.
+function expectPictureUrlKey(rows, label) {
+  rows.forEach((row, i) => {
+    if (!Object.prototype.hasOwnProperty.call(row, 'picture_url')) {
+      throw new Error(
+        `${label}[${i}] has NO picture_url key (an absent key !== a null key; the projection did not land): ${JSON.stringify(row)}`
+      );
+    }
+  });
+}
+
+describe('Wire sweep (88.8-08 R11/A6): picture_url present on the six chip payloads, three PII fields absent', () => {
+  const AVATAR = 'https://lh3.googleusercontent.com/a/sweep-avatar=s96-c';
+
+  let withAvatar; // group member + participant, picture_url NON-NULL
+  let withoutAvatar; // group member + participant, picture_url NULL (nullable shape)
+  let gameOnly; // participant on the event but NOT a group member (branch 2 caller)
+  let group;
+  let game;
+  let event;
+
+  beforeEach(async () => {
+    withAvatar = await makeUser({ username: 'chip-with', picture_url: AVATAR });
+    withoutAvatar = await makeUser({ username: 'chip-without' }); // picture_url defaults null
+    gameOnly = await makeUser({ username: 'chip-gameonly', picture_url: AVATAR });
+
+    group = await makeGroup({ name: 'Chip Sweep Group' });
+    await addToGroup(withAvatar, group, 'owner');
+    await addToGroup(withoutAvatar, group, 'member');
+    // gameOnly is DELIBERATELY not added to the group — that is what makes the
+    // caller take branch 2 of GET /groups/:group_id/users.
+
+    game = await Game.create({ name: 'Chip Sweep Game', is_custom: true });
+
+    event = await Event.create({
+      group_id: group.id,
+      game_id: game.id,
+      start_date: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+      status: 'scheduled',
+      // A name-only participant with no user row behind it — the serializer
+      // must emit an EXPLICIT picture_url: null for this one.
+      custom_participants: [{ username: 'Kitchen Table Steve', score: null, placement: null }],
+    });
+    await EventParticipation.create({ event_id: event.id, user_id: withAvatar.id });
+    await EventParticipation.create({ event_id: event.id, user_id: withoutAvatar.id });
+    await EventParticipation.create({ event_id: event.id, user_id: gameOnly.id });
+
+    await makeEventRsvp(event, withAvatar, { status: 'yes' });
+    await makeEventRsvp(event, withoutAvatar, { status: 'maybe' });
+    await makeEventBring(event, withAvatar, game);
+    await makeEventBring(event, withoutAvatar, game);
+
+    await makeFriendship(withAvatar, withoutAvatar, { status: 'accepted' });
+
+    currentActor = withAvatar.user_id;
+  });
+
+  afterEach(() => {
+    currentActor = null;
+  });
+
+  it('group roster — MEMBER branch of GET /groups/:group_id/users carries picture_url (value AND null), no PII', async () => {
+    const res = await request(app).get(`/api/groups/${group.id}/users`);
+    expect(res.status).toBe(200);
+    // Anti-vacuity: a zero-length roster makes every assertion below vacuous.
+    expect(Array.isArray(res.body)).toBe(true);
+    expect(res.body.length).toBeGreaterThanOrEqual(2);
+
+    expectPictureUrlKey(res.body, 'GET /groups/:group_id/users (member branch)');
+    // Both halves of the nullable shape are exercised on a real response.
+    const seeded = res.body.find((u) => u.id === withAvatar.id);
+    const nulled = res.body.find((u) => u.id === withoutAvatar.id);
+    expect(seeded.picture_url).toBe(AVATAR);
+    expect(nulled.picture_url).toBeNull();
+
+    expectNoUserPII(res.body, 'GET /groups/:group_id/users (member branch)');
+    expectSubFree(res, 'GET /groups/:group_id/users (member branch)');
+  });
+
+  it('group roster — GAME-ONLY branch carries picture_url through the fail-closed stripMemberPII allow-list', async () => {
+    // THE reason Task 1's allow-list edit exists. stripMemberPII is fail-CLOSED,
+    // so before that edit this branch dropped picture_url silently: avatars that
+    // work for group members and vanish for game-only participants, one branch
+    // of one endpoint, no error and no log.
+    currentActor = gameOnly.user_id;
+    const res = await request(app).get(`/api/groups/${group.id}/users`);
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body)).toBe(true);
+    // Anti-vacuity: co-attendees PLUS the injected synthetic caller row.
+    expect(res.body.length).toBeGreaterThanOrEqual(2);
+
+    expectPictureUrlKey(res.body, 'GET /groups/:group_id/users (game-only branch)');
+
+    // The co-attendee row came through the strip and kept its avatar.
+    const stripped = res.body.find((u) => u.id === withAvatar.id);
+    expect(stripped).toBeTruthy();
+    expect(stripped.picture_url).toBe(AVATAR);
+
+    // The injected synthetic caller row (UserGroup === null is the Phase 71.1
+    // game-only signal) also goes through the strip, and also keeps its avatar.
+    const callerRow = res.body.find((u) => u.id === gameOnly.id);
+    expect(callerRow).toBeTruthy();
+    expect(callerRow.UserGroup).toBeNull();
+    expect(callerRow.picture_url).toBe(AVATAR);
+
+    expectNoUserPII(res.body, 'GET /groups/:group_id/users (game-only branch)');
+    expectSubFree(res, 'GET /groups/:group_id/users (game-only branch)');
+  });
+
+  it('event participants — the hand-copy serializer emits picture_url, and an EXPLICIT null for name-only participants', async () => {
+    const res = await request(app).get(`/api/events/${event.id}`);
+    expect(res.status).toBe(200);
+    const parts = res.body.EventParticipations;
+    // Anti-vacuity: 3 real participants + 1 custom.
+    expect(Array.isArray(parts)).toBe(true);
+    expect(parts.length).toBeGreaterThanOrEqual(4);
+
+    expectPictureUrlKey(parts, 'GET /events/:event_id EventParticipations');
+
+    const seeded = parts.find((p) => p.user_id === withAvatar.id);
+    const nulled = parts.find((p) => p.user_id === withoutAvatar.id);
+    expect(seeded.picture_url).toBe(AVATAR);
+    expect(nulled.picture_url).toBeNull();
+
+    // The name-only row: EXPLICIT null, not an omitted key. Same reason the row
+    // already emits an explicit `user_id: null`.
+    const custom = parts.find((p) => p.is_custom === true);
+    expect(custom).toBeTruthy();
+    expect(custom.username).toBe('Kitchen Table Steve');
+    expect(Object.prototype.hasOwnProperty.call(custom, 'picture_url')).toBe(true);
+    expect(custom.picture_url).toBeNull();
+
+    expectNoUserPII(res.body, 'GET /events/:event_id');
+    expectSubFree(res, 'GET /events/:event_id');
+  });
+
+  it('RSVP roster — GET /rsvp/event/:event_id nested User carries picture_url, no PII', async () => {
+    const res = await request(app).get(`/api/rsvp/event/${event.id}`);
+    expect(res.status).toBe(200);
+    const users = res.body.rsvps.map((r) => r.User);
+    expect(users.length).toBeGreaterThanOrEqual(2); // anti-vacuity
+
+    expectPictureUrlKey(users, 'GET /rsvp/event/:event_id rsvps[].User');
+    expect(users.find((u) => u.id === withAvatar.id).picture_url).toBe(AVATAR);
+    expect(users.find((u) => u.id === withoutAvatar.id).picture_url).toBeNull();
+
+    expectNoUserPII(res.body, 'GET /rsvp/event/:event_id');
+    expectSubFree(res, 'GET /rsvp/event/:event_id');
+  });
+
+  it('RSVP write echo — POST /rsvp nested User carries picture_url (echo and roster must not disagree)', async () => {
+    const res = await request(app)
+      .post('/api/rsvp')
+      .send({ event_id: event.id, status: 'yes' });
+    expect(res.status).toBeGreaterThanOrEqual(200);
+    expect(res.status).toBeLessThan(300);
+    expect(res.body.User).toBeTruthy(); // anti-vacuity
+
+    expectPictureUrlKey([res.body.User], 'POST /rsvp body.User');
+    expect(res.body.User.picture_url).toBe(AVATAR);
+
+    expectNoUserPII(res.body, 'POST /rsvp (write echo)');
+    expectSubFree(res, 'POST /rsvp (write echo)');
+  });
+
+  it('friends list — GET /friendships Requester/Addressee carry picture_url (value AND null), no PII', async () => {
+    const res = await request(app).get('/api/friendships');
+    expect(res.status).toBe(200);
+    expect(res.body.length).toBeGreaterThan(0); // anti-vacuity
+
+    const people = res.body.flatMap((f) => [f.Requester, f.Addressee]).filter(Boolean);
+    expect(people.length).toBeGreaterThanOrEqual(2); // anti-vacuity
+    expectPictureUrlKey(people, 'GET /friendships Requester/Addressee');
+    expect(people.find((p) => p.id === withAvatar.id).picture_url).toBe(AVATAR);
+    expect(people.find((p) => p.id === withoutAvatar.id).picture_url).toBeNull();
+
+    expectNoUserPII(res.body, 'GET /friendships');
+    expectSubFree(res, 'GET /friendships');
+  });
+
+  it('brings list — GET /event-brings/event/:event_id nested User carries picture_url, no PII', async () => {
+    const res = await request(app).get(`/api/event-brings/event/${event.id}`);
+    expect(res.status).toBe(200);
+    const users = res.body.map((b) => b.User).filter(Boolean);
+    expect(users.length).toBeGreaterThanOrEqual(2); // anti-vacuity
+
+    expectPictureUrlKey(users, 'GET /event-brings/event/:event_id [].User');
+    expect(users.find((u) => u.id === withAvatar.id).picture_url).toBe(AVATAR);
+    expect(users.find((u) => u.id === withoutAvatar.id).picture_url).toBeNull();
+
+    expectNoUserPII(res.body, 'GET /event-brings/event/:event_id');
+    expectSubFree(res, 'GET /event-brings/event/:event_id');
+  });
+
+  it('friend SEARCH — GET /friendships/search must NOT carry picture_url (lookup, not a roster: T-88.8-38 / R10)', async () => {
+    // The negative surface. This projection sits ~200 lines from the two
+    // friendship includes widened in the same file and in the same commit, and
+    // widening it turns an identity oracle into an enumeration surface. The
+    // seeded target HAS a stored avatar, so a widened projection would show up
+    // as a real value here — this assertion is non-vacuous by construction.
+    const target = await User.unscoped().findByPk(withoutAvatar.id);
+    await target.update({ picture_url: AVATAR });
+
+    const res = await request(app).get(
+      `/api/friendships/search?email=${encodeURIComponent(target.email)}`
+    );
+    expect(res.status).toBe(200);
+    expect(res.body.id).toBe(withoutAvatar.id); // anti-vacuity: a real row came back
+    expect(res.body).not.toHaveProperty('picture_url');
+    expect(Object.keys(res.body).sort()).toEqual(['id', 'username']);
+
+    expectNoUserPII(res.body, 'GET /friendships/search');
+    expectSubFree(res, 'GET /friendships/search');
   });
 });

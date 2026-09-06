@@ -50,12 +50,22 @@ const SingleUseToken = sequelize.define('SingleUseToken', {
     // (`ALTER COLUMN "user_id" DROP NOT NULL`).
   },
   purpose: {
-    type: DataTypes.ENUM('oauth_state', 'rsvp', 'group_restore'),
+    type: DataTypes.ENUM('oauth_state', 'rsvp', 'group_restore', 'email_change_verify'),
     allowNull: false,
     // group_restore (Phase 88.2, D-02): backs the emailed group-restore acceptance
     // link. SingleUseToken was chosen over MagicToken (whose prompt_id is
     // allowNull:false with a CASCADE FK to AvailabilityPrompts) and over a new table
     // (this model exists to be the shared one — see the header).
+    //
+    // email_change_verify (Phase 88.8, D-07/D-35; owner-ruled 2026-09-04): backs the
+    // emailed CODE that proves a user controls the address they are changing TO. The
+    // pending address itself lives in `target` below. Chosen over a new table for the
+    // same reason group_restore was — the account-deletion sweep already destroys
+    // these rows by `user_id = sub` (services/accountDeletionService.js:286,
+    // services/pendingAuth0DeletionSweep.js:203) and a new table would silently opt
+    // out of it, which post-A12 would strand a real pending email address.
+    // Prod counterpart:
+    // migrations/20260902000004-single-use-tokens-email-change-verify.js.
   },
   event_id: {
     type: DataTypes.UUID,
@@ -112,6 +122,95 @@ const SingleUseToken = sequelize.define('SingleUseToken', {
     type: DataTypes.DATE,
     allowNull: true,
     // Set on atomic consume.
+  },
+  target: {
+    type: DataTypes.STRING,
+    allowNull: true,
+    // The PENDING address an email_change_verify token proves; NULL for every other
+    // purpose. Post-SPEC-A12 this is the ONLY place a requested-but-unverified
+    // address is ever stored.
+    //
+    // DECISION Phase 88.8 D-35: the pending address lives HERE, on the token row,
+    // chosen OVER two alternatives.
+    //   (a) A `pending_email` column on Users — REJECTED. It reintroduces the second
+    //       address column SPEC A12 deleted and duplicates this one, giving two
+    //       sources of truth for the same fact.
+    //   (b) Writing the pending address straight into `Users.email` behind a
+    //       verified flag — the shape the phone flow uses at routes/users.js
+    //       (`user.update({ phone: result.e164, phone_verified: false })`) — REJECTED
+    //       AS DANGEROUS. `phone` is not an identity key and `email` is: an
+    //       unverified address sitting in the identity column is matched by all three
+    //       invite-acceptance gates (routes/invites.js:593, :664, :757) and returned
+    //       by friend search (routes/friendships.js:146), so anyone could type a
+    //       stranger's address, never verify it, and be matched to that stranger's
+    //       invites. Keeping it here makes the identity column
+    //       verified-by-construction rather than verified-by-remembering-a-guard.
+    //
+    // RETENTION (T-88.8-71, accepted and recorded, not silent): the address persists
+    // on used/revoked rows until the account-deletion sweep destroys them
+    // (services/accountDeletionService.js:286,
+    // services/pendingAuth0DeletionSweep.js:203). Token rows are never serialized to
+    // the wire — the consumers build narrow responses (routes/groups.js:691,
+    // services/groupRecoveryService.js:414).
+    //
+    // NO INDEX, deliberately: plan 09 never looks a token up BY address. It resolves
+    // by `nonce` (single_use_tokens_nonce_unique) or by `purpose + user_id` (the
+    // leading prefix of single_use_tokens_purpose_user_event_status). Do not add one
+    // for symmetry — it would index a personal address for no reader.
+    //
+    // Prod counterpart: migrations/20260902000005-add-target-to-single-use-tokens.js.
+  },
+  send_failed_at: {
+    type: DataTypes.DATE,
+    allowNull: true,
+    // The mail carrying this token was REFUSED BY THE PROVIDER, so the row exists but
+    // no code was ever delivered. NULL on every row whose mail was not refused, and
+    // NULL for every purpose that sends no mail.
+    //
+    // DECISION Phase 88.8 (owner ruling 2026-09-04, review round 4 defect 2 — "keep
+    // the token"). A reader who finds a nullable timestamp on a token table with one
+    // consumer will otherwise read it as dead weight, so:
+    //
+    // WHAT IT IS FOR. Plan 09's per-user hourly mail budget (D-10, N=3) counts
+    // email_change_verify rows CREATED in the last hour. It must count at MINT time,
+    // inside the locked transaction — counting anything only known AFTER the mail
+    // leaves reopens the T-88.8-42 burst hole the lock exists to close. This column is
+    // the compensating write that lets a row stop counting AFTER the fact. The
+    // predicate plan 09 depends on is:
+    //     createdAt > now() - interval '1 hour' AND send_failed_at IS NULL
+    //
+    // CHOSEN OVER four alternatives:
+    //   (a) DESTROYING the row on a provider refusal (what plan 09 said before the
+    //       ruling) — REJECTED. It left the user with no way out: plan 09's resend
+    //       handler reads the address to re-send from the ACTIVE TOKEN ROW, so with
+    //       the row gone Resend answered the validation envelope forever, Verify had
+    //       no nonce to match, and a reload computed `pending_email_change: null` and
+    //       dropped the section to idle — while the response still said
+    //       `outcome: 'code_sent'` and plan 13 still rendered awaiting-code. One
+    //       nullable timestamp buys back all three.
+    //   (b) LETTING THE FAILED ATTEMPT CONSUME THE BUDGET (no column at all) —
+    //       REJECTED. A provider outage would spend a user's three-per-hour allowance
+    //       on mails that never left, and the shipped remedy for a refused send is
+    //       Resend, which mints again.
+    //   (c) BACK-DATING `createdAt` so the row falls out of the count window —
+    //       REJECTED. It falsifies a timestamp other code and any future audit reads;
+    //       that is the fragile-shortcut class this project bans outright.
+    //   (d) A FOURTH `status` ENUM value — REJECTED. The row must stay 'active' to
+    //       remain consumable by consumeByNonce's `status = 'active'` predicate, and
+    //       CONTEXT D-07 records that a Postgres ENUM value cannot be dropped by
+    //       down().
+    //
+    // Mirrors the nullable-timestamp-as-state-marker idiom plan 88.8-02 ships twice on
+    // Users (orphaned_at, email_changed_at) and the same reasoning D-36 records for a
+    // nullable DATE over a boolean: same guard cost, and it records WHEN.
+    //
+    // NO INDEX: the count already rides the leading `purpose, user_id` prefix of
+    // single_use_tokens_purpose_user_event_status below; `send_failed_at IS NULL` is a
+    // filter over rows that prefix has already narrowed to one user, so D-39's "NO new
+    // index is required" survives intact.
+    //
+    // Prod counterpart:
+    // migrations/20260902000006-add-send-failed-at-to-single-use-tokens.js.
   },
 }, {
   // Explicit snake_case table name — the migration creates `single_use_tokens`,
@@ -187,19 +286,32 @@ const SingleUseToken = sequelize.define('SingleUseToken', {
  *   The atomic single-UPDATE shape is preserved verbatim. Do NOT convert this to
  *   findOne-then-update to "make the transaction case clearer" — that reintroduces the
  *   check-then-mark race the whole function exists to avoid (T-88.2-07).
+ * @param {string} [options.purpose] - Phase 88.8 plan 09 (ADDITIVE, optional): narrow
+ *   the SAME single UPDATE to one purpose. Omitted by every pre-existing caller, so
+ *   routes/googleAuth.js:175, routes/rsvp.js:248 and
+ *   services/groupRecoveryService.js:517 behave exactly as they did.
+ * @param {string} [options.user_id] - Phase 88.8 plan 09 (ADDITIVE, optional): narrow
+ *   the SAME single UPDATE to one user. Together with `purpose` this is what makes the
+ *   email-change verify route unable to consume ANOTHER user's code, and unable to be
+ *   probed for one — a foreign nonce simply affects zero rows and is reported as
+ *   `invalid`, indistinguishable from a wrong code. Both predicates are added to the
+ *   existing WHERE; the atomic single-UPDATE shape is untouched.
  * @returns {Promise<Object|null>} The consumed row (with its pre-update field
  *   values, plus the now-'used' status) if consumption succeeded, else null.
  */
 SingleUseToken.consumeByNonce = async function consumeByNonce(nonce, options = {}) {
   if (!nonce) return null;
+  const where = {
+    nonce,
+    status: 'active',
+    expires_at: { [Op.gt]: new Date() },
+  };
+  if (options.purpose !== undefined) where.purpose = options.purpose;
+  if (options.user_id !== undefined) where.user_id = options.user_id;
   const [, rows] = await SingleUseToken.update(
     { status: 'used', used_at: new Date() },
     {
-      where: {
-        nonce,
-        status: 'active',
-        expires_at: { [Op.gt]: new Date() },
-      },
+      where,
       returning: true,
       transaction: options.transaction,
     }

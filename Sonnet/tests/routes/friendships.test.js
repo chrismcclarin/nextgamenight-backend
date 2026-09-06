@@ -615,3 +615,110 @@ describe('GET /friendships/search — BE-12 exact PII projection (PR-C + T-87.6-
     expect(attrs).toEqual(['id', 'username']);
   });
 });
+
+// Phase 88.8 / R10 (plan 03): friend-search trim + case-insensitive EXACT match.
+//
+// The route used to lowercase the QUERY and compare it against the column AS
+// STORED (`where: { email: email.toLowerCase() }`), so any row persisted with
+// different case — or a searcher who typed a stray trailing space — was
+// silently unfindable. The fix trims + lowercases the INPUT and compares
+// `lower(email)` on the STORED column.
+//
+// DELIBERATELY REJECTED, do not "complete" the normalisation: Gmail-dot
+// collapsing and plus-address stripping, in BOTH directions (SPEC Edge Coverage
+// `encoding / R10`). Each WIDENS what the endpoint matches and re-opens email
+// enumeration. The match is FULL-exact after trim+lowercase and nothing else —
+// no prefix, no substring, no pattern operator.
+//
+// These cases run against REAL seeded Users rows, NOT a jest.spyOn(User,
+// 'findOne') mock (the idiom the rest of this suite uses). A mock returns
+// whatever it is told and would prove nothing about a lower() comparison
+// actually reaching Postgres. tests/setup.js TRUNCATEs every table before each
+// test and runs BEFORE this block's beforeEach, so the seeds land on a clean
+// schema and need no explicit teardown.
+describe('GET /friendships/search — R10 trim + case-insensitive EXACT match (Phase 88.8)', () => {
+  // Stored EXACTLY as written — the case of these values is the whole point.
+  const SEEDS = [
+    {
+      user_id: 'auth0|r10-exact',
+      username: 'r10exact',
+      email: 'addressee@example.com',
+      phone: '+15555550199', // PII: must never reach the search response body
+    },
+    { user_id: 'auth0|r10-mixed', username: 'r10mixed', email: 'Mixed.Case@Example.com' },
+    { user_id: 'auth0|r10-lower', username: 'r10lower', email: 'lower@example.com' },
+    // Seeded so that `pallazzo` is a GENUINE prefix/substring of a stored
+    // address — a bare-token 404 only proves something if the token really is
+    // contained in a real row.
+    { user_id: 'auth0|r10-palla', username: 'r10palla', email: 'pallazzo.mcgee@example.com' },
+  ];
+
+  const search = (email) =>
+    request(app).get(`/api/friendships/search?email=${encodeURIComponent(email)}`);
+
+  beforeEach(async () => {
+    currentActor = REQUESTER;
+    // Sequential create (not bulkCreate) so the model validators actually run.
+    for (const seed of SEEDS) {
+      await User.create(seed);
+    }
+  });
+
+  it('a query with surrounding whitespace matches the stored row (200)', async () => {
+    const trailing = await search('addressee@example.com ');
+    expect(trailing.status).toBe(200);
+    expect(trailing.body.username).toBe('r10exact');
+
+    const surrounded = await search('  addressee@example.com  ');
+    expect(surrounded.status).toBe(200);
+    expect(surrounded.body.username).toBe('r10exact');
+  });
+
+  it('matches regardless of the STORED case, in both directions', async () => {
+    // stored mixed, queried lower
+    const storedMixed = await search('mixed.case@example.com');
+    expect(storedMixed.status).toBe(200);
+    expect(storedMixed.body.username).toBe('r10mixed');
+
+    // stored lower, queried upper
+    const storedLower = await search('LOWER@Example.COM');
+    expect(storedLower.status).toBe(200);
+    expect(storedLower.body.username).toBe('r10lower');
+  });
+
+  it('a partial, prefix or wildcard query still 404s — the match stays FULL-exact', async () => {
+    // Bare token that IS a substring of a stored address.
+    expect((await search('pallazzo')).status).toBe(404);
+    // Stored address truncated by one character.
+    expect((await search('addressee@example.co')).status).toBe(404);
+    // SQL LIKE metacharacters must not widen anything: these would match if the
+    // comparison were ever "improved" to Op.like / Op.iLike (T-88.8-12).
+    expect((await search('%@example.com')).status).toBe(404);
+    expect((await search('%')).status).toBe(404);
+    expect((await search('addressee@example.co_')).status).toBe(404);
+  });
+
+  it('a whitespace-only query is rejected 400, in the same shape as the missing-param branch', async () => {
+    const missing = await request(app).get('/api/friendships/search');
+    expect(missing.status).toBe(400);
+
+    const blank = await search('   ');
+    expect(blank.status).toBe(400);
+    // Same envelope shape as its sibling: raw { error } today, NOT the Phase 85
+    // envelope. Converting one of the pair would be an unrequested contract
+    // change, so this pins them as identical rather than asserting a `code`.
+    expect(blank.body).toEqual(missing.body);
+    expect(typeof blank.body.error).toBe('string');
+  });
+
+  it('the real-DB response body still projects id/username ONLY — no email, phone or sub', async () => {
+    const res = await search('addressee@example.com');
+    expect(res.status).toBe(200);
+    // Complements the mock-based attributes pin above: this one runs the real
+    // projection against a real row that actually carries PII.
+    expect(Object.keys(res.body).sort()).toEqual(['id', 'username']);
+    expect(JSON.stringify(res.body)).not.toContain('+15555550199');
+    expect(JSON.stringify(res.body)).not.toContain('addressee@example.com');
+    expect(JSON.stringify(res.body)).not.toMatch(/(auth0|google-oauth2|apple)\|/);
+  });
+});
