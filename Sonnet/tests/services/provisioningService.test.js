@@ -626,6 +626,43 @@ describe('services/provisioningService — provisionOrRepair', () => {
       expect(result.user.picture_url).toBeNull();
     });
 
+    // Phase 88.8 post-merge (round-5 #12/#28): the round-4 note shipped untested —
+    // `grep -rn "PICTURE_URL_REJECTED_HOST" tests/` returned nothing at the merge
+    // commit — and commit d2b26a7 had already had to repair a regression in exactly
+    // this note's threading, with nothing to stop the next one. The note is the whole
+    // point of the D-27 amendment: a rejected host must be DISTINGUISHABLE in telemetry
+    // from "this user has no avatar", both of which store null.
+    it('a rejected HOST is nameable in telemetry — the note rides BOTH the create and the repair path', async () => {
+      const sub = 'auth0|svc-pic-note';
+      const base = { email: 'picnote@example.com', email_verified: true, connection_strategy: SOCIAL };
+
+      // CREATE path: first login, parseable https URL on a non-allow-listed host.
+      const created = await provision({
+        sub,
+        claims: { ...base, picture: 'https://attacker.example/pixel.png' },
+      });
+      expect(created.user.picture_url).toBeNull();
+      expect(created.notes).toContain('picture_url_rejected_host');
+
+      // REPAIR path: the row exists now; a later login on a look-alike host must still
+      // say WHY it stored nothing.
+      const repaired = await provision({
+        sub,
+        claims: { ...base, picture: 'https://evil-googleusercontent.com/a/AAA' },
+      });
+      expect(repaired.user.picture_url).toBeNull();
+      expect(repaired.notes).toContain('picture_url_rejected_host');
+
+      // An ALLOW-LISTED host stores the value and emits no rejection note — the note
+      // must mean something, not fire on every social login.
+      const accepted = await provision({
+        sub,
+        claims: { ...base, picture: 'https://lh3.googleusercontent.com/a/AAA' },
+      });
+      expect(accepted.user.picture_url).toBe('https://lh3.googleusercontent.com/a/AAA');
+      expect(accepted.notes).not.toContain('picture_url_rejected_host');
+    });
+
     it('stores nothing for a DATABASE connection even when the picture is a valid https URL', async () => {
       const sub = 'auth0|svc-pic-db';
       const result = await provision({

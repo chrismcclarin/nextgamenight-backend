@@ -285,6 +285,38 @@ describe('POST /api/users/:user_id/email — refusals (nothing is stored)', () =
     expect(emailService.sendEmailChangeCode).not.toHaveBeenCalled();
   });
 
+  // Phase 88.8 post-merge (round-5 #9/#12/#28): round 4 added the synthetic-target
+  // refusal and shipped it untested — `grep -n "auth0.com" ` on this file returned
+  // nothing at the merge commit.
+  it.each([
+    ['the literal sentinel domain', 'x@auth0.local'],
+    ['a real deliverable @auth0 host', 'me@auth0.com'],
+    ['any other host beginning auth0 (the predicate is BROAD on purpose)', 'x@auth0lab.com'],
+  ])('a synthetic-shaped target — %s — is refused, and nothing is minted', async (_label, address) => {
+    const row = await seedUser();
+
+    const res = await request(makeApp(actorFor(row)))
+      .post(`/api/users/${row.user_id}/email`)
+      .send({ email: address })
+      .expect(400);
+
+    // The CODE stays `validation` DELIBERATELY (post-merge #6/#29): the FE passes
+    // body.code through verbatim, so a code absent from its union and from
+    // NON_RETRYABLE_API_CODES would make shouldRetry re-issue this state-changing POST.
+    // What must not regress is the MESSAGE — the generic validation prose named no
+    // reason, and the FE's own copy for `validation` on this section is "reload the
+    // page", which is false here.
+    expect(res.body.code).toBe('validation');
+    expect(res.body.message).toMatch(/cannot be used with this app/i);
+    expect(res.body.error).toBe(res.body.message); // legacy alias mirrors the override
+
+    // Nothing was minted, no mail was sent, and Users.email is untouched.
+    expect(await tokensFor(row.user_id)).toHaveLength(0);
+    expect(emailService.sendEmailChangeCode).not.toHaveBeenCalled();
+    const after = await User.scope('withContactInfo').findByPk(row.id);
+    expect(after.email).toBe(row.email);
+  });
+
   it('another user\'s sub in the path is refused before any read or write', async () => {
     const mine = await seedUser();
     const theirs = await seedUser();
