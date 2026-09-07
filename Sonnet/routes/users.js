@@ -1411,8 +1411,29 @@ router.post('/:user_id/email', writeOperationLimiter, async (req, res) => {
     // any host containing "auth0", the deliberately BROAD NIX-AUTH0 test) cannot be
     // stored: seventeen sites would read the stored value as a provisioning sentinel.
     // The shared predicate is reused, never re-spelled or narrowed.
+    //
+    // DECISION Phase 88.8 post-merge #6/#29: the registered code stays `validation` with
+    // only the MESSAGE made specific (the 4th sendError argument, the same override
+    // idiom sendEmailChangeRateLimited uses above), chosen OVER registering a new code
+    // such as `unsupported_address`. A new code reads better, and the registry is
+    // append-only by D-11 so adding one is sanctioned — but this is a CROSS-REPO wire
+    // change, and shipping the backend half alone has a consequence, not just a
+    // bookkeeping cost: the frontend's mapErrorToCode passes `body.code` through
+    // VERBATIM (periodictabletop/src/lib/api.ts:283-289), so an unrecognised code is in
+    // neither the ApiErrorCode union nor NON_RETRYABLE_API_CODES (queryClient.ts:61-100)
+    // — shouldRetry would then RE-ISSUE this state-changing POST once, the exact silent
+    // regression that file documents for `not_provisioned` and the two invite 409s. The
+    // user-facing fix is the frontend pre-check (the FE imports the same predicate), and
+    // `validation` is what an unknown client should keep seeing for a 400 on a typed
+    // field. If the FE ever adds the code to BOTH lists, promoting this is a decision
+    // that can be made then — do NOT add it backend-first.
     if (provisioningService.isSyntheticAddress(normalised)) {
-      return sendError(res, 'validation');
+      return sendError(
+        res,
+        'validation',
+        undefined,
+        'That address cannot be used with this app — the domain is reserved by our sign-in system.'
+      );
     }
 
     const state = { outcome: null, minted: null, code: null, rateLimited: false, missing: false };
