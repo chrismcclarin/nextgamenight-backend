@@ -49,6 +49,43 @@ function reportClaimsAbsentOnce(decoded) {
   }
 }
 
+/* post-merge #13/#20 — the PARTIAL-breakage arm. The alarm above is the DEPLOY-STATE
+   signal and, since round 4 narrowed it, fires only when the Action is entirely
+   undeployed. The failure with real user impact is the partial one: a dashboard edit
+   that drops or misspells the `email` / `email_verified` claim while `connection` still
+   lands. `email_verified` is load-bearing, not cosmetic — revertClaimAddress and
+   wasOldAddressProved both refuse without it, so the D-41 invite move and the D-42
+   feedback move silently skip and revert stops working. It fails CLOSED (no bypass is
+   created), which is why this is a monitoring hole rather than a hole. Own throttle
+   timestamp and own `op` tag: the two alarms must not starve each other. */
+const CLAIMS_PARTIAL_REPORT_INTERVAL_MS = CLAIMS_ABSENT_REPORT_INTERVAL_MS;
+let lastClaimsPartialReportAt = 0;
+function reportClaimsPartialOnce(decoded) {
+  if (process.env.NODE_ENV !== 'production') return;
+  const now = Date.now();
+  if (now - lastClaimsPartialReportAt < CLAIMS_PARTIAL_REPORT_INTERVAL_MS) return;
+  lastClaimsPartialReportAt = now;
+  const line = '[auth0] post-login Action claims are PARTIAL — the email / email_verified claim is missing from the access token while other namespaced claims are present. Has the Action been edited? (auth0/actions/README.md)';
+  console.warn(line);
+  if (Sentry && typeof Sentry.captureMessage === 'function') {
+    Sentry.captureMessage(line, {
+      level: 'warning',
+      tags: { feature: 'auth0-claims', op: 'claims-partial' },
+      // DISCRIMINATORS, never values: three booleans and the connection STRATEGY
+      // ('google-oauth2' / 'auth0' — low-cardinality, carries no address or sub). A
+      // genuinely email-less Auth0 user reports both email booleans false; an Action
+      // edited to drop one line reports exactly one of them true. That is what tells
+      // the accepted overlap apart on sight — see the call site's DECISION marker.
+      extra: {
+        hasNamespacedEmail: decoded[CLAIMS.email] !== undefined,
+        hasNamespacedEmailVerified: decoded[CLAIMS.emailVerified] !== undefined,
+        hasBareEmail: typeof decoded.email === 'string',
+        connection: typeof decoded[CLAIMS.connection] === 'string' ? decoded[CLAIMS.connection] : null,
+      },
+    });
+  }
+}
+
 // Check for required environment variables
 if (!process.env.AUTH0_DOMAIN) {
   console.warn('⚠️  WARNING: AUTH0_DOMAIN not set. JWT verification will fail.');
@@ -191,10 +228,27 @@ const verifyAuth0Token = (req, res, next) => {
         family_name: decoded.family_name,
         // Include any other claims you need
       };
-      // Round 4 #18: fire only when NO namespaced claim is present. A deployed Action
-      // omits the email claim for a user whose Auth0 profile has no email, but it ALWAYS
-      // sets the connection claim — so "none present" is the deploy-state signal.
-      if (!Object.values(CLAIMS).some((key) => decoded[key] !== undefined)) reportClaimsAbsentOnce(decoded);
+      // Round 4 #18: fire the DEPLOY-STATE alarm only when NO namespaced claim is
+      // present. A deployed Action omits the email claim for a user whose Auth0 profile
+      // has no email, but it ALWAYS sets the connection claim — so "none present" is
+      // the deploy-state signal.
+      //
+      // DECISION Phase 88.8 post-merge #13/#20: a SECOND, separately-tagged arm for
+      // PARTIAL breakage was chosen OVER leaving "none present" as the only alarm.
+      // Round 4's narrowing killed a false positive (an email-less Auth0 user) and with
+      // it the signal for the failure that actually degrades people — an edited Action
+      // that still sets `connection` while dropping `email` / `email_verified`, which
+      // is silent today. The email-less user DOES overlap this second arm; that overlap
+      // is accepted, and mitigated two ways: its own `op: 'claims-partial'` tag and its
+      // own throttle keep the deploy-state alarm clean, and the boolean discriminators
+      // on the event tell the two states apart without a second look. Re-collapsing
+      // this to the single "none present" test is a decision, not a cleanup.
+      const namespacedClaimPresent = Object.values(CLAIMS).some((key) => decoded[key] !== undefined);
+      if (!namespacedClaimPresent) {
+        reportClaimsAbsentOnce(decoded);
+      } else if (decoded[CLAIMS.email] === undefined || decoded[CLAIMS.emailVerified] === undefined) {
+        reportClaimsPartialOnce(decoded);
+      }
 
       // Log available token claims in development for debugging
       if (process.env.NODE_ENV === 'development' && !req.user.email) {
