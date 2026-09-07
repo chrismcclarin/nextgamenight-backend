@@ -243,14 +243,35 @@ router.delete('/me', writeOperationLimiter, async (req, res) => {
     // status === 'deleted'
     return res.json({ message: 'Your account and associated data have been deleted.' });
   } catch (error) {
-    // Class + SQLSTATE alongside the message (neither carries PII): the first CI run of
-    // 88.8 surfaced a 25P02 here with no way to tell which statement failed first.
+    // Class + SQLSTATE, and NEVER `.message` (post-merge #4/#11). The first CI run of
+    // 88.8 surfaced a 25P02 here with no way to tell which statement failed first —
+    // the class and the SQLSTATE answer that, and neither can carry an address. The
+    // raw message can: a Sequelize DatabaseError's `.message` is the Postgres message,
+    // which interpolates the offending VALUE for several everyday classes ("invalid
+    // input syntax for type uuid: ...", "value too long for type character
+    // varying(255)", check-constraint text) — and the values in flight on THIS handler
+    // are the deleting user's address, their Auth0 sub and their UUID, bound for
+    // Railway's retained stdout. Same rule and same reason as the self-read catch
+    // below and emailChangeTelemetry.
     console.error(
       '[users] account deletion failed:',
       error && error.name,
-      error && error.parent && error.parent.code,
-      error.message
+      error && error.parent && error.parent.code
     );
+    // post-merge #5/#27: report it, do not leave it on stdout alone. The self-read 500
+    // two handlers below gained this in round 4; this path is the irreversible,
+    // transactional, GDPR-facing one whose 25P02 cascade the phase spent a DECISION
+    // block on, and it was the blind one — the next production occurrence would be
+    // invisible until a user complained. WRAPPED, CLASS ONLY, with a low-cardinality
+    // tag: no address, no sub, no SQL text may reach Sentry (round-5 #23 accepted that
+    // posture deliberately — do not "enrich" this with error.message or the SQLSTATE
+    // without re-opening it).
+    if (Sentry && typeof Sentry.captureException === 'function') {
+      Sentry.captureException(
+        new Error(`account-deletion failed: ${(error && error.name) || 'Error'}`),
+        { tags: { feature: 'account-deletion' } }
+      );
+    }
     return sendError(res, 'internal');
   }
 });
