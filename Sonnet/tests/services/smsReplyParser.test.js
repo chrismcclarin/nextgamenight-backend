@@ -146,6 +146,29 @@ describe('smsReplyParser', () => {
       });
     });
 
+    // --- Typographic apostrophes (CodeQL hygiene 2026-09-08) ---
+    // iOS/Android smart punctuation rewrites a typed ' as U+2019, so these are the
+    // shapes a REAL phone sends. Before the input-side fold they all returned unknown.
+    describe('typographic apostrophe normalisation', () => {
+      it.each([
+        ['U+2019 right single quote', 'can’t'],
+        ['U+2018 left single quote', 'can‘t'],
+        ['U+02BC modifier letter apostrophe', 'canʼt'],
+      ])('treats %s as an ASCII apostrophe in an exact-word reply', (_label, input) => {
+        expect(parseReply(input)).toEqual({ type: 'rsvp', status: 'no' });
+      });
+
+      it('extracts a curly-apostrophe keyword from surrounding text', () => {
+        expect(parseReply('Can’t make it')).toEqual({ type: 'rsvp', status: 'no' });
+      });
+
+      it('folds one character to one character, so keyword tiebreak order is unchanged', () => {
+        // "yes" sits left of "can't"; a multi-char fold would shift match.index and
+        // could flip this to "no". Guards the 1:1 property the fold relies on.
+        expect(parseReply('yes I can’t believe it')).toEqual({ type: 'rsvp', status: 'yes' });
+      });
+    });
+
     // --- Priority order: keyword scanning (yes > no > maybe) ---
     describe('priority conflicts', () => {
       it('no before maybe - "no" found first wins', () => {

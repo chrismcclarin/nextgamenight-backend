@@ -33,12 +33,28 @@ YES_WORDS.forEach(w => { EXACT_WORD_MAP[w] = 'yes'; });
 NO_WORDS.forEach(w => { EXACT_WORD_MAP[w] = 'no'; });
 MAYBE_WORDS.forEach(w => { EXACT_WORD_MAP[w] = 'maybe'; });
 
+// Curly/typographic apostrophes -> the ASCII apostrophe the word lists are written with.
+// iOS and Android smart punctuation rewrite a typed ' as U+2019 by default, so a real
+// phone sends "Can't make it", which matched NOTHING before this normalisation existed
+// (CodeQL js/identity-replacement + js/incomplete-sanitization, first scan 2026-09-08:
+// the constants were being built with a no-op `w.replace("'", "'")` -- an ASCII
+// apostrophe replaced by itself -- which normalised nothing on either side).
+//
+// DECISION 2026-09-08 (CodeQL hygiene): normalise the INBOUND MESSAGE, chosen OVER
+// normalising the static word lists. The lists are ours and already ASCII; the untrusted
+// curly character only ever arrives in the SMS body, so that is the only side that can
+// carry it. Every replacement here is deliberately ONE character for ONE character:
+// step 4 below ranks keywords by `match.index`, so a multi-character substitution would
+// silently shift those offsets and change which status wins a tie. Widening this to a
+// multi-char rewrite is a decision, not a cleanup.
+const TYPOGRAPHIC_APOSTROPHES = /[‘’ʼ]/g;
+
 // Build keyword regex patterns with word boundaries for extraction
 // Each entry: [regex, status] -- order matters for same-position tiebreak
 const KEYWORD_PATTERNS = [
-  ...YES_WORDS.map(w => [new RegExp(`\\b${w.replace("'", "'")}\\b`, 'i'), 'yes']),
-  ...NO_WORDS.map(w => [new RegExp(`\\b${w.replace("'", "'")}\\b`, 'i'), 'no']),
-  ...MAYBE_WORDS.map(w => [new RegExp(`\\b${w.replace("'", "'")}\\b`, 'i'), 'maybe']),
+  ...YES_WORDS.map(w => [new RegExp(`\\b${w}\\b`, 'i'), 'yes']),
+  ...NO_WORDS.map(w => [new RegExp(`\\b${w}\\b`, 'i'), 'no']),
+  ...MAYBE_WORDS.map(w => [new RegExp(`\\b${w}\\b`, 'i'), 'maybe']),
 ];
 
 /**
@@ -58,7 +74,10 @@ function parseReply(body) {
     return { type: 'unknown' };
   }
 
-  const lower = trimmed.toLowerCase();
+  // Fold typographic apostrophes before ANY matching so a phone-typed "Can't" reaches
+  // the same branch as "Can't". Applied to `lower` only: `trimmed` is used solely for
+  // the digit lookup below, which no apostrophe can affect.
+  const lower = trimmed.toLowerCase().replace(TYPOGRAPHIC_APOSTROPHES, "'");
 
   // 1. Opt-out check (HIGHEST PRIORITY - regulatory compliance)
   for (const word of OPT_OUT_WORDS) {
