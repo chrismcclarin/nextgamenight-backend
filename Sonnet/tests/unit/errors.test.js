@@ -61,6 +61,13 @@ const EXPECTED_STATUS = {
   // gets 410, and this map is where the two would silently collapse into one another.
   // Also distinct from the generic `not_found` (404) — see the registry comment.
   not_provisioned: 404,
+  // Phase 88.8 post-merge (round-5 #29): the synthetic-target refusal on
+  // POST /users/:user_id/email. DELIBERATELY DISTINCT from the generic `validation`
+  // (400) at the top of this map — both are 400s, and this map is exactly where the
+  // two would silently collapse into one another. The distinction is the whole point:
+  // the frontend renders different copy per code, and it re-maps `validation` on that
+  // surface to "reload the page", which is the wrong sentence for a rejected address.
+  unsupported_address: 400,
 };
 
 describe('utils/errors — exports', () => {

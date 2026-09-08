@@ -300,15 +300,14 @@ describe('POST /api/users/:user_id/email — refusals (nothing is stored)', () =
       .send({ email: address })
       .expect(400);
 
-    // The CODE stays `validation` DELIBERATELY (post-merge #6/#29): the FE passes
-    // body.code through verbatim, so a code absent from its union and from
-    // NON_RETRYABLE_API_CODES would make shouldRetry re-issue this state-changing POST.
-    // What must not regress is the MESSAGE — the generic validation prose named no
-    // reason, and the FE's own copy for `validation` on this section is "reload the
-    // page", which is false here.
-    expect(res.body.code).toBe('validation');
+    // Its OWN registered code, NOT the generic `validation` (post-merge #6/#29, round 6).
+    // Both are 400s, so only the code distinguishes them on the wire — and the frontend
+    // re-maps `validation` on this surface to "reload the page", which is false for a
+    // typed address that will fail identically forever. Pinning the code here is what
+    // stops a future tidy collapsing the two back together.
+    expect(res.body.code).toBe('unsupported_address');
     expect(res.body.message).toMatch(/cannot be used with this app/i);
-    expect(res.body.error).toBe(res.body.message); // legacy alias mirrors the override
+    expect(res.body.error).toBe(res.body.message); // legacy alias mirrors the message
 
     // Nothing was minted, no mail was sent, and Users.email is untouched.
     expect(await tokensFor(row.user_id)).toHaveLength(0);
