@@ -86,9 +86,21 @@ function scrubPageUrl(pageUrl) {
 //   3. It is LOSSLESS. A stripper silently mangles a legitimate `C#` in a display
 //      name or a `+https://...` in a bot user agent — and mangled report data is
 //      the thing the owner actually reads.
-// The issue TITLE is the one slot that needs no escaping at all: GitHub renders
-// titles as PLAIN TEXT, not Markdown. A title part only needs its newlines
-// collapsed (a newline would truncate/garble the title) and a length clamp.
+// The issue TITLE is a weaker case that gets the SAME treatment anyway. GitHub
+// renders titles as PLAIN TEXT, not Markdown, so a title part strictly only needs
+// its newlines collapsed (a newline would truncate/garble the title) and a length
+// clamp. But that is an argument from GitHub's CURRENT title renderer, which this
+// repo cannot test against and does not control — and the cost of being wrong is a
+// real notification to an uninvolved third party. So title mode ALSO neutralises
+// the two notification/reference sigils, `@` and `#`, by mapping each to its
+// FULLWIDTH form (U+FF20 `＠`, U+FF03 `＃`) rather than DELETING it — owner ruling
+// 2026-09-08. Fullwidth over deletion for the same reason the fields above are
+// fenced over stripped: it is lossless. The owner still reads that the reporter
+// typed an @ and exactly where, and a legitimate `C#` or an address in the excerpt
+// is not silently mangled — while neither fullwidth codepoint is a sigil GitHub's
+// mention or issue-reference parser recognises. The title is a 50-character
+// EXCERPT of `text`, which appears verbatim inside the body's fence a few lines
+// down, so nothing is lost from the report either way.
 //
 // MAX_TITLE_PART is sized against a REAL constraint, not taste: the DB-fallback
 // path persists this same title into `Feedback.subject`, which is STRING(200)
@@ -125,7 +137,12 @@ function renderUntrusted(value, { mode, max }) {
   s = s.trim();
   if (s.length > max) s = `${s.slice(0, max).trimEnd()}...`;
   if (s === '') return '';
-  if (mode === 'title') return s;
+  if (mode === 'title') {
+    // Belt and braces — see the FULLWIDTH paragraph in DECISION Phase 91 FB-ESC.
+    // Titles are plain text today; this does not depend on that staying true.
+    // Length is unchanged (one codepoint for one), so the clamp above still holds.
+    return s.replace(/@/g, '\uff20').replace(/#/g, '\uff03');
+  }
 
   // A code span or fence is closed by a backtick run of its own length, so the
   // delimiter must be LONGER than any run in the content — otherwise the author

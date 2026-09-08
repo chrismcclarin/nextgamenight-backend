@@ -552,6 +552,47 @@ describe('POST /api/feedback/github — client strings are inert in the issue (P
     expect(title).toContain('Line one of the report line two');
   });
 
+  it('BELT AND BRACES: @ and # never appear BARE in the title (owner ruling 2026-09-08)', () => {
+    // GitHub renders issue TITLES as plain text today, so this is defence against
+    // a renderer this repo cannot test against and does not control. Fullwidth
+    // over deletion: lossless, and neither codepoint is a sigil GitHub's mention
+    // or issue-reference parser recognises.
+    const FW_AT = '\uff20';   // U+FF20
+    const FW_HASH = '\uff03'; // U+FF03
+
+    const { title, body } = buildGithubIssuePayload({
+      ...baseArgs,
+      category: 'General',
+      text: 'Ping @someone about #12 and the C# helper, which is long enough to fill the excerpt.',
+    });
+
+    expect(title).not.toContain('@');
+    expect(title).not.toContain('#');
+    expect(title).toContain(FW_AT + 'someone');
+    expect(title).toContain(FW_HASH + '12');
+    expect(title).toContain('C' + FW_HASH);
+    // Length is unchanged — one codepoint for one — so the STRING(200) clamp holds.
+    expect(title.length).toBeLessThanOrEqual(200);
+
+    // Nothing is lost from the report: the excerpt appears VERBATIM in the fence.
+    expect(splitOnFence(body).fenced).toContain('Ping @someone about #12 and the C# helper');
+  });
+
+  it('a hostile CATEGORY cannot smuggle a sigil into the title either', () => {
+    const { title } = buildGithubIssuePayload({ ...baseArgs, category: '@org/team #1' });
+    expect(title).not.toContain('@');
+    expect(title).not.toContain('#');
+    expect(title.startsWith('[Feedback] \uff20org/team \uff031: ')).toBe(true);
+  });
+
+  it('title-mode substitution does NOT leak into the body — the fenced text stays byte-exact', () => {
+    const raw = 'Exactly @someone and #12, verbatim, in a report long enough to be realistic.';
+    const { body } = buildGithubIssuePayload({ ...baseArgs, text: raw });
+    expect(splitOnFence(body).fenced).toBe(raw);
+    expect(body).not.toContain('\uff20');
+    expect(body).not.toContain('\uff03');
+  });
+
   it('an UNKNOWN label falls back to feedback:general — no client-chosen label reaches the repo', () => {
     for (const hostile of ['bug', 'feedback:not-real', 'FEEDBACK:GENERAL', '', null, undefined, 42, ['feedback:home']]) {
       const { labels } = buildGithubIssuePayload({ ...baseArgs, label: hostile });
