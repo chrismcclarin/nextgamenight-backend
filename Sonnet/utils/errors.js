@@ -91,6 +91,17 @@ const ERROR_REGISTRY = Object.freeze({
   // frontend renders its OWN copy from MESSAGE_BY_CODE (plan 11). Worded so it never
   // implies a deletion happened.
   not_provisioned:         { httpStatus: 404, message: 'This account has no stored data yet.' },
+  // Phase 88.8 post-merge (round-5 #29, round-6) — append-only per D-11. Emitted through
+  // sendError by POST /users/:user_id/email when the requested address matches the app's
+  // OWN synthetic-account sentinel (the broad NIX-AUTH0 predicate). DELIBERATELY DISTINCT
+  // from the generic `validation` (400) beside it: `validation` is the shape/length/body-key
+  // verdict, and the frontend's EmailAddressSection overrides copy for that code with
+  // "That action is no longer available — reload the page", which is false twice over for a
+  // typed address that will fail identically forever. A separate code is what lets the FE
+  // render a reason. Cross-repo: the FE adds it to its ApiErrorCode union, MESSAGE_BY_CODE
+  // and NON_RETRYABLE_API_CODES in the same fix set. The `message` here is the
+  // API-CONSUMER fallback; the FE renders its own copy.
+  unsupported_address:     { httpStatus: 400, message: 'That address cannot be used with this app — the domain is reserved by our sign-in system.' },
   internal:                { httpStatus: 500, message: 'An internal error occurred' }, // 500 fallback
 });
 

@@ -539,4 +539,86 @@ describe('accountDeletion integrity — full disposition table on real Postgres 
     expect(untouched).toBeTruthy();
     expect(untouched.selected_member_ids).toEqual([]);
   });
+
+  // -------------------------------------------------------------------------
+  // Phase 88.8 post-merge (round-5 #3/#9/#10/#12/#28) — the two ADDRESS-keyed
+  // scrubs round 4 added on this path.
+  //
+  // Both shipped green while covering nothing about their own selection, and the
+  // fixtures are the reason:
+  //   - makeGroupInvite generates `invitee-<ts>-<n>@example.com`, so the deleting
+  //     user was never the INVITEE — the destroy executed and could never match.
+  //   - the feedback assertion was byte-exact (`where: { user_email: target.email }`),
+  //     so it passed identically with or without the new lower() predicate.
+  // Every address below is therefore seeded at a DIFFERENT CASE from the stored one,
+  // and every status is represented: delete either predicate and this test fails.
+  // -------------------------------------------------------------------------
+  test('post-merge #3/#10 — invites addressed to the deleted user are pruned at EVERY status, case-insensitively', async () => {
+    const owner = await makeUser();
+    // Stored address is MIXED case. Nothing else in this suite exercises that.
+    const target = await makeUser({ email: `Mixed.Case-${Date.now()}@Example.COM` });
+
+    // A group the OWNER owns and the target merely belongs to: the run is not blocked,
+    // and the group (with its invites) survives the target's deletion, so a surviving
+    // bystander invite is a real assertion rather than an artifact of a purged group.
+    const group = await makeGroup();
+    await addToGroup(owner, group, 'owner');
+    await addToGroup(target, group, 'member');
+
+    const upper = target.email.toUpperCase();
+    const lower = target.email.toLowerCase();
+
+    // Invites ADDRESSED TO the target, one per status of the ENUM
+    // (models/GroupInvite.js:41-45). `invited_email` is the only link to the person on
+    // this table — there is no user column and no FK that could cascade.
+    const pendingToTarget = await makeGroupInvite(group, owner, { invited_email: upper, status: 'pending' });
+    const acceptedToTarget = await makeGroupInvite(group, owner, { invited_email: lower, status: 'accepted' });
+    const declinedToTarget = await makeGroupInvite(group, owner, { invited_email: target.email, status: 'declined' });
+
+    // Bystander invites in the SAME group. The pending one also proves the widened
+    // predicate did not become "delete every invite in a group the deleter was in".
+    const pendingToOther = await makeGroupInvite(group, owner, { status: 'pending' });
+    const acceptedToOther = await makeGroupInvite(group, owner, { status: 'accepted' });
+
+    // Feedback written under a case VARIANT. The email-only row is the one nothing but
+    // the address arm can reach; the control row belongs to the owner and must survive.
+    const fbEmailOnly = await makeFeedback(target, { user_id: null, user_email: upper });
+    const fbControl = await makeFeedback(owner);
+
+    // Seeded-then-gone (Pitfall 1): prove every row exists BEFORE the run, so a
+    // never-created fixture cannot masquerade as a successful scrub.
+    for (const row of [pendingToTarget, acceptedToTarget, declinedToTarget, pendingToOther, acceptedToOther]) {
+      expect(await GroupInvite.findByPk(row.id)).not.toBeNull();
+    }
+    expect(await Feedback.findByPk(fbEmailOnly.id)).not.toBeNull();
+
+    const result = await deleteAccount({ userId: target.user_id });
+    expect(result.status).toBe('deleted');
+
+    // Every invite carrying the target's address is gone — whatever its status,
+    // whatever its case. (Round 4 pruned `pending` only.)
+    expect(await GroupInvite.findByPk(pendingToTarget.id)).toBeNull();
+    expect(await GroupInvite.findByPk(acceptedToTarget.id)).toBeNull();
+    expect(await GroupInvite.findByPk(declinedToTarget.id)).toBeNull();
+    // No address of the deleted person survives anywhere on this table.
+    expect(await GroupInvite.count({ where: { invited_email: [upper, lower, target.email] } })).toBe(0);
+
+    // Nobody else's invite was touched, at any status.
+    expect(await GroupInvite.findByPk(pendingToOther.id)).not.toBeNull();
+    expect(await GroupInvite.findByPk(acceptedToOther.id)).not.toBeNull();
+    expect(await Group.findByPk(group.id)).not.toBeNull();
+
+    // The feedback scrub reached the case variant — a byte-exact predicate would not
+    // have matched this row, and its text still survives (anonymize, not delete).
+    const fbAfter = await Feedback.findByPk(fbEmailOnly.id);
+    expect(fbAfter).not.toBeNull();
+    expect(fbAfter.user_id).toBeNull();
+    expect(fbAfter.user_email).toBeNull();
+    expect(fbAfter.description).toBe('Something to keep after anonymization.');
+
+    // The control's feedback keeps both keys.
+    const fbControlAfter = await Feedback.findByPk(fbControl.id);
+    expect(fbControlAfter.user_id).toBe(owner.user_id);
+    expect(fbControlAfter.user_email).toBe(owner.email);
+  });
 });

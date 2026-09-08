@@ -243,14 +243,35 @@ router.delete('/me', writeOperationLimiter, async (req, res) => {
     // status === 'deleted'
     return res.json({ message: 'Your account and associated data have been deleted.' });
   } catch (error) {
-    // Class + SQLSTATE alongside the message (neither carries PII): the first CI run of
-    // 88.8 surfaced a 25P02 here with no way to tell which statement failed first.
+    // Class + SQLSTATE, and NEVER `.message` (post-merge #4/#11). The first CI run of
+    // 88.8 surfaced a 25P02 here with no way to tell which statement failed first —
+    // the class and the SQLSTATE answer that, and neither can carry an address. The
+    // raw message can: a Sequelize DatabaseError's `.message` is the Postgres message,
+    // which interpolates the offending VALUE for several everyday classes ("invalid
+    // input syntax for type uuid: ...", "value too long for type character
+    // varying(255)", check-constraint text) — and the values in flight on THIS handler
+    // are the deleting user's address, their Auth0 sub and their UUID, bound for
+    // Railway's retained stdout. Same rule and same reason as the self-read catch
+    // below and emailChangeTelemetry.
     console.error(
       '[users] account deletion failed:',
       error && error.name,
-      error && error.parent && error.parent.code,
-      error.message
+      error && error.parent && error.parent.code
     );
+    // post-merge #5/#27: report it, do not leave it on stdout alone. The self-read 500
+    // two handlers below gained this in round 4; this path is the irreversible,
+    // transactional, GDPR-facing one whose 25P02 cascade the phase spent a DECISION
+    // block on, and it was the blind one — the next production occurrence would be
+    // invisible until a user complained. WRAPPED, CLASS ONLY, with a low-cardinality
+    // tag: no address, no sub, no SQL text may reach Sentry (round-5 #23 accepted that
+    // posture deliberately — do not "enrich" this with error.message or the SQLSTATE
+    // without re-opening it).
+    if (Sentry && typeof Sentry.captureException === 'function') {
+      Sentry.captureException(
+        new Error(`account-deletion failed: ${(error && error.name) || 'Error'}`),
+        { tags: { feature: 'account-deletion' } }
+      );
+    }
     return sendError(res, 'internal');
   }
 });
@@ -1390,8 +1411,32 @@ router.post('/:user_id/email', writeOperationLimiter, async (req, res) => {
     // any host containing "auth0", the deliberately BROAD NIX-AUTH0 test) cannot be
     // stored: seventeen sites would read the stored value as a provisioning sentinel.
     // The shared predicate is reused, never re-spelled or narrowed.
+    //
+    // DECISION Phase 88.8 post-merge #6/#29: its OWN registered code
+    // (`unsupported_address`, utils/errors.js), chosen OVER reusing `validation` with a
+    // message override. The override kept the wire code honest for unknown clients but
+    // could not fix the surface that matters: EmailAddressSection re-maps `validation`
+    // to "That action is no longer available — reload the page", which is false in both
+    // halves for a typed address that will fail identically forever. A code the FE can
+    // branch on is the only thing that lets it render a reason.
+    //
+    // AN EARLIER REVISION OF THIS MARKER ARGUED THE OPPOSITE, ON A PREMISE THAT IS
+    // FALSE — recorded here so it is not re-litigated. It claimed an unrecognised code
+    // would fall outside NON_RETRYABLE_API_CODES and make `shouldRetry` re-issue this
+    // state-changing POST. Verified in the frontend: `retry: shouldRetry` is set ONLY
+    // under `defaultOptions.queries` (periodictabletop/src/lib/queryClient.ts:159-164)
+    // — there is no `mutations` default at all — and this route is reached by a plain
+    // `apiFetch` (src/lib/api.ts:852) awaited directly in the save handler
+    // (EmailAddressSection.tsx:683), not by a useMutation. No retry path exists here.
+    //
+    // Cross-repo sequencing, so the window is nameable rather than assumed: the FE adds
+    // this code to its ApiErrorCode union, MESSAGE_BY_CODE and NON_RETRYABLE_API_CODES
+    // in the SAME fix set, and until that ships its client-side pre-check
+    // (EmailAddressSection.tsx:666-669, the shared `isSyntheticAddress`) already refuses
+    // these addresses before any request is made — so an unmapped code cannot reach a
+    // user through the app's own UI in the meantime.
     if (provisioningService.isSyntheticAddress(normalised)) {
-      return sendError(res, 'validation');
+      return sendError(res, 'unsupported_address');
     }
 
     const state = { outcome: null, minted: null, code: null, rateLimited: false, missing: false };

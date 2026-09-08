@@ -313,11 +313,39 @@ async function applyDispositions(user, t) {
   );
   // Round 4 #16: D-42's argument applies verbatim to GroupInvite — the ADDRESS is the
   // invite-to-person link (no user column), and this phase's D-41 move actively rewrites
-  // it onto the user's current address. Pending invites addressed to the deleted user
-  // are removed (owned groups' invites were already purged above).
+  // it onto the user's current address. Invites addressed to the deleted user are
+  // removed (owned groups' invites were already purged above).
+  //
+  // DECISION Phase 88.8 post-merge #3/#10: EVERY status is pruned, chosen OVER round 4's
+  // `status: 'pending'` scope and OVER tombstoning `invited_email` to keep an audit
+  // trail. A SPENT row has no reader: every read of `invited_email` filters
+  // status='pending' — routes/invites.js:142 (GET /info/:token), :518 (my pending
+  // invites), :579/:650/:743 (the three accept/decline authorization sites), :801 (the
+  // group's pending list) — and the re-invite dedupe at :389 is pending-only too, so
+  // widening the delete changes nothing for anyone else. `group_invites_pending_unique`
+  // is a PARTIAL index on pending rows (models/GroupInvite.js:113-118), so it cannot be
+  // affected either. Left un-pruned, an accepted/declined row is the SOLE permanent
+  // record of the deleted person's real address — no user column exists on this table —
+  // which is exactly the PII-survives-deletion harm D-42 was written to prevent.
+  // Narrowing this back to 'pending' is a decision, not a cleanup.
+  //
+  // RESIDUAL (round-5 #21), stated rather than silently accepted: this keys on the
+  // CURRENT `Users.email` only, and two shipped states make that the wrong address.
+  //   (a) SYNTHETIC ROW — `Users.email` is `<sub>@auth0.local`, so the delete is a
+  //       no-op. Nothing can be done about it here: the person's real address was
+  //       never stored, so there is no second value to match on.
+  //   (b) POST-CHANGE, UNPROVED OLD ADDRESS — D-41's invite move is gated on
+  //       wasOldAddressProved() (routes/users.js:1767); when it is skipped the invites
+  //       stay at the OLD address while `Users.email` holds the new one, and this scrub
+  //       sees only the new one.
+  // (b) is NOT closed here because no prior address is persisted anywhere:
+  // `SingleUseToken.target` holds the PENDING (new) address of an email_change_verify
+  // row (models/SingleUseToken.js:126-131) and `Users.email_changed_at` is a timestamp
+  // (models/User.js:175). Closing it needs a prior-address column — a schema decision
+  // for its own phase, not something to invent inside a deletion scrub.
   if (normalisedEmail) {
     await GroupInvite.destroy({
-      where: { status: 'pending', [Op.and]: [where(fn('lower', col('invited_email')), normalisedEmail)] },
+      where: { [Op.and]: [where(fn('lower', col('invited_email')), normalisedEmail)] },
       transaction: t,
     });
   }
