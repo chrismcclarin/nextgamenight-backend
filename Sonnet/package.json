@@ -48,7 +48,6 @@
         "jwks-rsa": "^3.2.0",
         "libphonenumber-js": "^1.12.41",
         "node-cron": "^4.2.1",
-        "nodemailer": "^7.0.12",
         "pg": "^8.11.3",
         "pg-hstore": "^2.3.4",
         "react": "^18.3.1",
