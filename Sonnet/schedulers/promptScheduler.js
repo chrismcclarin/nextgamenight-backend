@@ -216,7 +216,10 @@ async function removePromptScheduler(settingsId, scheduleId) {
     if (err.message && err.message.includes('not found')) {
       return false;
     }
-    console.error(`[PromptScheduler] Failed to remove scheduler ${schedulerId}:`, err.message);
+    // schedulerId is passed as its own argument, never interpolated into the format
+    // string (CodeQL js/tainted-format-string): a `%s` inside the id would otherwise
+    // consume err.message and swallow the reason this failed.
+    console.error('[PromptScheduler] Failed to remove scheduler:', schedulerId, err.message);
     throw err;
   }
 }

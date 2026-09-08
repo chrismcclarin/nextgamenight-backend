@@ -12,7 +12,15 @@ class SmsService {
     // Initialize Twilio client if credentials are configured
     if (accountSid && authToken) {
       this.client = twilio(accountSid, authToken);
-      console.log(`Twilio SMS service initialized. From: ${this.fromNumber}`);
+      // Log PRESENCE, not the value (CodeQL js/clear-text-logging): the sending number
+      // is the app's own, not user PII, but it is configuration read from the
+      // environment and there is no diagnostic reason for it to sit in the log stream.
+      // Presence is what actually matters here — isConfigured() below requires BOTH the
+      // client and fromNumber, so "client built, number missing" is a real startup state
+      // that the old "initialized" line reported as healthy.
+      console.log(
+        `Twilio SMS service initialized. From number configured: ${this.fromNumber ? 'yes' : 'no'}`
+      );
     } else {
       this.client = null;
       console.warn('Twilio SMS service not configured (credentials not set).');
