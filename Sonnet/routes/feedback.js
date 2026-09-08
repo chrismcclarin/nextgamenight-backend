@@ -63,6 +63,175 @@ function scrubPageUrl(pageUrl) {
   return `${origin}${path}`;
 }
 
+// -----------------------------------------------------------------------------
+// [Phase 91 deferred, security — from 88.8 code-adversarial-review round 3 #10]
+// Untrusted-string rendering for the GitHub Issue sink.
+//
+// `userName`, `category`, `text` and `userAgent` are CLIENT-AUTHORED and land in
+// a Markdown document rendered in the owner's PRIVATE issue tracker. Unescaped,
+// any signed-in caller could author @mentions (notifying third parties who have
+// no relationship to this app), remote images (beaconing the viewer's IP), links
+// and fake collapsed sections. `label` could apply any label at all. The path has
+// never run in production — this lands BEFORE the integration is configured.
+//
+// DECISION Phase 91 FB-ESC: every untrusted string is RENDERED AS CODE — a fenced
+// block for the multi-line `text`, an inline code span for the short fields — over
+// STRIPPING the dangerous characters (`@`, `#`, backtick, `<`, `>`). Three reasons
+// to prefer it, and changing it back is a decision, not a cleanup:
+//   1. ONE mechanism for every field instead of two half-rules, so there is no
+//      "which fields got which treatment" question to get wrong later.
+//   2. Code is inert BY CONSTRUCTION, so it stays correct when a future GFM
+//      extension adds a vector nobody enumerated; a strip-list is only ever as
+//      complete as the day it was written.
+//   3. It is LOSSLESS. A stripper silently mangles a legitimate `C#` in a display
+//      name or a `+https://...` in a bot user agent — and mangled report data is
+//      the thing the owner actually reads.
+// The issue TITLE is the one slot that needs no escaping at all: GitHub renders
+// titles as PLAIN TEXT, not Markdown. A title part only needs its newlines
+// collapsed (a newline would truncate/garble the title) and a length clamp.
+//
+// MAX_TITLE_PART is sized against a REAL constraint, not taste: the DB-fallback
+// path persists this same title into `Feedback.subject`, which is STRING(200)
+// (models/Feedback.js:17-20). Worst case is 11 (`[Feedback] `) + 123 (category +
+// ellipsis) + 2 (`: `) + 53 (snippet + ellipsis) = 189. Before this change the
+// category part was UNBOUNDED, so a long category would have failed that insert.
+const MAX_TITLE_PART = 120;
+const MAX_TITLE_SNIPPET = 50; // unchanged from the shipped title shape
+const MAX_BODY_FIELD = 2000;
+const MAX_USER_AGENT = 300;
+const MAX_PAGE_URL = 500; // matches Feedback.page_context STRING(500)
+
+/**
+ * Render one untrusted, client-supplied string for one slot of a GitHub Issue.
+ * Pure. Exported for tests.
+ *
+ * mode:
+ *   'title'  — plain text for the issue TITLE: every whitespace run (newlines
+ *              included) collapses to a single space. Titles are not Markdown.
+ *   'inline' — an inline code span, for a short BODY field.
+ *   'block'  — a fenced code block, for the multi-line BODY `text`.
+ *
+ * Returns '' for a missing, blank or non-string value so each caller keeps its
+ * own fallback wording ('Unknown', 'Not captured', ...).
+ */
+function renderUntrusted(value, { mode, max }) {
+  if (typeof value !== 'string') return '';
+  // Drop C0/C1 controls BEFORE any length maths so a clamp cannot slice a
+  // control sequence in half. \n (\u000A) and \t (\u0009) survive because 'block'
+  // may legitimately carry them; a lone \r is dropped, which is also how CRLF
+  // input normalises to LF here.
+  let s = value.replace(/[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g, '');
+  if (mode !== 'block') s = s.replace(/\s+/g, ' ');
+  s = s.trim();
+  if (s.length > max) s = `${s.slice(0, max).trimEnd()}...`;
+  if (s === '') return '';
+  if (mode === 'title') return s;
+
+  // A code span or fence is closed by a backtick run of its own length, so the
+  // delimiter must be LONGER than any run in the content — otherwise the author
+  // closes the span and writes live Markdown after it.
+  const longestRun = (s.match(/`+/g) || []).reduce((n, r) => Math.max(n, r.length), 0);
+
+  if (mode === 'inline') {
+    const delim = '`'.repeat(longestRun + 1);
+    // CommonMark strips ONE leading and ONE trailing space from a code span, so
+    // the padding is invisible while keeping content that itself begins or ends
+    // with a backtick intact.
+    return `${delim} ${s} ${delim}`;
+  }
+
+  // 'block': an opening fence is at least three backticks, and a fenced block
+  // ends only at a line whose sole content is a run at least that long.
+  const fence = '`'.repeat(Math.max(3, longestRun + 1));
+  return `${fence}\n${s}\n${fence}`;
+}
+
+// The SEVEN `feedback:*` labels pre-created on the issue repo, and the ONLY
+// values this route will ever apply. ONE place, deliberately.
+//
+// FE SOURCE OF TRUTH for what the client emits:
+// periodictabletop/src/app/components/FeedbackModalProvider.tsx:65-78 — the six
+// CATEGORY_MAP entries (groups / friends-list / scheduling / home / games /
+// profile; `/groups` and `/groupHomePage` share `feedback:groups`) plus
+// getCategoryLabel's 'feedback:general' fallback at :78. Keep the two in step: a
+// label the FE adds without a matching entry here degrades to feedback:general
+// rather than failing, because an unknown label makes octokit's create 422 and
+// would drop the whole report into the DB fallback.
+const ALLOWED_FEEDBACK_LABELS = [
+  'feedback:general',
+  'feedback:groups',
+  'feedback:friends-list',
+  'feedback:scheduling',
+  'feedback:home',
+  'feedback:games',
+  'feedback:profile',
+];
+const DEFAULT_FEEDBACK_LABEL = 'feedback:general';
+
+// Non-strings fall through `includes` to the default — no typeof guard needed.
+function safeLabel(label) {
+  return ALLOWED_FEEDBACK_LABELS.includes(label) ? label : DEFAULT_FEEDBACK_LABEL;
+}
+
+/**
+ * Build the ENTIRE GitHub Issue payload from already-derived values. Pure, and
+ * the ONE place any client string enters the issue: the route hands this
+ * object's three fields straight to `octokit.issues.create`, so a test asserting
+ * on this return value is asserting on the created-issue payload.
+ *
+ * That it is a separate function is not decoration. @octokit/rest is an ESM-only
+ * DYNAMIC import and this repo's Jest runs without --experimental-vm-modules, so
+ * `await import('@octokit/rest')` throws inside the harness and the client can
+ * NOT be mocked (verified: "A dynamic import callback was invoked without
+ * --experimental-vm-modules"). The payload is therefore built somewhere a unit
+ * test can actually reach it.
+ *
+ * `safeUserEmail` is SERVER-DERIVED (see D-42 below) and is interpolated bare, on
+ * purpose — it is not a client string, and the Email line is pinned verbatim by
+ * tests/routes/feedback.test.js.
+ */
+function buildGithubIssuePayload({
+  category,
+  text,
+  safePageUrl,
+  userName,
+  safeUserEmail,
+  label,
+  userAgent,
+  submittedAt,
+}) {
+  const title = `[Feedback] ${renderUntrusted(category, { mode: 'title', max: MAX_TITLE_PART })}: ` +
+    `${renderUntrusted(text, { mode: 'title', max: MAX_TITLE_SNIPPET })}`;
+
+  const body = [
+    '## Feedback',
+    '',
+    renderUntrusted(text, { mode: 'block', max: MAX_BODY_FIELD }) || 'Not provided',
+    '',
+    '---',
+    // safePageUrl is scrubbed for CREDENTIALS (scrubPageUrl above), which says
+    // nothing about Markdown — the path segment is still client-controlled, and
+    // it enters the same sink as the four fields the finding names. The DB
+    // column keeps the unwrapped scrubbed value.
+    `**Page:** ${renderUntrusted(safePageUrl, { mode: 'inline', max: MAX_PAGE_URL }) || 'Not provided'}`,
+    `**User:** ${renderUntrusted(userName, { mode: 'inline', max: MAX_TITLE_PART }) || 'Unknown'}`,
+    `**Email:** ${safeUserEmail || 'Not provided'}`,
+    `**Category:** ${renderUntrusted(category, { mode: 'inline', max: MAX_TITLE_PART }) || 'Not provided'}`,
+    `**Submitted:** ${submittedAt}`,
+    '',
+    '<details>',
+    '<summary>Browser Info</summary>',
+    '',
+    renderUntrusted(userAgent, { mode: 'inline', max: MAX_USER_AGENT }) || 'Not captured',
+    '',
+    '</details>',
+  ].join('\n');
+
+  return { title, body, labels: [safeLabel(label)] };
+}
+
+// -----------------------------------------------------------------------------
+
 // Submit feedback as a GitHub Issue (with DB fallback)
 router.post('/github', verifyAuth0Token, async (req, res) => {
   try {
@@ -140,27 +309,19 @@ router.post('/github', verifyAuth0Token, async (req, res) => {
       safeUserEmail = caller.email;
     }
 
-    const title = `[Feedback] ${category}: ${text.substring(0, 50)}${text.length > 50 ? '...' : ''}`;
-    const body = [
-      '## Feedback',
-      '',
+    // [Phase 91 deferred, security] Every client string reaches the issue through
+    // this ONE pure builder — see DECISION Phase 91 FB-ESC above. `label` is
+    // allow-listed there too; it is no longer `label || 'feedback:general'`.
+    const { title, body, labels } = buildGithubIssuePayload({
+      category,
       text,
-      '',
-      '---',
-      `**Page:** ${safePageUrl}`,
-      `**User:** ${userName || 'Unknown'}`,
-      `**Email:** ${safeUserEmail || 'Not provided'}`,
-      `**Category:** ${category}`,
-      `**Submitted:** ${new Date().toISOString()}`,
-      '',
-      '<details>',
-      '<summary>Browser Info</summary>',
-      '',
-      userAgent || 'Not captured',
-      '',
-      '</details>',
-    ].join('\n');
-    const labels = [label || 'feedback:general'];
+      safePageUrl,
+      userName,
+      safeUserEmail,
+      label,
+      userAgent,
+      submittedAt: new Date().toISOString(),
+    });
 
     try {
       const OctokitClass = await getOctokit();
@@ -331,3 +492,9 @@ module.exports = router;
 // Exported for the unit test (tests/routes/feedback.test.js) — pure helper,
 // no router behaviour attached.
 module.exports.scrubPageUrl = scrubPageUrl;
+// [Phase 91 deferred, security] Same reason, plus one more: the GitHub client is
+// unmockable in this harness (see buildGithubIssuePayload's docblock), so the
+// created-issue payload is only assertable through the builder.
+module.exports.renderUntrusted = renderUntrusted;
+module.exports.buildGithubIssuePayload = buildGithubIssuePayload;
+module.exports.ALLOWED_FEEDBACK_LABELS = ALLOWED_FEEDBACK_LABELS;

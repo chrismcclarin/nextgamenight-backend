@@ -428,3 +428,218 @@ describe('POST /api/feedback — the PUBLIC writer keeps its client-supplied add
     });
   });
 });
+
+// -----------------------------------------------------------------------------
+// [Phase 91 deferred, security — 88.8 code-adversarial-review round 3 #10]
+// POST /api/feedback/github must not interpolate client strings into a GitHub
+// Issue unescaped, and must not apply an arbitrary label.
+//
+// WHY THESE ASSERT ON buildGithubIssuePayload RATHER THAN ON A MOCKED OCTOKIT:
+// @octokit/rest is an ESM-only DYNAMIC import and this repo's Jest runs without
+// --experimental-vm-modules, so `await import('@octokit/rest')` throws inside the
+// harness before any mock could apply (verified: "A dynamic import callback was
+// invoked without --experimental-vm-modules"; the 87.8-05 describe above records
+// the same constraint). The builder IS the created-issue payload — the route
+// destructures its three fields and passes them verbatim to issues.create — and
+// the last test in this block pins that wiring by source assertion, the same
+// technique the 88.8-09 block uses for the Email line.
+// -----------------------------------------------------------------------------
+
+describe('POST /api/feedback/github — client strings are inert in the issue (Phase 91 FB-ESC)', () => {
+  const { buildGithubIssuePayload, renderUntrusted, ALLOWED_FEEDBACK_LABELS } = feedbackRoutes;
+
+  const HOSTILE_TEXT = [
+    'Hey @someone and @another-person, please look at this.',
+    '![beacon](https://evil.test/track.png)',
+    'Here is `inline code` and ```a triple run``` in the prose.',
+    '</details><img src="https://evil.test/breakout.png">',
+  ].join('\n');
+
+  const baseArgs = {
+    category: 'General',
+    text: HOSTILE_TEXT,
+    safePageUrl: '/groupHomePage',
+    userName: 'Reporter',
+    safeUserEmail: 'stored@example.com',
+    label: 'feedback:general',
+    userAgent: 'Mozilla/5.0 (Macintosh)',
+    submittedAt: '2026-09-08T00:00:00.000Z',
+  };
+
+  // Split the body into (the one fenced block) and (everything else), so a test
+  // can assert that nothing hostile survives OUTSIDE the fence. The fence length
+  // is content-dependent by design, hence the backreference.
+  function splitOnFence(body) {
+    const match = body.match(/^(`{3,})\n([\s\S]*?)\n\1$/m);
+    if (!match) return { fenced: null, outside: body };
+    return { fenced: match[2], outside: body.replace(match[0], ' FENCE ') };
+  }
+
+  it('THE DISCRIMINATING CASE: @mentions, a remote image and an HTML breakout live ONLY inside the fence', () => {
+    const { body } = buildGithubIssuePayload(baseArgs);
+    const { fenced, outside } = splitOnFence(body);
+
+    expect(fenced).not.toBeNull();
+    // The report is not lossy — every hostile token is still readable by the owner.
+    expect(fenced).toContain('@someone');
+    expect(fenced).toContain('![beacon](https://evil.test/track.png)');
+    expect(fenced).toContain('</details><img src="https://evil.test/breakout.png">');
+
+    // ...but none of it renders: nothing hostile appears outside the fence.
+    expect(outside).not.toContain('@someone');
+    expect(outside).not.toContain('@another-person');
+    expect(outside).not.toContain('evil.test');
+    expect(outside).not.toContain('<img');
+  });
+
+  it('the fence is LONGER than the longest backtick run in the content, so the author cannot close it', () => {
+    const { body } = buildGithubIssuePayload(baseArgs);
+    const fenceRun = body.match(/^(`{3,})$/m)[1];
+    // The text carries a ``` run, so a 3-backtick fence would have been closable.
+    expect(fenceRun.length).toBeGreaterThanOrEqual(4);
+    expect(body).toContain('```a triple run```');
+
+    // And it scales: a 6-backtick run in the content forces a 7-backtick fence.
+    const wild = buildGithubIssuePayload({ ...baseArgs, text: 'break ``````out`````` now' });
+    expect(wild.body).toContain('`'.repeat(7));
+  });
+
+  it('a 10k-character body is clamped to the 2000-char limit (plus the ellipsis)', () => {
+    const huge = 'A'.repeat(10000);
+    const { body } = buildGithubIssuePayload({ ...baseArgs, text: huge });
+    const { fenced } = splitOnFence(body);
+
+    expect(huge.length).toBe(10000);
+    expect(fenced.length).toBe(2003); // 2000 + '...'
+    expect(fenced.endsWith('...')).toBe(true);
+    expect(body.length).toBeLessThan(3000);
+  });
+
+  it('the short fields are inline code spans — a hostile userName / userAgent cannot render', () => {
+    const { body } = buildGithubIssuePayload({
+      ...baseArgs,
+      text: 'A perfectly ordinary report, long enough to pass validation.',
+      userName: '@evil-org/security-team',
+      userAgent: 'Mozilla/5.0 @someone <img src=x>',
+    });
+    const { outside } = splitOnFence(body);
+
+    // Present (lossless) but wrapped, so the @ is inside a code span.
+    expect(outside).toContain('` @evil-org/security-team `');
+    expect(outside).toContain('` Mozilla/5.0 @someone <img src=x> `');
+    // No bare occurrence: every @ in the body sits between backticks.
+    expect(outside).not.toMatch(/(^|[^`\s])@evil-org/);
+  });
+
+  it('userAgent is clamped to 300 characters', () => {
+    const long = 'U'.repeat(1000);
+    const { body } = buildGithubIssuePayload({ ...baseArgs, userAgent: long });
+    expect(body).toContain('` ' + 'U'.repeat(300) + '... `');
+    expect(body).not.toContain('U'.repeat(400));
+  });
+
+  it('the TITLE never contains a newline, and is bounded so it fits Feedback.subject STRING(200)', () => {
+    const { title } = buildGithubIssuePayload({
+      ...baseArgs,
+      category: 'C'.repeat(400) + '\nsecond line',
+      text: 'Line one of the report\nline two\nline three, comfortably past fifty characters.',
+    });
+
+    expect(title).not.toContain('\n');
+    expect(title).not.toContain('\r');
+    expect(title.length).toBeLessThanOrEqual(200);
+    // The snippet's newlines collapsed to spaces rather than truncating the title.
+    expect(title).toContain('Line one of the report line two');
+  });
+
+  it('an UNKNOWN label falls back to feedback:general — no client-chosen label reaches the repo', () => {
+    for (const hostile of ['bug', 'feedback:not-real', 'FEEDBACK:GENERAL', '', null, undefined, 42, ['feedback:home']]) {
+      const { labels } = buildGithubIssuePayload({ ...baseArgs, label: hostile });
+      expect(labels).toEqual(['feedback:general']);
+    }
+  });
+
+  it('each of the SEVEN labels the frontend emits passes through unchanged', () => {
+    // Mirrors FeedbackModalProvider.tsx:65-78 (six CATEGORY_MAP labels plus
+    // getCategoryLabel's 'feedback:general' fallback).
+    const feLabels = [
+      'feedback:general',
+      'feedback:groups',
+      'feedback:friends-list',
+      'feedback:scheduling',
+      'feedback:home',
+      'feedback:games',
+      'feedback:profile',
+    ];
+    expect(ALLOWED_FEEDBACK_LABELS.slice().sort()).toEqual(feLabels.slice().sort());
+    for (const label of feLabels) {
+      expect(buildGithubIssuePayload({ ...baseArgs, label }).labels).toEqual([label]);
+    }
+  });
+
+  it('the Email line is untouched — server-derived, interpolated bare (88.8 D-42 is preserved)', () => {
+    const { body } = buildGithubIssuePayload(baseArgs);
+    expect(body).toContain('**Email:** stored@example.com');
+    const missing = buildGithubIssuePayload({ ...baseArgs, safeUserEmail: null });
+    expect(missing.body).toContain('**Email:** Not provided');
+  });
+
+  it('renderUntrusted is total — a non-string, blank or whitespace-only value yields the caller fallback', () => {
+    for (const junk of [null, undefined, 42, {}, [], '', '   ', '\n\n']) {
+      expect(renderUntrusted(junk, { mode: 'inline', max: 100 })).toBe('');
+      expect(renderUntrusted(junk, { mode: 'block', max: 100 })).toBe('');
+      expect(renderUntrusted(junk, { mode: 'title', max: 100 })).toBe('');
+    }
+    const { body } = buildGithubIssuePayload({ ...baseArgs, userName: '   ', userAgent: null });
+    expect(body).toContain('**User:** Unknown');
+    expect(body).toContain('Not captured');
+  });
+
+  it('source: the builder IS the created-issue payload — its three fields go straight to issues.create', () => {
+    const fs = require('fs');
+    const path = require('path');
+    const source = fs.readFileSync(path.join(__dirname, '../../routes/feedback.js'), 'utf8');
+    const code = source.split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
+
+    expect(code).toContain('const { title, body, labels } = buildGithubIssuePayload({');
+    // No second path into the issue: the old unescaped build and the old
+    // pass-through label must both be gone.
+    expect(code).not.toContain("label || 'feedback:general'");
+    expect(code).not.toMatch(/\*\*User:\*\*\s*\$\{userName/);
+    expect(code).not.toMatch(/\*\*Category:\*\*\s*\$\{category\}/);
+    // The rationale marker is present.
+    expect(source).toContain('DECISION Phase 91 FB-ESC');
+  });
+});
+
+describe('POST /api/feedback/github — the DB fallback is unchanged except for the now-bounded subject', () => {
+  const githubPayload = {
+    category: 'General',
+    text: 'This is a sufficiently long piece of feedback with @someone in it.',
+    pageUrl: '/groupHomePage',
+    userName: 'Reporter',
+  };
+
+  it('description keeps the RAW text and page_context keeps the unwrapped scrubbed URL', async () => {
+    const res = await request(app).post('/api/feedback/github').send({ ...githubPayload });
+
+    expect(res.status).toBe(200);
+    const persisted = Feedback.create.mock.calls[0][0];
+    // The fallback row is for the owner's own DB, not a Markdown renderer — it is
+    // deliberately NOT fenced, and this pins that it did not change.
+    expect(persisted.description).toBe(githubPayload.text);
+    expect(persisted.page_context).toBe('/groupHomePage');
+    expect(persisted.type).toBe('feedback');
+    expect(persisted.user_id).toBeNull();
+  });
+
+  it('an unbounded category no longer overflows Feedback.subject STRING(200)', async () => {
+    const res = await request(app)
+      .post('/api/feedback/github')
+      .send({ ...githubPayload, category: 'X'.repeat(5000) });
+
+    expect(res.status).toBe(200);
+    const persisted = Feedback.create.mock.calls[0][0];
+    expect(persisted.subject.length).toBeLessThanOrEqual(200);
+  });
+});
