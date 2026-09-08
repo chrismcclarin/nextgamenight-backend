@@ -5,6 +5,7 @@ const { BullMQAdapter } = require('@bull-board/api/bullMQAdapter');
 const { ExpressAdapter } = require('@bull-board/express');
 const { verifyAuth0Token } = require('../middleware/auth0');
 const { requirePlatformAdmin } = require('../middleware/adminAuth');
+const { apiLimiter } = require('../middleware/rateLimiter');
 
 /**
  * Mount Bull Board dashboard with Auth0 protection
@@ -52,16 +53,27 @@ function mountBullBoard(app) {
     }
   });
 
-  // Mount with Auth0 + platform-admin protection (D-02 / BSEC-02 — was
+  // Mount with rate limiting + Auth0 + platform-admin protection (D-02 / BSEC-02 — was
   // requireGroupAdmin, which let ANY group owner reach system-wide queues).
+  //
+  // apiLimiter runs FIRST, ahead of verifyAuth0Token (CodeQL js/missing-rate-limiting):
+  // the global limiter is mounted on `/api/` only (server.js:237) and this board lives
+  // at `/admin/queues`, OUTSIDE that prefix, so until now every unauthenticated request
+  // here reached JWT verification — the expensive step — unthrottled. Ordering is the
+  // point: a limiter behind the auth check cannot bound the cost of rejected traffic.
+  //
+  // This mounts the EXISTING limiter as-is; no limiter config is changed. The IP-keying
+  // caveat (Phase 86 / T-86-07 BFF egress sharing, durable per-user keying deferred to
+  // Phase 91 / BOPS-02) is recorded in middleware/rateLimiter.js and applies here too.
   app.use(
     '/admin/queues',
+    apiLimiter,
     verifyAuth0Token,
     requirePlatformAdmin,
     serverAdapter.getRouter()
   );
 
-  console.log('Bull Board mounted at /admin/queues (Auth0 + platform-admin protected)');
+  console.log('Bull Board mounted at /admin/queues (rate-limited + Auth0 + platform-admin protected)');
 }
 
 module.exports = mountBullBoard;
