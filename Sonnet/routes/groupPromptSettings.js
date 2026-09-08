@@ -19,7 +19,10 @@ async function syncToBullMQ(action, label) {
   try {
     await action();
   } catch (err) {
-    console.error(`[groupPromptSettings] BullMQ sync failed (${label}):`, err.message);
+    // `label` embeds a caller-supplied schedule_id, so it is passed as its own
+    // argument rather than interpolated into the format string (CodeQL
+    // js/tainted-format-string) — a `%s` in the id would consume err.message.
+    console.error('[groupPromptSettings] BullMQ sync failed:', label, err.message);
   }
 }
 

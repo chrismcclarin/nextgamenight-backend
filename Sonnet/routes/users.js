@@ -672,10 +672,13 @@ router.patch('/:user_id/notification-preferences', async (req, res) => {
         if (result.success) {
           await user.update({ sms_welcome_sent_at: new Date() });
         } else {
-          console.warn(`[users] Welcome SMS not sent for ${userId}: ${result.error}`);
+          // userId / result.error are separate arguments, never part of the format
+          // string (CodeQL js/tainted-format-string) — a `%s` in either would consume
+          // the value after it and drop the reason from the log.
+          console.warn('[users] Welcome SMS not sent for user:', userId, result.error);
         }
       } catch (error) {
-        console.error(`[users] Welcome SMS error for ${userId}:`, error.message);
+        console.error('[users] Welcome SMS error for user:', userId, error.message);
       }
     }
 
