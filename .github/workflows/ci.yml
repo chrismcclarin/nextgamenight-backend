@@ -29,6 +29,14 @@ on:
   push:
     branches-ignore: [main]
 
+# CodeQL `actions/missing-workflow-permissions` (first scan, 2026-09-08): all three jobs
+# ran on the repo-default GITHUB_TOKEN scopes. Verified read-only — no step calls the
+# GitHub API (no `gh`, no actions/github-script, no api.github.com), uploads an artifact,
+# comments, or writes a ref; the only token consumer is actions/checkout, which needs
+# `contents: read`. Adding a WRITE scope here requires a step that actually writes.
+permissions:
+  contents: read
+
 jobs:
   quality:
     name: quality
