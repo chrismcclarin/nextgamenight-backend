@@ -109,6 +109,15 @@ describe('reminderScheduler', () => {
         })
       );
 
+      // 2026-09-29 (code-adversarial-review 88.6 round 2, #28): the SMS is an RSVP prompt for ONE
+      // event, so `eventUrl` is the EVENT page — `/gameDetail?event_id=<id>&group_id=<gid>`, the
+      // link every other notification in this backend builds (routes/events.js). The shipped value
+      // was `/groupHomePage?group_id=<gid>`: a page that reads `?id=`, so every reminder opened
+      // an empty group page. Pinned EXACTLY so a param rename cannot slip through `stringContaining`.
+      const { eventUrl } = mockSmsServiceSend.mock.calls[0][0].data;
+      expect(eventUrl).toBe('https://example.com/gameDetail?event_id=event-uuid-1&group_id=group-uuid-1');
+      expect(eventUrl).not.toContain('groupHomePage');
+
       expect(mockRsvpUpdate).toHaveBeenCalledTimes(1);
       expect(mockRsvpUpdate).toHaveBeenCalledWith(
         expect.objectContaining({
