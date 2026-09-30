@@ -111,7 +111,7 @@ describe('reminderScheduler', () => {
 
       // 2026-09-29 (code-adversarial-review 88.6 round 2, #28): the SMS is an RSVP prompt for ONE
       // event, so `eventUrl` is the EVENT page — `/gameDetail?event_id=<id>&group_id=<gid>`, the
-      // link every other notification in this backend builds (routes/events.js). The shipped value
+      // form routes/events.js builds for its created / updated notifications. The shipped value
       // was `/groupHomePage?group_id=<gid>`: a page that reads `?id=`, so every reminder opened
       // an empty group page. Pinned EXACTLY so a param rename cannot slip through `stringContaining`.
       const { eventUrl } = mockSmsServiceSend.mock.calls[0][0].data;
@@ -124,6 +124,23 @@ describe('reminderScheduler', () => {
           reminder_sent_at: expect.any(Date)
         })
       );
+    });
+
+    // 2026-09-30 (code-adversarial-review 88.6 round 3, M11): the `Group` association can be
+    // absent on the row; the link then takes `event.group_id`. Without this arm pinned, a
+    // regression would send the literal `group_id=null`, which the event page treats as a real id.
+    test('falls back to event.group_id for the link when the Group association is not loaded', async () => {
+      const thirtyMinFromNow = new Date(Date.now() + 30 * 60000);
+      const event = createMockEvent({ startDate: thirtyMinFromNow, groupName: null, rsvps: [{}] });
+      event.group_id = 'group-uuid-2';
+      mockEventFindAll.mockResolvedValue([event]);
+
+      await processUpcomingReminders();
+
+      expect(mockSmsServiceSend).toHaveBeenCalledTimes(1);
+      const { eventUrl, groupName } = mockSmsServiceSend.mock.calls[0][0].data;
+      expect(eventUrl).toBe('https://example.com/gameDetail?event_id=event-uuid-1&group_id=group-uuid-2');
+      expect(groupName).toBe('your group');
     });
 
     test('skips users outside their reminder window', async () => {

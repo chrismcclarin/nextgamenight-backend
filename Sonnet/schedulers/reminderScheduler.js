@@ -100,9 +100,14 @@ async function processUpcomingReminders() {
     const groupId = event.Group ? event.Group.id : (event.group_id || null);
     // DECISION 2026-09-29 (code-adversarial-review 88.6 round 2, #28; owner: "lets just fix it real
     // quick"): the reminder is an RSVP prompt for ONE event, so its link is the EVENT page —
-    // `/gameDetail?event_id=<id>&group_id=<gid>`, the URL every other notification in this backend
-    // builds (routes/events.js). REJECTED: keeping the group page and only renaming the param to
-    // `?id=` — the shipped `/groupHomePage?group_id=` never rendered (the page reads `?id=`,
+    // `/gameDetail?event_id=<id>&group_id=<gid>`, the form routes/events.js builds for its
+    // created / updated notifications (three sites there; services/eventCreationService.js
+    // deliberately sends the bare `?event_id=` form, and the cancel notice links the group page).
+    // `group_id` is KEPT here: the event view still reads it from the URL at two sites
+    // (periodictabletop/src/app/gameDetail/page.js — the cancel redirect and the edit modal), so
+    // dropping it to shorten the SMS would break those.
+    // REJECTED: keeping the group page and only renaming the param to `?id=` — the shipped
+    // `/groupHomePage?group_id=` never rendered (the page reads `?id=`,
     // periodictabletop/src/app/groupHomePage/page.js), so every reminder opened an empty page,
     // and even fixed it would land the user one tap short of the event they were reminded about.
     const eventUrl = `${process.env.FRONTEND_URL || 'http://localhost:3000'}/gameDetail?event_id=${event.id}&group_id=${groupId}`;
