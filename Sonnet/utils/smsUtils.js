@@ -42,4 +42,51 @@ function sanitizeForSms(str) {
   return result.trim();
 }
 
-module.exports = { sanitizeForSms };
+// The fewest characters of a name an SMS keeps before the NEXT name starts giving way
+// (owner, 2026-09-30: "Twilight Imperium: Fourth Edition" down to "Twilight Imp" "would be fine").
+const NAME_FLOOR = 12;
+const ELLIPSIS = '...';
+
+/**
+ * Clip a name to at most `maxLength` characters INCLUDING the trailing "...".
+ * A name that already fits is returned untouched.
+ */
+function clipName(name, maxLength) {
+  if (name.length <= maxLength) return name;
+  if (maxLength <= 0) return '';
+  if (maxLength <= ELLIPSIS.length) return name.slice(0, maxLength);
+  return name.slice(0, maxLength - ELLIPSIS.length).trimEnd() + ELLIPSIS;
+}
+
+/**
+ * Make a message fit a character budget by shortening its NAMES — never its tail.
+ *
+ * DECISION 2026-09-30 (owner rule; code-adversarial-review 88.6 round 3, M1/M6/M8): an over-long
+ * SMS gives up name characters, chosen OVER cutting the assembled message from the end (what
+ * shipped — it removed "Reply STOP to opt out" first, then the reply options, then the link) and
+ * OVER capping names in the app or the database (owner: names are not limited for texting's
+ * sake). Names give way IN THE ORDER PASSED: the first shrinks to NAME_FLOOR characters before
+ * the second is touched, so callers pass the game name first and the group name second. Only if
+ * every name is at the floor and the message is still too long do names shrink further, same
+ * order. Reordering the names or cutting the tail again is a decision, not a cleanup.
+ *
+ * @param {(...names: string[]) => string} build - Renders the message from the (possibly clipped) names
+ * @param {string[]} names - Names in the order they give way
+ * @param {number} budget - Maximum length of the rendered message
+ * @returns {string} The rendered message; longer than `budget` only if it cannot fit with every name empty
+ */
+function fitNamesToBudget(build, names, budget) {
+  const fitted = names.map((n) => n || '');
+  const excess = () => build(...fitted).length - budget;
+
+  for (const floor of [NAME_FLOOR + ELLIPSIS.length, 0]) {
+    for (let i = 0; i < fitted.length; i += 1) {
+      const over = excess();
+      if (over <= 0) return build(...fitted);
+      fitted[i] = clipName(fitted[i], Math.max(floor, fitted[i].length - over));
+    }
+  }
+  return build(...fitted);
+}
+
+module.exports = { sanitizeForSms, fitNamesToBudget, NAME_FLOOR };

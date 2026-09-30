@@ -97,13 +97,30 @@ describe('smsService', () => {
       });
     });
 
-    it('truncates messages over 306 characters', () => {
+    // 2026-09-30 (owner rule; code-adversarial-review 88.6 round 3, M1/M6/M8): this case used to
+    // assert the message ENDED in "..." — i.e. it pinned the defect, a cut that removed the link
+    // and the opt-out line. An over-long message now shrinks the NAME; the tail is never cut.
+    it('shrinks the name, not the tail, when a message would run over 306 characters', () => {
+      const actionUrl = 'https://nextgamenight.app/events/some-really-long-uuid-here-with-extra-path-segments/additional';
       const msg = smsService.buildMessage('event_confirmation', {
         gameName: 'A Very Long Game Name That Goes On And On And On And Takes Up Lots Of Characters And Even More Characters To Really Push It Over The Limit Of Three Hundred And Six Characters Which Is Two GSM Seven Segments Worth Of Text Content In A Single Message Body Field',
         date: 'Saturday March 29th 2026 at 7:00 PM Eastern Standard Time',
-        actionUrl: 'https://nextgamenight.app/events/some-really-long-uuid-here-with-extra-path-segments/additional'
+        actionUrl
       });
       expect(msg.length).toBeLessThanOrEqual(306);
+      expect(msg).toContain('A Very Long Game Name');
+      expect(msg).toContain('... is set for ');
+      expect(msg).toContain(actionUrl);
+      expect(msg.endsWith(' Reply STOP to opt out')).toBe(true);
+    });
+
+    it('keeps the hard 306 cap as the last resort when the fixed text alone cannot fit', () => {
+      const msg = smsService.buildMessage('event_confirmation', {
+        gameName: 'Catan',
+        date: 'Friday',
+        actionUrl: `https://nextgamenight.app/${'x'.repeat(320)}`
+      });
+      expect(msg.length).toBe(306);
       expect(msg).toMatch(/\.\.\.$/);
     });
 
@@ -390,6 +407,130 @@ describe('smsService', () => {
       it('reminder with long data stays within 306 chars', () => {
         const msg = smsService.buildMessage('reminder', longData);
         expect(msg.length).toBeLessThanOrEqual(306);
+      });
+    });
+
+    // --- Name budget (owner rule 2026-09-30; code-adversarial-review 88.6 round 3, M1/M6/M8) ---
+    // "<= 306" alone (the block above) passes while the link and the opt-out line are being cut
+    // off the end. These pin WHAT survives: the link, the reply options and STOP always do; the
+    // game name gives way first (down to 12 characters), then the group name.
+    describe('name budget: names shrink, the link / reply options / STOP never do', () => {
+
+      const EVENT_URL = 'https://www.nextgamenight.app/gameDetail?event_id=a1b2c3d4-e5f6-7890-abcd-ef1234567890&group_id=a1b2c3d4-e5f6-7890-abcd-ef1234567890';
+      const GROUP_40 = 'The Thursday Night Board Game Crew PDX!!';
+      const GAME_33 = 'Twilight Imperium: Fourth Edition';
+      const GAME_80 = 'Twilight Imperium: Fourth Edition with Prophecy of Kings and Codex Volumes I-III';
+      const PROMPT = ' Reply 1=Yes, 2=No, 3=Maybe';
+      const STOP = ' Reply STOP to opt out';
+      const reminderData = {
+        eventName: GAME_33,
+        groupName: GROUP_40,
+        timeUntil: 'tomorrow at 7:00 PM PDT',
+        eventUrl: EVENT_URL,
+        rsvpPrompt: true
+      };
+
+      it('fixture lengths are what the cases below assume', () => {
+        expect(EVENT_URL).toHaveLength(132);
+        expect(GROUP_40).toHaveLength(40);
+        expect(GAME_33).toHaveLength(33);
+        expect(GAME_80).toHaveLength(80);
+      });
+
+      it('a reminder that fits is sent exactly as before', () => {
+        const msg = smsService.buildMessage('reminder', {
+          eventName: 'Board Game Night',
+          groupName: 'Friday Gamers',
+          timeUntil: 'tomorrow',
+          eventUrl: 'https://nextgamenight.app/events/abc123',
+          rsvpPrompt: true
+        });
+        expect(msg).toBe(
+          'Reminder: Board Game Night with Friday Gamers is tomorrow! Details: https://nextgamenight.app/events/abc123 Reply 1=Yes, 2=No, 3=Maybe Reply STOP to opt out'
+        );
+      });
+
+      it('an over-long reminder first drops "Reminder:" and the "!" — both names stay whole', () => {
+        const msg = smsService.buildMessage('reminder', reminderData);
+        expect(msg).toBe(
+          `${GAME_33} with ${GROUP_40} is tomorrow at 7:00 PM PDT Details: ${EVENT_URL}${PROMPT}${STOP}`
+        );
+        expect(msg.length).toBeLessThanOrEqual(306);
+      });
+
+      it('then the game name shrinks while the group name stays whole', () => {
+        const msg = smsService.buildMessage('reminder', { ...reminderData, eventName: GAME_80 });
+        expect(msg.length).toBeLessThanOrEqual(306);
+        // not over-trimmed: the game name keeps every character the budget allows
+        expect(msg.length).toBeGreaterThanOrEqual(300);
+        expect(msg.startsWith('Twilight Imperium: Fourth Edition')).toBe(true);
+        expect(msg).not.toContain(GAME_80);
+        expect(msg).toContain(`... with ${GROUP_40} is tomorrow at 7:00 PM PDT Details: ${EVENT_URL}${PROMPT}`);
+        expect(msg.endsWith(STOP)).toBe(true);
+      });
+
+      it('the game name stops shrinking at 12 characters; after that the group name shrinks', () => {
+        // a link 42 characters longer leaves 40 characters for both names together
+        const longUrl = `${EVENT_URL}&${'x'.repeat(41)}`;
+        const msg = smsService.buildMessage('reminder', { ...reminderData, eventName: GAME_80, eventUrl: longUrl });
+        expect(msg.length).toBeLessThanOrEqual(306);
+        expect(msg.startsWith('Twilight Imp... with The Thursday Night Boa... is tomorrow')).toBe(true);
+        expect(msg).toContain(`Details: ${longUrl}${PROMPT}`);
+        expect(msg.endsWith(STOP)).toBe(true);
+      });
+
+      it('event_created keeps its link, reply options and STOP with long names', () => {
+        const msg = smsService.buildMessage('event_created', {
+          eventName: GAME_80,
+          groupName: GROUP_40,
+          dateTime: 'Saturday March 29th at 7:00 PM',
+          eventUrl: EVENT_URL,
+          rsvpPrompt: true
+        });
+        expect(msg.length).toBeLessThanOrEqual(306);
+        expect(msg.startsWith('Hey! Twilight Imp')).toBe(true);
+        expect(msg).toContain(GROUP_40);
+        expect(msg).toContain(`Details: ${EVENT_URL}${PROMPT}`);
+        expect(msg.endsWith(STOP)).toBe(true);
+      });
+
+      it('event_updated keeps its link and STOP with long names', () => {
+        const msg = smsService.buildMessage('event_updated', {
+          eventName: `${GAME_80} ${GAME_80}`,
+          groupName: GROUP_40,
+          dateTime: 'Saturday March 29th at 7:00 PM',
+          eventUrl: EVENT_URL
+        });
+        expect(msg.length).toBeLessThanOrEqual(306);
+        expect(msg).toContain(GROUP_40);
+        expect(msg).toContain(`Details: ${EVENT_URL}`);
+        expect(msg.endsWith(STOP)).toBe(true);
+      });
+
+      it('event_cancelled keeps STOP with a very long name', () => {
+        const msg = smsService.buildMessage('event_cancelled', {
+          eventName: 'Z'.repeat(400),
+          groupName: GROUP_40,
+          dateTime: 'Saturday March 29th at 7:00 PM'
+        });
+        expect(msg.length).toBeLessThanOrEqual(306);
+        expect(msg).toContain('has been cancelled.');
+        expect(msg.endsWith(STOP)).toBe(true);
+      });
+
+      it('a legacy template with two names shrinks the group name before the person name', () => {
+        // leaves 45 characters for the two names together (21 + 40 asked for)
+        const actionUrl = `https://www.nextgamenight.app/invite/${'a'.repeat(169)}`;
+        const msg = smsService.buildMessage('group_invite', {
+          inviterName: 'Alexandria Montgomery',
+          groupName: GROUP_40,
+          actionUrl
+        });
+        expect(msg.length).toBeLessThanOrEqual(306);
+        expect(msg).toContain('Alexandria Montgomery invited you to The ');
+        expect(msg).not.toContain(GROUP_40);
+        expect(msg).toContain(actionUrl);
+        expect(msg.endsWith(STOP)).toBe(true);
       });
     });
   });
