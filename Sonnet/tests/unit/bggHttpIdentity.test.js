@@ -13,8 +13,9 @@
 // The source scan below is the half that matters over time: the disguise is the thing a future
 // reader reaches for when a 403 appears, and it is exactly what causes the 403.
 //
-// DB-free: bggService imports only axios + xml2js; bggCsvService (which imports the models) is
-// covered by the source scan, not by a require. Runs in the `npm run test:unit` lane.
+// DB-free: bggService imports axios, xml2js and the identity constant; bggCsvService (which imports
+// the models) is covered by the source scan, not by a require. Matched by both jest configs: the
+// DB-free `npm run test:unit` lane locally, and `npm test` — the lane CI runs.
 
 const fs = require('fs');
 const path = require('path');
@@ -66,15 +67,18 @@ describe('bggService.getHeaders()', () => {
 });
 
 describe('source scan — no browser disguise anywhere the backend makes requests', () => {
-  const files = [...sourceFiles('services'), ...sourceFiles('routes')];
+  // Every directory that holds request-making code, not just the two the BGG services live in:
+  // the next BGG client could be written anywhere.
+  const SCANNED = ['services', 'routes', 'utils', 'workers', 'queues', 'schedulers', 'middleware', 'scripts'];
+  const files = SCANNED.flatMap(sourceFiles);
 
   it('scans a non-trivial set of files (guards against a vacuous pass)', () => {
-    expect(files.length).toBeGreaterThan(20);
+    expect(files.length).toBeGreaterThan(100);
     expect(files).toContain(path.join('services', 'bggService.js'));
     expect(files).toContain(path.join('services', 'bggCsvService.js'));
   });
 
-  it('no service or route hardcodes a browser User-Agent', () => {
+  it('no backend source file hardcodes a browser User-Agent', () => {
     const offenders = files.filter((f) => /Mozilla\/\d/.test(fs.readFileSync(path.join(ROOT, f), 'utf8')));
     expect(offenders).toEqual([]);
   });
