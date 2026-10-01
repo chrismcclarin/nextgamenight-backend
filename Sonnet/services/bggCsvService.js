@@ -7,6 +7,7 @@ const path = require('path');
 const csv = require('csv-parser');
 const { Game } = require('../models');
 const { Op } = require('sequelize');
+const { BGG_USER_AGENT } = require('./bggHttpIdentity');
 
 class BGGCSVService {
   constructor() {
@@ -32,7 +33,7 @@ class BGGCSVService {
       const applicationToken = process.env.BGG_APPLICATION_TOKEN;
       
       const headers = {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+        'User-Agent': BGG_USER_AGENT,
         'Accept': 'text/csv, application/csv, */*',
       };
 

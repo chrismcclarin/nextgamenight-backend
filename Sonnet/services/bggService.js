@@ -1,6 +1,7 @@
 // services/bggService.js
 const axios = require('axios');
 const xml2js = require('xml2js');
+const { BGG_USER_AGENT } = require('./bggHttpIdentity');
 
 
 class BGGService {
@@ -20,10 +21,9 @@ class BGGService {
    */
   getHeaders() {
     const headers = {
-      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'User-Agent': BGG_USER_AGENT,
       'Accept': 'application/xml, text/xml, */*',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Referer': 'https://boardgamegeek.com/'
+      'Accept-Language': 'en-US,en;q=0.9'
     };
 
     // Add Authorization header if token is available
