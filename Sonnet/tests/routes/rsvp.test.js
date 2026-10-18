@@ -576,4 +576,47 @@ describe('RSVP UUID keyspace authz + wire (Phase 87.1)', () => {
     const row = await SingleUseToken.findOne({ where: { nonce: token } });
     expect(row.status).toBe('active');
   });
+
+  // Phase 88.6.1-87 (close ruling P-77, owner ruling D4 "Option A"): the FE's
+  // respondViaToken keys the RSVP page's EVENT_GONE card ("This game night was
+  // cancelled") on this 404 AND its body token, never on prose. This pins the body
+  // so an envelope conversion (Phase 93, .planning/deferred/phase-93.md entry
+  // "GET /rsvp/respond: the 404 for a missing event") cannot drop it silently.
+  // The event is HARD-deleted (force: true) after the link is minted:
+  // single_use_tokens.event_id carries no FK, so the token row survives, exactly
+  // as it does after DELETE /events/:id in production.
+  it('B1. GET /respond for an event that is gone answers 404 with body exactly { error: event_not_found }', async () => {
+    await mintRsvpBatch(event.id, owner.user_id);
+    const token = generateRsvpToken(event.id, owner.user_id, 'yes');
+    await event.destroy({ force: true });
+    expect(await Event.findByPk(event.id, { paranoid: false })).toBeNull();
+
+    const res = await request(app)
+      .get('/api/rsvp/respond')
+      .query({ token, e: event.id, u: owner.user_id, s: 'yes' });
+    expect(res.status).toBe(404);
+    expect(res.body).toEqual({ error: 'event_not_found' });
+  });
+
+  // B2: the same link again answers the spent-link 403, which pins that the 404
+  // above is answered AFTER the single-use consume (the premise the Phase 93 entry
+  // routes: look the event up before consuming). Green before and after plan 87.
+  it('B2. the same link a second time answers 403 expired_link: the 404 is sent after the consume', async () => {
+    await mintRsvpBatch(event.id, owner.user_id);
+    const token = generateRsvpToken(event.id, owner.user_id, 'yes');
+    await event.destroy({ force: true });
+
+    const first = await request(app)
+      .get('/api/rsvp/respond')
+      .query({ token, e: event.id, u: owner.user_id, s: 'yes' });
+    expect(first.status).toBe(404);
+
+    const again = await request(app)
+      .get('/api/rsvp/respond')
+      .query({ token, e: event.id, u: owner.user_id, s: 'yes' });
+    expect(again.status).toBe(403);
+    expect(again.body.error).toBe('expired_link');
+    const row = await SingleUseToken.findOne({ where: { nonce: token } });
+    expect(row.status).toBe('used');
+  });
 });

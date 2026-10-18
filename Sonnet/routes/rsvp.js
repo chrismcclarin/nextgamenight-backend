@@ -285,7 +285,20 @@ router.get('/respond', async (req, res) => {
       ],
     });
     if (!event) {
-      return res.status(404).json({ error: 'Event not found' });
+      // DECISION Phase 88.6.1-87 (close ruling P-77, owner 2026-10-18 Option A): CHOSEN a code
+      // token the FE keys on (periodictabletop/src/lib/api.ts respondViaToken -> the RSVP page's
+      // EVENT_GONE card, "This game night was cancelled") over the prose this line sent before;
+      // REJECTED an FE match on that prose (backend prose is never a discriminant) and an FE that
+      // accepts both bodies (D4). The two sibling 404s in this file (POST / and
+      // GET /event/:event_id) are deliberately unchanged: different routes, different consumers.
+      // The other case this answer covers: an event soft-deleted with its group and restorable for
+      // 30 days, its link already spent by the consume above. Owner-accepted 2026-10-18 ("a"),
+      // with the improvement (look up before consuming; a distinct code for a soft-deleted event)
+      // routed to Phase 93 (.planning/deferred/phase-93.md, entry
+      // "GET /rsvp/respond: the 404 for a missing event"). The token is event_not_found, pinned by
+      // tests/routes/rsvp.test.js B1. Changing this body is a contract change for the FE, not a
+      // cleanup.
+      return res.status(404).json({ error: 'event_not_found' });
     }
 
     // Check if event is cancelled
