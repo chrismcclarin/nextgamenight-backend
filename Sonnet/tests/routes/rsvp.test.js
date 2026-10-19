@@ -96,6 +96,10 @@ describe('RSVP single-use magic links (D-04 / BSEC-03)', () => {
     rsvpUserUuid = rsvpUser.id;
     testGroup = await Group.create({ name: 'RSVP Group', group_id: 'rsvp-test-group-001' });
     testGame = await Game.create({ name: 'Test Game' });
+    // 88.6.1 code review A-58: GET /respond now re-checks that the link's user may still read
+    // the event, so the RSVP-ing user is a member of the event's group, as every real
+    // recipient of a reminder email is.
+    await addToGroup(rsvpUser, testGroup, 'member');
 
     futureEvent = await Event.create({
       group_id: testGroup.id,
@@ -618,5 +622,75 @@ describe('RSVP UUID keyspace authz + wire (Phase 87.1)', () => {
     expect(again.body.error).toBe('expired_link');
     const row = await SingleUseToken.findOne({ where: { nonce: token } });
     expect(row.status).toBe('used');
+  });
+
+  // B3 (88.6.1 code review A-01 / A-53 / A-72): the OTHER case the DECISION Phase 88.6.1-87
+  // marker says this 404 answers — an event SOFT-deleted (Event is paranoid; a group delete
+  // soft-deletes restorably). Owner-accepted 2026-10-18 ("a"); expected to change when Phase 93
+  // lands its distinct code (.planning/deferred/phase-93.md entry
+  // "GET /rsvp/respond: the 404 for a missing event"). Green on the current code: it pins the
+  // accepted behaviour so a paranoid:false lookup cannot change it silently.
+  it('B3. GET /respond for a SOFT-deleted event answers 404 { error: event_not_found } and writes no RSVP', async () => {
+    await mintRsvpBatch(event.id, owner.user_id);
+    const token = generateRsvpToken(event.id, owner.user_id, 'yes');
+    await event.destroy();
+    expect(await Event.findByPk(event.id, { paranoid: false })).not.toBeNull();
+
+    const res = await request(app)
+      .get('/api/rsvp/respond')
+      .query({ token, e: event.id, u: owner.user_id, s: 'yes' });
+    expect(res.status).toBe(404);
+    expect(res.body).toEqual({ error: 'event_not_found' });
+    expect(await EventRsvp.count({ where: { event_id: event.id, user_uuid: owner.id } })).toBe(0);
+    const row = await SingleUseToken.findOne({ where: { nonce: token } });
+    expect(row.status).toBe('used');
+  });
+
+  // A-58 (88.6.1 code review): a member removed from the group after the email went out
+  // cannot RSVP from the old link. The refusal is the expired_link envelope (no new FE state,
+  // no membership oracle) and it does NOT burn the link.
+  it('M1. a link whose user has left the group answers 403 expired_link, writes no RSVP, and leaves the token active', async () => {
+    await mintRsvpBatch(event.id, owner.user_id);
+    const token = generateRsvpToken(event.id, owner.user_id, 'yes');
+    await UserGroup.destroy({ where: { user_uuid: owner.id, group_id: group.id } });
+
+    const res = await request(app)
+      .get('/api/rsvp/respond')
+      .query({ token, e: event.id, u: owner.user_id, s: 'yes' });
+    expect(res.status).toBe(403);
+    expect(res.body.error).toBe('expired_link');
+    expect(await EventRsvp.count({ where: { event_id: event.id, user_uuid: owner.id } })).toBe(0);
+    const row = await SingleUseToken.findOne({ where: { nonce: token } });
+    expect(row.status).toBe('active');
+  });
+
+  // A-20 / A-27 (88.6.1 code review): the HMAC is compared in constant time, and a malformed
+  // token is refused with the same 403 body without touching the single-use row.
+  it('H1. a wrong-length token and a same-length tampered token both answer 403 and leave the token active', async () => {
+    const crypto = require('crypto');
+    const spy = jest.spyOn(crypto, 'timingSafeEqual');
+    await mintRsvpBatch(event.id, owner.user_id);
+    const token = generateRsvpToken(event.id, owner.user_id, 'yes');
+    const flipped = (token[0] === 'A' ? 'B' : 'A') + token.slice(1);
+    expect(flipped).toHaveLength(token.length);
+
+    for (const bad of [token.slice(0, -1), `${token}x`, flipped]) {
+      const res = await request(app)
+        .get('/api/rsvp/respond')
+        .query({ token: bad, e: event.id, u: owner.user_id, s: 'yes' });
+      expect(res.status).toBe(403);
+      expect(res.body).toEqual({ error: 'Invalid or expired link' });
+    }
+    // The same-length tamper reached the constant-time compare.
+    expect(spy).toHaveBeenCalled();
+    const row = await SingleUseToken.findOne({ where: { nonce: token } });
+    expect(row.status).toBe('active');
+    expect(await EventRsvp.count({ where: { event_id: event.id, user_uuid: owner.id } })).toBe(0);
+
+    // And the genuine link still works afterwards.
+    const ok = await request(app)
+      .get('/api/rsvp/respond')
+      .query({ token, e: event.id, u: owner.user_id, s: 'yes' });
+    expect(ok.status).toBe(200);
   });
 });
