@@ -213,9 +213,14 @@ router.get('/respond', async (req, res) => {
       return res.status(400).json({ error: 'Invalid status. Must be yes, maybe, or no.' });
     }
 
-    // Verify HMAC token by recomputing (the signature layer)
+    // Verify HMAC token by recomputing (the signature layer). 88.6.1 code review A-20 / A-27:
+    // a length-checked constant-time compare (crypto.timingSafeEqual, the primitive
+    // routes/webhooks.js uses) over a plain !== that exits at the first differing character.
+    // timingSafeEqual throws on unequal lengths, so the length test runs first; same 403 body.
     const expectedToken = generateRsvpToken(eventId, userId, status);
-    if (token !== expectedToken) {
+    const givenBuf = Buffer.from(String(token));
+    const expectedBuf = Buffer.from(expectedToken);
+    if (givenBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(givenBuf, expectedBuf)) {
       return res.status(403).json({ error: 'Invalid or expired link' });
     }
 
@@ -235,6 +240,25 @@ router.get('/respond', async (req, res) => {
       return res.status(403).json({
         error: 'account_not_found',
         message: 'We could not find your account — sign in and open the event to RSVP.',
+      });
+    }
+
+    // DECISION 88.6.1 code review A-58 (the check half; the revoke-on-leave/kick half is routed
+    // to Phase 93): CHOSEN re-check that the link's user may still read this event, with the
+    // helper the authenticated sibling routes use (POST / and GET /event/:event_id), BEFORE the
+    // consume, so a refused link is not burned and stays usable if the person is re-added.
+    // REJECTED: no check (a member removed from the group could still RSVP from an emailed link
+    // for its 30-day life, and appear on the roster); a check AFTER the consume (burns the link);
+    // a distinct error code (a membership oracle, and a new FE state) — the refusal reuses the
+    // expired_link envelope below. A missing or soft-deleted event (helper answers event: null)
+    // is NOT refused here: it falls through to the consume and the event_not_found 404 below,
+    // unchanged (DECISION Phase 88.6.1-87; B1-B3 pin it). Moving this check after the consume,
+    // or refusing a missing event here, is a decision, not a cleanup.
+    const access = await canReadEventScopedSurface(userId, eventId);
+    if (access.event && !access.allowed) {
+      return res.status(403).json({
+        error: 'expired_link',
+        message: 'This RSVP link has expired or was already used. Open the event to RSVP.',
       });
     }
 
@@ -285,7 +309,22 @@ router.get('/respond', async (req, res) => {
       ],
     });
     if (!event) {
-      return res.status(404).json({ error: 'Event not found' });
+      // DECISION Phase 88.6.1-87 (close ruling P-77, owner 2026-10-18 Option A): CHOSEN a code
+      // token the FE keys on (periodictabletop/src/lib/api.ts respondViaToken -> the RSVP page's
+      // EVENT_GONE card, "This game night was cancelled") over the prose this line sent before;
+      // REJECTED an FE match on that prose (backend prose is never a discriminant) and an FE that
+      // accepts both bodies (D4). The two sibling 404s in this file (POST / and
+      // GET /event/:event_id) are deliberately unchanged: different routes, different consumers.
+      // The other case this answer covers: an event soft-deleted with its group and restorable for
+      // 30 days, its link already spent by the consume above (the A-58 membership check above
+      // lets a missing event through to that consume; AMENDED 2026-10-19, 88.6.1 code review
+      // A-58, and the soft-delete case is pinned by B3). Owner-accepted 2026-10-18 ("a"),
+      // with the improvement (look up before consuming; a distinct code for a soft-deleted event)
+      // routed to Phase 93 (.planning/deferred/phase-93.md, entry
+      // "GET /rsvp/respond: the 404 for a missing event"). The token is event_not_found, pinned by
+      // tests/routes/rsvp.test.js B1. Changing this body is a contract change for the FE, not a
+      // cleanup.
+      return res.status(404).json({ error: 'event_not_found' });
     }
 
     // Check if event is cancelled
