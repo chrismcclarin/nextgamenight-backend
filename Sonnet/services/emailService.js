@@ -91,10 +91,21 @@ class EmailService {
         ...(html && { html }),
         ...(plainText && { text: plainText }),
         ...(replyTo && { reply_to: replyTo }),
-        headers: {
-          'List-Unsubscribe': `<mailto:unsubscribe@nextgamenight.app>`,
-          'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click'
-        },
+        // DECISION quick-261020-u4u (owner ruling 2026-10-20): NO List-Unsubscribe /
+        // List-Unsubscribe-Post headers on any message, chosen OVER keeping the one-click
+        // pair that used to sit here pointing at `mailto:unsubscribe@nextgamenight.app`.
+        // Every emailType this service sends is transactional (account_deleted,
+        // availability_prompt, email_change_code, email_change_notice,
+        // game_join_confirmation, group_ownership_offer); Google's sender guidelines
+        // require one-click unsubscribe only for marketing / subscribed mail from
+        // 5,000+ messages-per-day senders; and that mailbox does not exist (owner,
+        // 2026-10-20: "It doesn't exist"). On transactional mail the pair is a bulk-mail
+        // signal — Gmail filed the owner's own check-ins under Promotions — that
+        // advertised a dead address. REJECTED: keeping it only on availability_prompt
+        // with a real notification-settings URL — a user's email preference already
+        // lives in the profile, and a header-driven opt-out would be a second path to
+        // the same setting. tests/services/emailService.noUnsubscribeHeader.test.js pins
+        // the absence. Re-adding a header here is a decision, not a cleanup.
         // Resend tags for analytics and webhook attribution
         tags: [
           { name: 'category', value: emailType || 'notification' },
