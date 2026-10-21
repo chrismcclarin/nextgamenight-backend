@@ -94,9 +94,12 @@ class EmailService {
         // DECISION quick-261020-u4u (owner ruling 2026-10-20): NO List-Unsubscribe /
         // List-Unsubscribe-Post headers on any message, chosen OVER keeping the one-click
         // pair that used to sit here pointing at `mailto:unsubscribe@nextgamenight.app`.
-        // Every emailType this service sends is transactional (account_deleted,
-        // availability_prompt, email_change_code, email_change_notice,
-        // game_join_confirmation, group_ownership_offer); Google's sender guidelines
+        // Every message this service sends is a notification to a known account, never
+        // marketing: the typed sends (account_deleted, availability_prompt, email_change_code,
+        // email_change_notice, game_join_confirmation, group_ownership_offer, reminder) and
+        // the untyped ones that default to the 'notification' tag below (feedback, group
+        // invite, the availability-prompt route, event creation, notificationService
+        // pass-through — census by the 261020-u4u review); Google's sender guidelines
         // require one-click unsubscribe only for marketing / subscribed mail from
         // 5,000+ messages-per-day senders; and that mailbox does not exist (owner,
         // 2026-10-20: "It doesn't exist"). On transactional mail the pair is a bulk-mail

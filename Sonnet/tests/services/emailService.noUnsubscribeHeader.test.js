@@ -1,7 +1,7 @@
 // tests/services/emailService.noUnsubscribeHeader.test.js
-// Quick task 261020-u4u (owner ruling 2026-10-20): every email this service sends is
-// transactional (account_deleted, availability_prompt, email_change_code,
-// email_change_notice, game_join_confirmation, group_ownership_offer), and the
+// Quick task 261020-u4u (owner ruling 2026-10-20): every email this service sends is a
+// notification to a known account, never marketing (the typed emailTypes plus the
+// untyped sends that default to the 'notification' tag — census in the review), and the
 // `unsubscribe@nextgamenight.app` mailbox the old List-Unsubscribe header pointed at
 // does not exist. Google's sender guidelines require one-click unsubscribe only for
 // marketing / subscribed mail from 5,000+ messages-per-day senders; on transactional
