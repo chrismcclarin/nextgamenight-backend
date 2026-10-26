@@ -20,6 +20,80 @@ const { scheduleReminders, scheduleDeadlineJob } = require('../services/reminder
 const { sendError } = require('../utils/errors');
 const { isUuid, resolveTargetUserUuidOnly } = require('../utils/resolveTargetUser');
 
+// The two includes every prompt read shares with decoratePromptForWire below.
+// D-SCHEMA-05: creator info for "Started by [name]" on manual polls; required:false
+// so auto-prompts (created_by_user_id IS NULL) still come back. D-UI-02: the settings
+// row that fired an auto-prompt, on the default belongsTo alias (AvailabilityPrompt.
+// belongsTo(GroupPromptSettings, { foreignKey: 'created_by_settings_id' }) in
+// models/index.js, no `as`); template_config is read only to derive schedule_name
+// and is stripped from the wire (quick-261025-rl3).
+function promptWireIncludes() {
+  return [
+    { model: User, as: 'Creator', attributes: ['id', 'username'], required: false },
+    { model: GroupPromptSettings, attributes: ['id', 'template_name', 'template_config'], required: false }
+  ];
+}
+
+/**
+ * Decorate one AvailabilityPrompt row (loaded with promptWireIncludes()) for the
+ * wire: { ...row, schedule_name, can_close }, with created_by_user_id and
+ * GroupPromptSetting.template_config deleted.
+ *
+ * DECISION quick-261026-pi6 B2: ONE decoration shared by the three prompt reads
+ * (GET /groups/:groupId/prompts/open, GET /groups/:groupId/prompts/active,
+ * GET /prompts/:promptId), chosen OVER a copy in each route, so a future wire field
+ * or strip lands once and the by-id read (the "Schedule it?" email's closed poll)
+ * can never again lag the open list. Inlining it back into one route is a
+ * decision, not a cleanup.
+ *
+ * @param {object} promptRow  Sequelize AvailabilityPrompt instance.
+ * @param {{ requesterUserId: string, isAdmin: boolean }} requester  Users.id of the
+ *   caller and whether their active UserGroup role is owner/admin.
+ */
+function decoratePromptForWire(promptRow, { requesterUserId, isAdmin }) {
+  const isCreator = promptRow.created_by_user_id !== null && promptRow.created_by_user_id === requesterUserId;
+  // DECISION quick-261026-pi6 B2: can_close is false on a closed or converted poll
+  // (D-CLOSE-04: closed is final, the PATCH close answers 409), OVER the bare
+  // creator-or-admin check /prompts/open used, which never saw a terminal poll but
+  // the by-id read does. /prompts/open and /prompts/active list only pending and
+  // active polls, so their values are unchanged. Dropping the status term is a
+  // decision, not a cleanup.
+  const isTerminal = promptRow.status === 'closed' || promptRow.status === 'converted';
+  const can_close = !isTerminal && (isAdmin || isCreator);
+  const json = promptRow.toJSON();
+  // DECISION quick-261025-rl3 (261025-dzo review WR-02): schedule_name is
+  // derived per request from the poll's schedule_id, OVER a name copied onto
+  // the poll (a rename shows through, and there is no second copy of the name
+  // to drift). template_config is loaded only to derive it and is deleted from
+  // the wire, because it carries selected_member_ids (member UUIDs): the same
+  // least-exposure rule as the T-71.2-02 strip below. The GroupPromptSetting
+  // alias with id and template_name STAYS on the wire, OVER dropping it,
+  // because the frontend live before its own PR deploys reads it.
+  // Dropping the delete, or reading the settings-level column first, is a
+  // decision, not a cleanup.
+  const settingsRow = json.GroupPromptSetting || null;
+  const schedules = Array.isArray(settingsRow?.template_config?.schedules)
+    ? settingsRow.template_config.schedules
+    : [];
+  const pollScheduleId = typeof json.schedule_id === 'string' ? json.schedule_id.toLowerCase() : null;
+  const firingSchedule = pollScheduleId
+    ? schedules.find(s => s && typeof s.id === 'string' && s.id.toLowerCase() === pollScheduleId)
+    : null;
+  let schedule_name = null;
+  if (typeof firingSchedule?.template_name === 'string' && firingSchedule.template_name !== '') {
+    schedule_name = firingSchedule.template_name;
+  } else if (typeof settingsRow?.template_name === 'string' && settingsRow.template_name !== '') {
+    schedule_name = settingsRow.template_name;
+  }
+  if (json.GroupPromptSetting) {
+    delete json.GroupPromptSetting.template_config;
+  }
+  // T-71.2-02: strip raw creator UUID from the wire — UI uses can_close +
+  // Creator.username only.
+  delete json.created_by_user_id;
+  return { ...json, schedule_name, can_close };
+}
+
 /**
  * GET /api/prompts/:promptId/respondents
  * Get list of all group members with their response status for a prompt
@@ -561,10 +635,17 @@ router.get('/groups/:groupId/prompts/active', verifyAuth0Token, async (req, res)
         group_id: groupId,
         status: { [Op.in]: ['active', 'pending'] }
       },
+      include: promptWireIncludes(),
       order: [['createdAt', 'DESC']]
     });
 
-    res.json({ prompt: prompt || null });
+    // quick-261026-pi6 B2: same decoration as /prompts/open (Creator, schedule_name,
+    // can_close; created_by_user_id and template_config stripped). Before this the
+    // raw row went out, created_by_user_id included (no frontend reader).
+    const isAdmin = ['owner', 'admin'].includes(userGroup.role);
+    res.json({
+      prompt: prompt ? decoratePromptForWire(prompt, { requesterUserId: caller.id, isAdmin }) : null
+    });
   } catch (error) {
     console.error('Error fetching active prompt:', error);
     res.status(500).json({ error: 'Failed to fetch active prompt' });
@@ -581,7 +662,7 @@ router.get('/prompts/:promptId', verifyAuth0Token, async (req, res) => {
   try {
     const { promptId } = req.params;
     const userId = req.user.user_id;
-    const prompt = await AvailabilityPrompt.findByPk(promptId);
+    const prompt = await AvailabilityPrompt.findByPk(promptId, { include: promptWireIncludes() });
     if (!prompt) {
       return res.status(404).json({ error: 'Prompt not found' });
     }
@@ -605,12 +686,13 @@ router.get('/prompts/:promptId', verifyAuth0Token, async (req, res) => {
       return res.status(403).json({ error: 'You must be a member of this group' });
     }
 
-    // T-71.2-02: strip the raw creator UUID from the wire, same as /prompts/open.
+    // T-71.2-02 + quick-261026-pi6 B2: the same decoration as /prompts/open
+    // (Creator, schedule_name, can_close; the raw creator UUID and template_config
+    // stripped), so a poll reached by id is named like its open-polls card.
     // group_id stays: the planning page's cross-group guard reads it
     // (periodictabletop src/app/groupPlanning/page.js ("data.prompt.group_id")).
-    const json = prompt.toJSON();
-    delete json.created_by_user_id;
-    res.json({ prompt: json });
+    const isAdmin = ['owner', 'admin'].includes(requesterGroup.role);
+    res.json({ prompt: decoratePromptForWire(prompt, { requesterUserId: requester.id, isAdmin }) });
   } catch (error) {
     console.error('Error fetching prompt:', error);
     res.status(500).json({ error: 'Failed to fetch prompt' });
@@ -742,56 +824,11 @@ router.get('/groups/:groupId/prompts/open', verifyAuth0Token, async (req, res) =
         group_id: groupId,
         status: { [Op.in]: ['pending', 'active'] }
       },
-      include: [
-        // D-SCHEMA-05 — creator info for "Started by [name]" on manual polls.
-        // required:false so auto-prompts (created_by_user_id IS NULL) still come back.
-        { model: User, as: 'Creator', attributes: ['id', 'username'], required: false },
-        // D-UI-02 — the settings row that fired an auto-prompt. The default
-        // belongsTo alias is used (matches the existing AvailabilityPrompt.belongsTo
-        // (GroupPromptSettings, { foreignKey: 'created_by_settings_id' }) wired in
-        // models/index.js with no `as`). template_config is read only to derive
-        // schedule_name below and is stripped from the wire (quick-261025-rl3).
-        { model: GroupPromptSettings, attributes: ['id', 'template_name', 'template_config'], required: false }
-      ],
+      include: promptWireIncludes(),
       order: [['createdAt', 'DESC']]
     });
 
-    const decorated = prompts.map(p => {
-      const isCreator = p.created_by_user_id !== null && p.created_by_user_id === dbUser.id;
-      const can_close = isAdmin || isCreator;
-      const json = p.toJSON();
-      // DECISION quick-261025-rl3 (261025-dzo review WR-02): schedule_name is
-      // derived per request from the poll's schedule_id, OVER a name copied onto
-      // the poll (a rename shows through, and there is no second copy of the name
-      // to drift). template_config is loaded only to derive it and is deleted from
-      // the wire, because it carries selected_member_ids (member UUIDs): the same
-      // least-exposure rule as the T-71.2-02 strip below. The GroupPromptSetting
-      // alias with id and template_name STAYS on the wire, OVER dropping it,
-      // because the frontend live before its own PR deploys reads it.
-      // Dropping the delete, or reading the settings-level column first, is a
-      // decision, not a cleanup.
-      const settingsRow = json.GroupPromptSetting || null;
-      const schedules = Array.isArray(settingsRow?.template_config?.schedules)
-        ? settingsRow.template_config.schedules
-        : [];
-      const pollScheduleId = typeof json.schedule_id === 'string' ? json.schedule_id.toLowerCase() : null;
-      const firingSchedule = pollScheduleId
-        ? schedules.find(s => s && typeof s.id === 'string' && s.id.toLowerCase() === pollScheduleId)
-        : null;
-      let schedule_name = null;
-      if (typeof firingSchedule?.template_name === 'string' && firingSchedule.template_name !== '') {
-        schedule_name = firingSchedule.template_name;
-      } else if (typeof settingsRow?.template_name === 'string' && settingsRow.template_name !== '') {
-        schedule_name = settingsRow.template_name;
-      }
-      if (json.GroupPromptSetting) {
-        delete json.GroupPromptSetting.template_config;
-      }
-      // T-71.2-02: strip raw creator UUID from the wire — UI uses can_close +
-      // Creator.username only.
-      delete json.created_by_user_id;
-      return { ...json, schedule_name, can_close };
-    });
+    const decorated = prompts.map(p => decoratePromptForWire(p, { requesterUserId: dbUser.id, isAdmin }));
 
     res.json({ prompts: decorated });
   } catch (error) {
