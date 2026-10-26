@@ -36,7 +36,8 @@ const request = require('supertest');
 const express = require('express');
 
 const availabilityPromptRoutes = require('../../routes/availabilityPrompt');
-const { AvailabilityPrompt, AvailabilityResponse, Group, UserGroup, Event } = require('../../models');
+const crypto = require('crypto');
+const { AvailabilityPrompt, AvailabilityResponse, Group, UserGroup, Event, GroupPromptSettings } = require('../../models');
 const emailService = require('../../services/emailService');
 const { makeUser, makeGroup, addToGroup } = require('../factories');
 
@@ -553,5 +554,124 @@ describe('88.2 MED-1 — AvailabilityPrompt endpoints hide a soft-deleted group'
     expect(res.status).not.toBe(404);
 
     jest.restoreAllMocks();
+  });
+});
+
+// ============================================================================
+// quick-261025-rl3 (261025-dzo review WR-02): each open poll carries
+// schedule_name, the CURRENT template_name of the nested schedule whose id equals
+// the poll's schedule_id, else the settings row's top-level template_name, else
+// null. template_config is loaded only to derive it and never reaches the wire
+// (it carries selected_member_ids, member UUIDs); the GroupPromptSetting alias
+// with id + template_name stays for the frontend that is live before its own PR.
+// Each it seeds its own world: tests/setup.js truncates before every test.
+// ============================================================================
+describe("GET /api/groups/:groupId/prompts/open: schedule_name from the poll's own schedule (quick-261025-rl3, dzo review WR-02)", () => {
+  async function seedWorld({ settingsTemplateName = null } = {}) {
+    const owner = await makeUser({ username: 'rl3-owner' });
+    const member = await makeUser({ username: 'rl3-member' });
+    const selectee = await makeUser({ username: 'rl3-selectee' });
+    const group = await makeGroup({ name: 'RL3 Open Polls Group' });
+    await addToGroup(owner, group, 'owner');
+    await addToGroup(member, group, 'member');
+    await addToGroup(selectee, group, 'member');
+    const A = crypto.randomUUID();
+    const B = crypto.randomUUID();
+    const settings = await GroupPromptSettings.create({
+      group_id: group.id,
+      schedule_timezone: 'UTC',
+      template_name: settingsTemplateName,
+      template_config: {
+        schedules: [
+          { id: A, template_name: 'Thursday Catan', is_active: true, selected_member_ids: [selectee.id] },
+          { id: B, template_name: 'Sunday Wingspan', is_active: true, selected_member_ids: [selectee.id] },
+        ],
+      },
+    });
+    return { owner, member, selectee, group, settings, A, B };
+  }
+
+  function makeAutoPoll(world, scheduleId, weekKey) {
+    return AvailabilityPrompt.create({
+      group_id: world.group.id,
+      prompt_date: new Date(),
+      deadline: new Date(Date.now() + 72 * 60 * 60 * 1000),
+      status: 'active',
+      week_identifier: weekKey || `2026-W43-${scheduleId}`,
+      created_by_settings_id: world.settings.id,
+      schedule_id: scheduleId,
+    });
+  }
+
+  async function getOpen(world) {
+    const res = await request(makeApp(world.member))
+      .get(`/api/groups/${world.group.id}/prompts/open`)
+      .send();
+    expect(res.status).toBe(200);
+    return res;
+  }
+
+  it('O1: an auto poll names its own schedule, keeps the alias, and never ships template_config or a selected member UUID', async () => {
+    const world = await seedWorld();
+    const poll = await makeAutoPoll(world, world.B);
+
+    const res = await getOpen(world);
+    const item = res.body.prompts.find((p) => p.id === poll.id);
+    expect(item).toBeDefined();
+    expect(item.schedule_name).toBe('Sunday Wingspan');
+    expect(item.GroupPromptSetting).toHaveProperty('template_name');
+    expect(item.GroupPromptSetting.template_config).toBeUndefined();
+    expect(JSON.stringify(res.body)).not.toContain(world.selectee.id);
+  });
+
+  it('O2: an auto poll whose schedule_id matches no schedule gets schedule_name null', async () => {
+    const world = await seedWorld();
+    const poll = await makeAutoPoll(world, crypto.randomUUID());
+
+    const res = await getOpen(world);
+    const item = res.body.prompts.find((p) => p.id === poll.id);
+    expect(item).toBeDefined();
+    expect(item.schedule_name).toBeNull();
+  });
+
+  it('O3: a manual poll gets schedule_name null', async () => {
+    const world = await seedWorld();
+    const poll = await AvailabilityPrompt.create({
+      group_id: world.group.id,
+      prompt_date: new Date(),
+      deadline: new Date(Date.now() + 72 * 60 * 60 * 1000),
+      status: 'active',
+      week_identifier: '2026-W43',
+      created_by_user_id: world.member.id,
+    });
+
+    const res = await getOpen(world);
+    const item = res.body.prompts.find((p) => p.id === poll.id);
+    expect(item).toBeDefined();
+    expect(item.schedule_name).toBeNull();
+  });
+
+  it('O4: an auto poll with no schedule_id falls back to the settings row template_name', async () => {
+    const world = await seedWorld({ settingsTemplateName: 'Legacy settings name' });
+    const poll = await makeAutoPoll(world, null, '2026-W43-legacy');
+
+    const res = await getOpen(world);
+    const item = res.body.prompts.find((p) => p.id === poll.id);
+    expect(item).toBeDefined();
+    expect(item.schedule_name).toBe('Legacy settings name');
+  });
+
+  it('O5: a rename of the schedule shows through on the next read', async () => {
+    const world = await seedWorld();
+    const poll = await makeAutoPoll(world, world.B);
+    const renamed = world.settings.template_config.schedules.map((s) => (
+      s.id === world.B ? { ...s, template_name: 'Sunday Wingspan (2p)' } : s
+    ));
+    await world.settings.update({ template_config: { schedules: renamed } });
+
+    const res = await getOpen(world);
+    const item = res.body.prompts.find((p) => p.id === poll.id);
+    expect(item).toBeDefined();
+    expect(item.schedule_name).toBe('Sunday Wingspan (2p)');
   });
 });

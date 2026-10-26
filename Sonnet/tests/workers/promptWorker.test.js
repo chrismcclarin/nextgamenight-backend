@@ -149,3 +149,77 @@ describe('promptWorker.processPromptJob — F-A3 group liveness guard (88.2, cal
     expect(models.AvailabilityPrompt.findOne).not.toHaveBeenCalled();
   });
 });
+
+// ---------------------------------------------------------------------------
+// quick-261025-rl3 (261025-dzo review WR-02): the poll the worker creates links
+// what fired it. Before the fix the create carried neither created_by_settings_id
+// nor a schedule link, so the open-polls card read every automatic poll as
+// started by a member and the D-ADAPT-05 close email resolved no recipient.
+// Call-grain only, like the F-A3 describe above: the model layer is mocked.
+// ---------------------------------------------------------------------------
+describe('promptWorker.processPromptJob: the poll links what fired it (quick-261025-rl3, dzo review WR-02)', () => {
+  const groupId = 'group-rl3-mocked';
+  const scheduleUuid = '3f2b8c1e-9a4d-4e6f-8b7a-1c2d3e4f5a6b';
+
+  function mockSettings(schedules) {
+    models.GroupPromptSettings.findByPk = jest.fn().mockResolvedValue({
+      id: 'settings-1',
+      default_token_expiry_hours: 168,
+      template_config: { schedules },
+    });
+  }
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+
+    mockSettings([{ id: scheduleUuid, is_active: true, game_id: null }]);
+    models.AvailabilityPrompt.findOne = jest.fn().mockResolvedValue(null);
+    models.AvailabilityPrompt.create = jest.fn().mockResolvedValue({
+      id: 'prompt-1',
+      deadline: new Date(),
+      update: jest.fn().mockResolvedValue(),
+    });
+    models.UserGroup.findAll = jest.fn().mockResolvedValue([]);
+    models.Group.findByPk = jest.fn().mockResolvedValue({ id: groupId, name: 'G' });
+    models.User.scope = jest.fn().mockReturnValue({});
+    emailService.send = jest.fn().mockResolvedValue({ success: true });
+  });
+
+  test('W1: a UUID schedule id is written as schedule_id beside created_by_settings_id; the dedup key is unchanged', async () => {
+    await processPromptJob({ id: 'job-w1', data: { groupId, settingsId: 'settings-1', scheduleId: scheduleUuid } });
+
+    expect(models.AvailabilityPrompt.create).toHaveBeenCalledTimes(1);
+    const created = models.AvailabilityPrompt.create.mock.calls[0][0];
+    expect(created).toEqual(expect.objectContaining({
+      created_by_settings_id: 'settings-1',
+      schedule_id: scheduleUuid,
+    }));
+    expect(created.week_identifier.endsWith(`-${scheduleUuid}`)).toBe(true);
+  });
+
+  test('W2: a schedule id that is not a UUID links the settings row and writes schedule_id null (the UUID column would reject it)', async () => {
+    mockSettings([{ id: 'sched-not-a-uuid', is_active: true, game_id: null }]);
+
+    await processPromptJob({ id: 'job-w2', data: { groupId, settingsId: 'settings-1', scheduleId: 'sched-not-a-uuid' } });
+
+    expect(models.AvailabilityPrompt.create).toHaveBeenCalledTimes(1);
+    expect(models.AvailabilityPrompt.create).toHaveBeenCalledWith(expect.objectContaining({
+      created_by_settings_id: 'settings-1',
+      schedule_id: null,
+    }));
+  });
+
+  test('W3: a legacy job with no schedules links the settings row, schedule_id null, week key ending -legacy', async () => {
+    mockSettings([]);
+
+    await processPromptJob({ id: 'job-w3', data: { groupId, settingsId: 'settings-1' } });
+
+    expect(models.AvailabilityPrompt.create).toHaveBeenCalledTimes(1);
+    const created = models.AvailabilityPrompt.create.mock.calls[0][0];
+    expect(created).toEqual(expect.objectContaining({
+      created_by_settings_id: 'settings-1',
+      schedule_id: null,
+    }));
+    expect(created.week_identifier.endsWith('-legacy')).toBe(true);
+  });
+});

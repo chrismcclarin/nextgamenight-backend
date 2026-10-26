@@ -63,6 +63,17 @@ const AvailabilityPrompt = sequelize.define('AvailabilityPrompt', {
     onDelete: 'SET NULL',
     // Tracks which schedule config created this prompt (null if manual)
   },
+  schedule_id: {
+    type: DataTypes.UUID,
+    allowNull: true,
+    // quick-261025-rl3: which nested schedule fired this automatic poll, matched
+    // against GroupPromptSettings.template_config.schedules[].id at read time.
+    // Null for manual polls, legacy polls, and a firing schedule whose id is not
+    // a UUID. No foreign key: the target is an element of a JSONB array, not a row.
+    // Byte-identical to migrations/20261025000001-add-schedule-id-to-availability-prompts.js
+    // (Pitfall 1), whose DECISION quick-261025-rl3 marker records why this is a
+    // link and not a stored name.
+  },
   custom_message: {
     type: DataTypes.TEXT,
     allowNull: true,

@@ -12,17 +12,20 @@
 //     close-notification email. Best-effort — errors logged, never thrown.
 //
 // LOCKED recipient resolution rule (D-ADAPT-05 + D-SCHEMA-06):
-//   Manual:  recipient = User.findByPk(prompt.created_by_user_id)
+//   Manual:  candidate = prompt.created_by_user_id
 //   Auto:    settings = GroupPromptSettings.findByPk(prompt.created_by_settings_id)
-//            recipient = settings.created_by_user_id
-//              ? User.findByPk(settings.created_by_user_id)
-//              : <group owner via UserGroup role='owner' → User.user_id Auth0 sub>
+//            candidate = settings.created_by_user_id (none → group owner)
+//   recipient = candidate, ONLY while the candidate holds an ACTIVE UserGroup
+//              membership in prompt.group_id (quick-261025-rl3 BE-1); a
+//              candidate who left or was removed falls back to the group owner
+//              <UserGroup role='owner', status='active' → User.findByPk(user_uuid)>.
 //
 // Note: the Group model has NO owner_id column in this codebase. Group ownership
-// is determined by `UserGroup.role === 'owner', status='active'`. UserGroup.user_id
-// is an Auth0 sub STRING, NOT a User.id UUID, so the owner-fallback path uses
-// User.findOne({ where: { user_id } }) NOT User.findByPk. See INVESTIGATION.md
-// step (d) for the full reasoning.
+// is determined by `UserGroup.role === 'owner', status='active'`. Since Phase 87.1
+// D-11 UserGroup is keyed on user_uuid (= Users.id), so the owner-fallback path
+// uses User.findByPk(ownerUg.user_uuid); the pre-87.1 text here said the opposite
+// (an Auth0-sub user_id read via User.findOne), which the code stopped doing then.
+// See INVESTIGATION.md step (d) for the original reasoning.
 //
 // D-ADAPT-03 invariant: this service NEVER writes to GroupPromptSettings —
 // closing an auto-prompt MUST NOT cancel the parent recurring schedule.
@@ -111,7 +114,11 @@ async function checkConsensusAndClose(promptId) {
  * Skips email send if:
  *   - response count === 0 (D-CLOSE-03 silent close)
  *   - top-slot list is empty (no viable suggestion to put in CTA)
- *   - recipient cannot be resolved or has no email
+ *   - recipient cannot be resolved or has no email. The stored creator
+ *     (manual poll creator, or the schedule creator for an auto-prompt) is
+ *     the recipient only while they hold an ACTIVE membership in the poll's
+ *     group; otherwise the group owner is, and if no active owner resolves
+ *     either, the send is skipped (quick-261025-rl3 BE-1)
  *
  * D-ADAPT-03: do NOT touch GroupPromptSettings — recurring schedule survives
  * the close. Reading settings.created_by_user_id is a READ, not a write —
@@ -138,35 +145,69 @@ async function handlePromptClosed(prompt) {
     console.log(`[promptLifecycle] prompt ${prompt.id} has ${responseCount} submitted response(s); continuing close-notification dispatch`);
 
     // Step 2 — resolve recipient per the LOCKED rule (D-ADAPT-05).
-    let recipient = null;
+    // 2a: the candidate is the stored creator — the manual poll's creator, or
+    //     the settings row's creator for an auto-prompt.
+    let candidateUserId = null;
+    let useOwnerFallback = false;
     if (prompt.created_by_user_id) {
-      // Manual poll — recipient is the poll creator.
-      // BSEC-01 (D-03): withContactInfo — recipient.email is read to send the email.
-      recipient = await User.scope('withContactInfo').findByPk(prompt.created_by_user_id);
+      // Manual poll — candidate is the poll creator.
+      candidateUserId = prompt.created_by_user_id;
     } else if (prompt.created_by_settings_id) {
-      // Auto-prompt — recipient is the schedule creator, falling back to the
-      // group owner if the settings row is gone or has NULL created_by_user_id
-      // (legacy / pre-Plan-01 row).
+      // Auto-prompt — candidate is the schedule creator. The settings row may be
+      // gone or carry a NULL created_by_user_id (legacy / pre-Plan-01 row); then
+      // there is no candidate and the group-owner fallback below applies.
       // D-ADAPT-03: do NOT touch GroupPromptSettings — recurring schedule
       // survives the close. Reading settings.created_by_user_id is read-only
       // and allowed.
       const settings = await GroupPromptSettings.findByPk(prompt.created_by_settings_id);
       if (settings && settings.created_by_user_id) {
-        // BSEC-01 (D-03): withContactInfo — recipient.email read below.
-        recipient = await User.scope('withContactInfo').findByPk(settings.created_by_user_id);
+        candidateUserId = settings.created_by_user_id;
       } else {
-        // Group-owner fallback — see INVESTIGATION.md step (d).
-        const ownerUg = await UserGroup.findOne({
-          where: { group_id: prompt.group_id, role: 'owner', status: 'active' },
-        });
-        if (ownerUg && ownerUg.user_uuid) {
-          // D-11 (Phase 87.1, BINT-02): UserGroup is re-keyed onto the Users.id UUID
-          // surrogate (user_uuid). Reading the OLD user_id here would be undefined
-          // after Plan 09 strips the column — a SILENT failure that skips the owner's
-          // close email. user_uuid IS Users.id, so resolve the owner via findByPk.
-          // BSEC-01 (D-03): withContactInfo — recipient.email read below.
-          recipient = await User.scope('withContactInfo').findByPk(ownerUg.user_uuid);
-        }
+        useOwnerFallback = true;
+      }
+    }
+    // A prompt with neither creator column set has no candidate and no fallback
+    // (unchanged): the "no recipient resolved" skip below applies.
+
+    // 2b: keep the candidate only while they hold an ACTIVE membership in the
+    //     poll's group.
+    // DECISION quick-261025-rl3 BE-1: recipient must hold an active membership, OVER
+    // trusting the stored creator id (a leaver keeps receiving the group's poll
+    // results) and OVER clearing GroupPromptSettings.created_by_user_id on leave
+    // (D-ADAPT-03 forbids writes there, and the manual-poll creator column has the
+    // same gap). Leaving or removal hard-deletes the UserGroup row
+    // (routes/groups.js, userGroup.destroy force: true) and clears neither creator
+    // column, so the stored id alone cannot tell a member from a former member.
+    let recipient = null;
+    if (candidateUserId) {
+      const membership = await UserGroup.findOne({
+        where: { group_id: prompt.group_id, user_uuid: candidateUserId, status: 'active' },
+      });
+      if (membership) {
+        // BSEC-01 (D-03): withContactInfo — recipient.email is read to send the email.
+        recipient = await User.scope('withContactInfo').findByPk(candidateUserId);
+      } else {
+        console.log(`[promptLifecycle] creator of prompt ${prompt.id} is no longer an active member of group ${prompt.group_id}; falling back to the group owner`);
+        useOwnerFallback = true;
+      }
+    }
+
+    // 2c: group-owner fallback — see INVESTIGATION.md step (d). Reached for an
+    //     auto-prompt with no candidate, or for either kind of poll whose
+    //     candidate is no longer an active member. The owner is by definition an
+    //     active member; if even the owner lookup fails, the "no recipient
+    //     resolved" skip below applies.
+    if (useOwnerFallback) {
+      const ownerUg = await UserGroup.findOne({
+        where: { group_id: prompt.group_id, role: 'owner', status: 'active' },
+      });
+      if (ownerUg && ownerUg.user_uuid) {
+        // D-11 (Phase 87.1, BINT-02): UserGroup is re-keyed onto the Users.id UUID
+        // surrogate (user_uuid). Reading the OLD user_id here would be undefined
+        // after Plan 09 strips the column — a SILENT failure that skips the owner's
+        // close email. user_uuid IS Users.id, so resolve the owner via findByPk.
+        // BSEC-01 (D-03): withContactInfo — recipient.email read below.
+        recipient = await User.scope('withContactInfo').findByPk(ownerUg.user_uuid);
       }
     }
 
