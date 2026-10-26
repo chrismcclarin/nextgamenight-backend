@@ -90,6 +90,16 @@ beforeEach(() => {
   AvailabilityResponse.count.mockResolvedValue(0);
   AvailabilityResponse.findAll.mockResolvedValue([]);
   UserGroup.count.mockResolvedValue(0);
+  // Review 261025-rl3 BE-1: handlePromptClosed keeps the stored creator only
+  // while UserGroup.findOne({ group_id, user_uuid, status: 'active' }) finds a
+  // row. Default: the creator is an active member (a membership row for any
+  // user_uuid query, no row for the role='owner' query). mockImplementation is
+  // re-set here because clearAllMocks keeps a prior test's implementation. The
+  // former-member path is pinned against Postgres in
+  // promptLifecycleService.membership.test.js.
+  UserGroup.findOne.mockImplementation(async ({ where }) => (where.user_uuid
+    ? { user_uuid: where.user_uuid, group_id: where.group_id, role: 'member', status: 'active' }
+    : null));
   Group.findByPk.mockResolvedValue({ id: 'group-uuid-1', name: 'Test Group' });
   Game.findByPk.mockResolvedValue(null);
 });
@@ -227,8 +237,15 @@ describe('promptLifecycleService.handlePromptClosed — recipient resolution', (
 
     expect(GroupPromptSettings.findByPk).toHaveBeenCalledWith('settings-uuid-1');
     expect(User.findByPk).toHaveBeenCalledWith('user-uuid-schedule-creator');
-    // Group-owner fallback NOT consulted.
-    expect(UserGroup.findOne).not.toHaveBeenCalled();
+    // Review 261025-rl3 BE-1: the settings creator's ACTIVE membership in the
+    // poll's group is checked before they are used as the recipient.
+    expect(UserGroup.findOne).toHaveBeenCalledWith({
+      where: { group_id: 'group-uuid-1', user_uuid: 'user-uuid-schedule-creator', status: 'active' },
+    });
+    // Group-owner fallback NOT consulted (the creator is still a member).
+    expect(UserGroup.findOne).not.toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ role: 'owner' }),
+    }));
     expect(emailService.send).toHaveBeenCalledTimes(1);
     expect(emailService.send.mock.calls[0][0].to).toBe('admin-a@test.com');
   });
