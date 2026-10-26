@@ -21,10 +21,11 @@
 //              <UserGroup role='owner', status='active' → User.findByPk(user_uuid)>.
 //
 // Note: the Group model has NO owner_id column in this codebase. Group ownership
-// is determined by `UserGroup.role === 'owner', status='active'`. UserGroup.user_id
-// is an Auth0 sub STRING, NOT a User.id UUID, so the owner-fallback path uses
-// User.findOne({ where: { user_id } }) NOT User.findByPk. See INVESTIGATION.md
-// step (d) for the full reasoning.
+// is determined by `UserGroup.role === 'owner', status='active'`. Since Phase 87.1
+// D-11 UserGroup is keyed on user_uuid (= Users.id), so the owner-fallback path
+// uses User.findByPk(ownerUg.user_uuid); the pre-87.1 text here said the opposite
+// (an Auth0-sub user_id read via User.findOne), which the code stopped doing then.
+// See INVESTIGATION.md step (d) for the original reasoning.
 //
 // D-ADAPT-03 invariant: this service NEVER writes to GroupPromptSettings —
 // closing an auto-prompt MUST NOT cancel the parent recurring schedule.
