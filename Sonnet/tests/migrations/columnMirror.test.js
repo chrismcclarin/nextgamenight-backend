@@ -70,6 +70,10 @@ const EXPECTED_MIGRATIONS = [
   ['20260902000005-add-target-to-single-use-tokens.js', 'target'],
   ['20260902000006-add-send-failed-at-to-single-use-tokens.js', 'send_failed_at'],
   ['20260902000007-add-lower-email-unique-index-to-users.js', 'users_email_lower_unique'],
+  // quick-261025-rl3 (261025-dzo review WR-02): the poll's link to the nested
+  // schedule that fired it. A model-only schedule_id would 500 the prompt worker's
+  // first create in production.
+  ['20261025000001-add-schedule-id-to-availability-prompts.js', 'schedule_id'],
 ];
 
 async function columnsOf(tableName) {
@@ -194,6 +198,30 @@ describe('Phase 88.8 plan 02 — column and ENUM-label mirroring', () => {
       expect(rows).toHaveLength(1);
       expect(rows[0].is_unique).toBe(true);
       expect(rows[0].def).toContain('lower');
+    });
+  });
+
+  describe('AvailabilityPrompts columns (quick-261025-rl3)', () => {
+    // Catalog read only, like every describe in this file. This half guards the
+    // MODEL declaration (the sync-built schema comes from the models); the
+    // EXPECTED_MIGRATIONS row above is the migration half.
+    let cols;
+    let byName;
+
+    beforeAll(async () => {
+      cols = await columnsOf('AvailabilityPrompts');
+      byName = new Map(cols.map((c) => [c.column_name, c]));
+    });
+
+    it('ANTI-VACUITY: the AvailabilityPrompts catalog query returns a real column set', () => {
+      expect(cols.length).toBeGreaterThan(10);
+    });
+
+    it('schedule_id exists as a nullable uuid (no default, no foreign key: its target is a JSONB element)', () => {
+      const col = byName.get('schedule_id');
+      expect(col).toBeDefined();
+      expect(col.is_nullable).toBe('YES');
+      expect(col.data_type).toBe('uuid');
     });
   });
 
