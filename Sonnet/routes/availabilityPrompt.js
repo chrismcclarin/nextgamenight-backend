@@ -606,6 +606,8 @@ router.get('/prompts/:promptId', verifyAuth0Token, async (req, res) => {
     }
 
     // T-71.2-02: strip the raw creator UUID from the wire, same as /prompts/open.
+    // group_id stays: the planning page's cross-group guard reads it
+    // (periodictabletop src/app/groupPlanning/page.js ("data.prompt.group_id")).
     const json = prompt.toJSON();
     delete json.created_by_user_id;
     res.json({ prompt: json });

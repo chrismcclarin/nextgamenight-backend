@@ -459,6 +459,10 @@ describe('GET /api/prompts/:promptId — membership gate + created_by_user_id st
     expect(res.body.prompt.id).toBe(prompt.id);
     // T-71.2-02: raw creator UUID stripped from the wire.
     expect(res.body.prompt.created_by_user_id).toBeUndefined();
+    // quick-261026-pi6 B1: group_id is a consumed wire field. The planning page's
+    // cross-group guard keeps a by-id poll only when it belongs to the page's group:
+    // periodictabletop src/app/groupPlanning/page.js ("data.prompt.group_id").
+    expect(res.body.prompt.group_id).toBe(group.id);
   });
 });
 
