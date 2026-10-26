@@ -699,14 +699,18 @@ router.patch('/availability-prompts/:id/close', verifyAuth0Token, async (req, re
 /**
  * GET /api/groups/:groupId/prompts/open
  * Phase 71.2 / D-UI-02 — list ALL open AvailabilityPrompts (manual + auto) for a group,
- * with creator info, the parent recurring-schedule name (for auto-prompts via
- * GroupPromptSettings.template_name), and a per-requester `can_close` flag.
+ * with creator info, a per-item `schedule_name`, and a per-requester `can_close` flag.
  *
  * Used by the unified open-polls list UI.
  *
- * Note on field name: the plan/CONTEXT references `GroupPromptSettings.name` (D-UI-02)
- * but the actual model column is `template_name`. We expose it as `template_name` in
- * the include payload — Plan 03 maps that to the "From [schedule name]" UI label.
+ * schedule_name (quick-261025-rl3, 261025-dzo review WR-02): the CURRENT template_name
+ * of the nested schedule (GroupPromptSettings.template_config.schedules[]) whose id
+ * equals the poll's schedule_id; else the settings row's top-level template_name
+ * (a column no current route writes, kept as a fallback for rows that hold one); else
+ * null. Manual polls get null. template_config is loaded only to derive the name and
+ * is deleted from each item before the response (it carries selected_member_ids).
+ * The GroupPromptSetting include alias with { id, template_name } stays on the wire
+ * for the frontend that predates schedule_name.
  *
  * D-CLOSE-05: server-derived `can_close` flag scoped to the requester so the
  * frontend never sees raw creator UUIDs. We also strip `created_by_user_id`
@@ -740,12 +744,12 @@ router.get('/groups/:groupId/prompts/open', verifyAuth0Token, async (req, res) =
         // D-SCHEMA-05 — creator info for "Started by [name]" on manual polls.
         // required:false so auto-prompts (created_by_user_id IS NULL) still come back.
         { model: User, as: 'Creator', attributes: ['id', 'username'], required: false },
-        // D-UI-02 — parent recurring-schedule name for auto-prompts. The default
+        // D-UI-02 — the settings row that fired an auto-prompt. The default
         // belongsTo alias is used (matches the existing AvailabilityPrompt.belongsTo
         // (GroupPromptSettings, { foreignKey: 'created_by_settings_id' }) wired in
-        // models/index.js with no `as`). template_name is the model field that maps
-        // to the user-facing "schedule name" referenced in the CONTEXT as `name`.
-        { model: GroupPromptSettings, attributes: ['id', 'template_name'], required: false }
+        // models/index.js with no `as`). template_config is read only to derive
+        // schedule_name below and is stripped from the wire (quick-261025-rl3).
+        { model: GroupPromptSettings, attributes: ['id', 'template_name', 'template_config'], required: false }
       ],
       order: [['createdAt', 'DESC']]
     });
@@ -754,10 +758,37 @@ router.get('/groups/:groupId/prompts/open', verifyAuth0Token, async (req, res) =
       const isCreator = p.created_by_user_id !== null && p.created_by_user_id === dbUser.id;
       const can_close = isAdmin || isCreator;
       const json = p.toJSON();
+      // DECISION quick-261025-rl3 (261025-dzo review WR-02): schedule_name is
+      // derived per request from the poll's schedule_id, OVER a name copied onto
+      // the poll (a rename shows through, and there is no second copy of the name
+      // to drift). template_config is loaded only to derive it and is deleted from
+      // the wire, because it carries selected_member_ids (member UUIDs): the same
+      // least-exposure rule as the T-71.2-02 strip below. The GroupPromptSetting
+      // alias with id and template_name STAYS on the wire, OVER dropping it,
+      // because the frontend live before its own PR deploys reads it.
+      // Dropping the delete, or reading the settings-level column first, is a
+      // decision, not a cleanup.
+      const settingsRow = json.GroupPromptSetting || null;
+      const schedules = Array.isArray(settingsRow?.template_config?.schedules)
+        ? settingsRow.template_config.schedules
+        : [];
+      const pollScheduleId = typeof json.schedule_id === 'string' ? json.schedule_id.toLowerCase() : null;
+      const firingSchedule = pollScheduleId
+        ? schedules.find(s => s && typeof s.id === 'string' && s.id.toLowerCase() === pollScheduleId)
+        : null;
+      let schedule_name = null;
+      if (typeof firingSchedule?.template_name === 'string' && firingSchedule.template_name !== '') {
+        schedule_name = firingSchedule.template_name;
+      } else if (typeof settingsRow?.template_name === 'string' && settingsRow.template_name !== '') {
+        schedule_name = settingsRow.template_name;
+      }
+      if (json.GroupPromptSetting) {
+        delete json.GroupPromptSetting.template_config;
+      }
       // T-71.2-02: strip raw creator UUID from the wire — UI uses can_close +
       // Creator.username only.
       delete json.created_by_user_id;
-      return { ...json, can_close };
+      return { ...json, schedule_name, can_close };
     });
 
     res.json({ prompts: decorated });

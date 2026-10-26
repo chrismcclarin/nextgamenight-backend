@@ -186,6 +186,22 @@ async function processPromptJob(job) {
     || settings.default_token_expiry_hours
     || 168;
 
+  // DECISION quick-261025-rl3 (261025-dzo review WR-02): the poll records the
+  // settings row and the firing schedule, OVER the pre-fix create that recorded
+  // neither. With created_by_settings_id null, the close-notification recipient
+  // rule in services/promptLifecycleService.js (handlePromptClosed, the D-ADAPT-05
+  // auto branch) resolved nobody, and the open-polls card read every automatic
+  // poll as started by a member.
+  // schedule_id is written only when the id is a UUID, OVER writing the id as-is:
+  // the column is UUID-typed and Postgres rejects any other string, which would
+  // lose the whole poll; a null link only loses the name on the card. Every id the
+  // schedule-create route writes is a crypto.randomUUID(), but the real-DB worker
+  // suites seed ids like sched-plus-a-group-id.
+  // The dedup key stays the week plus schedule key and the link is a separate
+  // column, OVER parsing the id back out of week_identifier at read time (a dedup
+  // key is not a link).
+  // Dropping either field, or the UUID guard, is a decision, not a cleanup.
+  //
   // Create the prompt — week_identifier uses the per-schedule dedup key so
   // multiple weekly schedules per group don't collide.
   const prompt = await AvailabilityPrompt.create({
@@ -196,7 +212,9 @@ async function processPromptJob(job) {
     status: 'pending',
     week_identifier: dedupKey,
     auto_schedule_enabled: true,
-    blind_voting_enabled: settings.template_config?.blind_voting || false
+    blind_voting_enabled: settings.template_config?.blind_voting || false,
+    created_by_settings_id: settings.id,
+    schedule_id: isUuid(triggeringSchedule?.id) ? triggeringSchedule.id : null
   });
 
   // Get active group members. If the schedule targets a specific subset of
