@@ -159,8 +159,9 @@ describe('quick-261027-glg — GET /api/games/:id carries no GameReviews payload
     liveGroup = await Group.create({ group_id: 'af10-live', name: 'AF10 Live Group' });
     deadGroup = await Group.create({ group_id: 'af10-dead', name: 'AF10 Doomed Group' });
 
-    // ONE shared game so the join is exercised with a live AND a hidden review
-    // on the same parent row.
+    // ONE shared game with a live AND a hidden review on the same parent row, so
+    // the tests below can prove NEITHER review reaches the payload (the include
+    // that once joined them is gone — quick-261027-glg).
     game = await Game.create({ name: 'AF10 Shared Game', is_custom: true });
 
     await GameReview.create({

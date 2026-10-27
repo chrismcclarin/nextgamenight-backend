@@ -62,7 +62,12 @@
 // handler, not a preference:
 //
 //   (a) ID-PRESENCE (the default) — the live run's body must CONTAIN the live
-//       group's id. Used by the 10 endpoints that actually serialize it.
+//       group's id. Used by the 9 endpoints that actually serialize it, PLUS
+//       one row — GET /api/games/:id — whose `livePresence` substitutes the
+//       GAME id (quick-261027-glg removed that route's only group-bearing
+//       payload): that control proves the route still answers with its row,
+//       not that a group id is absent; the absence is pinned by the standalone
+//       games test below and by games.test.js.
 //
 //   (b) GROUP-SCOPED WITNESS (`livePositive`) — six of these handlers return
 //       group-scoped content WITHOUT ever echoing the group id (verified by
@@ -513,8 +518,9 @@ describe('88.2 SPEC-REQ-4d — a soft-deleted group never reaches the wire', () 
       const hits = collectIdHits(res.body, needle);
       if (hits.length === 0) {
         throw new Error(
-          `POSITIVE CONTROL FAILED for ${ep.name} (${ep.file}): the LIVE group's ` +
-            `identifier "${needle}" is absent from a 2xx body, so the absence ` +
+          `POSITIVE CONTROL FAILED for ${ep.name} (${ep.file}): the LIVE run's ` +
+            `presence needle "${needle}" (the group id, or the row's livePresence ` +
+            `substitute) is absent from a 2xx body, so the absence ` +
             `assertion below proves nothing. Fix the SEED, never the assertion.\n` +
             `Body: ${JSON.stringify(res.body).slice(0, 500)}`
         );

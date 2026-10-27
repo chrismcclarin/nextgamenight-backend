@@ -15,8 +15,11 @@ const router = express.Router();
 // BSEC-02 / BE-098: this router is mounted under the global `/api` default-deny
 // authn layer (server.js). Post 87.5 SW-01/SW-02, ONLY the two search GETs
 // (`/search-all`, `/bgg/search`) are allow-listed public there. Everything else
-// — `GET /:id` (SW-01: its includes expose events/participants/winner UUIDs, so
-// it is authed; sole consumer is the authenticated gameDetail page) and the
+// — `GET /:id` (SW-01 kept it authed while its includes exposed events,
+// participants and winner UUIDs; those includes are gone — 88-34 WI-B2 and
+// quick-261027-glg — and it STAYS authed: a bare Game row is still a catalogue
+// read whose sole consumer is the authenticated gameDetail page, and opening it
+// to anonymous callers is a decision, not a cleanup) and the
 // write handlers (`POST /resolve`, `POST /import-bgg/:bgg_id`) — requires a
 // valid JWT before the handler runs.
 // 87.6 dead-api-surface cleanup deleted the custom-CRUD sinks (`POST /`,
@@ -220,9 +223,10 @@ router.get('/:id', async (req, res) => {
     // DECISION Phase 88-34 WI-B2 (fork B, owner-ruled 2026-08-20): the Event
     // include was DELETED here rather than history-filtered. It was DEAD
     // PAYLOAD — zero consumers. gameDetail is the only caller of this route
-    // (gameDetail/page.js:668 `gamesAPI.getGame`), it does `setGame(gameData)`
+    // (frontend:src/app/gameDetail/page.js ("gamesAPI.getGame(")), it does `setGame(gameData)`
     // and never reads `game.Events`; its Game Sessions list actually consumes
-    // the MIXED route GET /events/group/:group_id (page.js:677 -> :690), which
+    // the MIXED route GET /events/group/:group_id
+    // (frontend:src/app/gameDetail/page.js ("eventsAPI.getGroupEvents(")), which
     // must keep future events because it also feeds RSVP/Ballot/Bring. So the
     // sessions history filter belongs on the FE (88-33 Task 7), not here.
     // Deleting rather than filtering also killed two live defects for free:
