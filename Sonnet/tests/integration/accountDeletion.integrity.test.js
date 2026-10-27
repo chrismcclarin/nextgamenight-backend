@@ -572,6 +572,55 @@ describe('accountDeletion integrity — full disposition table on real Postgres 
     expect(byOwner.created_by_user_id).toBe(owner.id);
   });
 
+  test('review 261025-rl3 R1 — a creator who LEFT the group before deleting the account is scrubbed from that group\'s schedules too', async () => {
+    // Leaving does not clear a schedule's creator (by design: the close-email
+    // membership guard handles it), so the scrub must find the row by content,
+    // not by current membership. The target leaves through the REAL
+    // POST /api/groups/:group_id/leave route.
+    const request = require('supertest');
+    const express = require('express');
+    const groupRoutes = require('../../routes/groups');
+    const leaveApp = express();
+    leaveApp.use(express.json());
+    let actor = null;
+    leaveApp.use((req, _res, next) => {
+      if (actor) req.user = { user_id: actor.user_id, email: actor.email };
+      next();
+    });
+    leaveApp.use('/api/groups', groupRoutes);
+
+    const owner = await makeUser();
+    const target = await makeUser();
+    const group = await makeGroup();
+    await addToGroup(owner, group, 'owner');
+    await addToGroup(target, group, 'admin');
+
+    const settings = await makeGroupPromptSettings(group, owner, {
+      template_config: {
+        schedules: [
+          { id: 'sched-by-leaver', is_active: true, created_by_user_id: target.id },
+          { id: 'sched-by-owner-2', is_active: true, created_by_user_id: owner.id, selected_member_ids: [] },
+        ],
+      },
+    });
+
+    actor = target;
+    const left = await request(leaveApp).post(`/api/groups/${group.id}/leave`);
+    actor = null;
+    expect(left.status).toBe(200);
+    expect(await UserGroup.count({ where: { group_id: group.id, user_uuid: target.id } })).toBe(0);
+    const before = await GroupPromptSettings.findByPk(settings.id);
+    expect(before.template_config.schedules[0].created_by_user_id).toBe(target.id);
+
+    const result = await deleteAccount({ userId: target.user_id });
+    expect(result).toEqual({ status: 'deleted' });
+
+    const after = await GroupPromptSettings.findByPk(settings.id);
+    expect(JSON.stringify(after.template_config)).not.toContain(target.id);
+    expect(after.template_config.schedules.find((s) => s.id === 'sched-by-leaver').created_by_user_id).toBeNull();
+    expect(after.template_config.schedules.find((s) => s.id === 'sched-by-owner-2').created_by_user_id).toBe(owner.id);
+  });
+
   // -------------------------------------------------------------------------
   // Phase 88.8 post-merge (round-5 #3/#9/#10/#12/#28) — the two ADDRESS-keyed
   // scrubs round 4 added on this path.
