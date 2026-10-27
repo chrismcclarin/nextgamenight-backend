@@ -437,17 +437,31 @@ async function applyDispositions(user, t) {
     if (!Array.isArray(schedules)) continue;
     let changed = false;
     const updatedSchedules = schedules.map((s) => {
-      if (!s || !Array.isArray(s.selected_member_ids)) return s;
+      if (!s) return s;
+      let next = s;
+      // Review 261025-rl3 R1: each schedule records its creator's Users.id in
+      // created_by_user_id (the settings-row column of the same name is SET NULL by
+      // the FK). Clear it to null, OVER deleting the key, so the close-notification
+      // resolver reads "no schedule creator" and falls back exactly as for a legacy
+      // schedule. Residual: a creator who LEFT the group before deleting the account
+      // is outside userGroupIds, so that group's copy stays (the resolver's
+      // active-membership guard already skips them).
+      if (s.created_by_user_id === uuid) {
+        next = { ...next, created_by_user_id: null };
+      }
       // M-1 belt-and-braces (87.4-review): scrub BOTH shapes. Steady state stores the
       // UUID (Plan 04 backfill), but a deploy-window residue could hold the sub. A stale
       // tab can also PATCH either shape back post-scrub — this is hardening, not the
       // closure point (Plan 11's re-sweep + normalization is authoritative).
-      if (!s.selected_member_ids.includes(uuid) && !s.selected_member_ids.includes(sub)) return s;
-      changed = true;
-      return {
-        ...s,
-        selected_member_ids: s.selected_member_ids.filter((id) => id !== uuid && id !== sub),
-      };
+      if (Array.isArray(s.selected_member_ids)
+        && (s.selected_member_ids.includes(uuid) || s.selected_member_ids.includes(sub))) {
+        next = {
+          ...next,
+          selected_member_ids: s.selected_member_ids.filter((id) => id !== uuid && id !== sub),
+        };
+      }
+      if (next !== s) changed = true;
+      return next;
     });
     if (changed) {
       await settings.update(
