@@ -48,6 +48,23 @@ jest.mock('../../services/emailService', () => {
   return actual;
 });
 
+// Review 261025-rl3 R6: mock @sentry/node and force SENTRY_DSN BEFORE requiring
+// the service so its DSN-gated Sentry require (the notificationService idiom)
+// resolves to this mock. The original value is restored in afterAll; the
+// DSN-unset path is pinned below with jest.isolateModules.
+const mockCaptureException = jest.fn();
+const mockCaptureMessage = jest.fn();
+jest.mock('@sentry/node', () => ({
+  captureException: (...args) => mockCaptureException(...args),
+  captureMessage: (...args) => mockCaptureMessage(...args),
+}), { virtual: true });
+const ORIGINAL_SENTRY_DSN = process.env.SENTRY_DSN;
+process.env.SENTRY_DSN = 'https://fake@sentry.io/rl3';
+afterAll(() => {
+  if (ORIGINAL_SENTRY_DSN === undefined) delete process.env.SENTRY_DSN;
+  else process.env.SENTRY_DSN = ORIGINAL_SENTRY_DSN;
+});
+
 const lifecycleService = require('../../services/promptLifecycleService');
 const models = require('../../models');
 const emailService = require('../../services/emailService');
@@ -578,6 +595,94 @@ describe('promptLifecycleService.handlePromptClosed — no PII in logs (review 2
       logSpy.mockRestore();
       warnSpy.mockRestore();
       errorSpy.mockRestore();
+    }
+  });
+});
+
+// Review 261025-rl3 R6: the close-email path must not fail only to the console.
+// An unexpected error reports to Sentry; a prompt that HAS a creator column but
+// resolves no recipient (a broken invariant) reports a warning; a prompt with
+// neither creator column is a normal skip and reports nothing.
+describe('promptLifecycleService.handlePromptClosed — Sentry reporting (review 261025-rl3 R6)', () => {
+  const oneSuggestion = () => [
+    { id: 's1', score: 4, suggested_start: new Date('2026-05-10T18:00:00Z'), suggested_end: new Date('2026-05-10T21:00:00Z'), meets_minimum: true },
+  ];
+
+  it('R6-1: a throw inside the close path captures the exception with the promptId and is still swallowed', async () => {
+    const prompt = makePromptMock({ id: 'prompt-throw', status: 'closed', created_by_user_id: 'user-uuid-creator' });
+    const boom = new Error('boom');
+    AvailabilityResponse.count.mockRejectedValue(boom);
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await expect(lifecycleService.handlePromptClosed(prompt)).resolves.toBeUndefined();
+    } finally {
+      errorSpy.mockRestore();
+    }
+    expect(mockCaptureException).toHaveBeenCalledTimes(1);
+    expect(mockCaptureException).toHaveBeenCalledWith(boom, {
+      tags: { service: 'promptLifecycle' },
+      extra: { promptId: 'prompt-throw' },
+    });
+    expect(emailService.send).not.toHaveBeenCalled();
+  });
+
+  it('R6-2: an auto-prompt whose settings row has no creator and whose group has no owner reports one warning', async () => {
+    const prompt = makePromptMock({ id: 'prompt-orphan', status: 'closed', created_by_settings_id: 'settings-uuid-1' });
+    AvailabilityResponse.count.mockResolvedValue(2);
+    GroupPromptSettings.findByPk.mockResolvedValue({ id: 'settings-uuid-1', created_by_user_id: null });
+    UserGroup.findOne.mockResolvedValue(null); // no active owner
+    AvailabilitySuggestion.findAll.mockResolvedValue(oneSuggestion());
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      await lifecycleService.handlePromptClosed(prompt);
+    } finally {
+      warnSpy.mockRestore();
+    }
+    expect(emailService.send).not.toHaveBeenCalled();
+    expect(mockCaptureMessage).toHaveBeenCalledTimes(1);
+    expect(mockCaptureMessage).toHaveBeenCalledWith('[promptLifecycle] recipient expected but none resolved', {
+      level: 'warning',
+      tags: { service: 'promptLifecycle' },
+      extra: { promptId: 'prompt-orphan' },
+    });
+    expect(mockCaptureException).not.toHaveBeenCalled();
+  });
+
+  it('R6-3: a prompt with neither creator column is a normal skip and reports nothing to Sentry', async () => {
+    const prompt = makePromptMock({ id: 'prompt-legacy', status: 'closed' });
+    AvailabilityResponse.count.mockResolvedValue(2);
+    AvailabilitySuggestion.findAll.mockResolvedValue(oneSuggestion());
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      await lifecycleService.handlePromptClosed(prompt);
+    } finally {
+      warnSpy.mockRestore();
+    }
+    expect(emailService.send).not.toHaveBeenCalled();
+    expect(mockCaptureMessage).not.toHaveBeenCalled();
+    expect(mockCaptureException).not.toHaveBeenCalled();
+  });
+
+  it('R6-4: with SENTRY_DSN unset the service loads without Sentry and a throw is still swallowed', async () => {
+    const saved = process.env.SENTRY_DSN;
+    delete process.env.SENTRY_DSN;
+    try {
+      let isolatedService;
+      let isolatedModels;
+      jest.isolateModules(() => {
+        isolatedModels = require('../../models');
+        isolatedService = require('../../services/promptLifecycleService');
+      });
+      isolatedModels.AvailabilityResponse.count.mockRejectedValue(new Error('boom'));
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        await expect(isolatedService.handlePromptClosed(makePromptMock({ created_by_user_id: 'u' }))).resolves.toBeUndefined();
+      } finally {
+        errorSpy.mockRestore();
+      }
+      expect(mockCaptureException).not.toHaveBeenCalled();
+    } finally {
+      process.env.SENTRY_DSN = saved;
     }
   });
 });

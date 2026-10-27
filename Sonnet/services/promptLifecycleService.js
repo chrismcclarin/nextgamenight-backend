@@ -43,6 +43,18 @@ const {
 } = require('../models');
 const emailService = require('./emailService');
 
+// Optional Sentry integration (review 261025-rl3 R6). DSN-gated require copied
+// from services/notificationService.js (Phase 85 / BAPI-02) — not a third idiom;
+// Phase 91 consolidates them. Additive only: the console logging stays.
+let Sentry = null;
+if (process.env.SENTRY_DSN) {
+  try {
+    Sentry = require('@sentry/node');
+  } catch (err) {
+    console.warn('[promptLifecycle] Sentry not available:', err.message);
+  }
+}
+
 /**
  * Check whether all active group members have submitted responses for this
  * prompt. Closes the prompt and dispatches the close-notification side-effects
@@ -213,6 +225,17 @@ async function handlePromptClosed(prompt) {
 
     if (!recipient || !recipient.email) {
       console.warn(`[promptLifecycle] no recipient resolved for prompt ${prompt.id}; skipping email`);
+      // DECISION quick-261025-rl3 R6: report to Sentry only when a creator column is
+      // set (a recipient was expected and none resolved: a broken invariant), OVER
+      // reporting every skip. A legacy prompt with neither creator column is a
+      // normal skip and would only be noise.
+      if (Sentry && (prompt.created_by_user_id || prompt.created_by_settings_id)) {
+        Sentry.captureMessage('[promptLifecycle] recipient expected but none resolved', {
+          level: 'warning',
+          tags: { service: 'promptLifecycle' },
+          extra: { promptId: prompt.id },
+        });
+      }
       return;
     }
     if (recipient.email_notifications_enabled === false) {
@@ -299,6 +322,7 @@ async function handlePromptClosed(prompt) {
   } catch (err) {
     // Best-effort — close already committed. Log and swallow.
     console.error('[promptLifecycle] handlePromptClosed error (non-fatal):', err.message);
+    if (Sentry) Sentry.captureException(err, { tags: { service: 'promptLifecycle' }, extra: { promptId: prompt?.id } });
   }
 }
 
