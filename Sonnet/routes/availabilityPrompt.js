@@ -27,9 +27,15 @@ const { isUuid, resolveTargetUserUuidOnly } = require('../utils/resolveTargetUse
 // belongsTo(GroupPromptSettings, { foreignKey: 'created_by_settings_id' }) in
 // models/index.js, no `as`); template_config is read only to derive schedule_name
 // and is stripped from the wire (quick-261025-rl3).
+//
+// DECISION quick-261026-pi6 SC-2: the Creator include carries ['username'] only,
+// OVER ['id', 'username']: no frontend code reads Creator.id, and Creator.id is the
+// same Users.id UUID the T-71.2-02 created_by_user_id strip exists to keep off the
+// wire, so carrying it made that strip nominal on all three prompt reads. Adding
+// 'id' back is a decision, not a cleanup.
 function promptWireIncludes() {
   return [
-    { model: User, as: 'Creator', attributes: ['id', 'username'], required: false },
+    { model: User, as: 'Creator', attributes: ['username'], required: false },
     { model: GroupPromptSettings, attributes: ['id', 'template_name', 'template_config'], required: false }
   ];
 }
@@ -88,8 +94,9 @@ function decoratePromptForWire(promptRow, { requesterUserId, isAdmin }) {
   if (json.GroupPromptSetting) {
     delete json.GroupPromptSetting.template_config;
   }
-  // T-71.2-02: strip raw creator UUID from the wire — UI uses can_close +
-  // Creator.username only.
+  // T-71.2-02: strip raw creator UUID from the wire. UI uses can_close +
+  // Creator.username only; the creator's UUID reaches the wire nowhere (the
+  // Creator include carries no id, quick-261026-pi6 SC-2).
   delete json.created_by_user_id;
   return { ...json, schedule_name, can_close };
 }
@@ -639,8 +646,9 @@ router.get('/groups/:groupId/prompts/active', verifyAuth0Token, async (req, res)
       order: [['createdAt', 'DESC']]
     });
 
-    // quick-261026-pi6 B2: same decoration as /prompts/open (Creator, schedule_name,
-    // can_close; created_by_user_id and template_config stripped). Before this the
+    // quick-261026-pi6 B2: same decoration as /prompts/open (Creator { username },
+    // schedule_name, can_close; created_by_user_id and template_config stripped,
+    // and the creator's UUID reaches the wire nowhere, SC-2). Before this the
     // raw row went out, created_by_user_id included (no frontend reader).
     const isAdmin = ['owner', 'admin'].includes(userGroup.role);
     res.json({
@@ -687,8 +695,9 @@ router.get('/prompts/:promptId', verifyAuth0Token, async (req, res) => {
     }
 
     // T-71.2-02 + quick-261026-pi6 B2: the same decoration as /prompts/open
-    // (Creator, schedule_name, can_close; the raw creator UUID and template_config
-    // stripped), so a poll reached by id is named like its open-polls card.
+    // (Creator { username }, schedule_name, can_close; template_config stripped and
+    // the creator's UUID reaches the wire nowhere, neither as created_by_user_id nor
+    // as Creator.id, SC-2), so a poll reached by id is named like its open-polls card.
     // group_id stays: the planning page's cross-group guard reads it
     // (periodictabletop src/app/groupPlanning/page.js ("data.prompt.group_id")).
     const isAdmin = ['owner', 'admin'].includes(requesterGroup.role);

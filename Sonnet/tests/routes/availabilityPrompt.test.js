@@ -459,6 +459,10 @@ describe('GET /api/prompts/:promptId — membership gate + created_by_user_id st
     expect(res.body.prompt.id).toBe(prompt.id);
     // T-71.2-02: raw creator UUID stripped from the wire.
     expect(res.body.prompt.created_by_user_id).toBeUndefined();
+    // quick-261026-pi6 SC-2: the creator's UUID reaches the wire nowhere, not even
+    // as Creator.id: Creator carries the username only.
+    expect(res.body.prompt.Creator).toStrictEqual({ username: 'wr04-creator' });
+    expect(JSON.stringify(res.body)).not.toContain(creator.id);
     // quick-261026-pi6 B1: group_id is a consumed wire field. The planning page's
     // cross-group guard keeps a by-id poll only when it belongs to the page's group:
     // periodictabletop src/app/groupPlanning/page.js ("data.prompt.group_id").
@@ -638,7 +642,7 @@ describe("GET /api/groups/:groupId/prompts/open: schedule_name from the poll's o
     expect(item.schedule_name).toBeNull();
   });
 
-  it('O3: a manual poll gets schedule_name null', async () => {
+  it('O3: a manual poll gets schedule_name null and Creator carries the username only', async () => {
     const world = await seedWorld();
     const poll = await AvailabilityPrompt.create({
       group_id: world.group.id,
@@ -653,6 +657,11 @@ describe("GET /api/groups/:groupId/prompts/open: schedule_name from the poll's o
     const item = res.body.prompts.find((p) => p.id === poll.id);
     expect(item).toBeDefined();
     expect(item.schedule_name).toBeNull();
+    // quick-261026-pi6 SC-2: the creator's UUID (world.member here) reaches the wire
+    // nowhere, not even as Creator.id.
+    expect(item.Creator).toStrictEqual({ username: 'rl3-member' });
+    expect(item.created_by_user_id).toBeUndefined();
+    expect(JSON.stringify(res.body)).not.toContain(world.member.id);
   });
 
   it('O4: an auto poll with no schedule_id falls back to the settings row template_name', async () => {
@@ -683,7 +692,7 @@ describe("GET /api/groups/:groupId/prompts/open: schedule_name from the poll's o
 // ============================================================================
 // quick-261026-pi6 B2: the by-id read (GET /prompts/:promptId) and the active read
 // (GET /groups/:groupId/prompts/active) carry the same per-row decoration as
-// /prompts/open: Creator { id, username }, schedule_name and the requester's
+// /prompts/open: Creator { username }, schedule_name and the requester's
 // can_close, with created_by_user_id and GroupPromptSetting.template_config kept
 // off the wire. The planning page names a poll reached by id (the "Schedule it?"
 // email links a CLOSED poll, never in the open list) with the same label rule as
@@ -744,10 +753,12 @@ describe('GET /api/prompts/:promptId + GET /api/groups/:groupId/prompts/active: 
     const res = await request(makeApp(world.member)).get(`/api/prompts/${poll.id}`).send();
     expect(res.status).toBe(200);
     expect(res.body.prompt.id).toBe(poll.id);
-    expect(res.body.prompt.Creator.username).toBe('pi6-creator');
+    expect(res.body.prompt.Creator).toStrictEqual({ username: 'pi6-creator' });
     expect(res.body.prompt.schedule_name).toBeNull();
     expect(res.body.prompt.can_close).toBe(false);
     expect(res.body.prompt.created_by_user_id).toBeUndefined();
+    // quick-261026-pi6 SC-2: no Creator.id either, so the creator's UUID is nowhere in the body.
+    expect(JSON.stringify(res.body)).not.toContain(world.creator.id);
   });
 
   it('B2-2: by id, the creator (the group owner) gets can_close true', async () => {
@@ -787,10 +798,12 @@ describe('GET /api/prompts/:promptId + GET /api/groups/:groupId/prompts/active: 
     const res = await request(makeApp(world.member)).get(`/api/groups/${world.group.id}/prompts/active`).send();
     expect(res.status).toBe(200);
     expect(res.body.prompt.id).toBe(poll.id);
-    expect(res.body.prompt.Creator.username).toBe('pi6-creator');
+    expect(res.body.prompt.Creator).toStrictEqual({ username: 'pi6-creator' });
     expect(res.body.prompt.schedule_name).toBeNull();
     expect(res.body.prompt.can_close).toBe(false);
     expect(res.body.prompt.created_by_user_id).toBeUndefined();
+    // quick-261026-pi6 SC-2: no Creator.id either, so the creator's UUID is nowhere in the body.
+    expect(JSON.stringify(res.body)).not.toContain(world.creator.id);
   });
 
   it('B2-5: active, an auto poll names its own schedule and never ships template_config or a selected member UUID', async () => {
