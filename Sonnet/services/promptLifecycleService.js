@@ -11,10 +11,14 @@
 //     rule (D-ADAPT-05 + D-SCHEMA-06), builds the top-slot list, sends the
 //     close-notification email. Best-effort — errors logged, never thrown.
 //
-// LOCKED recipient resolution rule (D-ADAPT-05 + D-SCHEMA-06):
+// LOCKED recipient resolution rule (D-ADAPT-05 as amended 2026-10-26 by the owner
+// ruling on quick-261025-rl3 review R1, + D-SCHEMA-06):
 //   Manual:  candidate = prompt.created_by_user_id
 //   Auto:    settings = GroupPromptSettings.findByPk(prompt.created_by_settings_id)
-//            candidate = settings.created_by_user_id (none → group owner)
+//            firing   = settings.template_config.schedules[] entry whose id equals
+//                       prompt.schedule_id (case-insensitive)
+//            candidate = firing.created_by_user_id
+//                        (none → settings.created_by_user_id, none → group owner)
 //   recipient = candidate, ONLY while the candidate holds an ACTIVE UserGroup
 //              membership in prompt.group_id (quick-261025-rl3 BE-1); a
 //              candidate who left or was removed falls back to the group owner
@@ -42,6 +46,19 @@ const {
   Game,
 } = require('../models');
 const emailService = require('./emailService');
+const { findScheduleById } = require('../utils/findScheduleById');
+
+// Optional Sentry integration (review 261025-rl3 R6). DSN-gated require copied
+// from services/notificationService.js (Phase 85 / BAPI-02) — not a third idiom;
+// Phase 91 consolidates them. Additive only: the console logging stays.
+let Sentry = null;
+if (process.env.SENTRY_DSN) {
+  try {
+    Sentry = require('@sentry/node');
+  } catch (err) {
+    console.warn('[promptLifecycle] Sentry not available:', err.message);
+  }
+}
 
 /**
  * Check whether all active group members have submitted responses for this
@@ -95,7 +112,8 @@ async function checkConsensusAndClose(promptId) {
     // Won the claim → run the close side-effects on the freshly-updated row.
     // NOTE: a bare `update(...).returning` row carries only table columns, not
     // eager-loaded associations. handlePromptClosed reads only plain columns
-    // (id, group_id, created_by_user_id, created_by_settings_id, game_id) and
+    // (id, group_id, created_by_user_id, created_by_settings_id, schedule_id,
+    // game_id) and
     // re-queries every association itself, so the RETURNING row is sufficient
     // and no re-fetch-with-include is required here.
     await handlePromptClosed(rows[0]);
@@ -146,7 +164,8 @@ async function handlePromptClosed(prompt) {
 
     // Step 2 — resolve recipient per the LOCKED rule (D-ADAPT-05).
     // 2a: the candidate is the stored creator — the manual poll's creator, or
-    //     the settings row's creator for an auto-prompt.
+    //     for an auto-prompt the creator of the schedule that fired it, falling
+    //     back to the settings row's creator.
     let candidateUserId = null;
     let useOwnerFallback = false;
     if (prompt.created_by_user_id) {
@@ -160,7 +179,20 @@ async function handlePromptClosed(prompt) {
       // survives the close. Reading settings.created_by_user_id is read-only
       // and allowed.
       const settings = await GroupPromptSettings.findByPk(prompt.created_by_settings_id);
-      if (settings && settings.created_by_user_id) {
+      // DECISION quick-261025-rl3 R1 (owner ruling 2026-10-26, D-ADAPT-05 amended in
+      // the parent repo): the candidate is the creator of the schedule that FIRED
+      // this poll, OVER the settings-row created_by_user_id (whoever first set up
+      // scheduling for the group, which mailed one admin the results of another
+      // admin's schedule). The schedule is matched by prompt.schedule_id through the
+      // ONE matcher shared with decoratePromptForWire in routes/availabilityPrompt.js
+      // (utils/findScheduleById.js). Residual: schedules created before this
+      // change carry no created_by_user_id and fall back to the settings-row
+      // creator, then the group owner. Reading the settings column first is a
+      // decision, not a cleanup.
+      const firingSchedule = findScheduleById(settings?.template_config?.schedules, prompt.schedule_id);
+      if (firingSchedule && firingSchedule.created_by_user_id) {
+        candidateUserId = firingSchedule.created_by_user_id;
+      } else if (settings && settings.created_by_user_id) {
         candidateUserId = settings.created_by_user_id;
       } else {
         useOwnerFallback = true;
@@ -213,6 +245,17 @@ async function handlePromptClosed(prompt) {
 
     if (!recipient || !recipient.email) {
       console.warn(`[promptLifecycle] no recipient resolved for prompt ${prompt.id}; skipping email`);
+      // DECISION quick-261025-rl3 R6: report to Sentry only when a creator column is
+      // set (a recipient was expected and none resolved: a broken invariant), OVER
+      // reporting every skip. A legacy prompt with neither creator column is a
+      // normal skip and would only be noise.
+      if (Sentry && (prompt.created_by_user_id || prompt.created_by_settings_id)) {
+        Sentry.captureMessage('[promptLifecycle] recipient expected but none resolved', {
+          level: 'warning',
+          tags: { service: 'promptLifecycle' },
+          extra: { promptId: prompt.id },
+        });
+      }
       return;
     }
     if (recipient.email_notifications_enabled === false) {
@@ -264,7 +307,8 @@ async function handlePromptClosed(prompt) {
       console.log(`[promptLifecycle] prompt ${prompt.id} has no viable AvailabilitySuggestion rows (meets_minimum=true); skipping email`);
       return;
     }
-    console.log(`[promptLifecycle] prompt ${prompt.id} resolved ${suggestions.length} suggestion(s); top score=${suggestions[0].score}; recipient=${recipient.email}`);
+    // No PII in logs: the recipient is named by User UUID only (T-71.2-02 least exposure; Phase 91 owns the Sentry scrub).
+    console.log(`[promptLifecycle] prompt ${prompt.id} resolved ${suggestions.length} suggestion(s); top score=${suggestions[0].score}; recipient user ${recipient.id}`);
     const topScore = suggestions[0].score;
     // Render all ties at the top score, sorted ascending by start time so the
     // earliest tie is rendered first.
@@ -298,6 +342,7 @@ async function handlePromptClosed(prompt) {
   } catch (err) {
     // Best-effort — close already committed. Log and swallow.
     console.error('[promptLifecycle] handlePromptClosed error (non-fatal):', err.message);
+    if (Sentry) Sentry.captureException(err, { tags: { service: 'promptLifecycle' }, extra: { promptId: prompt?.id } });
   }
 }
 

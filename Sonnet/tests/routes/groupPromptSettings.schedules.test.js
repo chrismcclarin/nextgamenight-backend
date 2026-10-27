@@ -283,4 +283,85 @@ describe('groupPromptSettings write-path normalization — sub → UUID self-hea
     expect(logged).not.toContain(m1.id);
     warnSpy.mockRestore();
   });
+
+  // Review 261025-rl3 R1 (owner ruling 2026-10-26): each schedule records its own
+  // creator, so the close email for an automatic poll goes to whoever set the
+  // schedule that fired it. The creator is stored in the DB row and NEVER reaches
+  // the wire (least exposure, the quick-261026-pi6 SC-2 stance).
+  describe('per-schedule creator (261025-rl3 R1)', () => {
+    let admin;
+
+    beforeEach(async () => {
+      admin = await makeUser({ username: 'sched-admin' });
+      await addToGroup(admin, group, 'admin');
+    });
+
+    function noCreatorKey(obj) {
+      return !Object.prototype.hasOwnProperty.call(obj, 'created_by_user_id');
+    }
+
+    it('POST create stamps created_by_user_id on every new schedule (first and later), and the echo omits it', async () => {
+      const first = await request(makeApp())
+        .post(`/api/groups/${group.id}/prompt-settings/schedules`)
+        .send({ schedule_day_of_week: 1, schedule_time: '19:00', schedule_timezone: 'UTC' });
+      expect(first.status).toBe(201);
+      expect(noCreatorKey(first.body.schedule)).toBe(true);
+
+      currentActor = admin.user_id;
+      const second = await request(makeApp())
+        .post(`/api/groups/${group.id}/prompt-settings/schedules`)
+        .send({ schedule_day_of_week: 2, schedule_time: '19:00', schedule_timezone: 'UTC' });
+      expect(second.status).toBe(201);
+      expect(noCreatorKey(second.body.schedule)).toBe(true);
+
+      const schedules = await storedSchedules(group);
+      expect(schedules.find((s) => s.id === first.body.schedule.id).created_by_user_id).toBe(owner.id);
+      expect(schedules.find((s) => s.id === second.body.schedule.id).created_by_user_id).toBe(admin.id);
+      // The settings-row column still records the first setter (the fallback).
+      const settings = await GroupPromptSettings.findOne({ where: { group_id: group.id } });
+      expect(settings.created_by_user_id).toBe(owner.id);
+    });
+
+    it('GET prompt-settings omits created_by_user_id from every schedule while the DB row keeps it', async () => {
+      const created = await request(makeApp())
+        .post(`/api/groups/${group.id}/prompt-settings/schedules`)
+        .send({ schedule_day_of_week: 3, schedule_time: '19:00', schedule_timezone: 'UTC' });
+      expect(created.status).toBe(201);
+
+      const res = await request(makeApp()).get(`/api/groups/${group.id}/prompt-settings`);
+      expect(res.status).toBe(200);
+      expect(res.body.schedules).toHaveLength(1);
+      expect(res.body.template_config.schedules).toHaveLength(1);
+      expect(res.body.schedules.every(noCreatorKey)).toBe(true);
+      expect(res.body.template_config.schedules.every(noCreatorKey)).toBe(true);
+      expect(JSON.stringify(res.body)).not.toContain('created_by_user_id');
+
+      const schedules = await storedSchedules(group);
+      expect(schedules[0].created_by_user_id).toBe(owner.id);
+    });
+
+    it('PATCH by another admin keeps the original creator, and the PATCH and toggle echoes omit it', async () => {
+      const created = await request(makeApp())
+        .post(`/api/groups/${group.id}/prompt-settings/schedules`)
+        .send({ schedule_day_of_week: 4, schedule_time: '19:00', schedule_timezone: 'UTC' });
+      expect(created.status).toBe(201);
+      const scheduleId = created.body.schedule.id;
+
+      currentActor = admin.user_id;
+      const patched = await request(makeApp())
+        .patch(`/api/groups/${group.id}/prompt-settings/schedules/${scheduleId}`)
+        .send({ schedule_time: '20:00', created_by_user_id: admin.id });
+      expect(patched.status).toBe(200);
+      expect(noCreatorKey(patched.body.schedule)).toBe(true);
+
+      const toggled = await request(makeApp())
+        .patch(`/api/groups/${group.id}/prompt-settings/schedules/${scheduleId}/toggle`);
+      expect(toggled.status).toBe(200);
+      expect(noCreatorKey(toggled.body.schedule)).toBe(true);
+
+      const sched = (await storedSchedules(group)).find((s) => s.id === scheduleId);
+      expect(sched.schedule_time).toBe('20:00');
+      expect(sched.created_by_user_id).toBe(owner.id);
+    });
+  });
 });

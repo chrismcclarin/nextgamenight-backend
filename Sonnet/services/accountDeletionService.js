@@ -49,7 +49,7 @@
 // new Event.winner_id/picked_by_id SET NULL FKs from plan 87.2-01) fire automatically
 // on User.destroy via the 87.1 CASCADE / SET NULL graph — no explicit code needed here.
 
-const { Op, UniqueConstraintError, fn, col, where } = require('sequelize');
+const { Op, UniqueConstraintError, fn, col, where, cast } = require('sequelize');
 // Round 4 #8: THE normalisation rule for a stored address — imported, never re-derived.
 const { normaliseEmail } = require('./provisioningService');
 const {
@@ -424,30 +424,59 @@ async function applyDispositions(user, t) {
   //        M-2 (87.4-review): scope the lock to the deleting user's groups (captured
   //        up front) — an unscoped findAll FOR UPDATE would lock EVERY GroupPromptSettings
   //        row app-wide for the rest of the deletion txn, stalling all schedule edits
-  //        site-wide. An empty group set skips the query entirely.
-  const promptSettingsRows = userGroupIds.length === 0
-    ? []
-    : await GroupPromptSettings.findAll({
-        where: { group_id: { [Op.in]: userGroupIds } },
-        transaction: t,
-        lock: t.LOCK.UPDATE,
-      });
+  //        site-wide.
+  //        DECISION quick-261025-rl3 R1 (coordinator follow-up 2026-10-26): rows are
+  //        selected by CONTENT as well as by membership (an Op.or of the member-group
+  //        condition and template_config::text LIKE '%<uuid>%'), OVER membership alone,
+  //        because a former member's schedule creator id must not outlive the account:
+  //        leaving a group clears neither schedules[].created_by_user_id (by design, the
+  //        close-email membership guard handles it) nor a selected_member_ids entry.
+  //        The lock stays scoped (M-2): Postgres FOR UPDATE locks only the rows the
+  //        condition returns, i.e. the user's groups plus rows that hold the user's
+  //        UUID. uuid is the Users.id primary key (hex and hyphens only), so it carries
+  //        no LIKE wildcard. The per-row rewrite below only touches values equal to the
+  //        user's UUID/sub, so a content-selected row is scrubbed by the same rules;
+  //        the text match is a superset filter, never the deciding check. Selecting by
+  //        membership only is a decision, not a cleanup.
+  const promptSettingsRows = await GroupPromptSettings.findAll({
+    where: {
+      [Op.or]: [
+        ...(userGroupIds.length > 0 ? [{ group_id: { [Op.in]: userGroupIds } }] : []),
+        where(cast(col('template_config'), 'text'), { [Op.like]: `%${uuid}%` }),
+      ],
+    },
+    transaction: t,
+    lock: t.LOCK.UPDATE,
+  });
   for (const settings of promptSettingsRows) {
     const schedules = settings.template_config && settings.template_config.schedules;
     if (!Array.isArray(schedules)) continue;
     let changed = false;
     const updatedSchedules = schedules.map((s) => {
-      if (!s || !Array.isArray(s.selected_member_ids)) return s;
+      if (!s) return s;
+      let next = s;
+      // Review 261025-rl3 R1: each schedule records its creator's Users.id in
+      // created_by_user_id (the settings-row column of the same name is SET NULL by
+      // the FK). Clear it to null, OVER deleting the key, so the close-notification
+      // resolver reads "no schedule creator" and falls back exactly as for a legacy
+      // schedule. A creator who LEFT the group before deleting the account is found
+      // by the content match in the selection above.
+      if (s.created_by_user_id === uuid) {
+        next = { ...next, created_by_user_id: null };
+      }
       // M-1 belt-and-braces (87.4-review): scrub BOTH shapes. Steady state stores the
       // UUID (Plan 04 backfill), but a deploy-window residue could hold the sub. A stale
       // tab can also PATCH either shape back post-scrub — this is hardening, not the
       // closure point (Plan 11's re-sweep + normalization is authoritative).
-      if (!s.selected_member_ids.includes(uuid) && !s.selected_member_ids.includes(sub)) return s;
-      changed = true;
-      return {
-        ...s,
-        selected_member_ids: s.selected_member_ids.filter((id) => id !== uuid && id !== sub),
-      };
+      if (Array.isArray(s.selected_member_ids)
+        && (s.selected_member_ids.includes(uuid) || s.selected_member_ids.includes(sub))) {
+        next = {
+          ...next,
+          selected_member_ids: s.selected_member_ids.filter((id) => id !== uuid && id !== sub),
+        };
+      }
+      if (next !== s) changed = true;
+      return next;
     });
     if (changed) {
       await settings.update(

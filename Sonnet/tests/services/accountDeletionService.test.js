@@ -112,7 +112,7 @@ jest.mock('../../queues', () => ({
   auth0CleanupQueue: { add: (...a) => mockQueueAdd(...a) },
 }));
 
-const { UniqueConstraintError } = require('sequelize');
+const { UniqueConstraintError, Op } = require('sequelize');
 
 const { deleteAccount, classifyMissingRow } = require('../../services/accountDeletionService');
 
@@ -585,13 +585,17 @@ describe('deleteAccount — GroupPromptSettings selected_member_ids scrub (5c / 
     const res = await deleteAccount({ userId: SUB });
     expect(res).toEqual({ status: 'deleted' });
 
-    // Loaded FOR UPDATE inside the deletion txn, SCOPED to the user's groups (M-2).
+    // Loaded FOR UPDATE inside the deletion txn, SCOPED (M-2): the user's groups OR
+    // rows whose template_config holds the user's UUID (review 261025-rl3 R1
+    // follow-up: a former member's schedule creator id) — NOT an app-wide lock.
     expect(mockGPSFindAll).toHaveBeenCalledTimes(1);
     const gpsArgs = mockGPSFindAll.mock.calls[0][0];
     expect(gpsArgs).toEqual(expect.objectContaining({ lock: 'UPDATE' }));
-    // Scoped where clause: group_id IN (the captured group set) — NOT an app-wide lock.
     expect(gpsArgs.where).toBeDefined();
-    expect(gpsArgs.where.group_id).toBeDefined();
+    const orBranches = gpsArgs.where[Op.or];
+    expect(orBranches).toHaveLength(2);
+    expect(orBranches[0]).toEqual({ group_id: { [Op.in]: ['g1'] } });
+    expect(orBranches[1].logic).toEqual({ [Op.like]: `%${UUID}%` });
 
     // The row was rewritten with the deleting user's UUID removed from schedule[0],
     // the other members and the untouched schedule preserved.
@@ -644,12 +648,17 @@ describe('deleteAccount — GroupPromptSettings selected_member_ids scrub (5c / 
     expect(settingsUpdate).not.toHaveBeenCalled();
   });
 
-  // M-2 (87.4-review): a user in NO groups must not lock any GroupPromptSettings rows
-  // — the scoped findAll is skipped entirely (never an app-wide FOR UPDATE).
-  test('skips the GroupPromptSettings load entirely when the user belongs to no groups', async () => {
+  // M-2 (87.4-review), amended by review 261025-rl3 R1 follow-up: a user in NO groups
+  // still never takes an app-wide FOR UPDATE. The load now runs (a former member's
+  // UUID can sit in a group they left), but its ONLY condition is the content match
+  // on the user's UUID — no group branch, so only rows holding that UUID are locked.
+  test('a user in no groups loads only rows whose template_config holds their UUID', async () => {
     mockUGFindAll.mockResolvedValue([]); // no memberships -> empty userGroupIds
     await deleteAccount({ userId: SUB });
-    expect(mockGPSFindAll).not.toHaveBeenCalled();
+    expect(mockGPSFindAll).toHaveBeenCalledTimes(1);
+    const orBranches = mockGPSFindAll.mock.calls[0][0].where[Op.or];
+    expect(orBranches).toHaveLength(1);
+    expect(orBranches[0].logic).toEqual({ [Op.like]: `%${UUID}%` });
   });
 });
 
