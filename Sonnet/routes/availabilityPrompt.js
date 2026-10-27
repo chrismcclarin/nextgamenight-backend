@@ -699,7 +699,7 @@ router.get('/prompts/:promptId', verifyAuth0Token, async (req, res) => {
     // the creator's UUID reaches the wire nowhere, neither as created_by_user_id nor
     // as Creator.id, SC-2), so a poll reached by id is named like its open-polls card.
     // group_id stays: the planning page's cross-group guard reads it
-    // (periodictabletop src/app/groupPlanning/page.js ("data.prompt.group_id")).
+    // (periodictabletop src/app/groupPlanning/page.js ("sameId(data.prompt.group_id, forGroup)")).
     const isAdmin = ['owner', 'admin'].includes(requesterGroup.role);
     res.json({ prompt: decoratePromptForWire(prompt, { requesterUserId: requester.id, isAdmin }) });
   } catch (error) {

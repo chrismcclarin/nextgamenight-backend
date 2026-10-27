@@ -465,7 +465,7 @@ describe('GET /api/prompts/:promptId — membership gate + created_by_user_id st
     expect(JSON.stringify(res.body)).not.toContain(creator.id);
     // quick-261026-pi6 B1: group_id is a consumed wire field. The planning page's
     // cross-group guard keeps a by-id poll only when it belongs to the page's group:
-    // periodictabletop src/app/groupPlanning/page.js ("data.prompt.group_id").
+    // periodictabletop src/app/groupPlanning/page.js ("sameId(data.prompt.group_id, forGroup)").
     expect(res.body.prompt.group_id).toBe(group.id);
   });
 });
