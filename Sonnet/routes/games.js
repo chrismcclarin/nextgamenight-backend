@@ -2,7 +2,8 @@
 const express = require('express');
 // Phase 88-34 WI-B2: EventParticipation dropped from this destructure — its only
 // use was the GET /:id Event include deleted below (fork B).
-const { Game, Event, GameReview, Group, User, UserGame, UserGroup } = require('../models');
+// quick-261027-glg: GameReview and Group dropped too — their only use was the GET /:id GameReview include deleted below.
+const { Game, Event, User, UserGame, UserGroup } = require('../models');
 const { Op } = require('sequelize');
 const { matchesSelf } = require('../middleware/objectAuth');
 const { optionalAuth } = require('../middleware/auth0');
@@ -231,40 +232,32 @@ router.get('/:id', async (req, res) => {
     //     for a game to any logged-in caller (cross-group exposure).
     // If a consumer of a game's events is ever wanted here, it must be scoped
     // to the caller's groups — do NOT restore this include as it was.
-    const game = await Game.findByPk(req.params.id, {
-      include: [
-        {
-          model: GameReview,
-          include: [
-            { model: User, attributes: ['username'] },
-            // DECISION Phase 88.2 AF-10: hiding a soft-deleted group's reviews BY JOIN
-            // was chosen OVER making GameReview paranoid. D-01 deliberately keeps
-            // GameReview non-paranoid — SPEC-REQ-1 requires its row count to be
-            // UNCHANGED across a group delete, and plan 07's restore touches nothing
-            // there. GameReview therefore has NO SELF-DEFENCE: every route that reads
-            // it OUTSIDE the isActiveMember choke point must filter by join, and this
-            // route is one of them — it is authenticated but GROUP-AGNOSTIC, so any
-            // logged-in user would otherwise receive every group's reviews for a game,
-            // including a hidden group's group_id, review_text and reviewer usernames,
-            // for the whole 30-day window. That is a regression against today's
-            // behavior, where the hard delete destroys those rows.
-            //
-            // `attributes: []` keeps the join purely a filter — no group data enters
-            // the response, so the payload shape the gameDetail consumer reads is
-            // unchanged for live groups. Marking it required makes it an INNER JOIN,
-            // which is what actually DROPS the parent GameReview row; without that,
-            // Sequelize emits the paranoid clause in the ON clause and merely nulls
-            // the association while KEEPING the review.
-            //
-            // REJECTED: scoping the reviews to groups the caller belongs to. Today
-            // gameDetail deliberately shows reviews from every group; narrowing that
-            // would be a silent product change riding on a soft-delete phase. Do not
-            // "simplify" this into a membership scope.
-            { model: Group, attributes: [], required: true }
-          ]
-        }
-      ]
-    });
+    // DECISION Phase 88.2 AF-10 (AMENDED quick-261027-glg):
+    // the GameReview include (each review, its reviewer's username, and the 88.2
+    // AF-10 soft-delete filter join on Group) was DELETED here as dead payload.
+    // That was chosen OVER keeping the AF-10 join and OVER scoping the reviews to
+    // the caller's groups.
+    //   - Evidence: 0 frontend readers of GameReviews (word grep over the FE src/
+    //     and e2e/, measured 2026-10-27). The game page loads its reviews from the
+    //     membership-checked GET /game-reviews/game/:game_id/group/:group_id,
+    //     gated at routes/gameReviews.js ("const hasAccess = await isActiveMember(callerId, group_id);").
+    //   - The original AF-10 REJECTED paragraph rested on "gameDetail deliberately
+    //     shows reviews from every group". That premise was false, so its warning
+    //     against a membership scope no longer applies here: neither a scope nor
+    //     the join remains, because the payload itself is gone.
+    //   - The original AF-10 choice, kept as record: hide a soft-deleted group's
+    //     reviews BY JOIN, OVER making GameReview paranoid (D-01 keeps GameReview
+    //     non-paranoid; SPEC-REQ-1 keeps its row count unchanged across a group
+    //     delete). That rule still binds EVERY route that reads GameReview outside
+    //     the isActiveMember choke point; this route no longer reads it, so the
+    //     join is moot here.
+    //   - Deleting the include also closed a cross-group exposure (adversarial
+    //     review #317 of Phase 88.6.1): any signed-in caller, member of no group,
+    //     received every live group's review_text, group_id and reviewer username
+    //     for any game id.
+    // Restoring the include is a decision, not a cleanup: a future consumer must
+    // scope the reviews to the caller's groups AND re-apply the AF-10 join.
+    const game = await Game.findByPk(req.params.id);
     
     if (!game) {
       return res.status(404).json({ error: 'Game not found' });
