@@ -9,6 +9,8 @@
 // nothing clears either creator column, so without a membership check a former
 // member keeps receiving the group's poll results. A leaver must fall through to
 // the group-owner fallback instead.
+// Removal by an owner/admin (DELETE /:group_id/users/:target_user_id) hard-deletes
+// the row the same way and must fall through identically (review R8, M4).
 //
 // REAL-DB suite (the tests/services/promptLifecycleService.idempotency.test.js
 // pattern): real models, the member leaves through the REAL leave route, ONLY
@@ -60,6 +62,18 @@ async function leaveGroup(user, group) {
   currentActor = null;
   expect(res.status).toBe(200);
   expect(await UserGroup.count({ where: { group_id: group.id, user_uuid: user.id } })).toBe(0);
+}
+
+// Review 261025-rl3 R8: the admin-removal path. The owner removes a member
+// through the REAL DELETE /api/groups/:group_id/users/:target_user_id route
+// (routes/groups.js), which hard-deletes the UserGroup row the same way leave
+// does. The route resolves the target by Users.id UUID only (87.3 PR-C).
+async function removeMember(actor, target, group) {
+  currentActor = actor;
+  const res = await request(app).delete(`/api/groups/${group.id}/users/${target.id}`);
+  currentActor = null;
+  expect(res.status).toBe(200);
+  expect(await UserGroup.count({ where: { group_id: group.id, user_uuid: target.id } })).toBe(0);
 }
 
 // A group with an owner and a second member; the poll gets one submitted
@@ -140,5 +154,16 @@ describe('handlePromptClosed recipient must be an active member (261025-rl3 BE-1
     await lifecycleService.handlePromptClosed(prompt);
 
     expect(sentTo()).toEqual(['member-m3@example.com']);
+  });
+
+  it('M4: automatic poll whose schedule creator was REMOVED by the owner mails the group owner, not the removed member', async () => {
+    const { owner, member, group } = await seedGroup('m4');
+    const settings = await makeSettings(group, member);
+    await removeMember(owner, member, group);
+    const prompt = await makeClosedPrompt(group, owner, { created_by_settings_id: settings.id });
+
+    await lifecycleService.handlePromptClosed(prompt);
+
+    expect(sentTo()).toEqual(['owner-m4@example.com']);
   });
 });
