@@ -47,8 +47,11 @@
 // THIS SWEEP PROVES THE ENUMERATED SURFACES ONLY — never "the whole API". A grep
 // finds includes written one way; it cannot find a leak written another way,
 // which is exactly how routes/games.js (no `model: Group` at all, a real leak via
-// an unfiltered GameReview include) escaped the original scan. A red here is a
-// leak to fix at its owning site, never a row to delete.
+// an unfiltered GameReview include) escaped the original scan. (That GameReview
+// include was removed outright in quick-261027-glg; GET /api/games/:id now
+// serializes no group content, and its row's control is the game id — see the
+// DECISION at that row.)
+// A red here is a leak to fix at its owning site, never a row to delete.
 // ===========================================================================
 //
 // EVERY ROW CARRIES A POSITIVE CONTROL. A sweep that returns nothing at all
@@ -201,8 +204,10 @@ describe('88.2 SPEC-REQ-4d — a soft-deleted group never reaches the wire', () 
   let live;
   let dead;
 
-  // ONE shared Game across both groups' reviews, so GET /api/games/:id exercises
-  // Task 5's join with a LIVE and a HIDDEN review on the same parent row.
+  // ONE shared Game anchors both worlds' events, prompts and reviews; the lists
+  // and game-reviews rows read those reviews. (History: until quick-261027-glg it
+  // also exercised GET /api/games/:id's AF-10 join with a LIVE and a HIDDEN review
+  // on the same parent row; that include is gone.)
   // Re-created per test: tests/setup.js TRUNCATEs every table before each test, so
   // a handle held across tests points at a row that no longer exists (FK violation).
   let sharedGame = null;
@@ -351,12 +356,25 @@ describe('88.2 SPEC-REQ-4d — a soft-deleted group never reaches the wire', () 
       livePositive: (body) => Array.isArray(body?.members) && body.members.length > 0,
     },
     {
-      // Task 5 (AF-10): the live group's review must be present and the hidden
-      // group's absent, on the SAME shared game.
+      // DECISION quick-261027-glg: this row's positive control is the GAME's own
+      // id (livePresence), chosen OVER deleting the row (the header's "never a
+      // row to delete", and the 9-file / 16-path coverage assertion below) and
+      // OVER a third harness mode (it would duplicate the standalone test at the
+      // bottom of this describe). Since the GameReview include was removed from
+      // GET /api/games/:id, the handler serializes no group-scoped content at
+      // all, so neither mode (a)'s group id nor a mode (b) witness can exist.
+      // The control still proves the live run is a non-vacuous 2xx carrying the
+      // requested game, and the hidden run still proves the dead group's id is
+      // absent; the stronger "neither group" property is pinned by the
+      // standalone test below and by games.test.js. This is not a seed fix
+      // papering over a broken control: the handler changed by design. Setting
+      // the control back to the group id is a decision, not a cleanup; it would
+      // mean group content has returned to this route.
       name: 'GET /api/games/:id',
       file: 'routes/games.js',
       path: (w) => `/api/games/${w.game.id}`,
       deadStatus: 'any',
+      livePresence: (w) => w.game.id,
     },
     {
       name: 'GET /api/lists/games/:group_id/:user_id',
