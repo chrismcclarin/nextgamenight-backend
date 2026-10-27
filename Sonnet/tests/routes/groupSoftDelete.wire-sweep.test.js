@@ -62,12 +62,13 @@
 // handler, not a preference:
 //
 //   (a) ID-PRESENCE (the default) — the live run's body must CONTAIN the live
-//       group's id. Used by the 9 endpoints that actually serialize it, PLUS
-//       one row — GET /api/games/:id — whose `livePresence` substitutes the
-//       GAME id (quick-261027-glg removed that route's only group-bearing
-//       payload): that control proves the route still answers with its row,
-//       not that a group id is absent; the absence is pinned by the standalone
-//       games test below and by games.test.js.
+//       group's id. Ten rows use it: 8 serialize the live group's id; the
+//       invites/info row substitutes the group NAME via `livePresence` (still
+//       two-sided, the name is group-scoped); and GET /api/games/:id substitutes
+//       the GAME id (quick-261027-glg removed that route's only group-bearing
+//       payload) — that last control proves the route still answers with its
+//       row, not that a group id is absent; the absence is pinned by the
+//       standalone games test below and by games.test.js.
 //
 //   (b) GROUP-SCOPED WITNESS (`livePositive`) — six of these handlers return
 //       group-scoped content WITHOUT ever echoing the group id (verified by
