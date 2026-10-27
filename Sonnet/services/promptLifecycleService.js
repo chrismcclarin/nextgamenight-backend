@@ -264,7 +264,8 @@ async function handlePromptClosed(prompt) {
       console.log(`[promptLifecycle] prompt ${prompt.id} has no viable AvailabilitySuggestion rows (meets_minimum=true); skipping email`);
       return;
     }
-    console.log(`[promptLifecycle] prompt ${prompt.id} resolved ${suggestions.length} suggestion(s); top score=${suggestions[0].score}; recipient=${recipient.email}`);
+    // No PII in logs: the recipient is named by User UUID only (T-71.2-02 least exposure; Phase 91 owns the Sentry scrub).
+    console.log(`[promptLifecycle] prompt ${prompt.id} resolved ${suggestions.length} suggestion(s); top score=${suggestions[0].score}; recipient user ${recipient.id}`);
     const topScore = suggestions[0].score;
     // Render all ties at the top score, sorted ascending by start time so the
     // earliest tie is rendered first.

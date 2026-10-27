@@ -539,3 +539,45 @@ describe('emailService.generatePollClosedEmailTemplate', () => {
     expect(ctaMatches.length).toBe(1);
   });
 });
+
+// Review 261025-rl3 R3: the close-email path must not write the recipient's
+// email address to the logs (T-71.2-02 least exposure). The success log names
+// the recipient by User UUID only.
+describe('promptLifecycleService.handlePromptClosed — no PII in logs (review 261025-rl3 R3)', () => {
+  it('R3: drives the close through to the send and logs no part of the recipient email address', async () => {
+    const recipient = {
+      id: 'user-uuid-creator',
+      email: 'creator-pii@test.com',
+      username: 'Creator',
+      timezone: 'UTC',
+      email_notifications_enabled: true,
+    };
+    const prompt = makePromptMock({ status: 'closed', created_by_user_id: recipient.id });
+    AvailabilityResponse.count.mockResolvedValue(2);
+    User.findByPk.mockImplementation(async (id) => (id === recipient.id ? recipient : null));
+    AvailabilitySuggestion.findAll.mockResolvedValue([
+      { id: 's1', score: 4, suggested_start: new Date('2026-05-10T18:00:00Z'), suggested_end: new Date('2026-05-10T21:00:00Z'), meets_minimum: true },
+    ]);
+    emailService.send.mockResolvedValue({ success: true });
+
+    const logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await lifecycleService.handlePromptClosed(prompt);
+      // The send happened, so every log line on the success path was written.
+      expect(emailService.send).toHaveBeenCalledTimes(1);
+      expect(emailService.send.mock.calls[0][0].to).toBe(recipient.email);
+      const calls = [...logSpy.mock.calls, ...warnSpy.mock.calls, ...errorSpy.mock.calls]
+        .flat()
+        .map((a) => (typeof a === 'string' ? a : JSON.stringify(a)));
+      expect(calls.join(' ')).not.toContain(recipient.email);
+      // The success line still names the recipient, by User UUID.
+      expect(calls.join(' ')).toContain(`recipient user ${recipient.id}`);
+    } finally {
+      logSpy.mockRestore();
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+});
