@@ -112,6 +112,21 @@ function normalizeSelectedMemberIds(selectedMemberIds, roster, group_id) {
 }
 
 /**
+ * Copy of a schedule object for the wire, without its creator's Users.id.
+ *
+ * DECISION quick-261025-rl3 R1: created_by_user_id is stripped from every schedule
+ * in every prompt-settings response, OVER exposing a member UUID the admin UI never
+ * reads (the T-71.2-02 least-exposure stance quick-261026-pi6 SC-2 applied to prompt
+ * reads). It stays in the DB row: the close-notification resolver reads it there.
+ * Echoing a schedule without this helper is a decision, not a cleanup.
+ */
+function scheduleForWire(schedule) {
+  if (!schedule || typeof schedule !== 'object') return schedule;
+  const { created_by_user_id: _creator, ...rest } = schedule;
+  return rest;
+}
+
+/**
  * GET /api/groups/:group_id/prompt-settings
  * Returns GroupPromptSettings for group, including schedules from template_config
  */
@@ -224,8 +239,15 @@ router.get('/:group_id/prompt-settings', async (req, res) => {
     // in the same unit as the members[].user_id flip above. The GET response now carries
     // no sub-shaped value on either emission point (the top-level schedules[] projection
     // and the raw template_config both emit the stored UUIDs unchanged).
+    // quick-261025-rl3 R1: each schedule goes out through scheduleForWire (no
+    // creator UUID on the wire).
     const outputTemplateConfig = settings?.template_config
-      ? settings.template_config
+      ? {
+          ...settings.template_config,
+          ...(Array.isArray(settings.template_config.schedules)
+            ? { schedules: settings.template_config.schedules.map(scheduleForWire) }
+            : {}),
+        }
       : { schedules: [] };
 
     res.json({
@@ -236,7 +258,7 @@ router.get('/:group_id/prompt-settings', async (req, res) => {
       default_token_expiry_hours: settings?.default_token_expiry_hours || 168,
       is_active: settings?.is_active ?? true,
       template_config: outputTemplateConfig,
-      schedules: schedules.filter(s => !s.deleted_at), // Only return non-deleted schedules
+      schedules: schedules.filter(s => !s.deleted_at).map(scheduleForWire), // Only return non-deleted schedules
       games: groupGames || [],
       members: members || []
     });
@@ -334,7 +356,8 @@ router.post('/:group_id/prompt-settings/schedules', async (req, res) => {
       return res.status(400).json({ error: 'selected members are no longer in this group' });
     }
 
-    // Create new schedule object
+    // Create new schedule object. created_by_user_id is filled in inside the
+    // transaction below, once the requester's Users row is resolved.
     const newSchedule = {
       id: crypto.randomUUID(),
       schedule_day_of_week,
@@ -359,15 +382,17 @@ router.post('/:group_id/prompt-settings/schedules', async (req, res) => {
     //
     // Find or create GroupPromptSettings.
     //
-    // Phase 71.2 / D-SCHEMA-06: when the row is first created (i.e., this is the
-    // first schedule for the group), stamp `created_by_user_id` with the requester's
-    // User.id (UUID) so Plan 02's close-notification recipient resolution can route
-    // auto-prompt close emails to the schedule creator (rule:
-    // settings.created_by_user_id || group owner). For groups with an existing
-    // GroupPromptSettings row, the column stays at whatever it was (NULL for legacy
-    // rows, or the original setter for rows created post-migration). Per-schedule
-    // creator-tracking lives inside template_config.schedules[].created_by_user_id
-    // below.
+    // Creator tracking, two levels (owner ruling 2026-10-26, quick-261025-rl3 R1):
+    //   - EVERY new schedule records its own creator in
+    //     template_config.schedules[].created_by_user_id (the requester's Users.id).
+    //   - The settings-row column created_by_user_id records who FIRST set up
+    //     scheduling for the group (Phase 71.2 / D-SCHEMA-06): stamped only when this
+    //     POST creates the row, never changed afterwards (NULL on legacy rows).
+    // The close-notification resolver (services/promptLifecycleService.js
+    // handlePromptClosed) prefers the firing schedule's creator, then the
+    // settings-row column, then the group owner. The PATCH/toggle/DELETE handlers
+    // spread the stored schedule and never take this key from the body, so the
+    // creator survives edits.
     const t = await sequelize.transaction();
     let settings;
     try {
@@ -376,12 +401,13 @@ router.post('/:group_id/prompt-settings/schedules', async (req, res) => {
         transaction: t,
         lock: t.LOCK.UPDATE
       });
+      const dbUser = await User.findOne({ where: { user_id: userId }, transaction: t });
+      if (!dbUser) {
+        await t.rollback();
+        return res.status(404).json({ error: 'User record not found' });
+      }
+      newSchedule.created_by_user_id = dbUser.id;
       if (!settings) {
-        const dbUser = await User.findOne({ where: { user_id: userId }, transaction: t });
-        if (!dbUser) {
-          await t.rollback();
-          return res.status(404).json({ error: 'User record not found' });
-        }
         settings = await GroupPromptSettings.create({
           group_id,
           schedule_timezone,
@@ -424,7 +450,7 @@ router.post('/:group_id/prompt-settings/schedules', async (req, res) => {
     // already UUID-normalized (above) and no sub-shaped value is emitted on the wire.
     res.status(201).json({
       message: 'Schedule created successfully',
-      schedule: newSchedule
+      schedule: scheduleForWire(newSchedule)
     });
   } catch (error) {
     console.error('Error creating schedule:', error);
@@ -529,7 +555,8 @@ router.patch('/:group_id/prompt-settings/schedules/:schedule_id', async (req, re
       //   (c) the legit user-editable schedule shape (create path) adds
       //       template_name.
       // Omitting any field a consumer reads would silently mis-schedule the job
-      // or fire the wrong branch. id/updated_at stay server-managed.
+      // or fire the wrong branch. id/updated_at stay server-managed, and so does
+      // created_by_user_id (quick-261025-rl3 R1: the creator never changes on edit).
       const SCHEDULE_USER_FIELDS = [
         'schedule_day_of_week',
         'schedule_time',
@@ -599,7 +626,7 @@ router.patch('/:group_id/prompt-settings/schedules/:schedule_id', async (req, re
     // already UUID-normalized (above) and no sub-shaped value is emitted on the wire.
     res.json({
       message: 'Schedule updated successfully',
-      schedule: updatedSchedule
+      schedule: scheduleForWire(updatedSchedule)
     });
   } catch (error) {
     console.error('Error updating schedule:', error);
@@ -796,7 +823,7 @@ router.patch('/:group_id/prompt-settings/schedules/:schedule_id/toggle', async (
     // selected_member_ids are already UUIDs; no sub-shaped value crosses the wire.
     res.json({
       message: `Schedule ${!currentActive ? 'activated' : 'paused'} successfully`,
-      schedule: toggled
+      schedule: scheduleForWire(toggled)
     });
   } catch (error) {
     console.error('Error toggling schedule:', error);

@@ -11,10 +11,14 @@
 //     rule (D-ADAPT-05 + D-SCHEMA-06), builds the top-slot list, sends the
 //     close-notification email. Best-effort — errors logged, never thrown.
 //
-// LOCKED recipient resolution rule (D-ADAPT-05 + D-SCHEMA-06):
+// LOCKED recipient resolution rule (D-ADAPT-05 as amended 2026-10-26 by the owner
+// ruling on quick-261025-rl3 review R1, + D-SCHEMA-06):
 //   Manual:  candidate = prompt.created_by_user_id
 //   Auto:    settings = GroupPromptSettings.findByPk(prompt.created_by_settings_id)
-//            candidate = settings.created_by_user_id (none → group owner)
+//            firing   = settings.template_config.schedules[] entry whose id equals
+//                       prompt.schedule_id (case-insensitive)
+//            candidate = firing.created_by_user_id
+//                        (none → settings.created_by_user_id, none → group owner)
 //   recipient = candidate, ONLY while the candidate holds an ACTIVE UserGroup
 //              membership in prompt.group_id (quick-261025-rl3 BE-1); a
 //              candidate who left or was removed falls back to the group owner
@@ -107,7 +111,8 @@ async function checkConsensusAndClose(promptId) {
     // Won the claim → run the close side-effects on the freshly-updated row.
     // NOTE: a bare `update(...).returning` row carries only table columns, not
     // eager-loaded associations. handlePromptClosed reads only plain columns
-    // (id, group_id, created_by_user_id, created_by_settings_id, game_id) and
+    // (id, group_id, created_by_user_id, created_by_settings_id, schedule_id,
+    // game_id) and
     // re-queries every association itself, so the RETURNING row is sufficient
     // and no re-fetch-with-include is required here.
     await handlePromptClosed(rows[0]);
@@ -158,7 +163,8 @@ async function handlePromptClosed(prompt) {
 
     // Step 2 — resolve recipient per the LOCKED rule (D-ADAPT-05).
     // 2a: the candidate is the stored creator — the manual poll's creator, or
-    //     the settings row's creator for an auto-prompt.
+    //     for an auto-prompt the creator of the schedule that fired it, falling
+    //     back to the settings row's creator.
     let candidateUserId = null;
     let useOwnerFallback = false;
     if (prompt.created_by_user_id) {
@@ -172,7 +178,26 @@ async function handlePromptClosed(prompt) {
       // survives the close. Reading settings.created_by_user_id is read-only
       // and allowed.
       const settings = await GroupPromptSettings.findByPk(prompt.created_by_settings_id);
-      if (settings && settings.created_by_user_id) {
+      // DECISION quick-261025-rl3 R1 (owner ruling 2026-10-26, D-ADAPT-05 amended in
+      // the parent repo): the candidate is the creator of the schedule that FIRED
+      // this poll, OVER the settings-row created_by_user_id (whoever first set up
+      // scheduling for the group, which mailed one admin the results of another
+      // admin's schedule). The schedule is matched by prompt.schedule_id with the
+      // same case-insensitive comparison as decoratePromptForWire in
+      // routes/availabilityPrompt.js. Residual: schedules created before this
+      // change carry no created_by_user_id and fall back to the settings-row
+      // creator, then the group owner. Reading the settings column first is a
+      // decision, not a cleanup.
+      const schedules = Array.isArray(settings?.template_config?.schedules)
+        ? settings.template_config.schedules
+        : [];
+      const pollScheduleId = typeof prompt.schedule_id === 'string' ? prompt.schedule_id.toLowerCase() : null;
+      const firingSchedule = pollScheduleId
+        ? schedules.find(s => s && typeof s.id === 'string' && s.id.toLowerCase() === pollScheduleId)
+        : null;
+      if (firingSchedule && firingSchedule.created_by_user_id) {
+        candidateUserId = firingSchedule.created_by_user_id;
+      } else if (settings && settings.created_by_user_id) {
         candidateUserId = settings.created_by_user_id;
       } else {
         useOwnerFallback = true;
