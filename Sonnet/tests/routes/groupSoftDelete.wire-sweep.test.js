@@ -134,6 +134,7 @@ const {
   Event,
   EventParticipation,
   Game,
+  GameReview,
   Group,
   GroupInvite,
   UserGroup,
@@ -549,16 +550,26 @@ describe('88.2 SPEC-REQ-4d — a soft-deleted group never reaches the wire', () 
     expect(body).not.toContain(dead.group.id);
   });
 
-  // Task 5 (AF-10) on the shared game, asserted here as well as in games.test.js:
-  // the sweep proves the id is absent, that suite proves the review shape.
-  it('GET /api/games/:id keeps the LIVE group\'s review while dropping the hidden group\'s', async () => {
+  // This test pins the STRONG property on the shared game: neither group's
+  // content, live or hidden, reaches the body. The ENDPOINTS row above pins only
+  // the hidden group's absence, with the game id as its control (see the
+  // DECISION at that row).
+  it('GET /api/games/:id answers with the game and carries NEITHER group\'s review text nor id (include removed, quick-261027-glg)', async () => {
     await softDeleteGroup(dead.group);
 
     const res = await request(app).get(`/api/games/${live.game.id}`).send();
     expect(res.status).toBe(200);
 
-    const reviews = res.body.GameReviews || [];
-    expect(reviews.some((r) => r.group_id === live.group.id)).toBe(true);
-    expect(reviews.some((r) => r.group_id === dead.group.id)).toBe(false);
+    expect(res.body.id).toBe(live.game.id);
+    expect(res.body.GameReviews).toBeUndefined();
+    expect(collectIdHits(res.body, live.group.id)).toEqual([]);
+    expect(collectIdHits(res.body, dead.group.id)).toEqual([]);
+
+    const body = JSON.stringify(res.body);
+    expect(body).not.toContain('sweep-live-review');
+    expect(body).not.toContain('sweep-dead-review');
+
+    // Seed control: both worlds' reviews exist on the shared game.
+    expect(await GameReview.count({ where: { game_id: live.game.id } })).toBe(2);
   });
 });
