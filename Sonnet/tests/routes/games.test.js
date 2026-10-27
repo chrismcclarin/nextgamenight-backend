@@ -127,16 +127,23 @@ describe('Game Routes', () => {
 
 
 // ============================================================================
-// Phase 88.2 plan 04 Task 5 (AF-10 / AF-12): GET /api/games/:id must not return
-// a soft-deleted group's GameReview rows.
+// quick-261027-glg (amends Phase 88.2 plan 04 Task 5, AF-10 / AF-12): GET
+// /api/games/:id carries NO GameReviews payload at all.
 //
-// This route is authenticated but GROUP-AGNOSTIC — it never passes through the
-// isActiveMember choke point the rest of the phase relies on — and GameReview is
-// deliberately NON-paranoid (D-01), so it has no self-defence. The nested
-// { model: Group, attributes: [], required: true } INNER JOIN is what drops the
-// hidden group's reviews.
+// Until quick-261027-glg this route included every live group's reviews, and
+// 88.2 AF-10 filtered a soft-deleted group's reviews out with an inner join
+// (GameReview is deliberately NON-paranoid, D-01, so it has no self-defence).
+// The include was then deleted as dead payload: 0 frontend readers, and the
+// game page reads its reviews from the membership-checked
+// GET /game-reviews/game/:game_id/group/:group_id. Deleting it also closed the
+// cross-group exposure (adversarial review #317 of Phase 88.6.1), where any
+// signed-in caller received every live group's review text, group id and
+// reviewer username for any game.
+//
+// The fixtures stay as they were so these tests prove ABSENCE with reviews from
+// a live AND a soft-deleted group present on the same game.
 // ============================================================================
-describe('88.2 AF-10 — GET /api/games/:id hides a soft-deleted group\'s reviews', () => {
+describe('quick-261027-glg — GET /api/games/:id carries no GameReviews payload (amends 88.2 AF-10)', () => {
   let game;
   let liveGroup;
   let deadGroup;
@@ -152,8 +159,9 @@ describe('88.2 AF-10 — GET /api/games/:id hides a soft-deleted group\'s review
     liveGroup = await Group.create({ group_id: 'af10-live', name: 'AF10 Live Group' });
     deadGroup = await Group.create({ group_id: 'af10-dead', name: 'AF10 Doomed Group' });
 
-    // ONE shared game so the join is exercised with a live AND a hidden review
-    // on the same parent row.
+    // ONE shared game with a live AND a hidden review on the same parent row, so
+    // the tests below can prove NEITHER review reaches the payload (the include
+    // that once joined them is gone — quick-261027-glg).
     game = await Game.create({ name: 'AF10 Shared Game', is_custom: true });
 
     await GameReview.create({
@@ -182,44 +190,59 @@ describe('88.2 AF-10 — GET /api/games/:id hides a soft-deleted group\'s review
     return false;
   };
 
-  it('returns the LIVE group\'s review and ZERO rows from the soft-deleted group, for a caller who is a member of neither', async () => {
+  it('soft-deleted AND live group reviews exist: no GameReviews key, neither group\'s id or review text', async () => {
     await softDelete(deadGroup);
 
     const res = await request(app).get(`/api/games/${game.id}`).expect(200);
 
-    const reviews = res.body.GameReviews || [];
-    expect(reviews).toHaveLength(1);
-    expect(reviews[0].group_id).toBe(liveGroup.id);
-    expect(reviews.filter((r) => r.group_id === deadGroup.id)).toHaveLength(0);
+    expect(res.body.id).toBe(game.id);
+    expect(res.body.GameReviews).toBeUndefined();
+    expect(Object.keys(res.body)).not.toContain('GameReviews');
 
-    // Neither the id at any depth nor the review text itself.
+    // Neither group's id at any depth, nor either review text.
+    expect(containsValue(res.body, liveGroup.id)).toBe(false);
     expect(containsValue(res.body, deadGroup.id)).toBe(false);
+    expect(JSON.stringify(res.body)).not.toContain('LIVE-GROUP-REVIEW-TEXT');
     expect(JSON.stringify(res.body)).not.toContain('HIDDEN-GROUP-REVIEW-TEXT');
-    expect(JSON.stringify(res.body)).toContain('LIVE-GROUP-REVIEW-TEXT');
+
+    // Seed control: the absence is not an empty seed.
+    expect(await GameReview.count({ where: { game_id: game.id } })).toBe(2);
   });
 
-  it('(non-regression) returns BOTH reviews while both groups are live — the INNER JOIN drops nothing legitimate', async () => {
+  it('(both groups live) still no GameReviews key: the payload was removed, not filtered', async () => {
     const res = await request(app).get(`/api/games/${game.id}`).expect(200);
 
-    const reviews = res.body.GameReviews || [];
-    expect(reviews).toHaveLength(2);
-    expect(reviews.map((r) => r.group_id).sort()).toEqual([liveGroup.id, deadGroup.id].sort());
+    expect(res.body.id).toBe(game.id);
+    expect(res.body.GameReviews).toBeUndefined();
+    expect(Object.keys(res.body)).not.toContain('GameReviews');
+
+    expect(containsValue(res.body, liveGroup.id)).toBe(false);
+    expect(containsValue(res.body, deadGroup.id)).toBe(false);
+    expect(JSON.stringify(res.body)).not.toContain('LIVE-GROUP-REVIEW-TEXT');
+    expect(JSON.stringify(res.body)).not.toContain('HIDDEN-GROUP-REVIEW-TEXT');
+
+    expect(await GameReview.count({ where: { game_id: game.id } })).toBe(2);
   });
 
-  it('(shape unchanged) reviews still carry User.username, and no Group object is added to the payload', async () => {
+  it('no reviewer username, group name or group id reaches the body', async () => {
     await softDelete(deadGroup);
 
     const res = await request(app).get(`/api/games/${game.id}`).expect(200);
-    const reviews = res.body.GameReviews || [];
-    expect(reviews).toHaveLength(1);
+    const body = JSON.stringify(res.body);
 
-    // The User include must be undisturbed by the sibling filter join.
-    expect(reviews[0].User).toBeTruthy();
-    expect(reviews[0].User.username).toBe(reviewer.username);
+    expect(res.body.id).toBe(game.id);
+    expect(body).not.toContain(reviewer.username);
+    expect(body).not.toContain(liveGroup.name);
+    expect(body).not.toContain(deadGroup.name);
+    expect(body).not.toContain(liveGroup.id);
+    expect(body).not.toContain(deadGroup.id);
 
-    // attributes: [] means the join is purely a filter — no group data enters the
-    // response, so the gameDetail consumer's payload shape is unchanged.
-    expect(reviews[0].Group).toBeUndefined();
+    const keys = Object.keys(res.body);
+    expect(keys).not.toContain('User');
+    expect(keys).not.toContain('Group');
+    expect(keys).not.toContain('GameReviews');
+
+    expect(await GameReview.count({ where: { game_id: game.id } })).toBe(2);
   });
 });
 

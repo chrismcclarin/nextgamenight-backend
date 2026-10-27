@@ -47,8 +47,11 @@
 // THIS SWEEP PROVES THE ENUMERATED SURFACES ONLY — never "the whole API". A grep
 // finds includes written one way; it cannot find a leak written another way,
 // which is exactly how routes/games.js (no `model: Group` at all, a real leak via
-// an unfiltered GameReview include) escaped the original scan. A red here is a
-// leak to fix at its owning site, never a row to delete.
+// an unfiltered GameReview include) escaped the original scan. (That GameReview
+// include was removed outright in quick-261027-glg; GET /api/games/:id now
+// serializes no group content, and its row's control is the game id — see the
+// DECISION at that row.)
+// A red here is a leak to fix at its owning site, never a row to delete.
 // ===========================================================================
 //
 // EVERY ROW CARRIES A POSITIVE CONTROL. A sweep that returns nothing at all
@@ -59,7 +62,13 @@
 // handler, not a preference:
 //
 //   (a) ID-PRESENCE (the default) — the live run's body must CONTAIN the live
-//       group's id. Used by the 10 endpoints that actually serialize it.
+//       group's id. Ten rows use it: 8 serialize the live group's id; the
+//       invites/info row substitutes the group NAME via `livePresence` (still
+//       two-sided, the name is group-scoped); and GET /api/games/:id substitutes
+//       the GAME id (quick-261027-glg removed that route's only group-bearing
+//       payload) — that last control proves the route still answers with its
+//       row, not that a group id is absent; the absence is pinned by the
+//       standalone games test below and by games.test.js.
 //
 //   (b) GROUP-SCOPED WITNESS (`livePositive`) — six of these handlers return
 //       group-scoped content WITHOUT ever echoing the group id (verified by
@@ -134,6 +143,7 @@ const {
   Event,
   EventParticipation,
   Game,
+  GameReview,
   Group,
   GroupInvite,
   UserGroup,
@@ -200,8 +210,10 @@ describe('88.2 SPEC-REQ-4d — a soft-deleted group never reaches the wire', () 
   let live;
   let dead;
 
-  // ONE shared Game across both groups' reviews, so GET /api/games/:id exercises
-  // Task 5's join with a LIVE and a HIDDEN review on the same parent row.
+  // ONE shared Game anchors both worlds' events, prompts and reviews; the lists
+  // and game-reviews rows read those reviews. (History: until quick-261027-glg it
+  // also exercised GET /api/games/:id's AF-10 join with a LIVE and a HIDDEN review
+  // on the same parent row; that include is gone.)
   // Re-created per test: tests/setup.js TRUNCATEs every table before each test, so
   // a handle held across tests points at a row that no longer exists (FK violation).
   let sharedGame = null;
@@ -350,12 +362,25 @@ describe('88.2 SPEC-REQ-4d — a soft-deleted group never reaches the wire', () 
       livePositive: (body) => Array.isArray(body?.members) && body.members.length > 0,
     },
     {
-      // Task 5 (AF-10): the live group's review must be present and the hidden
-      // group's absent, on the SAME shared game.
+      // DECISION quick-261027-glg: this row's positive control is the GAME's own
+      // id (livePresence), chosen OVER deleting the row (the header's "never a
+      // row to delete", and the 9-file / 16-path coverage assertion below) and
+      // OVER a third harness mode (it would duplicate the standalone test at the
+      // bottom of this describe). Since the GameReview include was removed from
+      // GET /api/games/:id, the handler serializes no group-scoped content at
+      // all, so neither mode (a)'s group id nor a mode (b) witness can exist.
+      // The control still proves the live run is a non-vacuous 2xx carrying the
+      // requested game, and the hidden run still proves the dead group's id is
+      // absent; the stronger "neither group" property is pinned by the
+      // standalone test below and by games.test.js. This is not a seed fix
+      // papering over a broken control: the handler changed by design. Setting
+      // the control back to the group id is a decision, not a cleanup; it would
+      // mean group content has returned to this route.
       name: 'GET /api/games/:id',
       file: 'routes/games.js',
       path: (w) => `/api/games/${w.game.id}`,
       deadStatus: 'any',
+      livePresence: (w) => w.game.id,
     },
     {
       name: 'GET /api/lists/games/:group_id/:user_id',
@@ -494,8 +519,9 @@ describe('88.2 SPEC-REQ-4d — a soft-deleted group never reaches the wire', () 
       const hits = collectIdHits(res.body, needle);
       if (hits.length === 0) {
         throw new Error(
-          `POSITIVE CONTROL FAILED for ${ep.name} (${ep.file}): the LIVE group's ` +
-            `identifier "${needle}" is absent from a 2xx body, so the absence ` +
+          `POSITIVE CONTROL FAILED for ${ep.name} (${ep.file}): the LIVE run's ` +
+            `presence needle "${needle}" (the group id, or the row's livePresence ` +
+            `substitute) is absent from a 2xx body, so the absence ` +
             `assertion below proves nothing. Fix the SEED, never the assertion.\n` +
             `Body: ${JSON.stringify(res.body).slice(0, 500)}`
         );
@@ -549,16 +575,26 @@ describe('88.2 SPEC-REQ-4d — a soft-deleted group never reaches the wire', () 
     expect(body).not.toContain(dead.group.id);
   });
 
-  // Task 5 (AF-10) on the shared game, asserted here as well as in games.test.js:
-  // the sweep proves the id is absent, that suite proves the review shape.
-  it('GET /api/games/:id keeps the LIVE group\'s review while dropping the hidden group\'s', async () => {
+  // This test pins the STRONG property on the shared game: neither group's
+  // content, live or hidden, reaches the body. The ENDPOINTS row above pins only
+  // the hidden group's absence, with the game id as its control (see the
+  // DECISION at that row).
+  it('GET /api/games/:id answers with the game and carries NEITHER group\'s review text nor id (include removed, quick-261027-glg)', async () => {
     await softDeleteGroup(dead.group);
 
     const res = await request(app).get(`/api/games/${live.game.id}`).send();
     expect(res.status).toBe(200);
 
-    const reviews = res.body.GameReviews || [];
-    expect(reviews.some((r) => r.group_id === live.group.id)).toBe(true);
-    expect(reviews.some((r) => r.group_id === dead.group.id)).toBe(false);
+    expect(res.body.id).toBe(live.game.id);
+    expect(res.body.GameReviews).toBeUndefined();
+    expect(collectIdHits(res.body, live.group.id)).toEqual([]);
+    expect(collectIdHits(res.body, dead.group.id)).toEqual([]);
+
+    const body = JSON.stringify(res.body);
+    expect(body).not.toContain('sweep-live-review');
+    expect(body).not.toContain('sweep-dead-review');
+
+    // Seed control: both worlds' reviews exist on the shared game.
+    expect(await GameReview.count({ where: { game_id: live.game.id } })).toBe(2);
   });
 });

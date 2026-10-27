@@ -2,7 +2,8 @@
 const express = require('express');
 // Phase 88-34 WI-B2: EventParticipation dropped from this destructure — its only
 // use was the GET /:id Event include deleted below (fork B).
-const { Game, Event, GameReview, Group, User, UserGame, UserGroup } = require('../models');
+// quick-261027-glg: GameReview and Group dropped too — their only use was the GET /:id GameReview include deleted below.
+const { Game, Event, User, UserGame, UserGroup } = require('../models');
 const { Op } = require('sequelize');
 const { matchesSelf } = require('../middleware/objectAuth');
 const { optionalAuth } = require('../middleware/auth0');
@@ -14,8 +15,11 @@ const router = express.Router();
 // BSEC-02 / BE-098: this router is mounted under the global `/api` default-deny
 // authn layer (server.js). Post 87.5 SW-01/SW-02, ONLY the two search GETs
 // (`/search-all`, `/bgg/search`) are allow-listed public there. Everything else
-// — `GET /:id` (SW-01: its includes expose events/participants/winner UUIDs, so
-// it is authed; sole consumer is the authenticated gameDetail page) and the
+// — `GET /:id` (SW-01 kept it authed while its includes exposed events,
+// participants and winner UUIDs; those includes are gone — 88-34 WI-B2 and
+// quick-261027-glg — and it STAYS authed: a bare Game row is still a catalogue
+// read whose sole consumer is the authenticated gameDetail page, and opening it
+// to anonymous callers is a decision, not a cleanup) and the
 // write handlers (`POST /resolve`, `POST /import-bgg/:bgg_id`) — requires a
 // valid JWT before the handler runs.
 // 87.6 dead-api-surface cleanup deleted the custom-CRUD sinks (`POST /`,
@@ -219,9 +223,10 @@ router.get('/:id', async (req, res) => {
     // DECISION Phase 88-34 WI-B2 (fork B, owner-ruled 2026-08-20): the Event
     // include was DELETED here rather than history-filtered. It was DEAD
     // PAYLOAD — zero consumers. gameDetail is the only caller of this route
-    // (gameDetail/page.js:668 `gamesAPI.getGame`), it does `setGame(gameData)`
+    // (frontend:src/app/gameDetail/page.js ("gamesAPI.getGame(")), it does `setGame(gameData)`
     // and never reads `game.Events`; its Game Sessions list actually consumes
-    // the MIXED route GET /events/group/:group_id (page.js:677 -> :690), which
+    // the MIXED route GET /events/group/:group_id
+    // (frontend:src/app/gameDetail/page.js ("eventsAPI.getGroupEvents(")), which
     // must keep future events because it also feeds RSVP/Ballot/Bring. So the
     // sessions history filter belongs on the FE (88-33 Task 7), not here.
     // Deleting rather than filtering also killed two live defects for free:
@@ -231,40 +236,32 @@ router.get('/:id', async (req, res) => {
     //     for a game to any logged-in caller (cross-group exposure).
     // If a consumer of a game's events is ever wanted here, it must be scoped
     // to the caller's groups — do NOT restore this include as it was.
-    const game = await Game.findByPk(req.params.id, {
-      include: [
-        {
-          model: GameReview,
-          include: [
-            { model: User, attributes: ['username'] },
-            // DECISION Phase 88.2 AF-10: hiding a soft-deleted group's reviews BY JOIN
-            // was chosen OVER making GameReview paranoid. D-01 deliberately keeps
-            // GameReview non-paranoid — SPEC-REQ-1 requires its row count to be
-            // UNCHANGED across a group delete, and plan 07's restore touches nothing
-            // there. GameReview therefore has NO SELF-DEFENCE: every route that reads
-            // it OUTSIDE the isActiveMember choke point must filter by join, and this
-            // route is one of them — it is authenticated but GROUP-AGNOSTIC, so any
-            // logged-in user would otherwise receive every group's reviews for a game,
-            // including a hidden group's group_id, review_text and reviewer usernames,
-            // for the whole 30-day window. That is a regression against today's
-            // behavior, where the hard delete destroys those rows.
-            //
-            // `attributes: []` keeps the join purely a filter — no group data enters
-            // the response, so the payload shape the gameDetail consumer reads is
-            // unchanged for live groups. Marking it required makes it an INNER JOIN,
-            // which is what actually DROPS the parent GameReview row; without that,
-            // Sequelize emits the paranoid clause in the ON clause and merely nulls
-            // the association while KEEPING the review.
-            //
-            // REJECTED: scoping the reviews to groups the caller belongs to. Today
-            // gameDetail deliberately shows reviews from every group; narrowing that
-            // would be a silent product change riding on a soft-delete phase. Do not
-            // "simplify" this into a membership scope.
-            { model: Group, attributes: [], required: true }
-          ]
-        }
-      ]
-    });
+    // DECISION Phase 88.2 AF-10 (AMENDED quick-261027-glg):
+    // the GameReview include (each review, its reviewer's username, and the 88.2
+    // AF-10 soft-delete filter join on Group) was DELETED here as dead payload.
+    // That was chosen OVER keeping the AF-10 join and OVER scoping the reviews to
+    // the caller's groups.
+    //   - Evidence: 0 frontend readers of GameReviews (word grep over the FE src/
+    //     and e2e/, measured 2026-10-27). The game page loads its reviews from the
+    //     membership-checked GET /game-reviews/game/:game_id/group/:group_id,
+    //     gated at routes/gameReviews.js ("const hasAccess = await isActiveMember(callerId, group_id);").
+    //   - The original AF-10 REJECTED paragraph rested on "gameDetail deliberately
+    //     shows reviews from every group". That premise was false, so its warning
+    //     against a membership scope no longer applies here: neither a scope nor
+    //     the join remains, because the payload itself is gone.
+    //   - The original AF-10 choice, kept as record: hide a soft-deleted group's
+    //     reviews BY JOIN, OVER making GameReview paranoid (D-01 keeps GameReview
+    //     non-paranoid; SPEC-REQ-1 keeps its row count unchanged across a group
+    //     delete). That rule still binds EVERY route that reads GameReview outside
+    //     the isActiveMember choke point; this route no longer reads it, so the
+    //     join is moot here.
+    //   - Deleting the include also closed a cross-group exposure (adversarial
+    //     review #317 of Phase 88.6.1): any signed-in caller, member of no group,
+    //     received every live group's review_text, group_id and reviewer username
+    //     for any game id.
+    // Restoring the include is a decision, not a cleanup: a future consumer must
+    // scope the reviews to the caller's groups AND re-apply the AF-10 join.
+    const game = await Game.findByPk(req.params.id);
     
     if (!game) {
       return res.status(404).json({ error: 'Game not found' });
