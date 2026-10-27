@@ -46,6 +46,7 @@ const {
   Game,
 } = require('../models');
 const emailService = require('./emailService');
+const { findScheduleById } = require('../utils/findScheduleById');
 
 // Optional Sentry integration (review 261025-rl3 R6). DSN-gated require copied
 // from services/notificationService.js (Phase 85 / BAPI-02) — not a third idiom;
@@ -182,19 +183,13 @@ async function handlePromptClosed(prompt) {
       // the parent repo): the candidate is the creator of the schedule that FIRED
       // this poll, OVER the settings-row created_by_user_id (whoever first set up
       // scheduling for the group, which mailed one admin the results of another
-      // admin's schedule). The schedule is matched by prompt.schedule_id with the
-      // same case-insensitive comparison as decoratePromptForWire in
-      // routes/availabilityPrompt.js. Residual: schedules created before this
+      // admin's schedule). The schedule is matched by prompt.schedule_id through the
+      // ONE matcher shared with decoratePromptForWire in routes/availabilityPrompt.js
+      // (utils/findScheduleById.js). Residual: schedules created before this
       // change carry no created_by_user_id and fall back to the settings-row
       // creator, then the group owner. Reading the settings column first is a
       // decision, not a cleanup.
-      const schedules = Array.isArray(settings?.template_config?.schedules)
-        ? settings.template_config.schedules
-        : [];
-      const pollScheduleId = typeof prompt.schedule_id === 'string' ? prompt.schedule_id.toLowerCase() : null;
-      const firingSchedule = pollScheduleId
-        ? schedules.find(s => s && typeof s.id === 'string' && s.id.toLowerCase() === pollScheduleId)
-        : null;
+      const firingSchedule = findScheduleById(settings?.template_config?.schedules, prompt.schedule_id);
       if (firingSchedule && firingSchedule.created_by_user_id) {
         candidateUserId = firingSchedule.created_by_user_id;
       } else if (settings && settings.created_by_user_id) {

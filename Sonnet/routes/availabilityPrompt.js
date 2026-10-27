@@ -19,6 +19,7 @@ const emailService = require('../services/emailService');
 const { scheduleReminders, scheduleDeadlineJob } = require('../services/reminderService');
 const { sendError } = require('../utils/errors');
 const { isUuid, resolveTargetUserUuidOnly } = require('../utils/resolveTargetUser');
+const { findScheduleById } = require('../utils/findScheduleById');
 
 // The two includes every prompt read shares with decoratePromptForWire below.
 // D-SCHEMA-05: creator info for "Started by [name]" on manual polls; required:false
@@ -78,13 +79,9 @@ function decoratePromptForWire(promptRow, { requesterUserId, isAdmin }) {
   // Dropping the delete, or reading the settings-level column first, is a
   // decision, not a cleanup.
   const settingsRow = json.GroupPromptSetting || null;
-  const schedules = Array.isArray(settingsRow?.template_config?.schedules)
-    ? settingsRow.template_config.schedules
-    : [];
-  const pollScheduleId = typeof json.schedule_id === 'string' ? json.schedule_id.toLowerCase() : null;
-  const firingSchedule = pollScheduleId
-    ? schedules.find(s => s && typeof s.id === 'string' && s.id.toLowerCase() === pollScheduleId)
-    : null;
+  // The firing schedule is found by the ONE matcher shared with the close-email
+  // recipient resolver (utils/findScheduleById.js, review 261025-rl3 R1).
+  const firingSchedule = findScheduleById(settingsRow?.template_config?.schedules, json.schedule_id);
   let schedule_name = null;
   if (typeof firingSchedule?.template_name === 'string' && firingSchedule.template_name !== '') {
     schedule_name = firingSchedule.template_name;
