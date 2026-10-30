@@ -586,9 +586,11 @@ async function seedDatabase() {
     //     schedule is is_active=false with NO deleted_at (the GET keeps it; the
     //     toggle route flips it back). The seed writes the ROW only: a server
     //     already running does not pick the schedule up (BullMQ registration
-    //     happens in the create route and in the boot sync, which runs only with
-    //     NODE_ENV=production or ENABLE_WORKERS=true), so nothing fires until a
-    //     server restarted with workers enabled reaches Thursday 19:00 Pacific.
+    //     happens in the create / edit / toggle routes and in the boot sync,
+    //     which runs only with NODE_ENV=production or ENABLE_WORKERS=true), so
+    //     nothing fires until a server restarted with workers enabled — or a
+    //     schedule edit / toggle through the routes on such a server — reaches
+    //     Thursday 19:00 Pacific.
     //     The FE e2e fixture script DELETES this row for its own group
     //     (scripts/e2e-fixtures.js), because padding-budget.spec.ts anchors on
     //     ScheduleList's empty state.
