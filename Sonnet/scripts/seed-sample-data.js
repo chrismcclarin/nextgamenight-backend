@@ -10,6 +10,9 @@ const {
   // only by hand-seeding the DB (and that hand-seeded state is exactly what a
   // reseed destroys).
   Friendship, UserGame, UserAvailability, GroupInvite,
+  // Phase 88.9 round 1b (walk fixtures): a ballot and prompt schedules, so the
+  // look walk's rows render from a fresh seed instead of hand-staged rows.
+  GroupPromptSettings, EventBallotOption,
   sequelize,
 } = require('../models');
 const heatmapService = require('../services/heatmapService');
@@ -52,12 +55,26 @@ const sampleUsers = [
     username: 'Frank', 
     email: 'frank@example.com' 
   },
+  // Phase 88.9 round 1b (walk fixtures): a member who owns NO games, with a name
+  // long enough to wrap the 375px profile title (walk rows W152 / #29). The
+  // local walk signs in as this user for those two captures (the Alice-login
+  // runbook's repoint); nothing else references the account.
+  {
+    user_id: process.env.AUTH0_BART_SUB || 'auth0|695a0399c0ffee0000000001',
+    username: 'Bartholomew Featherstonehaugh-Cholmondeley',
+    email: 'bartholomew@example.com'
+  },
 ];
 
 const sampleGroups = [
   { group_id: 'weekend-warriors', name: 'Weekend Warriors' },
   { group_id: 'strategy-squad', name: 'Strategy Squad' },
   { group_id: 'casual-gamers', name: 'Casual Gamers' },
+  // Phase 88.9 round 1b (walk fixtures): Alice is a member of NEITHER. Dice
+  // Dynasty hosts the event she attends as a guest; No Games Yet is the group
+  // none of whose members own a game.
+  { group_id: 'dice-dynasty', name: 'Dice Dynasty' },
+  { group_id: 'no-games-yet', name: 'No Games Yet' },
 ];
 
 const sampleGames = [
@@ -210,9 +227,13 @@ async function seedDatabase() {
     await Friendship.destroy({ where: {} });
     await UserGame.destroy({ where: {} });
     await UserAvailability.destroy({ where: {} });
+    // Phase 88.9 round 1b: ballot options reference Events, prompt settings
+    // reference Groups — both go before their parents, same convention.
+    await EventBallotOption.destroy({ where: {} });
     await Event.destroy({ where: {}, force: true });
     await UserGroup.destroy({ where: {}, force: true });
     await Game.destroy({ where: {} });
+    await GroupPromptSettings.destroy({ where: {} });
     await Group.destroy({ where: {}, force: true });
     await User.destroy({ where: {} });
     console.log('✅ Existing data cleared\n');
@@ -262,6 +283,23 @@ async function seedDatabase() {
       { user: users[3], group: groups[2], role: 'owner' },
       { user: users[4], group: groups[2], role: 'member' },
       { user: users[5], group: groups[2], role: 'member' },
+
+      // Phase 88.9 round 1b (walk fixtures). Alice as a PLAIN member of two more
+      // groups (the walk's member-view rows); Dice Dynasty WITHOUT her — she is a
+      // guest at its event (the walk block below); and No Games Yet, whose members
+      // own no game at all, so create-event's Suggestions slot renders its empty
+      // hint (W152). suggestionService pools EVERY active member's UserGame rows,
+      // so Alice (3 games) and Bob (1) must stay OUT of No Games Yet.
+      { user: users[0], group: groups[1], role: 'member' },
+      { user: users[0], group: groups[2], role: 'member' },
+      // Dice Dynasty: Charlie (owner), Eve, Frank
+      { user: users[2], group: groups[3], role: 'owner' },
+      { user: users[4], group: groups[3], role: 'member' },
+      { user: users[5], group: groups[3], role: 'member' },
+      // No Games Yet: Frank (owner), Eve, Bartholomew
+      { user: users[5], group: groups[4], role: 'owner' },
+      { user: users[4], group: groups[4], role: 'member' },
+      { user: users[6], group: groups[4], role: 'member' },
     ];
 
     for (const { user, group, role } of userGroups) {
@@ -484,6 +522,124 @@ async function seedDatabase() {
     events.push(futureEvent2);
 
     console.log(`   ✓ Created 2 future events (status 'scheduled')`);
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Phase 88.9 round 1b — the states the 88.9 lane-C look walk had to stage
+    // BY HAND on 2026-10-27. Owner rule (2026-10-27): a walk row the seed could
+    // resolve is resolved IN the seed, never by a scratch insert — hand-staged
+    // state dies at the next reseed, exactly as the 88-34 block above records.
+    // Each block names the walk rows it serves (ids from deferred/phase-88.9.md).
+    // ────────────────────────────────────────────────────────────────────────
+    console.log('🚶 Seeding the 88.9 walk states (round 1b)...');
+
+    // (a) An OPEN ballot on the populated future event (#47: the Game Vote under
+    //     the RSVP card), two options, deadline a day before the event. game_id
+    //     stays set — the walk rendered exactly this shape.
+    await futureEvent1.update({
+      ballot_status: 'open',
+      rsvp_deadline: new Date(futureEvent1.start_date.getTime() - 24 * 60 * 60 * 1000),
+    });
+    const ballotOptions = [
+      { game: games[0], order: 0 }, // Catan
+      { game: games[2], order: 1 }, // Wingspan
+    ];
+    for (const { game, order } of ballotOptions) {
+      await EventBallotOption.create({
+        event_id: futureEvent1.id,
+        game_id: game.id,
+        game_name: game.name,
+        display_order: order,
+        created_by_uuid: users[0].id,
+      });
+    }
+
+    // (b) GUESTS. ParticipantRow's GUEST chip (#33) needs a guest on an event
+    //     Alice can open: Eve, not a Weekend Warriors member, joins futureEvent1
+    //     as one. UpcomingEventsCard's Guest pill (#76) paints when the VIEWER's
+    //     own participation row is is_guest=true, and GET /events/user/:id lists
+    //     every event the user participates in even outside their groups
+    //     (routes/events.js, the participatingEventIds OR-clause) — so Alice joins
+    //     Dice Dynasty's night as a guest. Dice Dynasty exists for this.
+    await EventParticipation.create({ event_id: futureEvent1.id, user_id: users[4].id, is_guest: true });
+    const diceGroup = groups[3];
+    const guestEvent = await Event.create({
+      group_id: diceGroup.id,
+      game_id: games[4].id, // Codenames
+      start_date: new Date(now.getTime() + 6 * 24 * 60 * 60 * 1000),
+      duration_minutes: 90,
+      is_group_win: false,
+      comments: 'Codenames at Charlie\'s — Alice is coming as a guest.',
+      status: 'scheduled',
+    });
+    events.push(guestEvent);
+    await EventParticipation.create({ event_id: guestEvent.id, user_id: users[2].id });
+    await EventParticipation.create({ event_id: guestEvent.id, user_id: users[4].id });
+    await EventParticipation.create({ event_id: guestEvent.id, user_id: users[0].id, is_guest: true });
+
+    // (c) Two prompt schedules on Weekend Warriors, one active and one paused, so
+    //     ScheduleList shows both chips (#89) and its emphasis spans (#91). The
+    //     object shape is the one POST /:group_id/prompt-settings/schedules writes
+    //     (routes/groupPromptSettings.js, `const newSchedule = {`): schedules live
+    //     INSIDE template_config.schedules, one settings row per group. A paused
+    //     schedule is is_active=false with NO deleted_at (the GET keeps it; the
+    //     toggle route flips it back). The active one is LIVE: a local server
+    //     left running will mint a real Weekend Warriors prompt when Thursday
+    //     19:00 Pacific comes round — a realistic state, not a defect.
+    const stamp = new Date().toISOString();
+    const weekendSchedules = [
+      {
+        id: crypto.randomUUID(),
+        schedule_day_of_week: 4,
+        schedule_time: '19:00',
+        schedule_timezone: 'America/Los_Angeles',
+        game_id: null,
+        template_name: 'Thursday check-in',
+        default_deadline_hours: 48,
+        default_token_expiry_hours: 168,
+        min_participants: 3,
+        selected_member_ids: [],
+        is_active: true,
+        created_at: stamp,
+        updated_at: stamp,
+        created_by_user_id: users[0].id,
+      },
+      {
+        id: crypto.randomUUID(),
+        schedule_day_of_week: 0,
+        schedule_time: '15:00',
+        schedule_timezone: 'America/Los_Angeles',
+        game_id: games[2].id, // Wingspan
+        template_name: 'Sunday afternoon',
+        default_deadline_hours: 72,
+        default_token_expiry_hours: 168,
+        min_participants: 2,
+        selected_member_ids: [],
+        is_active: false,
+        created_at: stamp,
+        updated_at: stamp,
+        created_by_user_id: users[0].id,
+      },
+    ];
+    await GroupPromptSettings.create({
+      group_id: weekendGroup.id,
+      schedule_timezone: 'America/Los_Angeles',
+      template_config: { schedules: weekendSchedules },
+      created_by_user_id: users[0].id,
+    });
+
+    // (d) A group with a stored colour AND a broken header image (#207, W48) and a
+    //     game whose BGG images are dead (the SafeImage fallback row): the states
+    //     the walk measures. `.invalid` is the RFC 2606 reserved TLD, so the
+    //     browser fails each fetch fast instead of hanging on a real host.
+    await casualGroup.update({
+      color_preset: 'blue',
+      background_image_url: 'https://images.example.invalid/casual-gamers-header.jpg',
+    });
+    await games[3].update({ // Azul
+      image_url: 'https://images.example.invalid/azul.jpg',
+      thumbnail_url: 'https://images.example.invalid/azul-thumb.jpg',
+    });
+    console.log('   ✓ Walk states: open ballot (2 options), 2 guests (Eve at Catan, Alice at Dice Dynasty), 2 schedules (1 active, 1 paused), Casual Gamers blue + broken image, Azul dead images');
     console.log(`✅ Created ${events.length} events with participations\n`);
 
     // Create Game Reviews
@@ -789,7 +945,7 @@ async function seedDatabase() {
     console.log(`   - ${groups.length} groups`);
     console.log(`   - ${userGroups.length} user-group memberships`);
     console.log(`   - ${games.length} games`);
-    console.log(`   - ${events.length} events (7 past + 2 future)`);
+    console.log(`   - ${events.length} events (7 past + 3 future)`);
     console.log(`   - ${reviews.length} reviews`);
     // Phase 88-34 Task 5 (WI-B4): report the new sections too, so a human
     // running the seed can see at a glance that the Test-2 gates are walkable.
@@ -797,6 +953,8 @@ async function seedDatabase() {
     console.log(`   - ${collectionRows.length} collection games`);
     console.log(`   - ${availabilityRows.length} recurring availability patterns`);
     console.log(`   - 1 pending group invite`);
+    // Phase 88.9 round 1b: the walk states, so a reader sees they are seeded.
+    console.log(`   - 1 open ballot (2 options), 2 guest participations, 2 prompt schedules, 1 coloured group with a broken image, 1 game with dead images`);
     console.log('\n✨ Your database is now populated with sample data!');
 
   } catch (error) {
