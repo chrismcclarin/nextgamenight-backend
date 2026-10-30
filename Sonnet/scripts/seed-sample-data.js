@@ -534,7 +534,9 @@ async function seedDatabase() {
 
     // (a) An OPEN ballot on the populated future event (#47: the Game Vote under
     //     the RSVP card), two options, deadline a day before the event. game_id
-    //     stays set — the walk rendered exactly this shape.
+    //     stays set — the walk rendered exactly this shape. routes/ballot.js
+    //     auto-closes an open ballot on read once the deadline passes, so the
+    //     ballot is open for ~2 days after seeding: reseed to walk it later.
     await futureEvent1.update({
       ballot_status: 'open',
       rsvp_deadline: new Date(futureEvent1.start_date.getTime() - 24 * 60 * 60 * 1000),
@@ -582,9 +584,14 @@ async function seedDatabase() {
     //     (routes/groupPromptSettings.js, `const newSchedule = {`): schedules live
     //     INSIDE template_config.schedules, one settings row per group. A paused
     //     schedule is is_active=false with NO deleted_at (the GET keeps it; the
-    //     toggle route flips it back). The active one is LIVE: a local server
-    //     left running will mint a real Weekend Warriors prompt when Thursday
-    //     19:00 Pacific comes round — a realistic state, not a defect.
+    //     toggle route flips it back). The seed writes the ROW only: a server
+    //     already running does not pick the schedule up (BullMQ registration
+    //     happens in the create route and in the boot sync, which runs only with
+    //     NODE_ENV=production or ENABLE_WORKERS=true), so nothing fires until a
+    //     server restarted with workers enabled reaches Thursday 19:00 Pacific.
+    //     The FE e2e fixture script DELETES this row for its own group
+    //     (scripts/e2e-fixtures.js), because padding-budget.spec.ts anchors on
+    //     ScheduleList's empty state.
     const stamp = new Date().toISOString();
     const weekendSchedules = [
       {
