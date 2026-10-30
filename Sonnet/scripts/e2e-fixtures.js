@@ -39,7 +39,7 @@
 
 const crypto = require('crypto');
 const { Op } = require('sequelize');
-const { User, Group, UserGroup, Friendship, SingleUseToken, Event, EventRsvp, AvailabilityPrompt, GroupInvite, UserAvailability, sequelize } = require('../models');
+const { User, Group, UserGroup, Friendship, SingleUseToken, Event, EventRsvp, AvailabilityPrompt, GroupInvite, UserAvailability, GroupPromptSettings, sequelize } = require('../models');
 const { generateToken } = require('../services/magicTokenService');
 const { assertNotProductionDb } = require('./lib/assert-not-production-db');
 
@@ -208,6 +208,14 @@ async function main() {
     },
     force: true,
   });
+  // RE-ASSERT the e2e group has NO recurring schedules: padding-budget.spec.ts
+  // ("groupPlanning availability polls") anchors on ScheduleList's empty state
+  // ("No schedules yet"), and touch-targets.spec.ts's census row 2 reads either
+  // affordance. The seed (Phase 88.9 round 1b) now gives Weekend Warriors two
+  // schedules in template_config for the look walk — so the fixture deletes the
+  // group's settings row, the same fixtures-own-their-invariants rule as the
+  // friendship teardown above and the UserGroup teardown below.
+  await GroupPromptSettings.destroy({ where: { group_id: group.id } });
   for (const member of [diana, bob]) {
     const [row] = await EventRsvp.findOrCreate({
       where: { event_id: event.id, user_uuid: member.id },
