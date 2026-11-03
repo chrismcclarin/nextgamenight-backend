@@ -13,10 +13,14 @@ const {
   // Phase 88.9 round 1b (walk fixtures): a ballot and prompt schedules, so the
   // look walk's rows render from a fresh seed instead of hand-staged rows.
   GroupPromptSettings, EventBallotOption,
+  // Quick 261103-glx: the seed now mints rsvp + group_restore tokens, so it must
+  // also clear them (see the G2 marker in the clearing block).
+  SingleUseToken,
   sequelize,
 } = require('../models');
 const heatmapService = require('../services/heatmapService');
 const { assertNotProductionDb } = require('./lib/assert-not-production-db');
+const { softDeleteGroup } = require('../services/groupRecoveryService');
 
 // Sample data arrays
 // NOTE: user_id should match your Auth0 'sub' claim value
@@ -75,6 +79,10 @@ const sampleGroups = [
   // none of whose members own a game.
   { group_id: 'dice-dynasty', name: 'Dice Dynasty' },
   { group_id: 'no-games-yet', name: 'No Games Yet' },
+  // Phase 88.9 round 2 (quick 261103-glx): soft-deleted at the END of the seed
+  // (the token-fixtures section) so /restore/group/[token] is walkable; hidden
+  // from every list by the paranoid clause until someone restores it.
+  { group_id: 'retired-raiders', name: 'Retired Raiders' },
 ];
 
 const sampleGames = [
@@ -171,7 +179,17 @@ const sampleGames = [
   }
 ];
 
-async function seedDatabase() {
+// DECISION quick-261103-glx G1: seedDatabase takes { syncSchema, closeConnection } so the
+// Jest suite (tests/scripts/seedSampleData.test.js) can run the seed IN-PROCESS against the
+// schema tests/globalSetup.js builds, on the suite's own shared connection. Chosen OVER a
+// child process (a child resolves its database through dotenv layering on top of the
+// worker's .env.test load — a second source of truth for WHICH database a mass delete
+// hits) and OVER syncing inside the suite (Sequelize 6.37's postgres alter re-emits a
+// unique constraint per column-level unique on every run, leaving later suites a
+// different schema). The defaults keep `npm run seed`'s schema sync and connection close
+// exactly as before. The guard below stays the first statement in BOTH modes. Removing
+// the options is a decision, not a cleanup.
+async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) {
   try {
     // Phase 87.8 Plan 02 Task 0 (T-87.8-05): default-deny guard BEFORE the first
     // destructive statement. The sync({ alter: true }) below is itself
@@ -196,9 +214,13 @@ async function seedDatabase() {
       throw error;
     }
 
-    // Sync database
-    await sequelize.sync({ alter: true });
-    console.log('✅ Database synced\n');
+    // Sync database (skipped only when the caller supplies the schema — G1 above)
+    if (syncSchema) {
+      await sequelize.sync({ alter: true });
+      console.log('✅ Database synced\n');
+    } else {
+      console.log('⏭️  Schema sync skipped — the caller supplied the schema (syncSchema: false)\n');
+    }
 
     // Clear existing data (optional - comment out if you want to keep existing data)
     console.log('🗑️  Clearing existing data...');
@@ -224,6 +246,14 @@ async function seedDatabase() {
     await GameReview.destroy({ where: {} });
     await EventParticipation.destroy({ where: {} });
     await GroupInvite.destroy({ where: {} });
+    // DECISION quick-261103-glx G2: clear ONLY the two token purposes this seed
+    // mints (rsvp, group_restore), chosen OVER a full wipe — oauth_state and
+    // email_change_verify rows are not the seed's, so it does not own them. And
+    // an explicit delete, chosen OVER relying on the user_id cascade from
+    // User.destroy below, whose disposition differs between sync-built and
+    // migration-built databases; group_restore rows carry user_id NULL and would
+    // otherwise accumulate one per reseed.
+    await SingleUseToken.destroy({ where: { purpose: { [Op.in]: ['rsvp', 'group_restore'] } } });
     await Friendship.destroy({ where: {} });
     await UserGame.destroy({ where: {} });
     await UserAvailability.destroy({ where: {} });
@@ -300,6 +330,12 @@ async function seedDatabase() {
       { user: users[5], group: groups[4], role: 'owner' },
       { user: users[4], group: groups[4], role: 'member' },
       { user: users[6], group: groups[4], role: 'member' },
+      // Retired Raiders (quick 261103-glx): Alice (owner), Bob, Eve. These three
+      // rows are stamped by the soft delete at the end of the seed, which is what
+      // lets any of them restore the group from the printed link.
+      { user: users[0], group: groups[5], role: 'owner' },
+      { user: users[1], group: groups[5], role: 'member' },
+      { user: users[4], group: groups[5], role: 'member' },
     ];
 
     for (const { user, group, role } of userGroups) {
@@ -948,13 +984,55 @@ async function seedDatabase() {
     });
     console.log(`   ✓ 1 pending invite to ${pendingInvite.invited_email} (token generated at runtime)\n`);
 
+    // ────────────────────────────────────────────────────────────────────────
+    // Token fixtures (Phase 88.9 round 2, quick 261103-glx). The two token states
+    // the 88.9 round-1 walk could not reach from a fresh seed: a group-restore
+    // link for a soft-deleted group. Owner rule (2026-10-27): a blocked walk row is
+    // a seed change, never a scratch insert.
+    // ────────────────────────────────────────────────────────────────────────
+    console.log('🔗 Seeding the walk token fixtures (quick 261103-glx)...');
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+
+    // --- Retired Raiders: one past event, then the soft delete ---------------
+    // The event is NOT pushed into `events` — the live-event count stays as is;
+    // this one is hidden with its group.
+    const retiredGroup = groups[5];
+    const retiredEvent = await Event.create({
+      group_id: retiredGroup.id,
+      game_id: games[1].id, // Ticket to Ride
+      start_date: new Date(now.getTime() - 20 * 24 * 60 * 60 * 1000),
+      duration_minutes: 70,
+      winner_id: users[0].id, // Alice won
+      picked_by_id: users[1].id, // Bob picked
+      is_group_win: false,
+      comments: 'Last game night before the group retired.',
+      status: 'completed',
+    });
+    await EventParticipation.create({ event_id: retiredEvent.id, user_id: users[0].id, score: 112, placement: 1, is_new_player: false });
+    await EventParticipation.create({ event_id: retiredEvent.id, user_id: users[1].id, score: 98, placement: 2, is_new_player: false });
+    await EventParticipation.create({ event_id: retiredEvent.id, user_id: users[4].id, score: 87, placement: 3, is_new_player: false });
+
+    // DECISION quick-261103-glx G3: Retired Raiders is soft-deleted through
+    // softDeleteGroup — the service the DELETE route calls — chosen OVER inserting
+    // pre-stamped rows or a hand-written destroy, because the service is the one
+    // place that writes the single deletedAt stamp, purge_after and the random
+    // 32-byte restore nonce together (a copy here would drift silently, and a
+    // destroy on the group trips the F-02 CI gate). The nonce is random, never
+    // derived from MAGIC_TOKEN_SECRET (same rule as the e2e fixture's DECISION
+    // Phase 87.8 R7). `recipients` is ignored: the service sends no email — the
+    // route does the fanout — so nothing is mailed from here.
+    const { nonce: restoreNonce } = await softDeleteGroup(retiredGroup.id, { excludeUserUuid: users[0].id });
+    // Same link shape and FRONTEND_URL fallback as the DELETE route's emailed link.
+    const restoreUrl = `${frontendUrl}/restore/group/${restoreNonce}`;
+    console.log(`   ✓ Retired Raiders soft-deleted (3 memberships + 1 past event hidden), 1 group-restore token minted\n`);
+
     console.log('🎉 Database seeding completed successfully!\n');
     console.log('📊 Summary:');
     console.log(`   - ${users.length} users`);
-    console.log(`   - ${groups.length} groups`);
-    console.log(`   - ${userGroups.length} user-group memberships`);
+    console.log(`   - ${groups.length} groups (1 of them soft-deleted: Retired Raiders, restorable for 30 days)`);
+    console.log(`   - ${userGroups.length} user-group memberships (3 hidden with Retired Raiders)`);
     console.log(`   - ${games.length} games`);
-    console.log(`   - ${events.length} events (7 past + 3 future)`);
+    console.log(`   - ${events.length} events (7 past + 3 future), plus 1 past event hidden with Retired Raiders`);
     console.log(`   - ${reviews.length} reviews`);
     // Phase 88-34 Task 5 (WI-B4): report the new sections too, so a human
     // running the seed can see at a glance that the Test-2 gates are walkable.
@@ -964,13 +1042,29 @@ async function seedDatabase() {
     console.log(`   - 1 pending group invite`);
     // Phase 88.9 round 1b: the walk states, so a reader sees they are seeded.
     console.log(`   - 1 open ballot (2 options), 2 guest participations, 2 prompt schedules, 1 coloured group with a broken image, 1 game with dead images`);
+    console.log(`   - 1 group-restore link (Retired Raiders)`);
+
+    // DECISION quick-261103-glx G6: the walk links are printed only when CI is
+    // unset — chosen OVER printing everywhere, because both CI jobs that run this
+    // seed (BE ci.yml and the FE e2e job) write to PUBLIC Actions logs, and a
+    // token in a public log is a published credential (T-82-11). Locally the owner
+    // needs the links to paste into a browser. Read at call time, not at load.
+    const linksVisible = !process.env.CI;
+    if (linksVisible) {
+      console.log('\n🔗 Walk links (paste into a browser):');
+      console.log(`   - Restore Retired Raiders: ${restoreUrl}`);
+    } else {
+      console.log('\n🔗 Walk links minted but not printed — CI is set, and a public Actions log never carries a token (T-82-11).');
+    }
     console.log('\n✨ Your database is now populated with sample data!');
 
   } catch (error) {
     console.error('❌ Error seeding database:', error);
     throw error;
   } finally {
-    await sequelize.close();
+    if (closeConnection) {
+      await sequelize.close();
+    }
   }
 }
 
