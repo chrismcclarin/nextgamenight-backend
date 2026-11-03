@@ -13,10 +13,32 @@ const {
   // Phase 88.9 round 1b (walk fixtures): a ballot and prompt schedules, so the
   // look walk's rows render from a fresh seed instead of hand-staged rows.
   GroupPromptSettings, EventBallotOption,
+  // Quick 261103-glx: the seed now mints rsvp + group_restore tokens, so it must
+  // also clear them (see the G2 marker in the clearing block).
+  SingleUseToken,
   sequelize,
 } = require('../models');
 const heatmapService = require('../services/heatmapService');
 const { assertNotProductionDb } = require('./lib/assert-not-production-db');
+const { softDeleteGroup } = require('../services/groupRecoveryService');
+// DECISION quick-261103-glx G4: Alice's RSVP links are minted by the route module's
+// own mintRsvpBatch / generateRsvpUrl — one definition of the HMAC payload and the
+// three-row batch — chosen OVER inlining them (scripts/e2e-fixtures.js inlines because
+// it once hung on the route module's timers; this script exits explicitly, so the
+// hang cannot recur here). Called through the module OBJECT, not destructured, so the
+// pinning test (tests/scripts/seedSampleData.test.js) can spy the mint.
+const rsvpLinks = require('../routes/rsvp');
+
+// DECISION quick-261103-glx G6: under CI a failed seed prints ONLY the error's name
+// and message, chosen OVER the whole error object, because a Sequelize error carries
+// `sql` and `parameters`, and this seed's token writes inline nonces into them — the
+// same reasoning scripts/e2e-fixtures.js records ("Log ONLY the error's name and
+// message"); both CI jobs that run this seed write to PUBLIC Actions logs. Locally the
+// full object stays, for debugging. Read at call time, so a test can toggle CI.
+function seedErrorForLog(error) {
+  if (!process.env.CI) return error;
+  return `${error && error.name}: ${error && error.message}`;
+}
 
 // Sample data arrays
 // NOTE: user_id should match your Auth0 'sub' claim value
@@ -24,9 +46,13 @@ const { assertNotProductionDb } = require('./lib/assert-not-production-db');
 // Or check Auth0 Dashboard > Users > [User] > User ID field
 // You can also set these via environment variables:
 //   AUTH0_ALICE_SUB, AUTH0_BOB_SUB, etc.
+// Alice's fallback sub, used when AUTH0_ALICE_SUB is unset. Named (quick 261103-glx,
+// scoped-check WR-02) so the RSVP-link notice at the end can compare the sub Alice was
+// actually seeded on against it; exported for the seed's tests.
+const ALICE_PLACEHOLDER_SUB = 'auth0|6959f749afc6f7d1e7fb1635';
 const sampleUsers = [
   { 
-    user_id: process.env.AUTH0_ALICE_SUB || 'auth0|6959f749afc6f7d1e7fb1635', 
+    user_id: process.env.AUTH0_ALICE_SUB || ALICE_PLACEHOLDER_SUB,
     username: 'Alice', 
     email: 'alice@example.com' 
   },
@@ -58,7 +84,10 @@ const sampleUsers = [
   // Phase 88.9 round 1b (walk fixtures): a member who owns NO games, with a name
   // long enough to wrap the 375px profile title (walk rows W152 / #29). The
   // local walk signs in as this user for those two captures (the Alice-login
-  // runbook's repoint); nothing else references the account.
+  // runbook's repoint); nothing else references the account. CAUTION (quick
+  // 261103-glx): any repoint that moves Alice's sub breaks the RSVP links the seed
+  // prints — they carry and are signed over the sub as seeded — so walk the RSVP
+  // rows first, or reseed afterwards.
   {
     user_id: process.env.AUTH0_BART_SUB || 'auth0|695a0399c0ffee0000000001',
     username: 'Bartholomew Featherstonehaugh-Cholmondeley',
@@ -75,6 +104,10 @@ const sampleGroups = [
   // none of whose members own a game.
   { group_id: 'dice-dynasty', name: 'Dice Dynasty' },
   { group_id: 'no-games-yet', name: 'No Games Yet' },
+  // Phase 88.9 round 2 (quick 261103-glx): soft-deleted at the END of the seed
+  // (the token-fixtures section) so /restore/group/[token] is walkable; hidden
+  // from every list by the paranoid clause until someone restores it.
+  { group_id: 'retired-raiders', name: 'Retired Raiders' },
 ];
 
 const sampleGames = [
@@ -171,7 +204,20 @@ const sampleGames = [
   }
 ];
 
-async function seedDatabase() {
+// DECISION quick-261103-glx G1: seedDatabase takes { syncSchema, closeConnection } so the
+// Jest suite (tests/scripts/seedSampleData.test.js) can run the seed IN-PROCESS against the
+// schema tests/globalSetup.js builds, on the suite's own shared connection. Chosen OVER a
+// child process (a child resolves its database through dotenv layering on top of the
+// worker's .env.test load — a second source of truth for WHICH database a mass delete
+// hits) and OVER syncing inside the suite (the suite already owns the schema, so a second
+// alter sync could only leave later suites a different one). Whether Sequelize's postgres
+// alter re-emits a unique constraint per column-level unique on every run was read from
+// Sequelize 6.37.8 source (postgres query-generator changeColumnQuery appends ADD UNIQUE
+// whenever the definition ends in UNIQUE), not measured here; the design does not depend
+// on it. The defaults keep `npm run seed`'s schema sync and connection close
+// exactly as before. The guard below stays the first statement in BOTH modes. Removing
+// the options is a decision, not a cleanup.
+async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) {
   try {
     // Phase 87.8 Plan 02 Task 0 (T-87.8-05): default-deny guard BEFORE the first
     // destructive statement. The sync({ alter: true }) below is itself
@@ -196,9 +242,13 @@ async function seedDatabase() {
       throw error;
     }
 
-    // Sync database
-    await sequelize.sync({ alter: true });
-    console.log('✅ Database synced\n');
+    // Sync database (skipped only when the caller supplies the schema — G1 above)
+    if (syncSchema) {
+      await sequelize.sync({ alter: true });
+      console.log('✅ Database synced\n');
+    } else {
+      console.log('⏭️  Schema sync skipped — the caller supplied the schema (syncSchema: false)\n');
+    }
 
     // Clear existing data (optional - comment out if you want to keep existing data)
     console.log('🗑️  Clearing existing data...');
@@ -224,6 +274,17 @@ async function seedDatabase() {
     await GameReview.destroy({ where: {} });
     await EventParticipation.destroy({ where: {} });
     await GroupInvite.destroy({ where: {} });
+    // DECISION quick-261103-glx G2: clear ONLY the two token purposes this seed
+    // mints (rsvp, group_restore), chosen OVER a full wipe — oauth_state and
+    // email_change_verify rows are not the seed's, so it does not own them. And
+    // an explicit delete, chosen OVER relying on the user_id cascade from
+    // User.destroy below. That cascade (models/index.js ("SingleUseToken.belongsTo(User")
+    // ON DELETE CASCADE; in prod since migrations/20260730000003-reconcile-single-use-tokens-user-fk.js)
+    // already takes every user-keyed token of EVERY purpose with the users, so
+    // this clear matters for rows with no user — group_restore rows carry
+    // user_id NULL, are reached by no cascade, and would otherwise accumulate one
+    // per reseed — and for any database not yet migrated past 20260730000003.
+    await SingleUseToken.destroy({ where: { purpose: { [Op.in]: ['rsvp', 'group_restore'] } } });
     await Friendship.destroy({ where: {} });
     await UserGame.destroy({ where: {} });
     await UserAvailability.destroy({ where: {} });
@@ -300,6 +361,12 @@ async function seedDatabase() {
       { user: users[5], group: groups[4], role: 'owner' },
       { user: users[4], group: groups[4], role: 'member' },
       { user: users[6], group: groups[4], role: 'member' },
+      // Retired Raiders (quick 261103-glx): Alice (owner), Bob, Eve. These three
+      // rows are stamped by the soft delete at the end of the seed, which is what
+      // lets any of them restore the group from the printed link.
+      { user: users[0], group: groups[5], role: 'owner' },
+      { user: users[1], group: groups[5], role: 'member' },
+      { user: users[4], group: groups[5], role: 'member' },
     ];
 
     for (const { user, group, role } of userGroups) {
@@ -948,13 +1015,80 @@ async function seedDatabase() {
     });
     console.log(`   ✓ 1 pending invite to ${pendingInvite.invited_email} (token generated at runtime)\n`);
 
+    // ────────────────────────────────────────────────────────────────────────
+    // Token fixtures (Phase 88.9 round 2, quick 261103-glx). The two token states
+    // the 88.9 round-1 walk could not reach from a fresh seed: Alice's open RSVP
+    // links and a group-restore link for a soft-deleted group. Owner rule
+    // (2026-10-27): a blocked walk row is a seed change, never a scratch insert.
+    // ────────────────────────────────────────────────────────────────────────
+    console.log('🔗 Seeding the walk token fixtures (quick 261103-glx)...');
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+
+    // --- Alice's RSVP links on the Weekend Warriors Catan night ---------------
+    // DECISION quick-261103-glx G5: a MISSING secret skips the mint with a notice,
+    // chosen to keep DEC-4's property ("`npm run seed` ALONE produces Weekend
+    // Warriors' populated heatmap — no secret, no chained script. CI-only token
+    // minting stays in e2e-fixtures.js."). A FAILED mint fails the seed, chosen
+    // OVER the routes' best-effort .catch: a seed that "succeeds" without the link
+    // reproduces the `not reached` UAT state silently, and nothing downstream would
+    // notice. mintRsvpBatch throws on failure (no catch, so none here either); the
+    // falsy check guards its docstring's "null on failure" promise in case the code
+    // is ever changed to match it. The secret is never printed, in whole or part.
+    const rsvpUrls = [];
+    if (!process.env.MAGIC_TOKEN_SECRET) {
+      // Unset OR empty — createHmac throws on an undefined key.
+      console.log('   ⚠️  RSVP links NOT minted: MAGIC_TOKEN_SECRET is not set — the secret signs the link; set it in the backend env (the value the server uses) to get one.');
+    } else {
+      const rsvpBatchId = await rsvpLinks.mintRsvpBatch(futureEvent1.id, users[0].user_id);
+      if (!rsvpBatchId) {
+        throw new Error('Seeding the RSVP fixture failed: mintRsvpBatch returned no batch id');
+      }
+      for (const status of ['yes', 'maybe', 'no']) {
+        rsvpUrls.push({ status, url: rsvpLinks.generateRsvpUrl(frontendUrl, futureEvent1.id, users[0].user_id, status) });
+      }
+      console.log(`   ✓ 3 RSVP links minted for Alice (yes / maybe / no, Weekend Warriors Catan night)`);
+    }
+
+    // --- Retired Raiders: one past event, then the soft delete ---------------
+    // The event is NOT pushed into `events` — the live-event count stays as is;
+    // this one is hidden with its group.
+    const retiredGroup = groups[5];
+    const retiredEvent = await Event.create({
+      group_id: retiredGroup.id,
+      game_id: games[1].id, // Ticket to Ride
+      start_date: new Date(now.getTime() - 20 * 24 * 60 * 60 * 1000),
+      duration_minutes: 70,
+      winner_id: users[0].id, // Alice won
+      picked_by_id: users[1].id, // Bob picked
+      is_group_win: false,
+      comments: 'Last game night before the group retired.',
+      status: 'completed',
+    });
+    await EventParticipation.create({ event_id: retiredEvent.id, user_id: users[0].id, score: 112, placement: 1, is_new_player: false });
+    await EventParticipation.create({ event_id: retiredEvent.id, user_id: users[1].id, score: 98, placement: 2, is_new_player: false });
+    await EventParticipation.create({ event_id: retiredEvent.id, user_id: users[4].id, score: 87, placement: 3, is_new_player: false });
+
+    // DECISION quick-261103-glx G3: Retired Raiders is soft-deleted through
+    // softDeleteGroup — the service the DELETE route calls — chosen OVER inserting
+    // pre-stamped rows or a hand-written destroy, because the service is the one
+    // place that writes the single deletedAt stamp, purge_after and the random
+    // 32-byte restore nonce together (a copy here would drift silently, and a
+    // destroy on the group trips the F-02 CI gate). The nonce is random, never
+    // derived from MAGIC_TOKEN_SECRET (same rule as the e2e fixture's DECISION
+    // Phase 87.8 R7). `recipients` is ignored: the service sends no email — the
+    // route does the fanout — so nothing is mailed from here.
+    const { nonce: restoreNonce } = await softDeleteGroup(retiredGroup.id, { excludeUserUuid: users[0].id });
+    // Same link shape and FRONTEND_URL fallback as the DELETE route's emailed link.
+    const restoreUrl = `${frontendUrl}/restore/group/${restoreNonce}`;
+    console.log(`   ✓ Retired Raiders soft-deleted (3 memberships + 1 past event hidden), 1 group-restore token minted\n`);
+
     console.log('🎉 Database seeding completed successfully!\n');
     console.log('📊 Summary:');
     console.log(`   - ${users.length} users`);
-    console.log(`   - ${groups.length} groups`);
-    console.log(`   - ${userGroups.length} user-group memberships`);
+    console.log(`   - ${groups.length} groups (1 of them soft-deleted: Retired Raiders, restorable for 30 days)`);
+    console.log(`   - ${userGroups.length} user-group memberships (3 hidden with Retired Raiders)`);
     console.log(`   - ${games.length} games`);
-    console.log(`   - ${events.length} events (7 past + 3 future)`);
+    console.log(`   - ${events.length} events (7 past + 3 future), plus 1 past event hidden with Retired Raiders`);
     console.log(`   - ${reviews.length} reviews`);
     // Phase 88-34 Task 5 (WI-B4): report the new sections too, so a human
     // running the seed can see at a glance that the Test-2 gates are walkable.
@@ -964,13 +1098,52 @@ async function seedDatabase() {
     console.log(`   - 1 pending group invite`);
     // Phase 88.9 round 1b: the walk states, so a reader sees they are seeded.
     console.log(`   - 1 open ballot (2 options), 2 guest participations, 2 prompt schedules, 1 coloured group with a broken image, 1 game with dead images`);
+    if (rsvpUrls.length) {
+      console.log(`   - 3 RSVP links for Alice (yes / maybe / no, Weekend Warriors Catan night)`);
+    } else {
+      console.log(`   - RSVP links not minted (MAGIC_TOKEN_SECRET is not set)`);
+    }
+    console.log(`   - 1 group-restore link (Retired Raiders)`);
+
+    // DECISION quick-261103-glx G6: the walk links are printed only when CI is
+    // unset — chosen OVER printing everywhere, because both CI jobs that run this
+    // seed (BE ci.yml and the FE e2e job) write to PUBLIC Actions logs, and a
+    // token in a public log is a published credential (T-82-11). Locally the owner
+    // needs the links to paste into a browser. Read at call time, not at load.
+    const linksVisible = !process.env.CI;
+    if (linksVisible) {
+      console.log('\n🔗 Walk links (paste into a browser):');
+      for (const { status, url } of rsvpUrls) {
+        console.log(`   - Alice RSVP ${status} (Weekend Warriors Catan night): ${url}`);
+      }
+      if (rsvpUrls.length) {
+        console.log('     The RSVP links are single-use: opening one answers the RSVP and revokes the other two. Reseed for fresh ones.');
+        console.log('     They work only until the Catan night starts, about 3 days after this seed (after that the respond route answers 410 for a past event) — reseed close to the walk.');
+        // Review finding 1 (quick 261103-glx): when Alice was seeded on the fallback
+        // sub, the links are signed over it, and the repoint needed to sign in as
+        // Alice breaks them.
+        // DECISION quick-261103-glx WR-02: the notice compares the sub Alice was
+        // actually seeded on (users[0], from sampleUsers, fixed when this module
+        // loaded) with ALICE_PLACEHOLDER_SUB, chosen OVER re-reading AUTH0_ALICE_SUB
+        // here: the env var read now can differ from the one sampleUsers captured at
+        // load, and the notice states a fact about the links, not about the env.
+        if (users[0].user_id === ALICE_PLACEHOLDER_SUB) {
+          console.log("   ⚠️  RSVP links are signed over Alice's placeholder sub; a later repoint of Alice breaks them — set AUTH0_ALICE_SUB and reseed.");
+        }
+      }
+      console.log(`   - Restore Retired Raiders: ${restoreUrl}`);
+    } else {
+      console.log('\n🔗 Walk links minted but not printed — CI is set, and a public Actions log never carries a token (T-82-11).');
+    }
     console.log('\n✨ Your database is now populated with sample data!');
 
   } catch (error) {
-    console.error('❌ Error seeding database:', error);
+    console.error('❌ Error seeding database:', seedErrorForLog(error));
     throw error;
   } finally {
-    await sequelize.close();
+    if (closeConnection) {
+      await sequelize.close();
+    }
   }
 }
 
@@ -982,10 +1155,10 @@ if (require.main === module) {
       process.exit(0);
     })
     .catch((error) => {
-      console.error('\n❌ Seeding failed:', error);
+      console.error('\n❌ Seeding failed:', seedErrorForLog(error));
       process.exit(1);
     });
 }
 
-module.exports = { seedDatabase };
+module.exports = { seedDatabase, ALICE_PLACEHOLDER_SUB };
 
