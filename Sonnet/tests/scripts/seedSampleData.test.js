@@ -19,14 +19,19 @@ const request = require('supertest');
 const express = require('express');
 const { User, Group, UserGroup, Event, SingleUseToken } = require('../../models');
 const groupRoutes = require('../../routes/groups');
+// The module OBJECT, not destructured: the seed calls rsvpLinks.mintRsvpBatch through
+// this same object (DECISION quick-261103-glx G4), so rsvp F can spy the mint here.
+const rsvpLinks = require('../../routes/rsvp');
 const { restoreGroupByToken } = require('../../services/groupRecoveryService');
 const { seedDatabase } = require('../../scripts/seed-sample-data');
 
-// The restore preview is public, so the router is mounted bare (same mounting as
-// tests/routes/groups.restore.test.js, minus the auth stub nothing here needs).
+// The restore preview and GET /rsvp/respond are both public, so the routers are
+// mounted bare (same mounting as tests/routes/groups.restore.test.js, minus the auth
+// stub nothing here needs).
 const app = express();
 app.use(express.json());
 app.use('/api/groups', groupRoutes);
+app.use('/api/rsvp', rsvpLinks);
 
 // An obviously fake, test-only value — never a real secret.
 const TEST_SECRET = 'glx-test-only-not-a-secret-000000000000';
@@ -46,6 +51,29 @@ function render(args) {
 async function runSeed() {
   await seedDatabase({ syncSchema: false, closeConnection: false });
   return logLines;
+}
+
+// A Sequelize-shaped write failure: sql and parameters carry the marker the way a real
+// one would carry an inlined nonce.
+const LEAK_MARKER = 'GLX-NONCE-MARKER';
+function sqlShapedError() {
+  return Object.assign(new Error('glx simulated token write failure'), {
+    name: 'SequelizeDatabaseError',
+    sql: `INSERT INTO "single_use_tokens" ("nonce") VALUES ('${LEAK_MARKER}')`,
+    parameters: [LEAK_MARKER],
+  });
+}
+
+function parseRsvpLink(lines, status) {
+  const line = lines.find((l) => l.includes('/rsvp/') && l.includes(`&s=${status}`));
+  expect(line).toBeDefined();
+  const url = new URL(line.match(/(http:\/\/localhost:3000\/rsvp\/\S+)/)[1]);
+  return {
+    token: url.pathname.split('/rsvp/')[1],
+    e: url.searchParams.get('e'),
+    u: url.searchParams.get('u'),
+    s: url.searchParams.get('s'),
+  };
 }
 
 async function seededUser(username) {
@@ -156,6 +184,8 @@ describe('seed token fixtures (quick 261103-glx)', () => {
     expect(second).toHaveLength(1);
     expect(second[0].nonce).not.toBe(first[0].nonce);
     expect(await SingleUseToken.findByPk(unrelated.id)).not.toBeNull();
+    // The RSVP batch is replaced too, never accumulated (any status).
+    expect(await SingleUseToken.count({ where: { purpose: 'rsvp' } })).toBe(3);
   }, 120000);
 
   it('group-restore: with CI set the token is still minted but neither the link nor the nonce is printed', async () => {
@@ -168,5 +198,103 @@ describe('seed token fixtures (quick 261103-glx)', () => {
     expect(lines.filter((l) => l.includes('/restore/group/'))).toEqual([]);
     expect(lines.filter((l) => l.includes(nonce))).toEqual([]);
     expect(lines.some((l) => l.includes('Walk links minted but not printed'))).toBe(true);
+  }, 120000);
+
+  it('rsvp: three active links for Alice on the Weekend Warriors Catan night, signed with the route HMAC and printed', async () => {
+    const lines = await runSeed();
+    const alice = await seededUser('Alice');
+
+    // A — one batch of three active rows for Alice's Auth0 sub, on one event.
+    const rows = await SingleUseToken.findAll({ where: { purpose: 'rsvp', status: 'active' } });
+    expect(rows).toHaveLength(3);
+    for (const row of rows) {
+      expect(row.user_id).toBe(alice.user_id);
+      expect(row.expires_at.getTime()).toBeGreaterThan(Date.now() + 29 * DAY_MS);
+    }
+    const batchIds = new Set(rows.map((r) => r.email_batch_id));
+    expect(batchIds.size).toBe(1);
+    expect([...batchIds][0]).toBeTruthy();
+    const eventIds = new Set(rows.map((r) => r.event_id));
+    expect(eventIds.size).toBe(1);
+    const eventId = [...eventIds][0];
+    expect(rows.map((r) => r.rsvp_status).sort()).toEqual(['maybe', 'no', 'yes']);
+
+    const event = await Event.findByPk(eventId);
+    expect(event).not.toBeNull();
+    expect(event.status).toBe('scheduled');
+    expect(event.ballot_status).toBe('open');
+    expect(event.start_date.getTime()).toBeGreaterThan(Date.now());
+    const eventGroup = await Group.findByPk(event.group_id);
+    expect(eventGroup.group_id).toBe('weekend-warriors');
+
+    // B — each nonce is the route's own HMAC, and each URL is printed.
+    for (const row of rows) {
+      expect(row.nonce).toBe(rsvpLinks.generateRsvpToken(eventId, alice.user_id, row.rsvp_status));
+      const url = rsvpLinks.generateRsvpUrl('http://localhost:3000', eventId, alice.user_id, row.rsvp_status);
+      expect(lines.some((l) => l.includes(url))).toBe(true);
+    }
+    // The secret itself never reaches the output.
+    expect(lines.filter((l) => l.includes(TEST_SECRET))).toEqual([]);
+  }, 120000);
+
+  it('rsvp: the printed yes link answers through GET /api/rsvp/respond, then the maybe link is refused (single-use)', async () => {
+    const lines = await runSeed();
+
+    const yes = parseRsvpLink(lines, 'yes');
+    const maybe = parseRsvpLink(lines, 'maybe');
+
+    const answered = await request(app).get('/api/rsvp/respond').query(yes);
+    expect(answered.status).toBe(200);
+    expect(answered.body.success).toBe(true);
+    expect(answered.body.group_name).toBe('Weekend Warriors');
+
+    const refused = await request(app).get('/api/rsvp/respond').query(maybe);
+    expect(refused.status).toBe(403);
+  }, 120000);
+
+  it('rsvp: with MAGIC_TOKEN_SECRET unset the seed still completes, mints no RSVP rows, says why, and still mints the restore link', async () => {
+    delete process.env.MAGIC_TOKEN_SECRET;
+    const lines = await runSeed();
+
+    expect(await SingleUseToken.count({ where: { purpose: 'rsvp' } })).toBe(0);
+    expect(lines.some((l) => l.includes('MAGIC_TOKEN_SECRET is not set'))).toBe(true);
+    expect(await SingleUseToken.count({ where: { purpose: 'group_restore' } })).toBe(1);
+  }, 120000);
+
+  it('rsvp: with CI set the three rows are minted but no RSVP link or nonce is printed', async () => {
+    process.env.CI = 'true';
+    const lines = await runSeed();
+
+    const rows = await SingleUseToken.findAll({ where: { purpose: 'rsvp' } });
+    expect(rows).toHaveLength(3);
+    expect(lines.filter((l) => l.includes('/rsvp/'))).toEqual([]);
+    for (const { nonce } of rows) {
+      expect(lines.filter((l) => l.includes(nonce))).toEqual([]);
+    }
+  }, 120000);
+
+  it('rsvp: a mint that returns no batch id fails the seed', async () => {
+    jest.spyOn(rsvpLinks, 'mintRsvpBatch').mockResolvedValue(null);
+    await expect(runSeed()).rejects.toThrow(/RSVP fixture/);
+  }, 120000);
+
+  it('rsvp: a mint that throws fails the seed', async () => {
+    jest.spyOn(SingleUseToken, 'bulkCreate').mockRejectedValueOnce(new Error('glx simulated bulkCreate failure'));
+    await expect(runSeed()).rejects.toThrow('glx simulated bulkCreate failure');
+  }, 120000);
+
+  it('rsvp: under CI a failed seed prints only the error name and message; locally it prints the whole error', async () => {
+    process.env.CI = 'true';
+    jest.spyOn(SingleUseToken, 'bulkCreate').mockRejectedValueOnce(sqlShapedError());
+    await expect(runSeed()).rejects.toThrow('glx simulated token write failure');
+    const ciOutput = errorLines.join('\n');
+    expect(ciOutput).toContain('glx simulated token write failure');
+    expect(ciOutput).not.toContain(LEAK_MARKER);
+
+    errorLines.length = 0;
+    delete process.env.CI;
+    SingleUseToken.bulkCreate.mockRejectedValueOnce(sqlShapedError());
+    await expect(runSeed()).rejects.toThrow('glx simulated token write failure');
+    expect(errorLines.join('\n')).toContain(LEAK_MARKER);
   }, 120000);
 });

@@ -21,6 +21,24 @@ const {
 const heatmapService = require('../services/heatmapService');
 const { assertNotProductionDb } = require('./lib/assert-not-production-db');
 const { softDeleteGroup } = require('../services/groupRecoveryService');
+// DECISION quick-261103-glx G4: Alice's RSVP links are minted by the route module's
+// own mintRsvpBatch / generateRsvpUrl — one definition of the HMAC payload and the
+// three-row batch — chosen OVER inlining them (scripts/e2e-fixtures.js inlines because
+// it once hung on the route module's timers; this script exits explicitly, so the
+// hang cannot recur here). Called through the module OBJECT, not destructured, so the
+// pinning test (tests/scripts/seedSampleData.test.js) can spy the mint.
+const rsvpLinks = require('../routes/rsvp');
+
+// DECISION quick-261103-glx G6: under CI a failed seed prints ONLY the error's name
+// and message, chosen OVER the whole error object, because a Sequelize error carries
+// `sql` and `parameters`, and this seed's token writes inline nonces into them — the
+// same reasoning scripts/e2e-fixtures.js records ("Log ONLY the error's name and
+// message"); both CI jobs that run this seed write to PUBLIC Actions logs. Locally the
+// full object stays, for debugging. Read at call time, so a test can toggle CI.
+function seedErrorForLog(error) {
+  if (!process.env.CI) return error;
+  return `${error && error.name}: ${error && error.message}`;
+}
 
 // Sample data arrays
 // NOTE: user_id should match your Auth0 'sub' claim value
@@ -986,12 +1004,37 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
 
     // ────────────────────────────────────────────────────────────────────────
     // Token fixtures (Phase 88.9 round 2, quick 261103-glx). The two token states
-    // the 88.9 round-1 walk could not reach from a fresh seed: a group-restore
-    // link for a soft-deleted group. Owner rule (2026-10-27): a blocked walk row is
-    // a seed change, never a scratch insert.
+    // the 88.9 round-1 walk could not reach from a fresh seed: Alice's open RSVP
+    // links and a group-restore link for a soft-deleted group. Owner rule
+    // (2026-10-27): a blocked walk row is a seed change, never a scratch insert.
     // ────────────────────────────────────────────────────────────────────────
     console.log('🔗 Seeding the walk token fixtures (quick 261103-glx)...');
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+
+    // --- Alice's RSVP links on the Weekend Warriors Catan night ---------------
+    // DECISION quick-261103-glx G5: a MISSING secret skips the mint with a notice,
+    // chosen to keep DEC-4's property ("`npm run seed` ALONE produces Weekend
+    // Warriors' populated heatmap — no secret, no chained script. CI-only token
+    // minting stays in e2e-fixtures.js."). A FAILED mint fails the seed, chosen
+    // OVER the routes' best-effort .catch: a seed that "succeeds" without the link
+    // reproduces the `not reached` UAT state silently, and nothing downstream would
+    // notice. mintRsvpBatch throws on failure (no catch, so none here either); the
+    // falsy check guards its docstring's "null on failure" promise in case the code
+    // is ever changed to match it. The secret is never printed, in whole or part.
+    const rsvpUrls = [];
+    if (!process.env.MAGIC_TOKEN_SECRET) {
+      // Unset OR empty — createHmac throws on an undefined key.
+      console.log('   ⚠️  RSVP links NOT minted: MAGIC_TOKEN_SECRET is not set — the secret signs the link; set it in the backend env (the value the server uses) to get one.');
+    } else {
+      const rsvpBatchId = await rsvpLinks.mintRsvpBatch(futureEvent1.id, users[0].user_id);
+      if (!rsvpBatchId) {
+        throw new Error('Seeding the RSVP fixture failed: mintRsvpBatch returned no batch id');
+      }
+      for (const status of ['yes', 'maybe', 'no']) {
+        rsvpUrls.push({ status, url: rsvpLinks.generateRsvpUrl(frontendUrl, futureEvent1.id, users[0].user_id, status) });
+      }
+      console.log(`   ✓ 3 RSVP links minted for Alice (yes / maybe / no, Weekend Warriors Catan night)`);
+    }
 
     // --- Retired Raiders: one past event, then the soft delete ---------------
     // The event is NOT pushed into `events` — the live-event count stays as is;
@@ -1042,6 +1085,11 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
     console.log(`   - 1 pending group invite`);
     // Phase 88.9 round 1b: the walk states, so a reader sees they are seeded.
     console.log(`   - 1 open ballot (2 options), 2 guest participations, 2 prompt schedules, 1 coloured group with a broken image, 1 game with dead images`);
+    if (rsvpUrls.length) {
+      console.log(`   - 3 RSVP links for Alice (yes / maybe / no, Weekend Warriors Catan night)`);
+    } else {
+      console.log(`   - RSVP links not minted (MAGIC_TOKEN_SECRET is not set)`);
+    }
     console.log(`   - 1 group-restore link (Retired Raiders)`);
 
     // DECISION quick-261103-glx G6: the walk links are printed only when CI is
@@ -1052,6 +1100,12 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
     const linksVisible = !process.env.CI;
     if (linksVisible) {
       console.log('\n🔗 Walk links (paste into a browser):');
+      for (const { status, url } of rsvpUrls) {
+        console.log(`   - Alice RSVP ${status} (Weekend Warriors Catan night): ${url}`);
+      }
+      if (rsvpUrls.length) {
+        console.log('     The RSVP links are single-use: opening one answers the RSVP and revokes the other two. Reseed for fresh ones.');
+      }
       console.log(`   - Restore Retired Raiders: ${restoreUrl}`);
     } else {
       console.log('\n🔗 Walk links minted but not printed — CI is set, and a public Actions log never carries a token (T-82-11).');
@@ -1059,7 +1113,7 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
     console.log('\n✨ Your database is now populated with sample data!');
 
   } catch (error) {
-    console.error('❌ Error seeding database:', error);
+    console.error('❌ Error seeding database:', seedErrorForLog(error));
     throw error;
   } finally {
     if (closeConnection) {
@@ -1076,7 +1130,7 @@ if (require.main === module) {
       process.exit(0);
     })
     .catch((error) => {
-      console.error('\n❌ Seeding failed:', error);
+      console.error('\n❌ Seeding failed:', seedErrorForLog(error));
       process.exit(1);
     });
 }
