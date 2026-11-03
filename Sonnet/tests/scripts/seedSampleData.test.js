@@ -17,13 +17,16 @@
 const util = require('util');
 const request = require('supertest');
 const express = require('express');
-const { User, Group, UserGroup, Event, SingleUseToken } = require('../../models');
+const models = require('../../models');
+const { User, Group, UserGroup, Event, SingleUseToken } = models;
 const groupRoutes = require('../../routes/groups');
 // The module OBJECT, not destructured: the seed calls rsvpLinks.mintRsvpBatch through
 // this same object (DECISION quick-261103-glx G4), so rsvp F can spy the mint here.
 const rsvpLinks = require('../../routes/rsvp');
-const { restoreGroupByToken } = require('../../services/groupRecoveryService');
-const { seedDatabase } = require('../../scripts/seed-sample-data');
+const heatmapService = require('../../services/heatmapService');
+const groupRecoveryService = require('../../services/groupRecoveryService');
+const { restoreGroupByToken } = groupRecoveryService;
+const { seedDatabase, ALICE_PLACEHOLDER_SUB } = require('../../scripts/seed-sample-data');
 
 // The restore preview and GET /rsvp/respond are both public, so the routers are
 // mounted bare (same mounting as tests/routes/groups.restore.test.js, minus the auth
@@ -78,6 +81,55 @@ function parseRsvpLink(lines, status) {
     u: url.searchParams.get('u'),
     s: url.searchParams.get('s'),
   };
+}
+
+// Scoped-check WR-02 (quick 261103-glx): the seed builds sampleUsers, and so the sub
+// Alice is seeded on, ONCE, when its module loads. The seedDatabase required at the top
+// of this file therefore always seeds Alice on whatever AUTH0_ALICE_SUB was when this
+// file loaded (in CI: unset, so the placeholder), and toggling the var afterwards changes
+// nothing the seed signs. To reach BOTH arms of the placeholder-sub notice, this helper
+// sets (or unsets) AUTH0_ALICE_SUB and then requires a FRESH copy of the seed inside
+// jest.isolateModules. Every module the seed requires that holds shared state (the models
+// and their one Sequelize connection, the rsvp router, the two services) is doMock-ed to
+// the instance this file already loaded, so only the seed module itself (and its
+// dependency-free lib helper) is re-evaluated, and no second connection pool is opened.
+// The mocks are dropped again right after, so nothing later in this file sees them.
+const SEED_SHARED_DEPS = {
+  '../../models': models,
+  '../../routes/rsvp': rsvpLinks,
+  '../../services/heatmapService': heatmapService,
+  '../../services/groupRecoveryService': groupRecoveryService,
+};
+function loadSeedWithAliceSub(aliceSub) {
+  if (aliceSub === undefined) {
+    delete process.env.AUTH0_ALICE_SUB;
+  } else {
+    process.env.AUTH0_ALICE_SUB = aliceSub;
+  }
+  let seed;
+  jest.isolateModules(() => {
+    for (const [dep, instance] of Object.entries(SEED_SHARED_DEPS)) {
+      jest.doMock(dep, () => instance);
+    }
+    seed = require('../../scripts/seed-sample-data');
+  });
+  for (const dep of Object.keys(SEED_SHARED_DEPS)) {
+    jest.dontMock(dep);
+  }
+  return async () => {
+    await seed.seedDatabase({ syncSchema: false, closeConnection: false });
+    return logLines;
+  };
+}
+
+// Review finding 1 + scoped-check WR-02: the notice states a fact about the printed links,
+// so it must appear exactly when the yes link's u= (the sub the link is signed over) is
+// Alice's placeholder sub. Returns u so each caller can also pin WHICH arm it reached.
+function expectNoticeTracksLink(lines) {
+  const { u } = parseRsvpLink(lines, 'yes');
+  expect(lines.filter((l) => l.includes(PLACEHOLDER_SUB_NOTICE)))
+    .toHaveLength(u === ALICE_PLACEHOLDER_SUB ? 1 : 0);
+  return u;
 }
 
 async function seededUser(username) {
@@ -268,34 +320,53 @@ describe('seed token fixtures (quick 261103-glx)', () => {
     expect(await SingleUseToken.count({ where: { purpose: 'group_restore' } })).toBe(1);
   }, 120000);
 
-  // Review finding 1: with AUTH0_ALICE_SUB unset, the links are signed over the made-up
-  // fallback sub, and the repoint the owner needs to sign in as Alice breaks them. The seed
-  // must say so in its own output, locally only (the same CI rule as the links).
-  it('rsvp: with AUTH0_ALICE_SUB unset the seed prints one placeholder-sub notice beside the links', async () => {
-    delete process.env.AUTH0_ALICE_SUB;
-    const lines = await runSeed();
+  // Review finding 1 + scoped-check WR-02: the links are signed over the sub Alice was
+  // seeded on. When that is the placeholder, the repoint the owner needs to sign in as
+  // Alice breaks them, and the seed must say so in its own output, locally only (the
+  // same CI rule as the links). Each seed below is loaded through loadSeedWithAliceSub,
+  // so the arm it reaches is decided by the sub in effect at module load.
+  it('rsvp: the placeholder-sub notice is printed iff the printed link is signed over the placeholder sub', async () => {
+    // Placeholder arm: AUTH0_ALICE_SUB unset at load and at run.
+    const placeholderLines = await loadSeedWithAliceSub(undefined)();
+    expect(expectNoticeTracksLink(placeholderLines)).toBe(ALICE_PLACEHOLDER_SUB);
 
-    expect(lines.some((l) => l.includes('/rsvp/'))).toBe(true);
-    expect(lines.filter((l) => l.includes(PLACEHOLDER_SUB_NOTICE))).toHaveLength(1);
-  }, 120000);
-
-  it('rsvp: no placeholder-sub notice when AUTH0_ALICE_SUB is set, under CI, or when no RSVP link was minted', async () => {
-    process.env.AUTH0_ALICE_SUB = TEST_ALICE_SUB;
-    const withSub = await runSeed();
-    // Control: the links are printed, so the absence below is not vacuous.
-    expect(withSub.some((l) => l.includes('/rsvp/'))).toBe(true);
-    expect(withSub.filter((l) => l.includes(PLACEHOLDER_SUB_NOTICE))).toEqual([]);
-
-    delete process.env.AUTH0_ALICE_SUB;
-    process.env.CI = 'true';
+    // Real-sub arm: AUTH0_ALICE_SUB set at load and at run.
     logLines.length = 0;
-    const underCi = await runSeed();
+    const realSubLines = await loadSeedWithAliceSub(TEST_ALICE_SUB)();
+    expect(expectNoticeTracksLink(realSubLines)).toBe(TEST_ALICE_SUB);
+  }, 180000);
+
+  it('rsvp: the notice follows the sub the seed used, not AUTH0_ALICE_SUB at run time', async () => {
+    // Loaded on the placeholder, var set before the run: the links are still signed over
+    // the placeholder, so the notice must still appear.
+    const runPlaceholder = loadSeedWithAliceSub(undefined);
+    process.env.AUTH0_ALICE_SUB = TEST_ALICE_SUB;
+    const placeholderLines = await runPlaceholder();
+    expect(expectNoticeTracksLink(placeholderLines)).toBe(ALICE_PLACEHOLDER_SUB);
+
+    // Loaded on a real sub, var unset before the run: the links are signed over the real
+    // sub, so no notice.
+    const runRealSub = loadSeedWithAliceSub(TEST_ALICE_SUB);
+    delete process.env.AUTH0_ALICE_SUB;
+    logLines.length = 0;
+    const realSubLines = await runRealSub();
+    expect(expectNoticeTracksLink(realSubLines)).toBe(TEST_ALICE_SUB);
+  }, 180000);
+
+  it('rsvp: no placeholder-sub notice under CI, or when no RSVP link was minted, even when Alice is on the placeholder', async () => {
+    const runPlaceholder = loadSeedWithAliceSub(undefined);
+
+    process.env.CI = 'true';
+    const underCi = await runPlaceholder();
+    // Control: Alice really is on the placeholder, so the absence below is not vacuous.
+    expect((await seededUser('Alice')).user_id).toBe(ALICE_PLACEHOLDER_SUB);
     expect(underCi.filter((l) => l.includes(PLACEHOLDER_SUB_NOTICE))).toEqual([]);
 
     delete process.env.CI;
     delete process.env.MAGIC_TOKEN_SECRET;
     logLines.length = 0;
-    const noMint = await runSeed();
+    const noMint = await runPlaceholder();
+    expect((await seededUser('Alice')).user_id).toBe(ALICE_PLACEHOLDER_SUB);
     expect(noMint.filter((l) => l.includes(PLACEHOLDER_SUB_NOTICE))).toEqual([]);
   }, 180000);
 

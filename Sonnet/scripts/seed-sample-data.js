@@ -46,9 +46,13 @@ function seedErrorForLog(error) {
 // Or check Auth0 Dashboard > Users > [User] > User ID field
 // You can also set these via environment variables:
 //   AUTH0_ALICE_SUB, AUTH0_BOB_SUB, etc.
+// Alice's fallback sub, used when AUTH0_ALICE_SUB is unset. Named (quick 261103-glx,
+// scoped-check WR-02) so the RSVP-link notice at the end can compare the sub Alice was
+// actually seeded on against it; exported for the seed's tests.
+const ALICE_PLACEHOLDER_SUB = 'auth0|6959f749afc6f7d1e7fb1635';
 const sampleUsers = [
   { 
-    user_id: process.env.AUTH0_ALICE_SUB || 'auth0|6959f749afc6f7d1e7fb1635', 
+    user_id: process.env.AUTH0_ALICE_SUB || ALICE_PLACEHOLDER_SUB,
     username: 'Alice', 
     email: 'alice@example.com' 
   },
@@ -1115,10 +1119,15 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
       if (rsvpUrls.length) {
         console.log('     The RSVP links are single-use: opening one answers the RSVP and revokes the other two. Reseed for fresh ones.');
         console.log('     They work only until the Catan night starts, about 3 days after this seed (after that the respond route answers 410 for a past event) — reseed close to the walk.');
-        // Review finding 1 (quick 261103-glx): unset AUTH0_ALICE_SUB means the links
-        // were signed over the made-up fallback sub above, and the repoint needed to
-        // sign in as Alice breaks them. Read at call time, like CI.
-        if (!process.env.AUTH0_ALICE_SUB) {
+        // Review finding 1 (quick 261103-glx): when Alice was seeded on the fallback
+        // sub, the links are signed over it, and the repoint needed to sign in as
+        // Alice breaks them.
+        // DECISION quick-261103-glx WR-02: the notice compares the sub Alice was
+        // actually seeded on (users[0], from sampleUsers, fixed when this module
+        // loaded) with ALICE_PLACEHOLDER_SUB, chosen OVER re-reading AUTH0_ALICE_SUB
+        // here: the env var read now can differ from the one sampleUsers captured at
+        // load, and the notice states a fact about the links, not about the env.
+        if (users[0].user_id === ALICE_PLACEHOLDER_SUB) {
           console.log("   ⚠️  RSVP links are signed over Alice's placeholder sub; a later repoint of Alice breaks them — set AUTH0_ALICE_SUB and reseed.");
         }
       }
@@ -1151,5 +1160,5 @@ if (require.main === module) {
     });
 }
 
-module.exports = { seedDatabase };
+module.exports = { seedDatabase, ALICE_PLACEHOLDER_SUB };
 
