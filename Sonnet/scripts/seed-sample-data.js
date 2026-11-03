@@ -80,7 +80,10 @@ const sampleUsers = [
   // Phase 88.9 round 1b (walk fixtures): a member who owns NO games, with a name
   // long enough to wrap the 375px profile title (walk rows W152 / #29). The
   // local walk signs in as this user for those two captures (the Alice-login
-  // runbook's repoint); nothing else references the account.
+  // runbook's repoint); nothing else references the account. CAUTION (quick
+  // 261103-glx): any repoint that moves Alice's sub breaks the RSVP links the seed
+  // prints — they carry and are signed over the sub as seeded — so walk the RSVP
+  // rows first, or reseed afterwards.
   {
     user_id: process.env.AUTH0_BART_SUB || 'auth0|695a0399c0ffee0000000001',
     username: 'Bartholomew Featherstonehaugh-Cholmondeley',
@@ -202,9 +205,12 @@ const sampleGames = [
 // schema tests/globalSetup.js builds, on the suite's own shared connection. Chosen OVER a
 // child process (a child resolves its database through dotenv layering on top of the
 // worker's .env.test load — a second source of truth for WHICH database a mass delete
-// hits) and OVER syncing inside the suite (Sequelize 6.37's postgres alter re-emits a
-// unique constraint per column-level unique on every run, leaving later suites a
-// different schema). The defaults keep `npm run seed`'s schema sync and connection close
+// hits) and OVER syncing inside the suite (the suite already owns the schema, so a second
+// alter sync could only leave later suites a different one). Whether Sequelize's postgres
+// alter re-emits a unique constraint per column-level unique on every run was read from
+// Sequelize 6.37.8 source (postgres query-generator changeColumnQuery appends ADD UNIQUE
+// whenever the definition ends in UNIQUE), not measured here; the design does not depend
+// on it. The defaults keep `npm run seed`'s schema sync and connection close
 // exactly as before. The guard below stays the first statement in BOTH modes. Removing
 // the options is a decision, not a cleanup.
 async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) {
@@ -268,9 +274,12 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
     // mints (rsvp, group_restore), chosen OVER a full wipe — oauth_state and
     // email_change_verify rows are not the seed's, so it does not own them. And
     // an explicit delete, chosen OVER relying on the user_id cascade from
-    // User.destroy below, whose disposition differs between sync-built and
-    // migration-built databases; group_restore rows carry user_id NULL and would
-    // otherwise accumulate one per reseed.
+    // User.destroy below. That cascade (models/index.js ("SingleUseToken.belongsTo(User")
+    // ON DELETE CASCADE; in prod since migrations/20260730000003-reconcile-single-use-tokens-user-fk.js)
+    // already takes every user-keyed token of EVERY purpose with the users, so
+    // this clear matters for rows with no user — group_restore rows carry
+    // user_id NULL, are reached by no cascade, and would otherwise accumulate one
+    // per reseed — and for any database not yet migrated past 20260730000003.
     await SingleUseToken.destroy({ where: { purpose: { [Op.in]: ['rsvp', 'group_restore'] } } });
     await Friendship.destroy({ where: {} });
     await UserGame.destroy({ where: {} });
@@ -1105,6 +1114,13 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
       }
       if (rsvpUrls.length) {
         console.log('     The RSVP links are single-use: opening one answers the RSVP and revokes the other two. Reseed for fresh ones.');
+        console.log('     They work only until the Catan night starts, about 3 days after this seed (after that the respond route answers 410 for a past event) — reseed close to the walk.');
+        // Review finding 1 (quick 261103-glx): unset AUTH0_ALICE_SUB means the links
+        // were signed over the made-up fallback sub above, and the repoint needed to
+        // sign in as Alice breaks them. Read at call time, like CI.
+        if (!process.env.AUTH0_ALICE_SUB) {
+          console.log("   ⚠️  RSVP links are signed over Alice's placeholder sub; a later repoint of Alice breaks them — set AUTH0_ALICE_SUB and reseed.");
+        }
       }
       console.log(`   - Restore Retired Raiders: ${restoreUrl}`);
     } else {

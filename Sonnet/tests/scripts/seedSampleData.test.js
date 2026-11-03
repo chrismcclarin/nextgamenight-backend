@@ -35,8 +35,12 @@ app.use('/api/rsvp', rsvpLinks);
 
 // An obviously fake, test-only value — never a real secret.
 const TEST_SECRET = 'glx-test-only-not-a-secret-000000000000';
-const ENV_KEYS = ['CI', 'MAGIC_TOKEN_SECRET', 'FRONTEND_URL'];
+const ENV_KEYS = ['CI', 'MAGIC_TOKEN_SECRET', 'FRONTEND_URL', 'AUTH0_ALICE_SUB'];
 const DAY_MS = 24 * 60 * 60 * 1000;
+// The seed's placeholder-sub notice (review finding 1); matched as a substring.
+const PLACEHOLDER_SUB_NOTICE = "RSVP links are signed over Alice's placeholder sub";
+// An obviously fake, test-only sub — never a real Auth0 account.
+const TEST_ALICE_SUB = 'auth0|glx-test-only-alice-sub';
 
 let envSnapshot;
 let logLines;
@@ -184,7 +188,10 @@ describe('seed token fixtures (quick 261103-glx)', () => {
     expect(second).toHaveLength(1);
     expect(second[0].nonce).not.toBe(first[0].nonce);
     expect(await SingleUseToken.findByPk(unrelated.id)).not.toBeNull();
-    // The RSVP batch is replaced too, never accumulated (any status).
+    // The RSVP batch is replaced too, never accumulated (any status). NOT a G2 pin: in
+    // this sync-built DB the User.destroy cascade clears the rsvp rows whether or not the
+    // G2 clear exists. G2 is pinned by the group_restore count above (user_id NULL, so no
+    // cascade reaches it); this line stays as a cheap accumulation guard.
     expect(await SingleUseToken.count({ where: { purpose: 'rsvp' } })).toBe(3);
   }, 120000);
 
@@ -261,6 +268,37 @@ describe('seed token fixtures (quick 261103-glx)', () => {
     expect(await SingleUseToken.count({ where: { purpose: 'group_restore' } })).toBe(1);
   }, 120000);
 
+  // Review finding 1: with AUTH0_ALICE_SUB unset, the links are signed over the made-up
+  // fallback sub, and the repoint the owner needs to sign in as Alice breaks them. The seed
+  // must say so in its own output, locally only (the same CI rule as the links).
+  it('rsvp: with AUTH0_ALICE_SUB unset the seed prints one placeholder-sub notice beside the links', async () => {
+    delete process.env.AUTH0_ALICE_SUB;
+    const lines = await runSeed();
+
+    expect(lines.some((l) => l.includes('/rsvp/'))).toBe(true);
+    expect(lines.filter((l) => l.includes(PLACEHOLDER_SUB_NOTICE))).toHaveLength(1);
+  }, 120000);
+
+  it('rsvp: no placeholder-sub notice when AUTH0_ALICE_SUB is set, under CI, or when no RSVP link was minted', async () => {
+    process.env.AUTH0_ALICE_SUB = TEST_ALICE_SUB;
+    const withSub = await runSeed();
+    // Control: the links are printed, so the absence below is not vacuous.
+    expect(withSub.some((l) => l.includes('/rsvp/'))).toBe(true);
+    expect(withSub.filter((l) => l.includes(PLACEHOLDER_SUB_NOTICE))).toEqual([]);
+
+    delete process.env.AUTH0_ALICE_SUB;
+    process.env.CI = 'true';
+    logLines.length = 0;
+    const underCi = await runSeed();
+    expect(underCi.filter((l) => l.includes(PLACEHOLDER_SUB_NOTICE))).toEqual([]);
+
+    delete process.env.CI;
+    delete process.env.MAGIC_TOKEN_SECRET;
+    logLines.length = 0;
+    const noMint = await runSeed();
+    expect(noMint.filter((l) => l.includes(PLACEHOLDER_SUB_NOTICE))).toEqual([]);
+  }, 180000);
+
   it('rsvp: with CI set the three rows are minted but no RSVP link or nonce is printed', async () => {
     process.env.CI = 'true';
     const lines = await runSeed();
@@ -280,7 +318,10 @@ describe('seed token fixtures (quick 261103-glx)', () => {
 
   it('rsvp: a mint that throws fails the seed', async () => {
     jest.spyOn(SingleUseToken, 'bulkCreate').mockRejectedValueOnce(new Error('glx simulated bulkCreate failure'));
-    await expect(runSeed()).rejects.toThrow('glx simulated bulkCreate failure');
+    // Either message: the raw throw (today) or the seed's own "RSVP fixture" error, if
+    // mintRsvpBatch is ever changed to return null on failure (the case G5 anticipates).
+    // What must hold is that the seed rejects instead of swallowing the failure.
+    await expect(runSeed()).rejects.toThrow(/glx simulated bulkCreate failure|RSVP fixture/);
   }, 120000);
 
   it('rsvp: under CI a failed seed prints only the error name and message; locally it prints the whole error', async () => {
