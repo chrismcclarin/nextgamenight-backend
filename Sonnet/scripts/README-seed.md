@@ -47,6 +47,17 @@ At the end of its output the seed prints two kinds of walk link (Phase 88.9 roun
 
 For both: the links are built from `FRONTEND_URL` (falls back to `http://localhost:3000`), are never printed when `CI` is set (one "Walk links minted but not printed" line instead — Actions logs are public), and are replaced by every reseed (the seed deletes the old `rsvp` and `group_restore` tokens explicitly, and its `User.destroy` takes every user-owned token of every kind with the users — the `ON DELETE CASCADE` on `single_use_tokens.user_id` in `models/index.js` and, in prod, migration `20260730000003-reconcile-single-use-tokens-user-fk.js` — so only tokens with no user survive a reseed, and no live token kind is user-less except `group_restore`; the explicit clear is what removes the restore token, and covers any database not yet migrated past that migration).
 
+## The seed is the fixture layer (owner rule, 2026-10-27)
+
+When a walk, UAT or capture row is blocked because the seeded data has no instance of the state it needs (a guest-joined event, a recurring schedule, an open ballot, a game-less group, an open RSVP link), the fix is a change to `seed-sample-data.js` so that a fresh `npm run seed` produces that state. Never a one-off scratch insert that the next reseed destroys, and never an escalation of the row to the owner. Owner, 2026-10-27: "We created the seed, if we come up against a thing that the seed could resolve, lets modify the seed to resolve that issue."
+
+How: a blocked row becomes a backend branch and PR with a review record, then the owner's go on the merge (backend `main` deploys production, even though the seed never runs there), then a reseed of the local walk database and a re-capture. A walk's scratch fixtures get folded into the seed rather than carried as scripts.
+
+Exceptions — the row stays escalated, with the reason written beside it:
+- The state needs a walk user other than Alice (a member who owns no games, for example: Alice keeps her games for every other row). The seed adds that user; the capture signs in as them instead.
+- Device-only checks the seed cannot reach (iPhone VoiceOver).
+- A state that needs a secret the seed does not have (the RSVP links are skipped with a notice when `MAGIC_TOKEN_SECRET` is unset).
+
 ## Usage
 
 ```bash
