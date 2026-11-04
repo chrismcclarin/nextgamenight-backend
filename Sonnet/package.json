@@ -29,8 +29,8 @@
         "census:group-colours": "node scripts/census-group-colours.js"
     },
     "dependencies": {
-        "@bull-board/api": "^6.18.0",
-        "@bull-board/express": "^6.18.0",
+        "@bull-board/api": "^6.21.3",
+        "@bull-board/express": "^6.21.3",
         "@octokit/rest": "^22.0.1",
         "@react-email/components": "^1.0.6",
         "@sentry/node": "^8.0.0",
@@ -52,7 +52,6 @@
         "pg-hstore": "^2.3.4",
         "react": "^18.3.1",
         "react-dom": "^18.3.1",
-        "react-email": "^5.2.5",
         "resend": "^4.8.0",
         "sequelize": "^6.35.0",
         "sequelize-cli": "^6.6.5",
@@ -64,6 +63,7 @@
         "jest": "^29.7.0",
         "js-yaml": "^3.14.2",
         "nodemon": "^3.0.1",
+        "react-email": "^5.2.5",
         "supertest": "^6.3.3"
     },
     "engines": {
