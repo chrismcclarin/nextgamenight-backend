@@ -334,7 +334,8 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
       { user: users[2], group: groups[0], role: 'member' },
       { user: users[3], group: groups[0], role: 'member' },
       
-      // Strategy Squad: Frank (owner), Bob, Charlie (admin), Eve
+      // Strategy Squad: Frank (owner), Bob, Charlie (admin), Eve — plus Alice, Diana and
+      // Bartholomew below (7 members; see the 88.9 round-2 note)
       { user: users[5], group: groups[1], role: 'owner' },
       { user: users[1], group: groups[1], role: 'member' },
       { user: users[2], group: groups[1], role: 'admin' },
@@ -353,6 +354,29 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
       // so Alice (3 games) and Bob (1) must stay OUT of No Games Yet.
       { user: users[0], group: groups[1], role: 'member' },
       { user: users[0], group: groups[2], role: 'member' },
+      // Phase 88.9 round 2 (lane-B page 3 item D2, register row #77 — the +N overflow
+      // chip). The home card's collapsed MemberChipStack shows COLLAPSED_LIMIT = 4 OTHER
+      // members and a "+N" chip for the rest
+      // (periodictabletop/src/app/components/MemberChipStack.tsx). No seeded group gave
+      // Alice more than 4 others, so the chip never rendered on the walk DB and the pick
+      // row was blocked. Diana and Bartholomew join Strategy Squad: 7 members, Alice sees
+      // four chips and "+2". Why this group: Weekend Warriors must keep MORE than its 3
+      // seeded prompt responders (consensus closes at respondedCount >= totalActive, and
+      // CI e2e walks its create-event surface); No Games Yet must stay game-less; Dice
+      // Dynasty must stay without Alice (she is its guest). KNOWN CONSEQUENCE, not a
+      // regression: create-event pre-fills every active member as a participant, so
+      // Strategy Squad's Suggestions slot now runs at playerCount 7, above every owned
+      // game's max_players (Catan 4, Azul 4, Ticket to Ride 5, Wingspan 5) — the slot
+      // shows the SAME empty hint as No Games Yet, and the "has games" contrast for walk
+      // row W152 is Weekend Warriors (4 players, all four owned games qualify). Giving a
+      // squad member a 7-player game would change Weekend Warriors (Alice, Bob, Charlie,
+      // Diana are in both) or un-empty No Games Yet (Eve, Frank, Bartholomew), so no
+      // UserGame row is added. Diana's Tue/Thu availability patterns also join the squad
+      // heatmap (availabilityService reads every member's recurring patterns); no test or
+      // walk row asserts on it. Pinned by tests/scripts/seedSampleData.test.js
+      // ("Strategy Squad has 7 active members").
+      { user: users[3], group: groups[1], role: 'member' },
+      { user: users[6], group: groups[1], role: 'member' },
       // Dice Dynasty: Charlie (owner), Eve, Frank
       { user: users[2], group: groups[3], role: 'owner' },
       { user: users[4], group: groups[3], role: 'member' },
@@ -840,9 +864,10 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
 
     // DECISION Phase 87.8 (R8/DEC-4): responses for Bob, Charlie and Diana ONLY —
     // Alice's response is deliberately WITHHELD, chosen OVER seeding all four
-    // members. promptLifecycleService.checkConsensusAndClose closes a prompt the
-    // instant respondedCount === totalActive, and Weekend Warriors has exactly 4
-    // active members — seeding 3 of 4 keeps the prompt 'active' by construction,
+    // members. promptLifecycleService.checkConsensusAndClose closes a prompt once
+    // respondedCount >= totalActive (it returns not-closed while respondedCount <
+    // totalActive), and Weekend Warriors has 4 active members — seeding 3 of 4 keeps
+    // the prompt 'active' by construction (any roster LARGER than the 3 responders does),
     // so a real member can still respond during a walkthrough without the seed
     // having pre-tripped consensus auto-close. Adding Alice here is a decision,
     // not a completeness fix.
@@ -873,7 +898,7 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
     const aggregation = await heatmapService.aggregateResponses(availabilityPrompt.id);
     console.log(`   ✓ aggregateResponses: ${aggregation.suggestionCount} suggestion rows (${aggregation.message})`);
 
-    // Consensus sanity line — same query shape promptLifecycleService.js:56-70
+    // Consensus sanity line — same query shape as promptLifecycleService.checkConsensusAndClose (the totalActive / respondedCount counts)
     // uses — so a human running `npm run seed` sees at a glance that consensus
     // was NOT tripped.
     const totalActive = await UserGroup.count({

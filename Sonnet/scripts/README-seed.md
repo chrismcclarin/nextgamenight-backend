@@ -10,7 +10,7 @@ This script populates your database with realistic sample data for testing and d
 
 ### Groups (6)
 - **Weekend Warriors** - 4 members (Alice owner, Bob, Charlie, Diana); two prompt schedules (Thursday check-in active, Sunday afternoon paused)
-- **Strategy Squad** - 5 members (Frank owner, Bob, Charlie, Eve, Alice)
+- **Strategy Squad** - 7 members (Frank owner, Bob, Charlie, Eve, Alice, Diana, Bartholomew); the one group where Alice sees more than 4 other members, so her home card shows four chips and a "+2" overflow chip (Phase 88.9 round 2, pick row D2 / #77). Consequence: create-event pre-fills all 7 as participants and no owned game allows 7 players, so its Suggestions slot shows the empty hint — Weekend Warriors (4 players) is the group whose slot shows suggestions
 - **Casual Gamers** - 4 members (Diana owner, Eve, Frank, Alice); colour preset `blue` with a BROKEN header image URL (the fallback the 88.9 walk measures)
 - **Dice Dynasty** - 3 members (Charlie owner, Eve, Frank); Alice is NOT a member and attends its event as a guest
 - **No Games Yet** - 3 members (Frank owner, Eve, Bartholomew); nobody in it owns a game, so create-event's Suggestions slot shows its empty hint
