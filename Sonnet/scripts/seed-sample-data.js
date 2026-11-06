@@ -334,7 +334,8 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
       { user: users[2], group: groups[0], role: 'member' },
       { user: users[3], group: groups[0], role: 'member' },
       
-      // Strategy Squad: Frank (owner), Bob, Charlie (admin), Eve
+      // Strategy Squad: Frank (owner), Bob, Charlie (admin), Eve — plus Alice, Diana and
+      // Bartholomew below (7 members; see the 88.9 round-2 note)
       { user: users[5], group: groups[1], role: 'owner' },
       { user: users[1], group: groups[1], role: 'member' },
       { user: users[2], group: groups[1], role: 'admin' },
@@ -353,6 +354,19 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
       // so Alice (3 games) and Bob (1) must stay OUT of No Games Yet.
       { user: users[0], group: groups[1], role: 'member' },
       { user: users[0], group: groups[2], role: 'member' },
+      // Phase 88.9 round 2 (lane-B page 3 item D2, register row #77 — the +N overflow
+      // chip). The home card's collapsed MemberChipStack shows COLLAPSED_LIMIT = 4 OTHER
+      // members and a "+N" chip for the rest (periodictabletop/src/app/components/
+      // MemberChipStack.tsx). No seeded group gave Alice more than 4 others, so the chip
+      // never rendered on the walk DB and the pick row was blocked. Diana and Bartholomew
+      // join Strategy Squad: 7 members, Alice sees four chips and "+2". Strategy Squad is
+      // the one group with no count-sensitive fixture (Weekend Warriors' prompt consensus
+      // needs exactly 4; No Games Yet must stay game-less; Dice Dynasty must stay without
+      // Alice). Bartholomew owns no games and Strategy Squad already pools its owners'
+      // games, so the Suggestions slot there is unchanged. Pinned by
+      // tests/scripts/seedSampleData.test.js ("Strategy Squad has 7 active members").
+      { user: users[3], group: groups[1], role: 'member' },
+      { user: users[6], group: groups[1], role: 'member' },
       // Dice Dynasty: Charlie (owner), Eve, Frank
       { user: users[2], group: groups[3], role: 'owner' },
       { user: users[4], group: groups[3], role: 'member' },
