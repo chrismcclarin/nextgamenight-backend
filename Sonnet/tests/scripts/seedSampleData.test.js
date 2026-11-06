@@ -1,5 +1,6 @@
 // tests/scripts/seedSampleData.test.js
-// Quick task 261103-glx (Phase 88.9 round 2) — the seed's two walk-link fixtures:
+// Quick task 261103-glx (Phase 88.9 round 2) — the seed's two walk-link fixtures, plus
+// (Phase 88.9 round 2, pick row D2) the Strategy Squad roster that renders the +N chip:
 // a group-restore link for the soft-deleted group Retired Raiders, and Alice's three
 // single-use RSVP links on the Weekend Warriors Catan night.
 //
@@ -166,18 +167,18 @@ afterEach(() => {
   jest.restoreAllMocks();
 });
 
-describe('seed token fixtures (quick 261103-glx)', () => {
-  // Phase 88.9 round 2, lane-B page 3 item D2 (#77, the +N overflow chip): the home card's
-  // collapsed MemberChipStack shows COLLAPSED_LIMIT = 4 other members and a "+N" chip for the
-  // rest (periodictabletop/src/app/components/MemberChipStack.tsx). Until this fixture no
-  // seeded group gave Alice more than 4 OTHER members, so the +N chip never rendered on the
-  // walk DB and the pick row was blocked. Strategy Squad now carries 7 members: Alice sees
-  // four chips and "+2". Pinned here so a later "tidy" of the roster does not re-block it.
-  it('members: Strategy Squad has 7 active members (Alice + 6 others, Diana and Bartholomew included) so her collapsed chip stack overflows', async () => {
+describe('seed membership fixtures (Phase 88.9 round 2, pick row D2)', () => {
+  // The home card's collapsed MemberChipStack shows COLLAPSED_LIMIT = 4 other members and
+  // a "+N" chip for the rest (periodictabletop/src/app/components/MemberChipStack.tsx);
+  // both it and the Suggestions filter read ACTIVE memberships only. Until this fixture
+  // no seeded group gave Alice more than 4 others, so the +N chip never rendered on the
+  // walk DB and the pick row was blocked. Strategy Squad carries 7 members: Alice sees
+  // four chips and "+2". Pinned so a later "tidy" of the roster does not re-block it.
+  it('Strategy Squad has 7 active members (Alice + 6 others, Diana and Bartholomew included), so her collapsed chip stack shows four chips and +2', async () => {
     await runSeed();
     const squad = await Group.findOne({ where: { group_id: 'strategy-squad' } });
     expect(squad).not.toBeNull();
-    const rows = await UserGroup.findAll({ where: { group_id: squad.id } });
+    const rows = await UserGroup.findAll({ where: { group_id: squad.id, status: 'active' } });
     expect(rows).toHaveLength(7);
     const alice = await seededUser('Alice');
     const diana = await seededUser('Diana');
@@ -186,10 +187,13 @@ describe('seed token fixtures (quick 261103-glx)', () => {
     expect(byUser[alice.id]).toBe('member');
     expect(byUser[diana.id]).toBe('member');
     expect(byUser[bartholomew.id]).toBe('member');
+    const COLLAPSED_LIMIT = 4; // MemberChipStack.tsx
     const others = rows.filter((m) => m.user_uuid !== alice.id);
-    expect(others.length).toBeGreaterThan(4); // COLLAPSED_LIMIT in MemberChipStack.tsx
+    expect(others.length - COLLAPSED_LIMIT).toBe(2); // the "+2" chip
   });
+});
 
+describe('seed token fixtures (quick 261103-glx)', () => {
   it('group-restore: Retired Raiders is soft-deleted through the service, its link is printed, previews publicly and restores as Alice', async () => {
     const lines = await runSeed();
 
