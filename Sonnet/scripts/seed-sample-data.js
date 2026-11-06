@@ -372,7 +372,8 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
       // squad member a 7-player game would change Weekend Warriors (Alice, Bob, Charlie,
       // Diana are in both) or un-empty No Games Yet (Eve, Frank, Bartholomew), so no
       // UserGame row is added. Diana's Tue/Thu availability patterns also join the squad
-      // heatmap; nothing reads it. Pinned by tests/scripts/seedSampleData.test.js
+      // heatmap (availabilityService reads every member's recurring patterns); no test or
+      // walk row asserts on it. Pinned by tests/scripts/seedSampleData.test.js
       // ("Strategy Squad has 7 active members").
       { user: users[3], group: groups[1], role: 'member' },
       { user: users[6], group: groups[1], role: 'member' },
@@ -863,9 +864,10 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
 
     // DECISION Phase 87.8 (R8/DEC-4): responses for Bob, Charlie and Diana ONLY —
     // Alice's response is deliberately WITHHELD, chosen OVER seeding all four
-    // members. promptLifecycleService.checkConsensusAndClose closes a prompt the
-    // instant respondedCount === totalActive, and Weekend Warriors has exactly 4
-    // active members — seeding 3 of 4 keeps the prompt 'active' by construction,
+    // members. promptLifecycleService.checkConsensusAndClose closes a prompt once
+    // respondedCount >= totalActive (it returns not-closed while respondedCount <
+    // totalActive), and Weekend Warriors has 4 active members — seeding 3 of 4 keeps
+    // the prompt 'active' by construction (any roster LARGER than the 3 responders does),
     // so a real member can still respond during a walkthrough without the seed
     // having pre-tripped consensus auto-close. Adding Alice here is a decision,
     // not a completeness fix.
@@ -896,7 +898,7 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
     const aggregation = await heatmapService.aggregateResponses(availabilityPrompt.id);
     console.log(`   ✓ aggregateResponses: ${aggregation.suggestionCount} suggestion rows (${aggregation.message})`);
 
-    // Consensus sanity line — same query shape promptLifecycleService.js:56-70
+    // Consensus sanity line — same query shape as promptLifecycleService.checkConsensusAndClose (the totalActive / respondedCount counts)
     // uses — so a human running `npm run seed` sees at a glance that consensus
     // was NOT tripped.
     const totalActive = await UserGroup.count({
