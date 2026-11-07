@@ -1113,8 +1113,11 @@ router.put('/:id', validateUUID('id'), validateEventUpdate, async (req, res) => 
     // as the form's ISO string, so String() of the two never matched and every pre-start edit sent a
     // "Date Changed" email (owner report 2026-11-07, pinned by events.lifecycle.test.js test 4b). Same
     // comparison the status-derivation gate above already uses.
-    const dateChanged =
-      !!start_date && new Date(start_date).getTime() !== new Date(oldStartDate).getTime();
+    // Owner ruling 2026-11-07 (PR #69 review note N2): compare WHOLE MINUTES. The edit form works in
+    // minutes, so a stored start carrying seconds (legacy or imported rows) must not read as a change on
+    // every unchanged save; no UI can move a start by less than a minute.
+    const toMinute = (d) => Math.floor(new Date(d).getTime() / 60000);
+    const dateChanged = !!start_date && toMinute(start_date) !== toMinute(oldStartDate);
     const updateNowMs = Date.now();
     const oldStartMs = oldStartDate ? new Date(oldStartDate).getTime() : 0;
     const updateEmailsAllowed = oldStartMs > 0 && updateNowMs < oldStartMs;
