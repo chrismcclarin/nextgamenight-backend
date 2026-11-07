@@ -292,6 +292,37 @@ describe('Event lifecycle: update cutoff', () => {
     expect(mockSendToMany.mock.calls[0][1]).toBe('event_updated');
   });
 
+  // Test 4b (owner report 2026-11-07: "I changed nothing else and then I got an email 'Date changed'"):
+  // the client sends the whole form on every edit, start_date included, as an ISO string; the stored
+  // start_date is a Date. Comparing their STRING forms made every pre-start edit a "Date Changed" email.
+  // An edit that leaves the start INSTANT unchanged must send nothing.
+  it('does NOT fire update emails when start_date is re-sent unchanged (same instant, ISO string form)', async () => {
+    const oldStart = new Date(Date.now() + 2 * 60 * 60 * 1000); // +2h, a Date as Sequelize returns it
+    const sameStart = oldStart.toISOString(); // what the edit form sends back
+    const event = {
+      id: TEST_EVENT_ID,
+      group_id: TEST_GROUP_ID,
+      game_id: TEST_GAME_ID,
+      start_date: oldStart,
+      duration_minutes: 60,
+      update: jest.fn().mockResolvedValue({}),
+    };
+    mockEventFindByPk
+      .mockResolvedValueOnce(event)
+      .mockResolvedValueOnce({
+        ...event,
+        EventParticipations: [],
+        toJSON: () => ({ id: event.id, custom_participants: [] }),
+      });
+
+    const res = await request(app)
+      .put(`/api/events/${TEST_EVENT_ID}`)
+      .send({ start_date: sameStart, duration_minutes: 60, notes: 'faction names added' });
+
+    expect(res.status).toBe(200);
+    expect(mockSendToMany).not.toHaveBeenCalled();
+  });
+
   // Test 5: Silent update after start
   it('SUPPRESSES update emails when event already started 5 min ago', async () => {
     const oldStart = new Date(Date.now() - 5 * 60 * 1000); // -5min
