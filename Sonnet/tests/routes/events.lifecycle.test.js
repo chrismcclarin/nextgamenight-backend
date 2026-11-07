@@ -317,7 +317,7 @@ describe('Event lifecycle: update cutoff', () => {
 
     const res = await request(app)
       .put(`/api/events/${TEST_EVENT_ID}`)
-      .send({ start_date: sameStart, duration_minutes: 60, notes: 'faction names added' });
+      .send({ start_date: sameStart, duration_minutes: 60, comments: 'faction names added' });
 
     expect(res.status).toBe(200);
     expect(mockSendToMany).not.toHaveBeenCalled();
