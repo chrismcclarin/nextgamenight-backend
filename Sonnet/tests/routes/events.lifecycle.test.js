@@ -292,6 +292,63 @@ describe('Event lifecycle: update cutoff', () => {
     expect(mockSendToMany.mock.calls[0][1]).toBe('event_updated');
   });
 
+  // Test 4b (owner report 2026-11-07: "I changed nothing else and then I got an email 'Date changed'"):
+  // the client sends the whole form on every edit, start_date included, as an ISO string; the stored
+  // start_date is a Date. Comparing their STRING forms made every pre-start edit a "Date Changed" email.
+  // An edit that leaves the start INSTANT unchanged must send nothing.
+  it('does NOT fire update emails when start_date is re-sent unchanged (same instant, ISO string form)', async () => {
+    const oldStart = new Date(Date.now() + 2 * 60 * 60 * 1000); // +2h, a Date as Sequelize returns it
+    const sameStart = oldStart.toISOString(); // what the edit form sends back
+    const event = {
+      id: TEST_EVENT_ID,
+      group_id: TEST_GROUP_ID,
+      game_id: TEST_GAME_ID,
+      start_date: oldStart,
+      duration_minutes: 60,
+      update: jest.fn().mockResolvedValue({}),
+    };
+    mockEventFindByPk
+      .mockResolvedValueOnce(event)
+      .mockResolvedValueOnce({
+        ...event,
+        EventParticipations: [],
+        toJSON: () => ({ id: event.id, custom_participants: [] }),
+      });
+
+    const res = await request(app)
+      .put(`/api/events/${TEST_EVENT_ID}`)
+      .send({ start_date: sameStart, duration_minutes: 60, comments: 'faction names added' });
+
+    expect(res.status).toBe(200);
+    expect(mockSendToMany).not.toHaveBeenCalled();
+  });
+
+  // Test 4c (owner, 2026-11-07, after review note N2): the edit form works in whole minutes, so a stored start
+  // with hidden SECONDS (legacy or imported rows) would otherwise read as a change on every unchanged save.
+  // The gate compares whole minutes: 19:30:17 re-sent as 19:30:00 is NOT a change; 19:31:00 IS.
+  it('does NOT fire update emails when only hidden seconds differ (minute-level guard), but DOES for a one-minute move', async () => {
+    const base = new Date(Date.now() + 2 * 60 * 60 * 1000);
+    base.setSeconds(17, 0); // stored start carries :17 seconds
+    const sameMinute = new Date(base); sameMinute.setSeconds(0, 0);
+    const nextMinute = new Date(base); nextMinute.setSeconds(0, 0); nextMinute.setMinutes(nextMinute.getMinutes() + 1);
+    const mk = () => ({
+      id: TEST_EVENT_ID, group_id: TEST_GROUP_ID, game_id: TEST_GAME_ID, start_date: new Date(base), duration_minutes: 60,
+      update: jest.fn().mockResolvedValue({}),
+    });
+    let event = mk();
+    mockEventFindByPk.mockResolvedValueOnce(event).mockResolvedValueOnce({ ...event, EventParticipations: [], toJSON: () => ({ id: event.id, custom_participants: [] }) });
+    let res = await request(app).put(`/api/events/${TEST_EVENT_ID}`).send({ start_date: sameMinute.toISOString(), duration_minutes: 60 });
+    expect(res.status).toBe(200);
+    expect(mockSendToMany).not.toHaveBeenCalled();
+
+    event = mk();
+    mockEventFindByPk.mockResolvedValueOnce(event).mockResolvedValueOnce({ ...event, EventParticipations: [], toJSON: () => ({ id: event.id, custom_participants: [] }) });
+    res = await request(app).put(`/api/events/${TEST_EVENT_ID}`).send({ start_date: nextMinute.toISOString(), duration_minutes: 60 });
+    expect(res.status).toBe(200);
+    expect(mockSendToMany).toHaveBeenCalledTimes(1);
+    expect(mockSendToMany.mock.calls[0][1]).toBe('event_updated');
+  });
+
   // Test 5: Silent update after start
   it('SUPPRESSES update emails when event already started 5 min ago', async () => {
     const oldStart = new Date(Date.now() - 5 * 60 * 1000); // -5min

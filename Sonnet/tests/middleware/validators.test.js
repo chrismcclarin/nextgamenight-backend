@@ -55,3 +55,34 @@ describe('validate middleware -> validation envelope (dual-emit)', () => {
     expect(res.body.ok).toBe(true);
   });
 });
+
+// PR #69 review L1 (2026-11-07): express-validator's non-strict isISO8601() accepts ISO week ("2026-W10"), ordinal
+// ("2026-100") and basic ("20261107T100000Z") forms that `new Date()` cannot parse (NaN). Downstream, PUT /events/:id
+// compares instants with getTime(), so a NaN start would read as "date changed" AND flip the status derivation. Both
+// event validators must reject anything JavaScript cannot parse as a date.
+describe('event validators -> start_date must parse as a JavaScript date', () => {
+  const { validateEventCreate, validateEventUpdate } = require('../../middleware/validators');
+  const app2 = express();
+  app2.use(express.json());
+  app2.post('/create', validateEventCreate, (req, res) => res.json({ ok: true }));
+  app2.put('/update', validateEventUpdate, (req, res) => res.json({ ok: true }));
+  const unparsable = ['2026-W10', '2026-100', '20261107T100000Z'];
+  const createBody = { group_id: '11111111-1111-4111-8111-111111111111', game_name: 'Catan' };
+
+  for (const bad of unparsable) {
+    it(`update rejects start_date "${bad}" (ISO 8601 by the library, NaN to new Date)`, async () => {
+      const res = await request(app2).put('/update').send({ start_date: bad });
+      expect(res.status).toBe(400);
+      expect(res.body.errors.some((e) => e.field === 'start_date')).toBe(true);
+    });
+    it(`create rejects start_date "${bad}"`, async () => {
+      const res = await request(app2).post('/create').send({ ...createBody, start_date: bad });
+      expect(res.status).toBe(400);
+      expect(res.body.errors.some((e) => e.field === 'start_date')).toBe(true);
+    });
+  }
+  it('update still accepts a real ISO string', async () => {
+    const res = await request(app2).put('/update').send({ start_date: '2026-11-14T03:00:00.000Z' });
+    expect(res.status).toBe(200);
+  });
+});

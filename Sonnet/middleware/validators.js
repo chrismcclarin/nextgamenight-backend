@@ -329,6 +329,14 @@ const guestNameCarrierRules = () => [
     .custom(makeGuestNameFieldValidator('Picked-by name')),
 ];
 
+// PR #69 review L1 (2026-11-07): isISO8601() without `strict` accepts ISO week ("2026-W10"), ordinal ("2026-100")
+// and basic ("20261107T100000Z") forms that `new Date()` turns into NaN; the routes then compare getTime() values and
+// derive status from the parsed date, so an unparsable start must stop here. Pinned by validators.test.js.
+const parsesAsDate = (value) => {
+  if (Number.isNaN(new Date(value).getTime())) throw new Error('Start date must be a date JavaScript can parse');
+  return true;
+};
+
 const validateEventCreate = [
   body('group_id')
     .isUUID()
@@ -344,7 +352,9 @@ const validateEventCreate = [
     .withMessage('Game name must be between 1 and 255 characters'),
   body('start_date')
     .isISO8601()
-    .withMessage('Start date must be a valid ISO 8601 date'),
+    .withMessage('Start date must be a valid ISO 8601 date')
+    .bail()
+    .custom(parsesAsDate),
   body('duration_minutes')
     .optional({ nullable: true })
     .isInt({ min: 1, max: 1440 })
@@ -415,7 +425,9 @@ const validateEventUpdate = [
   body('start_date')
     .optional()
     .isISO8601()
-    .withMessage('Start date must be a valid ISO 8601 date'),
+    .withMessage('Start date must be a valid ISO 8601 date')
+    .bail()
+    .custom(parsesAsDate),
   body('duration_minutes')
     .optional({ nullable: true })
     .custom((value) => {
