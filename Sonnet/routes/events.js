@@ -1109,7 +1109,12 @@ router.put('/:id', validateUUID('id'), validateEventUpdate, async (req, res) => 
     // (no grace window). Use the OLD start time as the cutoff — once an event has
     // started, recipients are en route or on-site; emailing them about a venue
     // change post-start is worse than silent.
-    const dateChanged = start_date && String(oldStartDate) !== String(start_date);
+    // Compare INSTANTS, never string forms: `oldStartDate` is a Date (Sequelize) and `start_date` arrives
+    // as the form's ISO string, so String() of the two never matched and every pre-start edit sent a
+    // "Date Changed" email (owner report 2026-11-07, pinned by events.lifecycle.test.js test 4b). Same
+    // comparison the status-derivation gate above already uses.
+    const dateChanged =
+      !!start_date && new Date(start_date).getTime() !== new Date(oldStartDate).getTime();
     const updateNowMs = Date.now();
     const oldStartMs = oldStartDate ? new Date(oldStartDate).getTime() : 0;
     const updateEmailsAllowed = oldStartMs > 0 && updateNowMs < oldStartMs;
