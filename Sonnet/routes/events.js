@@ -1109,13 +1109,16 @@ router.put('/:id', validateUUID('id'), validateEventUpdate, async (req, res) => 
     // (no grace window). Use the OLD start time as the cutoff — once an event has
     // started, recipients are en route or on-site; emailing them about a venue
     // change post-start is worse than silent.
-    // Compare INSTANTS, never string forms: `oldStartDate` is a Date (Sequelize) and `start_date` arrives
-    // as the form's ISO string, so String() of the two never matched and every pre-start edit sent a
-    // "Date Changed" email (owner report 2026-11-07, pinned by events.lifecycle.test.js test 4b). Same
-    // comparison the status-derivation gate above already uses.
-    // Owner ruling 2026-11-07 (PR #69 review note N2): compare WHOLE MINUTES. The edit form works in
-    // minutes, so a stored start carrying seconds (legacy or imported rows) must not read as a change on
-    // every unchanged save; no UI can move a start by less than a minute.
+    // DECISION PR #69 (2026-11-07, owner ruling after review note N2): the email gate compares WHOLE
+    // MINUTES, never string forms and deliberately NOT exact instants. `oldStartDate` is a Date (Sequelize)
+    // and `start_date` arrives as the form's ISO string, so String() of the two never matched and every
+    // pre-start edit sent a "Date Changed" email (owner report; pinned by events.lifecycle.test.js 4b). The
+    // edit form works in minutes, so a stored start carrying seconds (legacy or imported rows) must not read
+    // as a change on every unchanged save (test 4c); no UI can move a start by less than a minute. The
+    // status-derivation gate above stays on exact instants ON PURPOSE: a same-minute, different-seconds
+    // edit then re-derives status once (harmless — the update writes the new value, and the status only
+    // flips when the start really is in the past) while sending no email. Making the two gates match is a
+    // decision, not a cleanup.
     const toMinute = (d) => Math.floor(new Date(d).getTime() / 60000);
     const dateChanged = !!start_date && toMinute(start_date) !== toMinute(oldStartDate);
     const updateNowMs = Date.now();
