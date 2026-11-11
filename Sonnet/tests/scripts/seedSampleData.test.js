@@ -298,7 +298,7 @@ describe('seed look fixtures (88.9 round 2, quick 261110-ugi)', () => {
     expect(weekend.background_image_url).toBeNull();
   }, 120000);
 
-  it('N16: Photo Club is a photo card with NO stored colour that Alice belongs to — the image is the app\'s own /bgg-logo.png, and Dice Dynasty and No Games Yet still have no Alice', async () => {
+  it('N16: Photo Club is a photo card with NO stored colour that Alice belongs to — the image is the app\'s own game-table picture /seed/photo-club-table.jpg (a busy picture, not a logo), and Dice Dynasty and No Games Yet still have no Alice', async () => {
     // A FRONTEND_URL distinct from the seed's localhost:3000 fallback, so the pin can tell
     // an env read from a hardcoded origin (review L-2). Per test only: parseRsvpLink
     // hardcodes localhost:3000 for the others, and afterEach restores the env snapshot.
@@ -313,7 +313,7 @@ describe('seed look fixtures (88.9 round 2, quick 261110-ugi)', () => {
     if (club.background_color !== null) {
       expect(club.background_color).toMatch(/^#(?:fff|ffffff)$/i);
     }
-    expect(club.background_image_url).toBe(`${walkOrigin}/bgg-logo.png`);
+    expect(club.background_image_url).toBe(`${walkOrigin}/seed/photo-club-table.jpg`);
 
     const alice = await seededUser('Alice');
     const eve = await seededUser('Eve');
