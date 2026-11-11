@@ -250,8 +250,16 @@ describe('seed look fixtures (88.9 round 2, quick 261110-ugi)', () => {
     expect(onDay.map((e) => e.status).sort()).toEqual(['cancelled', 'completed']);
 
     // Both are a game the squad has already played, so its games list does not grow.
+    // Play history is a past start AND a status other than cancelled, the games list's own
+    // rule (routes/lists.js ("event.status !== 'cancelled'"), DECISION Phase 88-34 WI-B2).
+    // Without the status filter, the started-today cancelled Gloomhaven night alone would
+    // satisfy this pin (review M-1).
     const history = await Event.findAll({
-      where: { group_id: squad.id, start_date: { [Op.lte]: new Date() } },
+      where: {
+        group_id: squad.id,
+        start_date: { [Op.lte]: new Date() },
+        status: { [Op.ne]: 'cancelled' },
+      },
     });
     const playedGameIds = new Set(history.map((e) => e.game_id));
     expect(playedGameIds.has(cancelled.game_id)).toBe(true);
@@ -291,6 +299,11 @@ describe('seed look fixtures (88.9 round 2, quick 261110-ugi)', () => {
   }, 120000);
 
   it('N16: Photo Club is a photo card with NO stored colour that Alice belongs to — the image is the app\'s own /bgg-logo.png, and Dice Dynasty and No Games Yet still have no Alice', async () => {
+    // A FRONTEND_URL distinct from the seed's localhost:3000 fallback, so the pin can tell
+    // an env read from a hardcoded origin (review L-2). Per test only: parseRsvpLink
+    // hardcodes localhost:3000 for the others, and afterEach restores the env snapshot.
+    const walkOrigin = 'http://walk.test:3999';
+    process.env.FRONTEND_URL = walkOrigin;
     await runSeed();
     const club = await Group.findOne({ where: { group_id: 'photo-club' } });
     expect(club).not.toBeNull();
@@ -300,7 +313,7 @@ describe('seed look fixtures (88.9 round 2, quick 261110-ugi)', () => {
     if (club.background_color !== null) {
       expect(club.background_color).toMatch(/^#(?:fff|ffffff)$/i);
     }
-    expect(club.background_image_url).toBe('http://localhost:3000/bgg-logo.png');
+    expect(club.background_image_url).toBe(`${walkOrigin}/bgg-logo.png`);
 
     const alice = await seededUser('Alice');
     const eve = await seededUser('Eve');
@@ -332,9 +345,17 @@ describe('seed look fixtures (88.9 round 2, quick 261110-ugi)', () => {
     });
     expect(started).toHaveLength(1);
     const s = started[0].start_date;
-    const localMidnight = new Date(before.getFullYear(), before.getMonth(), before.getDate());
+    const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
+    const localMidnightOf = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate());
+    const localMidnight = localMidnightOf(before);
     expect(s.getTime()).toBeGreaterThanOrEqual(localMidnight.getTime());
-    expect(s.getTime()).toBeGreaterThanOrEqual(before.getTime() - 2 * 60 * 60 * 1000 - 1000);
+    expect(s.getTime()).toBeGreaterThanOrEqual(before.getTime() - TWO_HOURS_MS - 1000);
+    // Upper bound (review L-1): the seed's now lies in [before, after] and the rule
+    // max(local midnight of now, now - 2h) never decreases as now grows, so its value at
+    // after caps the start. Without this, a start AT the seed instant would pass. The
+    // 1 s tolerance matches the lower bound's.
+    const latestAllowed = Math.max(localMidnightOf(after).getTime(), after.getTime() - TWO_HOURS_MS);
+    expect(s.getTime()).toBeLessThanOrEqual(latestAllowed + 1000);
     // A run that crosses local midnight may land on either day.
     expect([before.toDateString(), after.toDateString()]).toContain(s.toDateString());
     const gloomhaven = await Game.findOne({ where: { bgg_id: 174430 } });
