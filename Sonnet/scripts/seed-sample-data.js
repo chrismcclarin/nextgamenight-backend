@@ -1043,7 +1043,7 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
     // what makes a fresh `npm run seed` walkable end-to-end instead.
     // ────────────────────────────────────────────────────────────────────────
 
-    // --- Friendships: one accepted, one pending -----------------------------
+    // --- Friendships: four accepted, one pending ----------------------------
     // Both states are needed: accepted drives the friend list + the
     // invite-by-friend path, pending drives the incoming-request surface AND
     // the friend-pill staleness the walk flagged.
@@ -1058,7 +1058,23 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
       addressee_uuid: users[0].id, // -> Alice (INCOMING pending request for Alice)
       status: 'pending',
     });
-    console.log('   ✓ 2 friendships (Alice<->Diana accepted, Charlie->Alice pending)\n');
+    // DECISION quick-261111-frd (88.9-51 glance rows N45 / N54): three MORE accepted
+    // friends — Eve, Frank and Bartholomew — chosen because none of them is a Weekend
+    // Warriors member (the one group Alice owns, so the one she can invite to), OVER
+    // (a) befriending Bob or Charlie, who are members there and would render as disabled
+    // checkboxes like Diana, and (b) staging friends per walk with a scratch insert, which
+    // the next reseed destroys (README-seed.md: the seed is the fixture layer). N45 ticks two
+    // friends and then a third while the first send is held, so three is the floor. Bob keeps
+    // NO friendship row on purpose: he is the Weekend Warriors member whose name popover
+    // offers a live "Add friend". Tidying these away re-blocks both glance rows.
+    for (const friend of [users[4], users[5], users[6]]) { // 88.9-R2 fixture — Eve, Frank, Bartholomew: invitable accepted friends (N45, N54)
+      await Friendship.create({
+        requester_uuid: users[0].id, // Alice
+        addressee_uuid: friend.id,
+        status: 'accepted',
+      });
+    }
+    console.log('   ✓ 5 friendships (Alice<->Diana, Eve, Frank, Bartholomew accepted; Charlie->Alice pending)\n');
 
     // --- Game collections ---------------------------------------------------
     // UserGame is the "my collection" surface and the BringGamePicker source.
@@ -1242,7 +1258,7 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
     console.log(`   - ${reviews.length} reviews`);
     // Phase 88-34 Task 5 (WI-B4): report the new sections too, so a human
     // running the seed can see at a glance that the Test-2 gates are walkable.
-    console.log(`   - 2 friendships (1 accepted, 1 pending)`);
+    console.log(`   - 5 friendships (4 accepted, 1 pending)`);
     console.log(`   - ${collectionRows.length} collection games`);
     console.log(`   - ${availabilityRows.length} recurring availability patterns`);
     console.log(`   - 1 pending group invite`);
