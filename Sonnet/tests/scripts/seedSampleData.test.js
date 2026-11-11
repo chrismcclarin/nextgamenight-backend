@@ -3,6 +3,8 @@
 // (Phase 88.9 round 2, pick row D2) the Strategy Squad roster that renders the +N chip:
 // a group-restore link for the soft-deleted group Retired Raiders, and Alice's three
 // single-use RSVP links on the Weekend Warriors Catan night.
+// Quick task 261110-ugi adds the 88.9 round-2 glance fixtures block (status nights,
+// group colours and images, the cancelled-today night), one pin per glance row.
 //
 // Runs the seed IN-PROCESS (the reportAccountHygiene.test.js precedent), calling
 // seedDatabase({ syncSchema: false, closeConnection: false }): the schema stays the one
@@ -19,7 +21,8 @@ const util = require('util');
 const request = require('supertest');
 const express = require('express');
 const models = require('../../models');
-const { User, Group, UserGroup, Event, SingleUseToken } = models;
+const { User, Group, UserGroup, Event, SingleUseToken, Game, EventParticipation } = models;
+const { Op } = require('sequelize');
 const groupRoutes = require('../../routes/groups');
 // The module OBJECT, not destructured: the seed calls rsvpLinks.mintRsvpBatch through
 // this same object (DECISION quick-261103-glx G4), so rsvp F can spy the mint here.
@@ -191,6 +194,69 @@ describe('seed membership fixtures (Phase 88.9 round 2, pick row D2)', () => {
     const others = rows.filter((m) => m.user_uuid !== alice.id);
     expect(others.length - COLLAPSED_LIMIT).toBe(2); // the "+2" chip
   });
+});
+
+describe('seed look fixtures (88.9 round 2, quick 261110-ugi)', () => {
+  // The 88.9-51 owner glance reads these on the local walk DB after a fresh reseed. Each
+  // pin names its glance row; see sub-block (e) in scripts/seed-sample-data.js and its
+  // DECISION quick-261110-ugi markers for why each fixture is shaped as it is.
+  async function futureSquadNight(squad, status) {
+    const rows = await Event.findAll({
+      where: { group_id: squad.id, status, start_date: { [Op.gt]: new Date() } },
+    });
+    expect(rows).toHaveLength(1);
+    return rows[0];
+  }
+
+  it('W57 / R2-03: Strategy Squad holds one FUTURE cancelled Gloomhaven night at 18:00 local, 12 local days out, and Alice is an active member so her calendar lists it', async () => {
+    await runSeed();
+    const squad = await Group.findOne({ where: { group_id: 'strategy-squad' } });
+    expect(squad).not.toBeNull();
+    const night = await futureSquadNight(squad, 'cancelled');
+    const gloomhaven = await Game.findOne({ where: { bgg_id: 174430 } });
+    expect(night.game_id).toBe(gloomhaven.id);
+    const ahead = night.start_date.getTime() - Date.now();
+    expect(ahead).toBeGreaterThan(11 * DAY_MS);
+    expect(ahead).toBeLessThan(13 * DAY_MS);
+    expect(night.start_date.getHours()).toBe(18);
+    expect(night.start_date.getMinutes()).toBe(0);
+    const alice = await seededUser('Alice');
+    expect(await UserGroup.count({ where: { group_id: squad.id, user_uuid: alice.id, status: 'active' } })).toBe(1);
+  }, 120000);
+
+  it('W57 / R2-03: a FUTURE completed night sits on the same local day as the cancelled one, so Alice\'s day modal opens with exactly those two rows, both Gloomhaven, already in Strategy Squad\'s history', async () => {
+    await runSeed();
+    const squad = await Group.findOne({ where: { group_id: 'strategy-squad' } });
+    expect(squad).not.toBeNull();
+    const cancelled = await futureSquadNight(squad, 'cancelled');
+    const completed = await futureSquadNight(squad, 'completed');
+    const day = cancelled.start_date.toDateString();
+    expect(completed.start_date.toDateString()).toBe(day);
+    expect(completed.start_date.getHours()).toBe(20);
+    expect(completed.start_date.getMinutes()).toBe(30);
+
+    // Alice's calendar, built the way GET /events/user/:user_id builds it: her active
+    // groups' events OR the events she participates in, with no status filter.
+    const alice = await seededUser('Alice');
+    const groupIds = (await UserGroup.findAll({ where: { user_uuid: alice.id, status: 'active' } }))
+      .map((m) => m.group_id);
+    const eventIds = (await EventParticipation.findAll({ where: { user_id: alice.id } }))
+      .map((p) => p.event_id);
+    const calendar = await Event.findAll({
+      where: { [Op.or]: [{ group_id: { [Op.in]: groupIds } }, { id: { [Op.in]: eventIds } }] },
+    });
+    const onDay = calendar.filter((e) => e.start_date.toDateString() === day);
+    expect(onDay).toHaveLength(2);
+    expect(onDay.map((e) => e.status).sort()).toEqual(['cancelled', 'completed']);
+
+    // Both are a game the squad has already played, so its games list does not grow.
+    const history = await Event.findAll({
+      where: { group_id: squad.id, start_date: { [Op.lte]: new Date() } },
+    });
+    const playedGameIds = new Set(history.map((e) => e.game_id));
+    expect(playedGameIds.has(cancelled.game_id)).toBe(true);
+    expect(playedGameIds.has(completed.game_id)).toBe(true);
+  }, 120000);
 });
 
 describe('seed token fixtures (quick 261103-glx)', () => {
