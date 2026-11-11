@@ -108,6 +108,8 @@ const sampleGroups = [
   // (the token-fixtures section) so /restore/group/[token] is walkable; hidden
   // from every list by the paranoid clause until someone restores it.
   { group_id: 'retired-raiders', name: 'Retired Raiders' },
+  // Quick 261110-ugi: appended at index 6 so every existing groups[N] stays put; see sub-block (e) U3.
+  { group_id: 'photo-club', name: 'Photo Club' }, // 88.9-R2 fixture — Photo Club (N16)
 ];
 
 const sampleGames = [
@@ -391,6 +393,9 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
       { user: users[0], group: groups[5], role: 'owner' },
       { user: users[1], group: groups[5], role: 'member' },
       { user: users[4], group: groups[5], role: 'member' },
+      // Photo Club (quick 261110-ugi): Eve (owner), Alice; see walk-states sub-block (e) U3.
+      { user: users[4], group: groups[6], role: 'owner' }, // 88.9-R2 fixture — Photo Club (N16)
+      { user: users[0], group: groups[6], role: 'member' }, // 88.9-R2 fixture — Photo Club (N16)
     ];
 
     for (const { user, group, role } of userGroups) {
@@ -731,7 +736,7 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
     //     game whose BGG images are dead (the SafeImage fallback row): the states
     //     the walk measures. `.invalid` is the RFC 2606 reserved TLD, so the
     //     browser fails each fetch fast instead of hanging on a real host.
-    await casualGroup.update({
+    await casualGroup.update({ // 88.9-R2 fixture — O-02 / #207, the O02d1 image-failure arm (N16; seeded since round 1b)
       color_preset: 'blue',
       background_image_url: 'https://images.example.invalid/casual-gamers-header.jpg',
     });
@@ -742,7 +747,9 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
 
     // (e) Phase 88.9 round 2 (quick 261110-ugi): the 88.9-51 owner-glance fixtures.
     //     The W57 / R2-03 status nights below serve N11 (the Calendar sheet's Later
-    //     rows at 375) and N12 (the day modal at 1280).
+    //     rows at 375) and N12 (the day modal at 1280); after them come Strategy
+    //     Squad's colour (N12, N16b), Photo Club (N16) and the cancelled night that
+    //     started earlier today (N40).
     // DECISION quick-261110-ugi U1: the two status nights go on Strategy Squad, OVER
     // Weekend Warriors (the shared CI journey group, kept unmutated by e2e-fixtures.js
     // "DECISION Phase 88.3 (OQ-1)") and OVER Casual Gamers (its valid-protocol broken
@@ -783,7 +790,72 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
       status: 'completed',
     });
     events.push(completedFutureNight);
-    console.log('   ✓ Walk states: open ballot (2 options), 2 guests (Eve at Catan, Alice at Dice Dynasty), 2 schedules (1 active, 1 paused), Casual Gamers blue + broken image, Azul dead images');
+
+    // Strategy Squad's colour (A + B; N12 tint, N16b).
+    // DECISION quick-261110-ugi U2: Strategy Squad is the coloured, image-less group,
+    // OVER Weekend Warriors (e2e-fixtures.js "DECISION Phase 88.3 (OQ-1)" keeps the shared
+    // CI journey group unmutated). The preset is 'green' because N16b's wording expects
+    // the preset green and it is in the validator's preset list (GROUP_COLOUR_PRESET_IDS);
+    // only color_preset is written, the Casual Gamers precedent above. Recorded
+    // consequence: Strategy Squad is the only seeded group giving Alice more than four
+    // other members, so on the walk DB the +N chip now renders on the tinted arm. The
+    // tinted arm adds a hairline; the +N fill pair is unchanged (MemberChipStack
+    // OVERFLOW_PAIR). Its past rows, its started-today cancelled night and both future
+    // status nights all carry the green. Changing the group or the preset is a decision,
+    // not a cleanup.
+    await strategyGroup.update({ color_preset: 'green' }); // 88.9-R2 fixture — coloured, image-less group (N12 tint, N16b)
+
+    // Photo Club, the photo card with NO stored colour (C; N16).
+    // DECISION quick-261110-ugi U3: a NEW two-member group, OVER (1) Weekend Warriors
+    // (OQ-1, unmutated); (2) adding Alice to Dice Dynasty (she must stay its guest) or to
+    // No Games Yet (it must stay game-less: suggestionService pools every member's games,
+    // and Alice owns three); (3) stripping Strategy Squad's or Casual Gamers' colour (each
+    // serves another glance row); (4) un-deleting Retired Raiders (the restore fixture).
+    // The image is the app's own public asset built from FRONTEND_URL, OVER a .invalid
+    // host (a second failure-arm card, when N16 needs a picture that renders) and OVER a
+    // third-party photo host (every page load would reach an outside site). The trade-off:
+    // it is a logo, not a photo; and if the FE ever drops the asset, or FRONTEND_URL points
+    // somewhere that does not serve it, the card degrades to the image-failure arm. The
+    // URL is absolute because the FE allow-list rejects relative refs. background_color
+    // stays at the model default, which the FE treats as unset: the shape of every group
+    // nobody ever coloured. Eve is owner and Alice a plain member, so no owner affordance
+    // joins her card. One past Ticket to Ride night, so the "Last Game:" row shows a game
+    // name (N16's question is that row's ink). Changing the group, the image or the
+    // members is a decision, not a cleanup.
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+    const photoClub = groups[6];
+    await photoClub.update({ background_image_url: `${frontendUrl}/bgg-logo.png` }); // 88.9-R2 fixture — photo card with NO stored colour (N16)
+    const photoClubNight = await Event.create({ // 88.9-R2 fixture — Photo Club's Last Game night (N16)
+      group_id: photoClub.id,
+      game_id: games[1].id, // Ticket to Ride
+      start_date: new Date(now.getTime() - 4 * 24 * 60 * 60 * 1000),
+      duration_minutes: 60,
+      is_group_win: false,
+      comments: 'First club night: a quick round before the slideshow.',
+      status: 'completed',
+    });
+    events.push(photoClubNight);
+
+    // The cancelled night that started earlier today (D; N40).
+    // DECISION quick-261110-ugi U4: the start is the LATER of local midnight of the seed's
+    // day and the seed time minus 2 hours. REJECTED: a fixed evening hour today, because a
+    // morning seed puts it in the future, where it lands in Later WITH a tag (the opposite
+    // of N40). REJECTED: an unclamped seed-time-minus-2-hours, because before 02:00 it
+    // falls on yesterday and reaches Past by the date split, skipping the started-today
+    // routing N40 checks. The rule needs a reseed on the glance's own local day.
+    const seedDayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const startedTodayAt = new Date(Math.max(seedDayStart.getTime(), now.getTime() - 2 * 60 * 60 * 1000));
+    const cancelledTodayNight = await Event.create({ // 88.9-R2 fixture — cancelled after it started today (N40)
+      group_id: strategyGroup.id,
+      game_id: games[5].id, // Gloomhaven
+      start_date: startedTodayAt,
+      duration_minutes: 150,
+      is_group_win: false,
+      comments: 'Called off mid-game: the host had to leave.',
+      status: 'cancelled',
+    });
+    events.push(cancelledTodayNight);
+    console.log('   ✓ Walk states: open ballot (2 options), 2 guests (Eve at Catan, Alice at Dice Dynasty), 2 schedules (1 active, 1 paused), Casual Gamers blue + broken image, Azul dead images, Strategy Squad green + 3 status nights (2 future on one local day, 1 cancelled earlier today), Photo Club image + no colour');
     console.log(`✅ Created ${events.length} events with participations\n`);
 
     // Create Game Reviews
@@ -1091,7 +1163,7 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
     // (2026-10-27): a blocked walk row is a seed change, never a scratch insert.
     // ────────────────────────────────────────────────────────────────────────
     console.log('🔗 Seeding the walk token fixtures (quick 261103-glx)...');
-    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+    // frontendUrl is defined once, in walk-states sub-block (e) above (Photo Club's image).
 
     // --- Alice's RSVP links on the Weekend Warriors Catan night ---------------
     // DECISION quick-261103-glx G5: a MISSING secret skips the mint with a notice,
@@ -1157,7 +1229,7 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
     console.log(`   - ${groups.length} groups (1 of them soft-deleted: Retired Raiders, restorable for 30 days)`);
     console.log(`   - ${userGroups.length} user-group memberships (3 hidden with Retired Raiders)`);
     console.log(`   - ${games.length} games`);
-    console.log(`   - ${events.length} events (7 past + 3 future), plus 1 past event hidden with Retired Raiders`);
+    console.log(`   - ${events.length} events (8 past + 1 cancelled earlier today + 5 future), plus 1 past event hidden with Retired Raiders`);
     console.log(`   - ${reviews.length} reviews`);
     // Phase 88-34 Task 5 (WI-B4): report the new sections too, so a human
     // running the seed can see at a glance that the Test-2 gates are walkable.
@@ -1166,7 +1238,7 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
     console.log(`   - ${availabilityRows.length} recurring availability patterns`);
     console.log(`   - 1 pending group invite`);
     // Phase 88.9 round 1b: the walk states, so a reader sees they are seeded.
-    console.log(`   - 1 open ballot (2 options), 2 guest participations, 2 prompt schedules, 1 coloured group with a broken image, 1 game with dead images`);
+    console.log(`   - 1 open ballot (2 options), 2 guest participations, 2 prompt schedules, 1 coloured group with a broken image, 1 game with dead images, Strategy Squad green, 3 status nights, 1 no-colour photo group (Photo Club)`);
     if (rsvpUrls.length) {
       console.log(`   - 3 RSVP links for Alice (yes / maybe / no, Weekend Warriors Catan night)`);
     } else {
