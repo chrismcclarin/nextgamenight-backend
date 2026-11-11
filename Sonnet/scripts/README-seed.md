@@ -15,7 +15,7 @@ This script populates your database with realistic sample data for testing and d
 - **Dice Dynasty** - 3 members (Charlie owner, Eve, Frank); Alice is NOT a member and attends its event as a guest
 - **No Games Yet** - 3 members (Frank owner, Eve, Bartholomew); nobody in it owns a game, so create-event's Suggestions slot shows its empty hint
 - **Retired Raiders** - 3 members (Alice owner, Bob, Eve) and 1 past event; SOFT-DELETED at the end of the seed through the same service the delete button uses, so it is hidden everywhere and restorable for 30 days from the seed run (the restore link below)
-- **Photo Club** - 2 members (Eve owner, Alice); NO stored colour, and a header image that loads: the app's own `/bgg-logo.png` at `FRONTEND_URL`; 1 past Ticket to Ride night, so its "Last Game:" row shows a game name. It is the photo card with no stored colour (88.9-R2 fixture, quick 261110-ugi; N16)
+- **Photo Club** - 2 members (Eve owner, Alice); NO stored colour, and a header image that loads: the FE's own `/seed/photo-club-table.jpg` at `FRONTEND_URL` (a busy generated game-table picture with a bright and a dark corner, so the title is judged over a real picture, not a logo); 1 past Ticket to Ride night, so its "Last Game:" row shows a game name. It is the photo card with no stored colour (88.9-R2 fixture, quick 261110-ugi; N16)
 
 ### Games (8)
 - **BGG Games:**

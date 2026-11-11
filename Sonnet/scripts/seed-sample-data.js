@@ -815,11 +815,16 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
     // No Games Yet (it must stay game-less: suggestionService pools every member's games,
     // and Alice owns three); (3) stripping Strategy Squad's or Casual Gamers' colour (each
     // serves another glance row); (4) un-deleting Retired Raiders (the restore fixture).
-    // The image is the app's own public asset built from FRONTEND_URL, OVER a .invalid
-    // host (a second failure-arm card, when N16 needs a picture that renders) and OVER a
-    // third-party photo host (every page load would reach an outside site). The trade-off:
-    // it is a logo, not a photo; and if the FE ever drops the asset, or FRONTEND_URL points
-    // somewhere that does not serve it, the card degrades to the image-failure arm. The
+    // The image is the FE's own public asset /seed/photo-club-table.jpg built from
+    // FRONTEND_URL, OVER a .invalid host (a second failure-arm card, when N16 needs a
+    // picture that renders) and OVER a third-party photo host (every page load would reach
+    // an outside site). AMENDED quick-261110-ugi R1 (owner, 2026-11-11): a busy game-table
+    // picture with a bright corner and a dark corner, OVER the app's /bgg-logo.png this
+    // line first used — a 368x108 logo on a transparent ground cannot show what N16 asks
+    // the owner to judge (a white outlined title over an undimmed photo). The picture is
+    // generated, not a photograph; swapping the file for a real photo needs no seed
+    // change. If the FE ever drops the asset, or FRONTEND_URL points somewhere that does
+    // not serve it, the card degrades to the image-failure arm. The
     // URL is absolute because the FE allow-list rejects relative refs. background_color
     // stays at the model default, which the FE treats as unset: the shape of every group
     // nobody ever coloured. Eve is owner and Alice a plain member, so no owner affordance
@@ -828,7 +833,7 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
     // members is a decision, not a cleanup.
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
     const photoClub = groups[6];
-    await photoClub.update({ background_image_url: `${frontendUrl}/bgg-logo.png` }); // 88.9-R2 fixture — photo card with NO stored colour (N16)
+    await photoClub.update({ background_image_url: `${frontendUrl}/seed/photo-club-table.jpg` }); // 88.9-R2 fixture — photo card with NO stored colour (N16)
     const photoClubNight = await Event.create({ // 88.9-R2 fixture — Photo Club's Last Game night (N16)
       group_id: photoClub.id,
       game_id: games[1].id, // Ticket to Ride
