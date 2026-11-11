@@ -739,6 +739,50 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
       image_url: 'https://images.example.invalid/azul.jpg',
       thumbnail_url: 'https://images.example.invalid/azul-thumb.jpg',
     });
+
+    // (e) Phase 88.9 round 2 (quick 261110-ugi): the 88.9-51 owner-glance fixtures.
+    //     The W57 / R2-03 status nights below serve N11 (the Calendar sheet's Later
+    //     rows at 375) and N12 (the day modal at 1280).
+    // DECISION quick-261110-ugi U1: the two status nights go on Strategy Squad, OVER
+    // Weekend Warriors (the shared CI journey group, kept unmutated by e2e-fixtures.js
+    // "DECISION Phase 88.3 (OQ-1)") and OVER Casual Gamers (its valid-protocol broken
+    // header image makes every one of its rows an image row and would mix the O02d1 arm
+    // into the status-tag glance). Both nights sit on ONE local calendar day at fixed
+    // local hours, OVER the now-plus-N-days offsets the other future events use:
+    // EventCalendar's handleDayClick opens the day modal only for two or more events,
+    // and two now-relative offsets can straddle local midnight. This relies on the same
+    // "seed machine shares the walk browser's TZ" assumption the heatmap block records.
+    // The game is Gloomhaven, OVER Azul (dead images, so a broken picture would appear in
+    // the rows) and OVER a game the squad has not played (routes/lists.js would add it to
+    // the group's games list with play_count 0). No participations, so no per-user
+    // history surface moves. No route writes either status on a future night today (the
+    // create route derives 'scheduled' for a future start), so both rows are written
+    // straight through the model, like every seeded row. Changing the group, the day or
+    // the game is a decision, not a cleanup.
+    const statusDay = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 12);
+    const statusDayAt = (hours, minutes) => new Date(
+      statusDay.getFullYear(), statusDay.getMonth(), statusDay.getDate(), hours, minutes, 0, 0,
+    );
+    const cancelledFutureNight = await Event.create({ // 88.9-R2 fixture — CANCELLED future night (W57 / R2-03; N11, N12)
+      group_id: strategyGroup.id,
+      game_id: games[5].id, // Gloomhaven
+      start_date: statusDayAt(18, 0),
+      duration_minutes: 120,
+      is_group_win: false,
+      comments: 'Called off: not enough players this week.',
+      status: 'cancelled',
+    });
+    events.push(cancelledFutureNight);
+    const completedFutureNight = await Event.create({ // 88.9-R2 fixture — COMPLETED future night, same local day (W57 / R2-03; N11, N12)
+      group_id: strategyGroup.id,
+      game_id: games[5].id, // Gloomhaven
+      start_date: statusDayAt(20, 30),
+      duration_minutes: 90,
+      is_group_win: false,
+      comments: 'Short scenario, already marked done.',
+      status: 'completed',
+    });
+    events.push(completedFutureNight);
     console.log('   ✓ Walk states: open ballot (2 options), 2 guests (Eve at Catan, Alice at Dice Dynasty), 2 schedules (1 active, 1 paused), Casual Gamers blue + broken image, Azul dead images');
     console.log(`✅ Created ${events.length} events with participations\n`);
 
