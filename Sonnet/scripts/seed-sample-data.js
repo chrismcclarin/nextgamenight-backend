@@ -764,8 +764,12 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
     // the group's games list with play_count 0). No participations, so no per-user
     // history surface moves. No route writes either status on a future night today (the
     // create route derives 'scheduled' for a future start), so both rows are written
-    // straight through the model, like every seeded row. Changing the group, the day or
-    // the game is a decision, not a cleanup.
+    // straight through the model, like every seeded row. The future 'completed' night
+    // deliberately reproduces the state that migration
+    // 20260820000002-backfill-future-completed-events.js calls bug M4 and re-stamps
+    // 'scheduled' (the FE W57 tag renders it); never run that repair on a walk DB that
+    // needs this row, reseed instead. Changing the group, the day or the game is a
+    // decision, not a cleanup.
     const statusDay = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 12);
     const statusDayAt = (hours, minutes) => new Date(
       statusDay.getFullYear(), statusDay.getMonth(), statusDay.getDate(), hours, minutes, 0, 0,
