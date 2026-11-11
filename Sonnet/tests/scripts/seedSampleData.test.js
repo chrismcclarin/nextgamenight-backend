@@ -363,6 +363,48 @@ describe('seed look fixtures (88.9 round 2, quick 261110-ugi)', () => {
   }, 120000);
 });
 
+describe('seed friend fixtures (88.9 round 2, quick 261111-frd)', () => {
+  // The 88.9-51 glance rows N45 (invite panel bulk invite: tick two friends, tick a third
+  // while the first send is held) and N54 (Friends page, Invite to Group mid-send) need
+  // THREE accepted friends Alice can still invite to a group she may invite to. Weekend
+  // Warriors is the only seeded group Alice owns; Diana, her one earlier accepted friend,
+  // is already a member there, so the panel offered one disabled checkbox. See the
+  // DECISION quick-261111-frd marker in scripts/seed-sample-data.js.
+  it('N45 / N54: Alice has three accepted friends (Eve, Frank, Bartholomew) who are not Weekend Warriors members and have no pending invite there, Bob keeps no friendship row, and Charlie\'s incoming request stays pending', async () => {
+    await runSeed();
+    const { Friendship, GroupInvite } = models;
+    const alice = await seededUser('Alice');
+    const warriors = await Group.findOne({ where: { group_id: 'weekend-warriors' } });
+    expect(warriors).not.toBeNull();
+    expect(await UserGroup.count({ where: { group_id: warriors.id, user_uuid: alice.id, role: 'owner', status: 'active' } })).toBe(1);
+    const accepted = await Friendship.findAll({
+      where: { status: 'accepted', [Op.or]: [{ requester_uuid: alice.id }, { addressee_uuid: alice.id }] },
+    });
+    const friendIds = accepted.map((f) => (f.requester_uuid === alice.id ? f.addressee_uuid : f.requester_uuid));
+    const invitable = [];
+    for (const name of ['Eve', 'Frank', 'Bartholomew Featherstonehaugh-Cholmondeley']) {
+      const friend = await seededUser(name);
+      expect(friendIds).toContain(friend.id);
+      expect(await UserGroup.count({ where: { group_id: warriors.id, user_uuid: friend.id } })).toBe(0);
+      const withEmail = await User.scope('withContactInfo').findByPk(friend.id);
+      expect(await GroupInvite.count({ where: { group_id: warriors.id, invited_email: withEmail.email, status: 'pending' } })).toBe(0);
+      invitable.push(friend.id);
+    }
+    expect(invitable).toHaveLength(3);
+    // Diana stays an accepted friend (the friend who is already a member: the disabled box).
+    const diana = await seededUser('Diana');
+    expect(friendIds).toContain(diana.id);
+    expect(accepted).toHaveLength(4);
+    // Bob keeps NO friendship row with Alice: he is the member whose popover offers Add friend.
+    const bob = await seededUser('Bob');
+    expect(await Friendship.count({
+      where: { [Op.or]: [{ requester_uuid: alice.id, addressee_uuid: bob.id }, { requester_uuid: bob.id, addressee_uuid: alice.id }] },
+    })).toBe(0);
+    const charlie = await seededUser('Charlie');
+    expect(await Friendship.count({ where: { requester_uuid: charlie.id, addressee_uuid: alice.id, status: 'pending' } })).toBe(1);
+  }, 120000);
+});
+
 describe('seed token fixtures (quick 261103-glx)', () => {
   it('group-restore: Retired Raiders is soft-deleted through the service, its link is printed, previews publicly and restores as Alice', async () => {
     const lines = await runSeed();

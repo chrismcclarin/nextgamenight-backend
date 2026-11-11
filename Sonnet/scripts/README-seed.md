@@ -44,6 +44,11 @@ This script populates your database with realistic sample data for testing and d
 ### Game Reviews (11)
 - Reviews from various users across different groups
 
+### Friendships (5)
+- Alice has four accepted friends: Diana (already a Weekend Warriors member, so her invite checkbox there is disabled) and Eve, Frank and Bartholomew (not members of Weekend Warriors, the one group Alice owns, so all three can be ticked in its invite panel and on the Friends page's Invite to Group; 88.9-R2 fixtures, quick 261111-frd, glance rows N45 / N54).
+- Charlie has sent Alice a request that is still pending (the incoming-request surface).
+- Bob has no friendship row with Alice on purpose: his name popover is the one that offers "Add friend".
+
 ### Links the seed prints
 At the end of its output the seed prints two kinds of walk link (Phase 88.9 round 2, quick 261103-glx):
 
