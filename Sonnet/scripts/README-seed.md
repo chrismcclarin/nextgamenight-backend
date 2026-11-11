@@ -8,13 +8,14 @@ This script populates your database with realistic sample data for testing and d
 - Alice, Bob, Charlie, Diana, Eve, Frank
 - Bartholomew Featherstonehaugh-Cholmondeley — owns no games; the long name wraps a 375px profile title (Phase 88.9 walk, rows W152 / #29)
 
-### Groups (6)
+### Groups (7)
 - **Weekend Warriors** - 4 members (Alice owner, Bob, Charlie, Diana); two prompt schedules (Thursday check-in active, Sunday afternoon paused)
-- **Strategy Squad** - 7 members (Frank owner, Bob, Charlie, Eve, Alice, Diana, Bartholomew); the one group where Alice sees more than 4 other members, so her home card shows four chips and a "+2" overflow chip (Phase 88.9 round 2, pick row D2 / #77). Consequence: create-event pre-fills all 7 as participants and no owned game allows 7 players, so its Suggestions slot shows the empty hint — Weekend Warriors (4 players) is the group whose slot shows suggestions
-- **Casual Gamers** - 4 members (Diana owner, Eve, Frank, Alice); colour preset `blue` with a BROKEN header image URL (the fallback the 88.9 walk measures)
+- **Strategy Squad** - 7 members (Frank owner, Bob, Charlie, Eve, Alice, Diana, Bartholomew); the one group where Alice sees more than 4 other members, so her home card shows four chips and a "+2" overflow chip (Phase 88.9 round 2, pick row D2 / #77). Consequence: create-event pre-fills all 7 as participants and no owned game allows 7 players, so its Suggestions slot shows the empty hint — Weekend Warriors (4 players) is the group whose slot shows suggestions. It stores the colour preset `green` and has no header image (88.9-R2 fixture, quick 261110-ugi): it is the coloured, image-less group Alice belongs to (N16b, and the tint on N12's day-modal rows), so its +N chip now sits on a green card. It also holds three status nights (see Events)
+- **Casual Gamers** - 4 members (Diana owner, Eve, Frank, Alice); colour preset `blue` with a BROKEN header image URL (the fallback the 88.9 walk measures) (88.9-R2 fixture: O-02 / #207, the O02d1 image-failure arm, N16; the host is on the RFC 2606 `.invalid` TLD so the fetch fails fast without reaching a real site)
 - **Dice Dynasty** - 3 members (Charlie owner, Eve, Frank); Alice is NOT a member and attends its event as a guest
 - **No Games Yet** - 3 members (Frank owner, Eve, Bartholomew); nobody in it owns a game, so create-event's Suggestions slot shows its empty hint
 - **Retired Raiders** - 3 members (Alice owner, Bob, Eve) and 1 past event; SOFT-DELETED at the end of the seed through the same service the delete button uses, so it is hidden everywhere and restorable for 30 days from the seed run (the restore link below)
+- **Photo Club** - 2 members (Eve owner, Alice); NO stored colour, and a header image that loads: the FE's own `/seed/photo-club-table.jpg` at `FRONTEND_URL` (a busy generated game-table picture with a bright and a dark corner, so the title is judged over a real picture, not a logo); 1 past Ticket to Ride night, so its "Last Game:" row shows a game name. It is the photo card with no stored colour (88.9-R2 fixture, quick 261110-ugi; N16)
 
 ### Games (8)
 - **BGG Games:**
@@ -28,13 +29,17 @@ This script populates your database with realistic sample data for testing and d
   - Custom Card Game
   - House Rules Monopoly
 
-### Events (7 past game sessions + 3 upcoming, plus 1 past event hidden inside Retired Raiders)
+### Events (8 past game sessions + 1 cancelled earlier on the seed day + 5 upcoming, plus 1 past event hidden inside Retired Raiders)
 - Weekend Warriors: 3 past events (Catan, Ticket to Ride, Wingspan); 1 upcoming (Catan, ~3 days out) with an OPEN ballot (Catan / Wingspan) and Eve joined as a guest
-- Strategy Squad: 2 past events (Gloomhaven, Azul); 1 upcoming (~10 days out, no participants yet)
+- Strategy Squad: 2 past events (Gloomhaven, Azul); 1 upcoming (~10 days out, no participants yet); plus three status nights, all Gloomhaven with no participants (88.9-R2 fixtures, quick 261110-ugi):
+  - a CANCELLED night (18:00) and a COMPLETED night (20:30) on one local day 12 days after the seed (W57 / R2-03; N11 Later rows, N12 day modal). Tapping that day opens the day modal with both tagged rows
+  - a cancelled night that started earlier on the seed day (N40). It sits under Past, untagged
 - Casual Gamers: 2 past events (Codenames, Custom Card Game)
 - Dice Dynasty: 1 upcoming (Codenames, ~6 days out) with Alice joined as a guest
+- Photo Club: 1 past event (Ticket to Ride, ~4 days ago, completed), its "Last Game:" (N16)
 - Retired Raiders: 1 past event (Ticket to Ride, ~20 days ago, Alice won) — hidden with its group until someone restores it
 - Azul's image URLs are deliberately dead (the SafeImage fallback)
+- Reseed timing for the 88.9 round-2 glance: the N40 night needs a reseed on the glance's own local day (it is "earlier today" only on the seed day), and the two status nights stay in Later for 12 days after the seed
 
 ### Game Reviews (11)
 - Reviews from various users across different groups

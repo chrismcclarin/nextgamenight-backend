@@ -3,6 +3,8 @@
 // (Phase 88.9 round 2, pick row D2) the Strategy Squad roster that renders the +N chip:
 // a group-restore link for the soft-deleted group Retired Raiders, and Alice's three
 // single-use RSVP links on the Weekend Warriors Catan night.
+// Quick task 261110-ugi adds the 88.9 round-2 glance fixtures block (status nights,
+// group colours and images, the cancelled-today night), one pin per glance row.
 //
 // Runs the seed IN-PROCESS (the reportAccountHygiene.test.js precedent), calling
 // seedDatabase({ syncSchema: false, closeConnection: false }): the schema stays the one
@@ -19,7 +21,8 @@ const util = require('util');
 const request = require('supertest');
 const express = require('express');
 const models = require('../../models');
-const { User, Group, UserGroup, Event, SingleUseToken } = models;
+const { User, Group, UserGroup, Event, SingleUseToken, Game, EventParticipation } = models;
+const { Op } = require('sequelize');
 const groupRoutes = require('../../routes/groups');
 // The module OBJECT, not destructured: the seed calls rsvpLinks.mintRsvpBatch through
 // this same object (DECISION quick-261103-glx G4), so rsvp F can spy the mint here.
@@ -191,6 +194,173 @@ describe('seed membership fixtures (Phase 88.9 round 2, pick row D2)', () => {
     const others = rows.filter((m) => m.user_uuid !== alice.id);
     expect(others.length - COLLAPSED_LIMIT).toBe(2); // the "+2" chip
   });
+});
+
+describe('seed look fixtures (88.9 round 2, quick 261110-ugi)', () => {
+  // The 88.9-51 owner glance reads these on the local walk DB after a fresh reseed. Each
+  // pin names its glance row; see sub-block (e) in scripts/seed-sample-data.js and its
+  // DECISION quick-261110-ugi markers for why each fixture is shaped as it is.
+  async function futureSquadNight(squad, status) {
+    const rows = await Event.findAll({
+      where: { group_id: squad.id, status, start_date: { [Op.gt]: new Date() } },
+    });
+    expect(rows).toHaveLength(1);
+    return rows[0];
+  }
+
+  it('W57 / R2-03: Strategy Squad holds one FUTURE cancelled Gloomhaven night at 18:00 local, 12 local days out, and Alice is an active member so her calendar lists it', async () => {
+    await runSeed();
+    const squad = await Group.findOne({ where: { group_id: 'strategy-squad' } });
+    expect(squad).not.toBeNull();
+    const night = await futureSquadNight(squad, 'cancelled');
+    const gloomhaven = await Game.findOne({ where: { bgg_id: 174430 } });
+    expect(night.game_id).toBe(gloomhaven.id);
+    const ahead = night.start_date.getTime() - Date.now();
+    expect(ahead).toBeGreaterThan(11 * DAY_MS);
+    expect(ahead).toBeLessThan(13 * DAY_MS);
+    expect(night.start_date.getHours()).toBe(18);
+    expect(night.start_date.getMinutes()).toBe(0);
+    const alice = await seededUser('Alice');
+    expect(await UserGroup.count({ where: { group_id: squad.id, user_uuid: alice.id, status: 'active' } })).toBe(1);
+  }, 120000);
+
+  it('W57 / R2-03: a FUTURE completed night sits on the same local day as the cancelled one, so Alice\'s day modal opens with exactly those two rows, both Gloomhaven, already in Strategy Squad\'s history', async () => {
+    await runSeed();
+    const squad = await Group.findOne({ where: { group_id: 'strategy-squad' } });
+    expect(squad).not.toBeNull();
+    const cancelled = await futureSquadNight(squad, 'cancelled');
+    const completed = await futureSquadNight(squad, 'completed');
+    const day = cancelled.start_date.toDateString();
+    expect(completed.start_date.toDateString()).toBe(day);
+    expect(completed.start_date.getHours()).toBe(20);
+    expect(completed.start_date.getMinutes()).toBe(30);
+
+    // Alice's calendar, built the way GET /events/user/:user_id builds it: her active
+    // groups' events OR the events she participates in, with no status filter.
+    const alice = await seededUser('Alice');
+    const groupIds = (await UserGroup.findAll({ where: { user_uuid: alice.id, status: 'active' } }))
+      .map((m) => m.group_id);
+    const eventIds = (await EventParticipation.findAll({ where: { user_id: alice.id } }))
+      .map((p) => p.event_id);
+    const calendar = await Event.findAll({
+      where: { [Op.or]: [{ group_id: { [Op.in]: groupIds } }, { id: { [Op.in]: eventIds } }] },
+    });
+    const onDay = calendar.filter((e) => e.start_date.toDateString() === day);
+    expect(onDay).toHaveLength(2);
+    expect(onDay.map((e) => e.status).sort()).toEqual(['cancelled', 'completed']);
+
+    // Both are a game the squad has already played, so its games list does not grow.
+    // Play history is a past start AND a status other than cancelled, the games list's own
+    // rule (routes/lists.js ("event.status !== 'cancelled'"), DECISION Phase 88-34 WI-B2).
+    // Without the status filter, the started-today cancelled Gloomhaven night alone would
+    // satisfy this pin (review M-1).
+    const history = await Event.findAll({
+      where: {
+        group_id: squad.id,
+        start_date: { [Op.lte]: new Date() },
+        status: { [Op.ne]: 'cancelled' },
+      },
+    });
+    const playedGameIds = new Set(history.map((e) => e.game_id));
+    expect(playedGameIds.has(cancelled.game_id)).toBe(true);
+    expect(playedGameIds.has(completed.game_id)).toBe(true);
+  }, 120000);
+
+  it('O-02 / #207: Casual Gamers stores colour preset blue and an https header image on an RFC 2606 .invalid host, and Alice is an active member, so the card takes the image arm and the image fails to load', async () => {
+    await runSeed();
+    const casual = await Group.findOne({ where: { group_id: 'casual-gamers' } });
+    expect(casual).not.toBeNull();
+    expect(casual.color_preset).toBe('blue');
+    // The FE allow-list checks the protocol only, so https passes it; the .invalid host
+    // then fails at fetch time: the image-failure arm, not the rejected-URL arm.
+    const url = new URL(casual.background_image_url);
+    expect(url.protocol).toBe('https:');
+    expect(url.hostname.endsWith('.invalid')).toBe(true);
+    const alice = await seededUser('Alice');
+    expect(await UserGroup.count({ where: { group_id: casual.id, user_uuid: alice.id, status: 'active' } })).toBe(1);
+  }, 120000);
+
+  it('N12 / N16b: Strategy Squad stores colour preset green and no image, so Alice\'s coloured image-less card and its status rows take the tinted arm, and Weekend Warriors stays uncoloured', async () => {
+    await runSeed();
+    const squad = await Group.findOne({ where: { group_id: 'strategy-squad' } });
+    expect(squad).not.toBeNull();
+    expect(squad.color_preset).toBe('green');
+    expect(squad.background_image_url).toBeNull();
+    // The validator's own preset list.
+    const { GROUP_COLOUR_PRESET_IDS } = require('../../utils/groupColourPresets');
+    expect(GROUP_COLOUR_PRESET_IDS).toContain('green');
+    const alice = await seededUser('Alice');
+    expect(await UserGroup.count({ where: { group_id: squad.id, user_uuid: alice.id, status: 'active' } })).toBe(1);
+    // e2e-fixtures.js "DECISION Phase 88.3 (OQ-1)": the shared CI journey group stays unmutated.
+    const weekend = await Group.findOne({ where: { group_id: 'weekend-warriors' } });
+    expect(weekend).not.toBeNull();
+    expect(weekend.color_preset).toBeNull();
+    expect(weekend.background_image_url).toBeNull();
+  }, 120000);
+
+  it('N16: Photo Club is a photo card with NO stored colour that Alice belongs to — the image is the app\'s own game-table picture /seed/photo-club-table.jpg (a busy picture, not a logo), and Dice Dynasty and No Games Yet still have no Alice', async () => {
+    // A FRONTEND_URL distinct from the seed's localhost:3000 fallback, so the pin can tell
+    // an env read from a hardcoded origin (review L-2). Per test only: parseRsvpLink
+    // hardcodes localhost:3000 for the others, and afterEach restores the env snapshot.
+    const walkOrigin = 'http://walk.test:3999';
+    process.env.FRONTEND_URL = walkOrigin;
+    await runSeed();
+    const club = await Group.findOne({ where: { group_id: 'photo-club' } });
+    expect(club).not.toBeNull();
+    expect(club.name).toBe('Photo Club');
+    expect(club.color_preset).toBeNull();
+    // The FE treats a null or #fff / #ffffff background_color as unset.
+    if (club.background_color !== null) {
+      expect(club.background_color).toMatch(/^#(?:fff|ffffff)$/i);
+    }
+    expect(club.background_image_url).toBe(`${walkOrigin}/seed/photo-club-table.jpg`);
+
+    const alice = await seededUser('Alice');
+    const eve = await seededUser('Eve');
+    const members = await UserGroup.findAll({ where: { group_id: club.id, status: 'active' } });
+    expect(Object.fromEntries(members.map((m) => [m.user_uuid, m.role])))
+      .toEqual({ [eve.id]: 'owner', [alice.id]: 'member' });
+
+    // Its "Last Game:" night: the group's only event, past and completed.
+    const clubEvents = await Event.findAll({ where: { group_id: club.id } });
+    expect(clubEvents).toHaveLength(1);
+    expect(clubEvents[0].status).toBe('completed');
+    expect(clubEvents[0].start_date.getTime()).toBeLessThanOrEqual(Date.now());
+
+    for (const slug of ['dice-dynasty', 'no-games-yet']) {
+      const group = await Group.findOne({ where: { group_id: slug } });
+      expect(group).not.toBeNull();
+      expect(await UserGroup.count({ where: { group_id: group.id, user_uuid: alice.id }, paranoid: false })).toBe(0);
+    }
+  }, 120000);
+
+  it('N40: Strategy Squad holds one cancelled night that started earlier on the seed\'s local day, starting at the later of local midnight and seed time minus 2 hours', async () => {
+    const before = new Date();
+    await runSeed();
+    const after = new Date();
+    const squad = await Group.findOne({ where: { group_id: 'strategy-squad' } });
+    expect(squad).not.toBeNull();
+    const started = await Event.findAll({
+      where: { group_id: squad.id, status: 'cancelled', start_date: { [Op.lte]: after } },
+    });
+    expect(started).toHaveLength(1);
+    const s = started[0].start_date;
+    const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
+    const localMidnightOf = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate());
+    const localMidnight = localMidnightOf(before);
+    expect(s.getTime()).toBeGreaterThanOrEqual(localMidnight.getTime());
+    expect(s.getTime()).toBeGreaterThanOrEqual(before.getTime() - TWO_HOURS_MS - 1000);
+    // Upper bound (review L-1): the seed's now lies in [before, after] and the rule
+    // max(local midnight of now, now - 2h) never decreases as now grows, so its value at
+    // after caps the start. Without this, a start AT the seed instant would pass. The
+    // 1 s tolerance matches the lower bound's.
+    const latestAllowed = Math.max(localMidnightOf(after).getTime(), after.getTime() - TWO_HOURS_MS);
+    expect(s.getTime()).toBeLessThanOrEqual(latestAllowed + 1000);
+    // A run that crosses local midnight may land on either day.
+    expect([before.toDateString(), after.toDateString()]).toContain(s.toDateString());
+    const gloomhaven = await Game.findOne({ where: { bgg_id: 174430 } });
+    expect(started[0].game_id).toBe(gloomhaven.id);
+  }, 120000);
 });
 
 describe('seed token fixtures (quick 261103-glx)', () => {
