@@ -45,7 +45,7 @@ This script populates your database with realistic sample data for testing and d
 - Reviews from various users across different groups
 
 ### Friendships (5)
-- Alice has four accepted friends: Diana (already a Weekend Warriors member, so her invite checkbox there is disabled) and Eve, Frank and Bartholomew (not members of Weekend Warriors, the one group Alice owns, so all three can be ticked in its invite panel and on the Friends page's Invite to Group; 88.9-R2 fixtures, quick 261111-frd, glance rows N45 / N54).
+- Alice has four accepted friends: Diana (already a Weekend Warriors member, so her invite checkbox there is disabled) and Eve, Frank and Bartholomew (not members of Weekend Warriors, the one live group Alice owns (Retired Raiders, her other, is soft-deleted by the seed), so all three can be ticked in its invite panel and on the Friends page's Invite to Group; 88.9-R2 fixtures, quick 261111-frd, glance rows N45 / N54).
 - Charlie has sent Alice a request that is still pending (the incoming-request surface).
 - Bob has no friendship row with Alice on purpose: his name popover is the one that offers "Add friend".
 

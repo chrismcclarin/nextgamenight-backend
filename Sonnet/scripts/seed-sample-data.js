@@ -1060,7 +1060,7 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
     });
     // DECISION quick-261111-frd (88.9-51 glance rows N45 / N54): three MORE accepted
     // friends — Eve, Frank and Bartholomew — chosen because none of them is a Weekend
-    // Warriors member (the one group Alice owns, so the one she can invite to), OVER
+    // Warriors member (the one live group Alice owns, so the one she can invite to), OVER
     // (a) befriending Bob or Charlie, who are members there and would render as disabled
     // checkboxes like Diana, and (b) staging friends per walk with a scratch insert, which
     // the next reseed destroys (README-seed.md: the seed is the fixture layer). N45 ticks two

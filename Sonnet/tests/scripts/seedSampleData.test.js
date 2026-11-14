@@ -367,7 +367,7 @@ describe('seed friend fixtures (88.9 round 2, quick 261111-frd)', () => {
   // The 88.9-51 glance rows N45 (invite panel bulk invite: tick two friends, tick a third
   // while the first send is held) and N54 (Friends page, Invite to Group mid-send) need
   // THREE accepted friends Alice can still invite to a group she may invite to. Weekend
-  // Warriors is the only seeded group Alice owns; Diana, her one earlier accepted friend,
+  // Warriors is the only live seeded group Alice owns (Retired Raiders is soft-deleted); Diana, her one earlier accepted friend,
   // is already a member there, so the panel offered one disabled checkbox. See the
   // DECISION quick-261111-frd marker in scripts/seed-sample-data.js.
   it('N45 / N54: Alice has three accepted friends (Eve, Frank, Bartholomew) who are not Weekend Warriors members and have no pending invite there, Bob keeps no friendship row, and Charlie\'s incoming request stays pending', async () => {
