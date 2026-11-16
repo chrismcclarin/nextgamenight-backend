@@ -113,6 +113,24 @@ async function main() {
   // which swallowed every journey click on '/' (run 27317492586 screenshot).
   await alice.update({ tutorial_version: 999 });
 
+  // RE-ASSERT the E2E login identity has NO SMS entitlement and no phone. The seed (quick
+  // 261115-seed-r3, "DECISION quick-261115-seed-r3 R1") now gives the walk's Alice
+  // sms_enabled, a verified phone on a reserved fictional number and a stamped welcome, so
+  // the after-build capture can show the Profile phone Remove. FE e2e stages every SMS state
+  // in the browser ON TOP of a row that has none (profile-pressed-controls.spec.ts patches
+  // the self read; contrast.spec.ts records that "the fixture does not set" the entitlement),
+  // so in CI the row goes back to the shape those specs were written against. Chosen OVER leaving the
+  // seeded entitlement in CI (every Profile spec would meet a phone block and an SMS column
+  // it never measured) and OVER seeding it only outside CI (a seed whose data forks on an
+  // env var is a second, hidden fixture). Same fixtures-own-their-invariants rule as the
+  // friendship and schedule teardowns below. Pinned by tests/unit/e2e-fixtures-guard.test.js.
+  await alice.update({
+    sms_enabled: false,
+    phone: null,
+    phone_verified: false,
+    sms_welcome_sent_at: null,
+  });
+
   // Future event so the RSVP respond endpoint accepts it.
   const event = await Event.create({
     group_id: group.id,

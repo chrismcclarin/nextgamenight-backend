@@ -16,6 +16,9 @@ const {
   // Quick 261103-glx: the seed now mints rsvp + group_restore tokens, so it must
   // also clear them (see the G2 marker in the clearing block).
   SingleUseToken,
+  // Quick 261115-seed-r3: the capture fixtures seed RSVP answers, so the model joins the
+  // import and the clearing block.
+  EventRsvp,
   sequelize,
 } = require('../models');
 const heatmapService = require('../services/heatmapService');
@@ -110,6 +113,9 @@ const sampleGroups = [
   { group_id: 'retired-raiders', name: 'Retired Raiders' },
   // Quick 261110-ugi: appended at index 6 so every existing groups[N] stays put; see sub-block (e) U3.
   { group_id: 'photo-club', name: 'Photo Club' }, // 88.9-R2 fixture — Photo Club (N16)
+  // Quick 261115-seed-r3: appended at index 7 so every existing groups[N] stays put; see sub-block (f) R6.
+  // The colour rides in the create defaults (no later update), so the row is written once.
+  { group_id: 'amber-aces', name: 'Amber Aces', color_preset: 'amber' }, // 88.9-R3 fixture — amber, image-less group (P64-1)
 ];
 
 const sampleGames = [
@@ -293,6 +299,10 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
     // Phase 88.9 round 1b: ballot options reference Events, prompt settings
     // reference Groups — both go before their parents, same convention.
     await EventBallotOption.destroy({ where: {} });
+    // Quick 261115-seed-r3: RSVP answers reference Events and Users. Both parents cascade to
+    // them, so this explicit clear is the "a model seeded is a model wiped" convention above,
+    // and the cover for any database whose foreign keys were not built with the cascade.
+    await EventRsvp.destroy({ where: {} });
     await Event.destroy({ where: {}, force: true });
     await UserGroup.destroy({ where: {}, force: true });
     await Game.destroy({ where: {} });
@@ -313,6 +323,30 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
       if (created) console.log(`   ✓ Created user: ${user.username}`);
     }
     console.log(`✅ Created ${users.length} users\n`);
+
+    // DECISION quick-261115-seed-r3 R1 (capture rows P68-2 / X36b and P59-4): Alice, the walk
+    // login, carries the SMS entitlement and a VERIFIED phone, so her Profile renders the phone
+    // row with its Remove control (and, once a Remove is answered in the browser, the
+    // "phone removed" SMS banner P59-4 asks about: one seed serves both). Chosen OVER (a) a
+    // second walk user (the walk signs in as the one Auth0 account mapped to Alice, and this is
+    // a state Alice can hold), OVER (b) patching the self read in the browser at capture time
+    // (plan 88.9-68's hand-off and row P68-2 name it a seed change), and OVER (c) any real
+    // number: +1 202 555 0143 sits in 555-0100..0199, the block reserved for fiction, so no
+    // text can reach a person even on a machine with a live SMS provider configured.
+    // notification_preferences stay null (email on, SMS off), so notificationService never
+    // picks the SMS channel for her; sms_welcome_sent_at is stamped, so a walk that ticks an SMS
+    // box cannot fire the one-time welcome text either. This is a fixture write: no route or
+    // service writes sms_enabled, and that stays true. Alice is also the CI login identity, and
+    // FE e2e stages its SMS states on a row that has none, so scripts/e2e-fixtures.js clears
+    // these fields again in CI (pinned in tests/unit/e2e-fixtures-guard.test.js). Removing the
+    // entitlement re-blocks P68-2; swapping in a real number is never a cleanup.
+    await users[0].update({ // 88.9-R3 fixture — SMS entitlement + verified fictional phone (P68-2, P59-4)
+      sms_enabled: true,
+      phone: '+12025550143',
+      phone_verified: true,
+      sms_welcome_sent_at: new Date(),
+    });
+    console.log('   ✓ Alice: SMS entitlement + verified phone on a reserved fictional number (no SMS opted in)\n');
 
     // Create Groups
     console.log('👥 Creating groups...');
@@ -396,6 +430,10 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
       // Photo Club (quick 261110-ugi): Eve (owner), Alice; see walk-states sub-block (e) U3.
       { user: users[4], group: groups[6], role: 'owner' }, // 88.9-R2 fixture — Photo Club (N16)
       { user: users[0], group: groups[6], role: 'member' }, // 88.9-R2 fixture — Photo Club (N16)
+      // Amber Aces (quick 261115-seed-r3): Diana (owner), Alice, Charlie; see walk-states sub-block (f) R6.
+      { user: users[3], group: groups[7], role: 'owner' }, // 88.9-R3 fixture — Amber Aces (P64-1)
+      { user: users[0], group: groups[7], role: 'member' }, // 88.9-R3 fixture — Amber Aces (P64-1)
+      { user: users[2], group: groups[7], role: 'member' }, // 88.9-R3 fixture — Amber Aces (P64-1)
     ];
 
     for (const { user, group, role } of userGroups) {
@@ -736,7 +774,10 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
     //     game whose BGG images are dead (the SafeImage fallback row): the states
     //     the walk measures. `.invalid` is the RFC 2606 reserved TLD, so the
     //     browser fails each fetch fast instead of hanging on a real host.
-    await casualGroup.update({ // 88.9-R2 fixture — O-02 / #207, the O02d1 image-failure arm (N16; seeded since round 1b)
+    // AMENDED quick 261115-seed-r3 (plan 88.9-60 hand-off b): since 88.9-60 a header picture
+    // that fails to load shows the group's NO-PICTURE look (here the blue tint), not a separate
+    // image-failure look. The fixture is unchanged: still the group whose picture never loads.
+    await casualGroup.update({ // 88.9-R2 fixture — O-02 / #207, a picture that fails to load (N16; seeded since round 1b)
       color_preset: 'blue',
       background_image_url: 'https://images.example.invalid/casual-gamers-header.jpg',
     });
@@ -770,6 +811,11 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
     // 'scheduled' (the FE W57 tag renders it); never run that repair on a walk DB that
     // needs this row, reseed instead. Changing the group, the day or the game is a
     // decision, not a cleanup.
+    // AMENDED quick 261115-seed-r3 (plan 88.9-61 hand-off a, "drop it or keep it as a no-tag
+    // row"): KEPT. Since 88.9-61 only a cancelled row carries a status tag, so the completed
+    // night shows none; it stays because it is the second row that opens the day modal for
+    // N12 (two or more events), OVER dropping it and leaving the cancelled night alone on
+    // its day.
     const statusDay = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 12);
     const statusDayAt = (hours, minutes) => new Date(
       statusDay.getFullYear(), statusDay.getMonth(), statusDay.getDate(), hours, minutes, 0, 0,
@@ -864,7 +910,168 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
       status: 'cancelled',
     });
     events.push(cancelledTodayNight);
+
+    // (f) Phase 88.9 after-build capture (quick 261115-seed-r3): the states capture rows
+    //     P57-1 to P69-6 need that no earlier block produced (the row table is in the parent
+    //     repo's 88.9-69-SUMMARY.md, "After-build pictures owed to the owner"). Alice's SMS
+    //     entitlement (R1) sits with the users above; the rest is here.
+    const DAY_MS = 24 * 60 * 60 * 1000;
+
+    // The Saturday with three nights (P62-3: the "+N more" label; a day cell renders two tiles).
+    // DECISION quick-261115-seed-r3 R2: three Strategy Squad Gloomhaven nights at fixed local
+    // hours on ONE Saturday of the seed's local month (the month the calendar opens on).
+    // Saturday, OVER any weekday: it is the grid's last column, where the label runs past the
+    // card at 200% text (plan 88.9-62's finding). Strategy Squad, OVER Weekend Warriors (the
+    // shared CI journey group stays unmutated, e2e-fixtures.js "DECISION Phase 88.3 (OQ-1)")
+    // and OVER Photo Club or any other uncoloured group: FE e2e's month-tile spec measures the
+    // plain tile on "a scheduled night of an uncoloured group the viewer is not a guest on", so
+    // a new night of that kind changes what CI measures; a green group's nights never qualify.
+    // WHICH Saturday: the nearest one still to come, else the nearest one behind, skipping
+    // days other fixtures need. Never (hard): the seed day (N40's started-today night), the
+    // day 3 days out (the Catan night and CI's own fixture night: their two tiles are the
+    // ones that spec reads) and the day 12 days out (the two status nights: U1 above and its
+    // pin want exactly two rows there). Avoided when another Saturday exists (soft): the days
+    // of the other single nights (-11 and -4 Photo Club, +6 Dice Dynasty, +8 Photo Club, +10
+    // Strategy Squad), so no fixture tile is pushed off its cell; a month whose Saturdays are
+    // all soft still gets its trio. A month always has a Saturday outside the hard set. Ahead
+    // of today the three are 'scheduled'; behind it, 'completed'. Gloomhaven, as U1 chose it.
+    // Tidying this to "now + N days" breaks the Saturday on six days of every seven.
+    const seedDay = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const HARD_DAYS = [0, 3, 12];
+    const SOFT_DAYS = [-11, -4, 6, 8, 10];
+    const saturdays = [];
+    for (let dayOfMonth = 1; dayOfMonth <= 31; dayOfMonth++) {
+      const day = new Date(now.getFullYear(), now.getMonth(), dayOfMonth);
+      if (day.getMonth() !== now.getMonth()) break;
+      if (day.getDay() !== 6) continue;
+      // Rounded: a 23 or 25 hour DST day still counts as one day.
+      const offset = Math.round((day.getTime() - seedDay.getTime()) / DAY_MS);
+      if (!HARD_DAYS.includes(offset)) saturdays.push({ day, offset });
+    }
+    saturdays.sort((a, b) => (
+      (Number(SOFT_DAYS.includes(a.offset)) - Number(SOFT_DAYS.includes(b.offset)))
+      || (Number(a.offset < 0) - Number(b.offset < 0))
+      || (Math.abs(a.offset) - Math.abs(b.offset))
+    ));
+    const trioDay = saturdays[0].day;
+    const trioAhead = trioDay.getTime() > now.getTime();
+    const trioNights = [];
+    for (const [hours, comments] of [
+      [13, 'Afternoon scenario: the early table.'],
+      [16, 'Second table: Alice is dropping in as a guest.'],
+      [19, 'Evening scenario: the late table.'],
+    ]) {
+      const trioNight = await Event.create({ // 88.9-R3 fixture — one of three nights on one Saturday (P62-3)
+        group_id: strategyGroup.id,
+        game_id: games[5].id, // Gloomhaven
+        start_date: new Date(trioDay.getFullYear(), trioDay.getMonth(), trioDay.getDate(), hours, 0, 0, 0),
+        duration_minutes: 150,
+        is_group_win: false,
+        comments,
+        status: trioAhead ? 'scheduled' : 'completed',
+      });
+      events.push(trioNight);
+      trioNights.push(trioNight);
+    }
+
+    // Guest nights on a tinted row and on a picture row (P63-2 / X27).
+    // DECISION quick-261115-seed-r3 R3: Alice's own participation carries is_guest on the
+    // middle Saturday night (Strategy Squad: tinted) and on a new Photo Club night 8 days out
+    // (picture), both in groups she BELONGS to. That is a real state: joining a night by a
+    // game-only link writes is_guest (routes/events.js, the game-token join) and nothing
+    // clears it when the person later joins the group. Chosen OVER a new picture group
+    // without Alice: a non-member cannot open the group page, and the guest row is owed on
+    // the group-page list as well as on Home; and no membership the comments above protect
+    // changes (Dice Dynasty keeps no Alice and stays her plain guest night). The Photo Club
+    // night is 'scheduled' in an uncoloured group, but as a guest night it is never the plain
+    // tile FE e2e measures (see R2). Frank and Eve are there as ordinary participants, so
+    // neither night is guest-only. Ticket to Ride, the club's one played game, so its games
+    // list does not grow. If the Saturday falls behind the seed day, the Gloomhaven guest row
+    // is a played night in Frank's and Alice's history (no scores).
+    await EventParticipation.create({ event_id: trioNights[1].id, user_id: users[5].id }); // Frank
+    await EventParticipation.create({ event_id: trioNights[1].id, user_id: users[0].id, is_guest: true }); // 88.9-R3 fixture — Alice a guest on a tinted row (P63-2)
+    const photoClubGuestNight = await Event.create({ // 88.9-R3 fixture — Alice a guest on a picture row (P63-2)
+      group_id: photoClub.id,
+      game_id: games[1].id, // Ticket to Ride
+      start_date: new Date(now.getTime() + 8 * DAY_MS),
+      duration_minutes: 60,
+      is_group_win: false,
+      comments: 'Club night: Alice came in on the game link before she joined.',
+      status: 'scheduled',
+    });
+    events.push(photoClubGuestNight);
+    await EventParticipation.create({ event_id: photoClubGuestNight.id, user_id: users[4].id }); // Eve
+    await EventParticipation.create({ event_id: photoClubGuestNight.id, user_id: users[0].id, is_guest: true });
+
+    // A picture row with RSVP counts, and the scores 57.50 and 57.00 (P60-3 chip; P65-1 / X50).
+    // DECISION quick-261115-seed-r3 R4: an OLDER past Photo Club night (11 days back), OVER a
+    // future one (a scheduled night of an uncoloured group Alice is not a guest on is exactly
+    // the plain tile FE e2e measures, see R2) and OVER putting the answers on the Last Game
+    // night above (that row is the "No RSVPs yet" frame, and N16 judged it as it is). Older
+    // than that night, so "Last Game:" still names it. The list row prints its RSVP count at
+    // every age, so a past row shows the chip. The club has two members and the three counts
+    // need three people, so Frank, Diana and Bob are there as game-link guests (the RSVP route
+    // accepts a participant who is not a member); Alice is not on the night at all, so none of
+    // her history, stats or RSVP buttons move. Scores are DECIMAL(10,2): 57.5 and 57 are
+    // stored and sent as "57.50" and "57.00", the two strings X50's formatter was built for.
+    const photoClubRsvpNight = await Event.create({ // 88.9-R3 fixture — picture row with going / maybe / can't and scores 57.50, 57.00 (P60-3, P65-1)
+      group_id: photoClub.id,
+      game_id: games[1].id, // Ticket to Ride
+      start_date: new Date(now.getTime() - 11 * DAY_MS),
+      duration_minutes: 75,
+      winner_id: users[4].id, // Eve won
+      picked_by_id: users[4].id,
+      is_group_win: false,
+      comments: 'Half a point in it: Eve edged Frank on the last route.',
+      status: 'completed',
+    });
+    events.push(photoClubRsvpNight);
+    const rsvpNightRows = [
+      { user: users[4], rsvp: 'yes', score: 57.5, placement: 1, is_guest: false }, // Eve
+      { user: users[5], rsvp: 'yes', score: 57, placement: 2, is_guest: true }, // Frank
+      { user: users[3], rsvp: 'maybe', score: 41, placement: 3, is_guest: true }, // Diana
+      { user: users[1], rsvp: 'no', score: null, placement: null, is_guest: true }, // Bob
+    ];
+    for (const { user, rsvp, score, placement, is_guest } of rsvpNightRows) {
+      await EventParticipation.create({ event_id: photoClubRsvpNight.id, user_id: user.id, score, placement, is_guest });
+      await EventRsvp.create({ event_id: photoClubRsvpNight.id, user_uuid: user.id, status: rsvp });
+    }
+
+    // A night in the previous calendar year (P61-1: a Past row that prints its year).
+    // DECISION quick-261115-seed-r3 R5: one completed Casual Gamers Codenames night on 20
+    // December of last year at 19:00 local, a FIXED date OVER "now minus N days" (which is in
+    // last year only for part of the year). Casual Gamers, because Alice belongs to it, it is
+    // coloured (never the plain tile, see R2) and Codenames is already in its history. No
+    // participants, so no per-user history moves.
+    const lastYearNight = await Event.create({ // 88.9-R3 fixture — a night dated last year (P61-1)
+      group_id: casualGroup.id,
+      game_id: games[4].id, // Codenames
+      start_date: new Date(now.getFullYear() - 1, 11, 20, 19, 0, 0, 0),
+      duration_minutes: 30,
+      is_group_win: true,
+      comments: 'Holiday party round.',
+      status: 'completed',
+    });
+    events.push(lastYearNight);
+
+    // Six participants on the Catan night (P63-1 and P65-3: the strip shows five chips, then
+    // "See all (N)"). Frank joins as a second guest beside Eve (sub-block (b)); he is not a
+    // Weekend Warriors member, so he stays tickable in its invite panel (quick 261111-frd).
+    await EventParticipation.create({ event_id: futureEvent1.id, user_id: users[5].id, is_guest: true }); // 88.9-R3 fixture — sixth participant, second guest (P63-1, P65-3)
+
+    // Amber Aces (P64-1: Manage Members on an amber header).
+    // DECISION quick-261115-seed-r3 R6: a NEW group storing the amber preset and no image,
+    // with Alice as a PLAIN member, OVER recolouring a seeded group (each colour above serves
+    // another row) and OVER making Alice its owner or admin: Weekend Warriors must stay the one
+    // live group she can invite to (quick 261111-frd, N45 / N54). The group and its three
+    // memberships are created with the other groups above; it has no event, so no calendar or
+    // history moves. NOT seeded on purpose: an owner or admin role for Alice on a tinted or a
+    // picture group (the gear on those cards and headers, P59-3 / P69-5), for the same
+    // N45 / N54 reason. That is a decision for whoever owns the capture, not a seed gap to
+    // fill quietly.
+    const amberGroup = groups[7];
     console.log('   ✓ Walk states: open ballot (2 options), 2 guests (Eve at Catan, Alice at Dice Dynasty), 2 schedules (1 active, 1 paused), Casual Gamers blue + broken image, Azul dead images, Strategy Squad green + 3 status nights (2 future on one local day, 1 cancelled earlier today), Photo Club image + no colour');
+    console.log(`   ✓ Capture states (quick 261115-seed-r3): 3 Strategy Squad nights on Saturday ${trioDay.toDateString()} (${trioAhead ? 'scheduled' : 'completed'}), Alice a guest on its 16:00 night and on a Photo Club night 8 days out, a Photo Club night 11 days back with 2 going / 1 maybe / 1 can't and scores 57.50 / 57.00, a Casual Gamers night on 20 December last year, Frank a second guest at Catan (6 participants), ${amberGroup.name} amber`);
     console.log(`✅ Created ${events.length} events with participations\n`);
 
     // Create Game Reviews
@@ -1254,7 +1461,7 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
     console.log(`   - ${groups.length} groups (1 of them soft-deleted: Retired Raiders, restorable for 30 days)`);
     console.log(`   - ${userGroups.length} user-group memberships (3 hidden with Retired Raiders)`);
     console.log(`   - ${games.length} games`);
-    console.log(`   - ${events.length} events (8 past + 1 cancelled earlier today + 5 future), plus 1 past event hidden with Retired Raiders`);
+    console.log(`   - ${events.length} events (${events.filter((e) => e.start_date.getTime() <= now.getTime()).length} already started, ${events.filter((e) => e.start_date.getTime() > now.getTime()).length} still to come), plus 1 past event hidden with Retired Raiders`);
     console.log(`   - ${reviews.length} reviews`);
     // Phase 88-34 Task 5 (WI-B4): report the new sections too, so a human
     // running the seed can see at a glance that the Test-2 gates are walkable.
@@ -1263,7 +1470,8 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
     console.log(`   - ${availabilityRows.length} recurring availability patterns`);
     console.log(`   - 1 pending group invite`);
     // Phase 88.9 round 1b: the walk states, so a reader sees they are seeded.
-    console.log(`   - 1 open ballot (2 options), 2 guest participations, 2 prompt schedules, 1 coloured group with a broken image, 1 game with dead images, Strategy Squad green, 3 status nights, 1 no-colour photo group (Photo Club)`);
+    console.log(`   - 1 open ballot (2 options), 8 guest participations (3 of them Alice's own), 2 prompt schedules, 1 coloured group with a broken image, 1 game with dead images, Strategy Squad green, 3 status nights, 1 no-colour photo group (Photo Club)`);
+    console.log(`   - capture states: 3 nights on one Saturday, 4 RSVP answers on one Photo Club night, 1 night dated last year, 1 amber group, Alice's SMS entitlement + verified fictional phone`);
     if (rsvpUrls.length) {
       console.log(`   - 3 RSVP links for Alice (yes / maybe / no, Weekend Warriors Catan night)`);
     } else {
