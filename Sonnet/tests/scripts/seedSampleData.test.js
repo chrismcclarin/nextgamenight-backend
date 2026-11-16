@@ -21,7 +21,7 @@ const util = require('util');
 const request = require('supertest');
 const express = require('express');
 const models = require('../../models');
-const { User, Group, UserGroup, Event, SingleUseToken, Game, EventParticipation } = models;
+const { User, Group, UserGroup, Event, SingleUseToken, Game, EventParticipation, EventRsvp, GroupPromptSettings } = models;
 const { Op } = require('sequelize');
 const groupRoutes = require('../../routes/groups');
 // The module OBJECT, not destructured: the seed calls rsvpLinks.mintRsvpBatch through
@@ -321,11 +321,19 @@ describe('seed look fixtures (88.9 round 2, quick 261110-ugi)', () => {
     expect(Object.fromEntries(members.map((m) => [m.user_uuid, m.role])))
       .toEqual({ [eve.id]: 'owner', [alice.id]: 'member' });
 
-    // Its "Last Game:" night: the group's only event, past and completed.
-    const clubEvents = await Event.findAll({ where: { group_id: club.id } });
-    expect(clubEvents).toHaveLength(1);
-    expect(clubEvents[0].status).toBe('completed');
-    expect(clubEvents[0].start_date.getTime()).toBeLessThanOrEqual(Date.now());
+    // Its "Last Game:" night: the club's LATEST past night, completed, Ticket to Ride.
+    // AMENDED quick 261115-seed-r3: this pin read "the group's only event" until the capture
+    // fixtures gave the club two more nights (an older past one and a future one; see the
+    // 'seed capture fixtures' block below). What N16 needs is unchanged: the newest past
+    // night that is not cancelled is the one the "Last Game:" row names.
+    const clubPast = await Event.findAll({
+      where: { group_id: club.id, start_date: { [Op.lte]: new Date() }, status: { [Op.ne]: 'cancelled' } },
+      order: [['start_date', 'DESC']],
+    });
+    expect(clubPast.length).toBeGreaterThanOrEqual(1);
+    expect(clubPast[0].status).toBe('completed');
+    const ticketToRide = await Game.findOne({ where: { bgg_id: 9209 } });
+    expect(clubPast[0].game_id).toBe(ticketToRide.id);
 
     for (const slug of ['dice-dynasty', 'no-games-yet']) {
       const group = await Group.findOne({ where: { group_id: slug } });
@@ -402,6 +410,255 @@ describe('seed friend fixtures (88.9 round 2, quick 261111-frd)', () => {
     })).toBe(0);
     const charlie = await seededUser('Charlie');
     expect(await Friendship.count({ where: { requester_uuid: charlie.id, addressee_uuid: alice.id, status: 'pending' } })).toBe(1);
+  }, 120000);
+});
+
+describe('seed capture fixtures (88.9 after-build capture, quick 261115-seed-r3)', () => {
+  // The states the 88.9 after-build capture pass (rows P57-1 to P69-6) reads on the local walk
+  // DB after a fresh reseed. Each pin names its capture row; see sub-block (f) in
+  // scripts/seed-sample-data.js and its DECISION quick-261115-seed-r3 markers for why each
+  // fixture is shaped as it is.
+  const localDayStart = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  // Whole local days from `from` to `d`; rounded, so a 23 or 25 hour DST day still counts as one.
+  const localDayOffset = (d, from) => Math.round((localDayStart(d).getTime() - localDayStart(from).getTime()) / DAY_MS);
+  const aliceCalendar = async (alice) => {
+    // Built the way GET /events/user/:user_id builds it (her active groups' events OR the
+    // events she participates in, no status filter).
+    const groupIds = (await UserGroup.findAll({ where: { user_uuid: alice.id, status: 'active' } }))
+      .map((m) => m.group_id);
+    const eventIds = (await EventParticipation.findAll({ where: { user_id: alice.id } }))
+      .map((p) => p.event_id);
+    return Event.findAll({
+      where: { [Op.or]: [{ group_id: { [Op.in]: groupIds } }, { id: { [Op.in]: eventIds } }] },
+    });
+  };
+  const squadSaturdayTrio = async () => {
+    const squad = await Group.findOne({ where: { group_id: 'strategy-squad' } });
+    expect(squad).not.toBeNull();
+    const byDay = new Map();
+    for (const e of await Event.findAll({ where: { group_id: squad.id } })) {
+      if (e.start_date.getDay() !== 6) continue; // local Saturday
+      const key = e.start_date.toDateString();
+      byDay.set(key, [...(byDay.get(key) || []), e]);
+    }
+    const trios = [...byDay.values()].filter((rows) => rows.length >= 3);
+    expect(trios).toHaveLength(1);
+    return { squad, trio: trios[0].sort((a, b) => a.start_date - b.start_date) };
+  };
+
+  it('P57-4 (X46): Weekend Warriors keeps an ACTIVE and a PAUSED prompt schedule and Alice is its owner, so her Plan Game Session schedule list shows Edit / Pause / Delete and Edit / Resume / Delete', async () => {
+    await runSeed();
+    const warriors = await Group.findOne({ where: { group_id: 'weekend-warriors' } });
+    expect(warriors).not.toBeNull();
+    const alice = await seededUser('Alice');
+    // The schedule manager mounts for owner and admin only (FE PromptScheduleSection).
+    expect(await UserGroup.count({ where: { group_id: warriors.id, user_uuid: alice.id, role: 'owner', status: 'active' } })).toBe(1);
+    const settings = await GroupPromptSettings.findAll({ where: { group_id: warriors.id } });
+    expect(settings).toHaveLength(1);
+    const live = (settings[0].template_config?.schedules || []).filter((s) => !s.deleted_at);
+    expect(live.filter((s) => s.is_active === true)).toHaveLength(1);
+    expect(live.filter((s) => s.is_active === false)).toHaveLength(1);
+    for (const s of live) {
+      expect(typeof s.id).toBe('string');
+      expect(s.template_name).toBeTruthy();
+    }
+  }, 120000);
+
+  it('P68-2 (X36b) / P59-4: Alice alone carries the SMS entitlement with a verified phone on a reserved fictional number, has opted in to no SMS, and the welcome text is already stamped, so the Profile phone Remove renders and nothing can be texted', async () => {
+    await runSeed();
+    const alice = await User.scope('withContactInfo').findOne({ where: { username: 'Alice' } });
+    expect(alice).not.toBeNull();
+    expect(alice.sms_enabled).toBe(true);
+    expect(alice.phone_verified).toBe(true);
+    // +1 NXX 555 01XX: the North American block reserved for fictional use, never a real line.
+    expect(alice.phone).toMatch(/^\+1[2-9]\d{2}55501\d{2}$/);
+    // No SMS preference is opted in (null = defaults: email on, SMS off), so
+    // notificationService never selects the SMS channel for her.
+    expect(alice.notification_preferences).toBeNull();
+    // Stamped, so a later opt-in during a walk cannot fire the one-time welcome text either.
+    expect(alice.sms_welcome_sent_at).toBeInstanceOf(Date);
+    const others = await User.scope('withContactInfo').findAll({ where: { username: { [Op.ne]: 'Alice' } } });
+    expect(others.length).toBeGreaterThanOrEqual(6);
+    for (const user of others) {
+      expect(user.sms_enabled).toBe(false);
+      expect(user.phone).toBeNull();
+      expect(user.phone_verified).toBe(false);
+    }
+  }, 120000);
+
+  it('P62-3: Strategy Squad holds three Gloomhaven nights (13:00, 16:00, 19:00 local) on ONE Saturday of the seed\'s local month, never the seed day or the local days 3 and 12 days out, all scheduled when ahead and all completed when behind, so that Saturday cell shows "+1 more"', async () => {
+    const before = new Date();
+    await runSeed();
+    const after = new Date();
+    const { trio } = await squadSaturdayTrio();
+    expect(trio).toHaveLength(3);
+    const day = trio[0].start_date;
+    expect(trio.map((e) => [e.start_date.getHours(), e.start_date.getMinutes()])).toEqual([[13, 0], [16, 0], [19, 0]]);
+    // The visible month: the local month of the seed run (either side of a month-crossing run).
+    expect([before, after].map((d) => `${d.getFullYear()}-${d.getMonth()}`))
+      .toContain(`${day.getFullYear()}-${day.getMonth()}`);
+    // Hard-reserved local days: 0 (the started-today cancelled night, N40), 3 (the Weekend
+    // Warriors Catan night and CI's own fixture night, whose two tiles FE e2e measures) and
+    // 12 (the two status nights; the W57 pin above wants exactly two rows on that day). The
+    // seed's own clock lies in [before, after], so one of the two offsets is the seed's.
+    const HARD = [0, 3, 12];
+    expect([localDayOffset(day, before), localDayOffset(day, after)].some((o) => !HARD.includes(o))).toBe(true);
+    const ahead = day.getTime() > after.getTime();
+    expect(trio.map((e) => e.status)).toEqual(Array(3).fill(ahead ? 'scheduled' : 'completed'));
+    const gloomhaven = await Game.findOne({ where: { bgg_id: 174430 } });
+    for (const night of trio) expect(night.game_id).toBe(gloomhaven.id);
+    // Alice's own calendar holds all three on that day: more than the two tiles a day cell
+    // renders (FE CalendarMonthView), which is what prints "+N more".
+    const alice = await seededUser('Alice');
+    const onDay = (await aliceCalendar(alice)).filter((e) => e.start_date.toDateString() === day.toDateString());
+    expect(onDay.length).toBeGreaterThanOrEqual(3);
+  }, 120000);
+
+  it('P63-2 (X27): Alice is a GUEST on one night of a tinted group and one night of a picture group she belongs to (Strategy Squad\'s middle Saturday night, Photo Club\'s night 8 days out), and still a guest at Dice Dynasty, which she does not belong to', async () => {
+    await runSeed();
+    const alice = await seededUser('Alice');
+    const eve = await seededUser('Eve');
+    const guestRows = await EventParticipation.findAll({ where: { user_id: alice.id, is_guest: true } });
+    const guestEvents = await Event.findAll({ where: { id: { [Op.in]: guestRows.map((p) => p.event_id) } } });
+    const slugById = Object.fromEntries((await Group.findAll()).map((g) => [g.id, g.group_id]));
+    expect(guestEvents.map((e) => slugById[e.group_id]).sort()).toEqual(['dice-dynasty', 'photo-club', 'strategy-squad']);
+
+    // Tinted: the 16:00 night of the Saturday trio, in a group that stores a colour and no image.
+    const { squad, trio } = await squadSaturdayTrio();
+    expect(squad.color_preset).toBe('green');
+    expect(squad.background_image_url).toBeNull();
+    const squadGuestNight = guestEvents.find((e) => e.group_id === squad.id);
+    expect(squadGuestNight.id).toBe(trio[1].id);
+    expect(await UserGroup.count({ where: { group_id: squad.id, user_uuid: alice.id, status: 'active' } })).toBe(1);
+
+    // Picture: a scheduled Ticket to Ride night about 8 days out, the club's only future night.
+    const club = await Group.findOne({ where: { group_id: 'photo-club' } });
+    expect(club.background_image_url).toMatch(/\/seed\/photo-club-table\.jpg$/);
+    const clubFuture = await Event.findAll({ where: { group_id: club.id, start_date: { [Op.gt]: new Date() } } });
+    expect(clubFuture).toHaveLength(1);
+    const clubGuestNight = guestEvents.find((e) => e.group_id === club.id);
+    expect(clubGuestNight.id).toBe(clubFuture[0].id);
+    expect(clubGuestNight.status).toBe('scheduled');
+    const aheadMs = clubGuestNight.start_date.getTime() - Date.now();
+    expect(aheadMs).toBeGreaterThan(7.5 * DAY_MS);
+    expect(aheadMs).toBeLessThan(8.5 * DAY_MS);
+    const ticketToRide = await Game.findOne({ where: { bgg_id: 9209 } });
+    expect(clubGuestNight.game_id).toBe(ticketToRide.id);
+    expect(await UserGroup.count({ where: { group_id: club.id, user_uuid: alice.id, status: 'active' } })).toBe(1);
+    // Eve, the owner, is there as a member, so the row is not a guest-only night.
+    expect(await EventParticipation.count({ where: { event_id: clubGuestNight.id, user_id: eve.id, is_guest: false } })).toBe(1);
+
+    // Plain: the Dice Dynasty night, as before, in a group with no Alice.
+    const dice = await Group.findOne({ where: { group_id: 'dice-dynasty' } });
+    expect(await UserGroup.count({ where: { group_id: dice.id, user_uuid: alice.id }, paranoid: false })).toBe(0);
+  }, 120000);
+
+  it('P60-3 (Q3 chip) / P65-1 (X50): Photo Club\'s older past night carries going, maybe and can\'t RSVPs all above zero and the stored scores 57.50 and 57.00, while its Last Game night keeps no RSVP at all', async () => {
+    await runSeed();
+    const club = await Group.findOne({ where: { group_id: 'photo-club' } });
+    expect(club).not.toBeNull();
+    const past = await Event.findAll({
+      where: { group_id: club.id, start_date: { [Op.lte]: new Date() } },
+      order: [['start_date', 'DESC']],
+    });
+    expect(past).toHaveLength(2);
+    const [lastGame, older] = past;
+    // "No RSVPs yet": the row the RSVP chip prints its zero state on.
+    expect(await EventRsvp.count({ where: { event_id: lastGame.id } })).toBe(0);
+    // All three counts above zero, counted the way routes/events.js attachRsvpSummaries does.
+    const counts = { yes: 0, maybe: 0, no: 0 };
+    for (const r of await EventRsvp.findAll({ where: { event_id: older.id } })) counts[r.status] += 1;
+    expect(counts).toEqual({ yes: 2, maybe: 1, no: 1 });
+    expect(older.status).toBe('completed');
+    const behindMs = Date.now() - older.start_date.getTime();
+    expect(behindMs).toBeGreaterThan(10.5 * DAY_MS);
+    expect(behindMs).toBeLessThan(11.5 * DAY_MS);
+    // Same game as the Last Game night, so the club's games list does not grow.
+    expect(older.game_id).toBe(lastGame.game_id);
+    // Every RSVP belongs to a participant (the RSVP route's own gate), and Alice is not one,
+    // so none of her history or stats surfaces move.
+    const participants = await EventParticipation.findAll({ where: { event_id: older.id } });
+    const participantIds = participants.map((p) => p.user_id);
+    for (const r of await EventRsvp.findAll({ where: { event_id: older.id } })) {
+      expect(participantIds).toContain(r.user_uuid);
+    }
+    const alice = await seededUser('Alice');
+    expect(participantIds).not.toContain(alice.id);
+    // The two scores as the wire carries them: a DECIMAL(10,2) arrives as a string.
+    const scores = participants.map((p) => p.score).filter((s) => s !== null).map(String);
+    expect(scores).toContain('57.50');
+    expect(scores).toContain('57.00');
+  }, 120000);
+
+  it('P61-1: Alice\'s calendar holds one completed night dated in the previous local calendar year (Casual Gamers, 20 December, 19:00), so a Past row prints its year', async () => {
+    const before = new Date();
+    await runSeed();
+    const alice = await seededUser('Alice');
+    const casual = await Group.findOne({ where: { group_id: 'casual-gamers' } });
+    // Matched on its own date, not on "anything last year": a seed run in January puts the
+    // now-relative past nights in the previous year as well.
+    const lastYear = (await aliceCalendar(alice)).filter((e) => (
+      e.group_id === casual.id
+      && e.start_date.getFullYear() === before.getFullYear() - 1
+      && e.start_date.getMonth() === 11 && e.start_date.getDate() === 20
+    ));
+    expect(lastYear).toHaveLength(1);
+    const [night] = lastYear;
+    expect(night.status).toBe('completed');
+    expect([night.start_date.getHours(), night.start_date.getMinutes()]).toEqual([19, 0]);
+    // A game the group has already played, so its games list does not grow.
+    const played = await Event.findAll({ where: { group_id: casual.id, id: { [Op.ne]: night.id }, status: 'completed' } });
+    expect(played.map((e) => e.game_id)).toContain(night.game_id);
+  }, 120000);
+
+  it('P63-1 / P65-3 (See all): the Weekend Warriors Catan night has six participants, two of them guests (Eve and Frank), so its strip shows five chips and "See all (6)"', async () => {
+    await runSeed();
+    const warriors = await Group.findOne({ where: { group_id: 'weekend-warriors' } });
+    const future = await Event.findAll({ where: { group_id: warriors.id, start_date: { [Op.gt]: new Date() } } });
+    expect(future).toHaveLength(1);
+    const participants = await EventParticipation.findAll({ where: { event_id: future[0].id } });
+    const STRIP_LIMIT = 5; // FE gameDetail page: participants.length > 5 renders "See all (N)"
+    expect(participants.length).toBe(STRIP_LIMIT + 1);
+    const eve = await seededUser('Eve');
+    const frank = await seededUser('Frank');
+    expect(participants.filter((p) => p.is_guest).map((p) => p.user_id).sort()).toEqual([eve.id, frank.id].sort());
+    // Neither guest is a member: Frank stays tickable in the invite panel (N45 / N54).
+    for (const guest of [eve, frank]) {
+      expect(await UserGroup.count({ where: { group_id: warriors.id, user_uuid: guest.id } })).toBe(0);
+    }
+  }, 120000);
+
+  it('P64-1: Amber Aces stores colour preset amber and no image, Alice is a plain member, and Weekend Warriors is still the only live group she owns or administers', async () => {
+    await runSeed();
+    const amber = await Group.findOne({ where: { group_id: 'amber-aces' } });
+    expect(amber).not.toBeNull();
+    expect(amber.name).toBe('Amber Aces');
+    expect(amber.color_preset).toBe('amber');
+    expect(amber.background_image_url).toBeNull();
+    const { GROUP_COLOUR_PRESET_IDS } = require('../../utils/groupColourPresets');
+    expect(GROUP_COLOUR_PRESET_IDS).toContain('amber');
+    const alice = await seededUser('Alice');
+    const diana = await seededUser('Diana');
+    const charlie = await seededUser('Charlie');
+    const members = await UserGroup.findAll({ where: { group_id: amber.id, status: 'active' } });
+    expect(Object.fromEntries(members.map((m) => [m.user_uuid, m.role])))
+      .toEqual({ [diana.id]: 'owner', [alice.id]: 'member', [charlie.id]: 'member' });
+    // No event of its own: nothing joins any calendar.
+    expect(await Event.count({ where: { group_id: amber.id } })).toBe(0);
+    // The N45 / N54 premise (quick 261111-frd): one live group Alice may invite to.
+    const managed = await UserGroup.findAll({
+      where: { user_uuid: alice.id, status: 'active', role: { [Op.in]: ['owner', 'admin'] } },
+    });
+    const warriors = await Group.findOne({ where: { group_id: 'weekend-warriors' } });
+    expect(managed.map((m) => m.group_id)).toEqual([warriors.id]);
+  }, 120000);
+
+  it('a re-seed replaces the RSVP rows instead of adding to them', async () => {
+    await runSeed();
+    const first = await EventRsvp.count();
+    expect(first).toBe(4);
+    await runSeed();
+    expect(await EventRsvp.count()).toBe(first);
   }, 120000);
 });
 
