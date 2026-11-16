@@ -29,6 +29,22 @@ const path = require('path');
 const SCRIPT_PATH = path.join(__dirname, '..', '..', 'scripts', 'e2e-fixtures.js');
 const source = fs.readFileSync(SCRIPT_PATH, 'utf8');
 
+// Quick 261115-seed-r3: the seed now gives the walk's Alice the SMS entitlement and a verified
+// phone (the Profile phone Remove, capture row P68-2). Alice is also the CI login identity, and
+// FE e2e stages every SMS state in the browser on top of a row that has NONE (its Profile specs
+// patch the self read). So the fixture script, which runs after the seed in CI, must put her row
+// back: fixtures own their invariants, the same rule as its friendship and schedule teardowns.
+// A text scan for the same reason as the guard pins below: the script cannot be imported here.
+describe('scripts/e2e-fixtures.js — re-asserts the CI identity has no SMS entitlement', () => {
+  test('one alice.update clears sms_enabled, phone and phone_verified together', () => {
+    const updates = [...source.matchAll(/alice\.update\(\{([\s\S]*?)\}\)/g)].map((m) => m[1]);
+    const reset = updates.find((body) => /sms_enabled:\s*false/.test(body));
+    expect(reset).toBeDefined();
+    expect(reset).toMatch(/phone:\s*null/);
+    expect(reset).toMatch(/phone_verified:\s*false/);
+  });
+});
+
 describe('scripts/e2e-fixtures.js — fails closed on a non-local database', () => {
   test('requires the SHARED guard helper, not a local reimplementation', () => {
     // The path is asserted, not just the symbol: a second copy of the host-resolution logic

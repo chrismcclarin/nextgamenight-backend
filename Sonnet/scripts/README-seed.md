@@ -6,16 +6,18 @@ This script populates your database with realistic sample data for testing and d
 
 ### Users (7)
 - Alice, Bob, Charlie, Diana, Eve, Frank
+- Alice alone carries the SMS entitlement (`sms_enabled`) with a VERIFIED phone, `+1 202 555 0143` — a number in the 555-0100 to 555-0199 block reserved for fiction, so no text can reach a person. She has opted in to no SMS notification and her one-time welcome text is already stamped, so nothing is sent. Her Profile therefore shows the phone row with its Remove control (88.9-R3 fixture, quick 261115-seed-r3; capture rows P68-2 and P59-4 — answering a Remove in the browser then shows the "phone removed" SMS banner). `scripts/e2e-fixtures.js` clears these fields again for the CI login identity
 - Bartholomew Featherstonehaugh-Cholmondeley — owns no games; the long name wraps a 375px profile title (Phase 88.9 walk, rows W152 / #29)
 
-### Groups (7)
+### Groups (8)
 - **Weekend Warriors** - 4 members (Alice owner, Bob, Charlie, Diana); two prompt schedules (Thursday check-in active, Sunday afternoon paused)
-- **Strategy Squad** - 7 members (Frank owner, Bob, Charlie, Eve, Alice, Diana, Bartholomew); the one group where Alice sees more than 4 other members, so her home card shows four chips and a "+2" overflow chip (Phase 88.9 round 2, pick row D2 / #77). Consequence: create-event pre-fills all 7 as participants and no owned game allows 7 players, so its Suggestions slot shows the empty hint — Weekend Warriors (4 players) is the group whose slot shows suggestions. It stores the colour preset `green` and has no header image (88.9-R2 fixture, quick 261110-ugi): it is the coloured, image-less group Alice belongs to (N16b, and the tint on N12's day-modal rows), so its +N chip now sits on a green card. It also holds three status nights (see Events)
-- **Casual Gamers** - 4 members (Diana owner, Eve, Frank, Alice); colour preset `blue` with a BROKEN header image URL (the fallback the 88.9 walk measures) (88.9-R2 fixture: O-02 / #207, the O02d1 image-failure arm, N16; the host is on the RFC 2606 `.invalid` TLD so the fetch fails fast without reaching a real site)
+- **Strategy Squad** - 7 members (Frank owner, Bob, Charlie, Eve, Alice, Diana, Bartholomew); the one group where Alice sees more than 4 other members, so her home card shows four chips and a "+2" overflow chip (Phase 88.9 round 2, pick row D2 / #77). Consequence: create-event pre-fills all 7 as participants and no owned game allows 7 players, so its Suggestions slot shows the empty hint — Weekend Warriors (4 players) is the group whose slot shows suggestions. It stores the colour preset `green` and has no header image (88.9-R2 fixture, quick 261110-ugi): it is the coloured, image-less group Alice belongs to (N16b, and the tint on N12's day-modal rows), so its +N chip now sits on a green card. It also holds three status nights and three nights on one Saturday (see Events)
+- **Casual Gamers** - 4 members (Diana owner, Eve, Frank, Alice); colour preset `blue` with a BROKEN header image URL (the fallback the 88.9 walk measures) (88.9-R2 fixture: O-02 / #207, N16; the host is on the RFC 2606 `.invalid` TLD so the fetch fails fast without reaching a real site). Since plan 88.9-60 a picture that fails to load shows the group's no-picture look, here the blue tint
 - **Dice Dynasty** - 3 members (Charlie owner, Eve, Frank); Alice is NOT a member and attends its event as a guest
 - **No Games Yet** - 3 members (Frank owner, Eve, Bartholomew); nobody in it owns a game, so create-event's Suggestions slot shows its empty hint
 - **Retired Raiders** - 3 members (Alice owner, Bob, Eve) and 1 past event; SOFT-DELETED at the end of the seed through the same service the delete button uses, so it is hidden everywhere and restorable for 30 days from the seed run (the restore link below)
-- **Photo Club** - 2 members (Eve owner, Alice); NO stored colour, and a header image that loads: the FE's own `/seed/photo-club-table.jpg` at `FRONTEND_URL` (a busy generated game-table picture with a bright and a dark corner, so the title is judged over a real picture, not a logo); 1 past Ticket to Ride night, so its "Last Game:" row shows a game name. It is the photo card with no stored colour (88.9-R2 fixture, quick 261110-ugi; N16)
+- **Photo Club** - 2 members (Eve owner, Alice); NO stored colour, and a header image that loads: the FE's own `/seed/photo-club-table.jpg` at `FRONTEND_URL` (a busy generated game-table picture with a bright and a dark corner, so the title is judged over a real picture, not a logo); its newest past night is Ticket to Ride, so its "Last Game:" row shows a game name. It is the photo card with no stored colour (88.9-R2 fixture, quick 261110-ugi; N16). It also holds an older past night with RSVP answers and scores, and a future night Alice attends as a guest (see Events)
+- **Amber Aces** - 3 members (Diana owner, Alice, Charlie); colour preset `amber`, no header image, no events. The amber group page header (88.9-R3 fixture, quick 261115-seed-r3; capture row P64-1). Alice is a plain member: Weekend Warriors stays the one live group she owns or administers
 
 ### Games (8)
 - **BGG Games:**
@@ -29,17 +31,22 @@ This script populates your database with realistic sample data for testing and d
   - Custom Card Game
   - House Rules Monopoly
 
-### Events (8 past game sessions + 1 cancelled earlier on the seed day + 5 upcoming, plus 1 past event hidden inside Retired Raiders)
-- Weekend Warriors: 3 past events (Catan, Ticket to Ride, Wingspan); 1 upcoming (Catan, ~3 days out) with an OPEN ballot (Catan / Wingspan) and Eve joined as a guest
+### Events (10 past game sessions + 1 cancelled earlier on the seed day + 6 upcoming + 3 on one Saturday, plus 1 past event hidden inside Retired Raiders)
+- Weekend Warriors: 3 past events (Catan, Ticket to Ride, Wingspan); 1 upcoming (Catan, ~3 days out) with an OPEN ballot (Catan / Wingspan) and Eve and Frank joined as guests: six participants, so the participant strip shows five chips and "See all (6)" (Frank: 88.9-R3 fixture, capture rows P63-1 / P65-3)
 - Strategy Squad: 2 past events (Gloomhaven, Azul); 1 upcoming (~10 days out, no participants yet); plus three status nights, all Gloomhaven with no participants (88.9-R2 fixtures, quick 261110-ugi):
   - a CANCELLED night (18:00) and a COMPLETED night (20:30) on one local day 12 days after the seed (W57 / R2-03; N11 Later rows, N12 day modal). Tapping that day opens the day modal with both tagged rows
   - a cancelled night that started earlier on the seed day (N40). It sits under Past, untagged
-- Casual Gamers: 2 past events (Codenames, Custom Card Game)
+  - three Gloomhaven nights (13:00, 16:00, 19:00 local) on ONE Saturday of the month the seed runs in, so that day cell shows two tiles and "+1 more" (88.9-R3 fixture, quick 261115-seed-r3; capture row P62-3). The Saturday is the nearest one still to come, else the nearest one behind; it is never the seed day or the days 3 and 12 days out, and it avoids the days of the other single nights when another Saturday exists. Ahead of the seed day the three are scheduled; behind it they are completed. Alice attends the 16:00 night as a GUEST (her own participation is flagged, as after joining by a game-only link before joining the group): a guest row on a tinted group (P63-2)
+- Casual Gamers: 2 past events (Codenames, Custom Card Game), plus one Codenames night dated 20 December of LAST year, so a Past row prints its year (88.9-R3 fixture; capture row P61-1)
 - Dice Dynasty: 1 upcoming (Codenames, ~6 days out) with Alice joined as a guest
-- Photo Club: 1 past event (Ticket to Ride, ~4 days ago, completed), its "Last Game:" (N16)
+- Photo Club: 1 past event (Ticket to Ride, ~4 days ago, completed), its "Last Game:" (N16), with no RSVP answers ("No RSVPs yet"); 1 older past Ticket to Ride night (~11 days ago) with 2 going, 1 maybe and 1 can't and the scores 57.50, 57.00 and 41.00 (Eve, and Frank, Diana and Bob as guests; 88.9-R3 fixture, capture rows P60-3 and P65-1); 1 upcoming Ticket to Ride night (~8 days out) that Alice attends as a GUEST: a guest row on a picture group (P63-2)
 - Retired Raiders: 1 past event (Ticket to Ride, ~20 days ago, Alice won) — hidden with its group until someone restores it
 - Azul's image URLs are deliberately dead (the SafeImage fallback)
 - Reseed timing for the 88.9 round-2 glance: the N40 night needs a reseed on the glance's own local day (it is "earlier today" only on the seed day), and the two status nights stay in Later for 12 days after the seed
+- Reseed timing for the 88.9 after-build capture: the Saturday with three nights is chosen from the month the seed runs in, so capture in the same calendar month as the reseed; the Photo Club guest night is upcoming for 8 days
+
+### RSVP answers (4)
+- All on the older Photo Club night: Eve and Frank going, Diana maybe, Bob can't. Every other seeded night has none
 
 ### Game Reviews (11)
 - Reviews from various users across different groups
