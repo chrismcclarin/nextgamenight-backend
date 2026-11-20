@@ -48,7 +48,8 @@ function makeApp(actor) {
     if (actor) req.__actor = { user_id: actor.user_id, email: actor.email };
     next();
   });
-  // Mounted at '/api' to mirror server.js:337 (the router declares /prompts/... paths).
+  // Mounted at '/api' to mirror Sonnet/server.js ("app.use('/api', writeOperationLimiter, availabilityPromptRoutes)")
+  // (the router declares /prompts/... paths).
   app.use('/api', availabilityPromptRoutes);
   return app;
 }

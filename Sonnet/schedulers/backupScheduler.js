@@ -46,7 +46,14 @@ function runBackupChild() {
  * Weekly backup job - spawns backup-database.js as a child process
  * so it runs independently and won't crash the server on failure.
  */
-const backupJob = cron.schedule(BACKUP_SCHEDULE, async () => {
+// DECISION quick-261119-w61 R1: createTask chosen over cron.schedule. In node-cron 4,
+// schedule() always starts the task and the old "scheduled: false" option is ignored, so a
+// scheduler built with it runs from the moment this file is required, before any start gate
+// is read. server.js happens to require this file only inside its scheduler gate, but that
+// placement is not the guard: createTask registers the task and leaves it stopped, and
+// server.js calls .start() behind the gate. Changing this back re-arms the cron at import.
+// tests/unit/schedulerStart.test.js pins it.
+const backupJob = cron.createTask(BACKUP_SCHEDULE, async () => {
   console.log(`[${new Date().toISOString()}] Starting scheduled database backup...`);
 
   try {
@@ -70,7 +77,6 @@ const backupJob = cron.schedule(BACKUP_SCHEDULE, async () => {
     console.error('Backup scheduler error:', error.message);
   }
 }, {
-  scheduled: false,  // Don't start automatically - server.js will call .start()
   timezone: 'UTC'
 });
 

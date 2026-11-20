@@ -57,7 +57,7 @@ function mountBullBoard(app) {
   // requireGroupAdmin, which let ANY group owner reach system-wide queues).
   //
   // apiLimiter runs FIRST, ahead of verifyAuth0Token (CodeQL js/missing-rate-limiting):
-  // the global limiter is mounted on `/api/` only (server.js:237) and this board lives
+  // the global limiter is mounted on `/api/` only, at Sonnet/server.js ("app.use('/api/', apiLimiter)"), and this board lives
   // at `/admin/queues`, OUTSIDE that prefix, so until now every unauthenticated request
   // here reached JWT verification — the expensive step — unthrottled. Ordering is the
   // point: a limiter behind the auth check cannot bound the cost of rejected traffic.

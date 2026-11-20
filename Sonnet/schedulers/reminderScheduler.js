@@ -181,7 +181,14 @@ async function processUpcomingReminders() {
  * Main scheduler job - runs every 5 minutes by default
  * Finds upcoming events and sends SMS reminders to RSVP'd users
  */
-const reminderJob = cron.schedule(REMINDER_CHECK_INTERVAL, async () => {
+// DECISION quick-261119-w61 R1: createTask chosen over cron.schedule. In node-cron 4,
+// schedule() always starts the task and the old "scheduled: false" option is ignored, so a
+// scheduler built with it runs from the moment this file is required, in every environment,
+// before any start gate is read (server.js requires this file at the top). createTask
+// registers the task and leaves it stopped; server.js calls .start() behind its gate.
+// Changing this back re-arms every cron at import, and this one sends texts.
+// tests/unit/schedulerStart.test.js pins it.
+const reminderJob = cron.createTask(REMINDER_CHECK_INTERVAL, async () => {
   console.log(`[${new Date().toISOString()}] Running reminder check...`);
   try {
     // recordRun persists telemetry + sends Sentry events on throw, then re-throws
@@ -192,7 +199,6 @@ const reminderJob = cron.schedule(REMINDER_CHECK_INTERVAL, async () => {
     console.error('Reminder scheduler error:', error);
   }
 }, {
-  scheduled: false, // Don't start automatically - server.js will start it
   timezone: 'UTC'
 });
 

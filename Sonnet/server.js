@@ -4,6 +4,12 @@ const cors = require('cors');
 const helmet = require('helmet');
 const { sequelize } = require('./models');
 const { buildAllowedOrigins } = require('./config/allowedOrigins');
+const {
+  BACKGROUND_JOBS_OFF_MESSAGE,
+  backgroundJobsDisabled,
+  schedulersEnabled,
+  workersEnabled,
+} = require('./config/backgroundJobs');
 const { formatEnvelope } = require('./utils/errors');
 
 // Global error handlers to prevent crashes from unhandled promise rejections
@@ -70,6 +76,9 @@ const eventBringRoutes = require('./routes/eventBrings');
 const ballotRoutes = require('./routes/ballot');
 const suggestionRoutes = require('./routes/suggestions');
 
+// Loading these three does not start anything: each module builds its task with createTask
+// and leaves it stopped (DECISION quick-261119-w61 R1, in each scheduler file). The start
+// is .start(), in the listen callback below, behind schedulersOn.
 // Scheduler for deadline-based auto-scheduling
 const { deadlineJob } = require('./schedulers/deadlineScheduler');
 // Scheduler for auto-promoting pending members after 24h
@@ -473,20 +482,41 @@ const startServer = async () => {
       console.log(`Server is running on port ${PORT}`);
       console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
 
+      // Background jobs: decided ONCE here, by config/backgroundJobs.js (quick-261119-w61,
+      // owner ruling N1; the DECISION marker is in that file). schedulersOn gates the seven
+      // scheduler and sweep starts below, workersOn the BullMQ workers and Bull Board.
+      // DISABLE_BACKGROUND_JOBS exactly '1' turns both off in any NODE_ENV and prints the
+      // one line below; without it both are what they always were.
+      const jobsOff = backgroundJobsDisabled(process.env);
+      const schedulersOn = schedulersEnabled(process.env);
+      const workersOn = workersEnabled(process.env);
+      if (jobsOff) {
+        console.log(BACKGROUND_JOBS_OFF_MESSAGE);
+        // Where Sentry runs (production; staging deletes its DSN) the off state is an
+        // alarm: nobody should be running the live site with its reminders stopped.
+        if (Sentry) {
+          try {
+            Sentry.captureMessage(BACKGROUND_JOBS_OFF_MESSAGE, 'warning');
+          } catch (err) {
+            console.warn('Sentry warning for the background-jobs off switch failed:', err.message);
+          }
+        }
+      }
+
       // Start deadline scheduler (only in production or if explicitly enabled)
-      if (process.env.NODE_ENV === 'production' || process.env.ENABLE_SCHEDULER === 'true') {
+      if (schedulersOn) {
         try {
           deadlineJob.start();
           console.log('Deadline scheduler started (node-cron)');
         } catch (err) {
           console.error('Deadline scheduler failed to start:', err.message, err.stack);
         }
-      } else {
+      } else if (!jobsOff) {
         console.log('Deadline scheduler disabled (set ENABLE_SCHEDULER=true to enable)');
       }
 
       // Start backup scheduler (weekly database backups, same guard as deadline scheduler)
-      if (process.env.NODE_ENV === 'production' || process.env.ENABLE_SCHEDULER === 'true') {
+      if (schedulersOn) {
         try {
           const { backupJob } = require('./schedulers/backupScheduler');
           backupJob.start();
@@ -497,7 +527,7 @@ const startServer = async () => {
       }
 
       // Start auto-promotion scheduler (promotes pending members after 24h)
-      if (process.env.NODE_ENV === 'production' || process.env.ENABLE_SCHEDULER === 'true') {
+      if (schedulersOn) {
         try {
           autoPromotionJob.start();
           console.log('Auto-promotion scheduler started (every 15 min)');
@@ -507,7 +537,7 @@ const startServer = async () => {
       }
 
       // Start reminder scheduler (SMS reminders for upcoming events)
-      if (process.env.NODE_ENV === 'production' || process.env.ENABLE_SCHEDULER === 'true') {
+      if (schedulersOn) {
         try {
           reminderJob.start();
           console.log('Reminder scheduler started (every 5 min, SMS reminders)');
@@ -517,7 +547,7 @@ const startServer = async () => {
       }
 
       // Start BullMQ workers (only in production or if explicitly enabled)
-      if (process.env.NODE_ENV === 'production' || process.env.ENABLE_WORKERS === 'true') {
+      if (workersOn) {
         try {
           const { promptWorker, deadlineWorker, reminderWorker } = require('./workers');
           // Use the telemetry wrapper so the prompt-schedule sync at boot lands
@@ -527,14 +557,14 @@ const startServer = async () => {
         } catch (err) {
           console.error('BullMQ workers failed to start:', err.message, err.stack);
         }
-      } else {
+      } else if (!jobsOff) {
         console.log('BullMQ workers disabled (set ENABLE_WORKERS=true to enable)');
       }
 
-      // Scheduler anomaly sweep (every 30 min, production + ENABLE_SCHEDULER only).
+      // Scheduler anomaly sweep (every 30 min, only when schedulersOn).
       // Sentry-pages when historically-non-zero jobs go silent. See
       // services/schedulerHealthService.js for the full criteria.
-      if (process.env.NODE_ENV === 'production' || process.env.ENABLE_SCHEDULER === 'true') {
+      if (schedulersOn) {
         try {
           const cron = require('node-cron');
           const { runAnomalySweep } = require('./services/schedulerHealthService');
@@ -552,7 +582,7 @@ const startServer = async () => {
       }
 
       // PendingAuth0Deletion reconciliation sweep (Phase 87.2 / REQ-6, D-08 backstop;
-      // every 30 min, production + ENABLE_SCHEDULER only, UTC). Three passes — see
+      // every 30 min, only when schedulersOn, UTC). Three passes — see
       // services/pendingAuth0DeletionSweep.js:
       //   1. Stale pending markers (completed_at NULL, >5 min): fetch the queue job by
       //      its deterministic id (auth0-cleanup-<sub>) and gate on its STATE — an
@@ -564,7 +594,7 @@ const startServer = async () => {
       //   3. Retention purge: tombstones with completed_at older than 24h (>= max
       //      access-token TTL) are destroyed; pending rows are never purged.
       // The queue is lazy-required inside the sweep (never at module top).
-      if (process.env.NODE_ENV === 'production' || process.env.ENABLE_SCHEDULER === 'true') {
+      if (schedulersOn) {
         try {
           const cron = require('node-cron');
           const { runPendingAuth0DeletionSweep } = require('./services/pendingAuth0DeletionSweep');
@@ -581,8 +611,8 @@ const startServer = async () => {
         }
       }
 
-      // Group purge sweep (Phase 88.2 / SPEC-REQ-10, D-05; production +
-      // ENABLE_SCHEDULER only, UTC). Permanently destroys every group whose stamped
+      // Group purge sweep (Phase 88.2 / SPEC-REQ-10, D-05; only when
+      // schedulersOn, UTC). Permanently destroys every group whose stamped
       // `purge_after` deadline has passed, together with its events, roster, reviews,
       // pending invites and restore tokens — see services/groupPurgeSweep.js.
       //
@@ -593,7 +623,7 @@ const startServer = async () => {
       // It deletes for real from day one — a log-only first month would have depended
       // on somebody remembering to flip a switch ~30 days after launch, and forgotten,
       // it leaves deleted groups accumulating while still holding invitee email PII.
-      if (process.env.NODE_ENV === 'production' || process.env.ENABLE_SCHEDULER === 'true') {
+      if (schedulersOn) {
         try {
           const cron = require('node-cron');
           const { runGroupPurgeSweep } = require('./services/groupPurgeSweep');
@@ -611,7 +641,7 @@ const startServer = async () => {
       }
 
       // Mount Bull Board dashboard (only if workers are enabled)
-      if (process.env.NODE_ENV === 'production' || process.env.ENABLE_WORKERS === 'true') {
+      if (workersOn) {
         try {
           const mountBullBoard = require('./routes/bullBoard');
           mountBullBoard(app);

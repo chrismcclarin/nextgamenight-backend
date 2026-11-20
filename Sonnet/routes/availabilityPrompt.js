@@ -563,6 +563,15 @@ router.post('/prompts', verifyAuth0Token, async (req, res) => {
     }
 
     // Schedule reminder and deadline jobs (only if BullMQ is enabled)
+    // DECISION quick-261119-w61 (owner ruling N1): this producer keeps its OWN
+    // NODE_ENV-or-ENABLE_WORKERS condition and ignores DISABLE_BACKGROUND_JOBS, over
+    // calling workersEnabled() from config/backgroundJobs.js like server.js does. The
+    // two calls below only ENQUEUE delayed jobs (services/reminderService.js). With the
+    // switch set, this poll's reminder and deadline jobs still go into the queue and run
+    // once the workers are back; skipping them here would lose this poll's reminders for
+    // good, because nothing queues a manual poll's reminders a second time (only the
+    // deadline has a cron backstop, schedulers/deadlineScheduler.js). Looks inconsistent
+    // with server.js on purpose. Changing it is a decision, not a cleanup.
     if (process.env.NODE_ENV === 'production' || process.env.ENABLE_WORKERS === 'true') {
       try {
         await scheduleDeadlineJob(prompt);

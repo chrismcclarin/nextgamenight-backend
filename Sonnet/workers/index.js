@@ -6,8 +6,9 @@ const reminderWorker = require('./reminderWorker');
 const gcalSyncWorker = require('./gcalSyncWorker');
 const auth0CleanupWorker = require('./auth0CleanupWorker');
 // Phase 88.8 / D-40: requiring this module is what CONSTRUCTS the Worker (each
-// worker file does `new Worker(...)` at load), and server.js:522's destructure
-// names only three workers but is not a start list — `require('./workers')`
+// worker file does `new Worker(...)` at load), and the destructure at
+// Sonnet/server.js ("deadlineWorker, reminderWorker } = require('./workers')"), behind
+// `workersOn`, names only three workers but is not a start list — `require('./workers')`
 // itself starts all of them. This require line is therefore what puts the
 // email-notice lane into production.
 const emailNoticeWorker = require('./emailNoticeWorker');
