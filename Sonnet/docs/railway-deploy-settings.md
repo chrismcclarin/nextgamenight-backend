@@ -21,7 +21,7 @@ Rules:
 ## History
 
 Until November 2026 these three values lived in `Sonnet/railway.json` (Railway "Config as Code"), which
-Railway stopped reading on 2026-12-01. They were applied to the service with `railway config apply` on
-2026-11-19 and the old file was deleted afterwards. Do not add a `railway.json` back: Railway would
-ignore it. Older comments in the code that say "railway.json's preDeployCommand" mean the pre-deploy
+Railway stops reading on 2026-12-01. They were applied to the service with `railway config apply` on
+2026-11-19 and the old file was deleted afterwards. Do not add a `railway.json` back: until 2026-12-01
+Railway would read it again and it would override the service's settings; after that date it is ignored. Older comments in the code that say "railway.json's preDeployCommand" mean the pre-deploy
 command described above.
