@@ -142,7 +142,7 @@ All of these are set on the **staging** backend service. Names only; the values 
 | `NODE_ENV` | Leave as `production` | Staging must behave like the live site (owner ruling G1). |
 | `POSTGRES_PRIVATE_URL`, `POSTGRES_URL`, `DATABASE_URL`, `PGDATABASE_URL`, `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | Each one that exists: a `${{ ... }}` reference to **staging's own** Postgres, or deleted. Never pasted text. | The STOP box in step (d). A pasted production address runs the staging server on real data. |
 | `REDIS_URL` | A `${{ ... }}` reference to **staging's own** Redis | The STOP box. Production's Redis holds the live site's queued reminders. |
-| `AUTH0_MANAGEMENT_CLIENT_ID`, `AUTH0_MANAGEMENT_CLIENT_SECRET` | **Delete both on staging, before the first deploy. Never add them back.** | Staging must never be able to delete or change a login in the Auth0 tenant the live site uses. With them in place, Delete account on staging deletes the real login. What staging loses without them is written under this table. |
+| `AUTH0_MANAGEMENT_CLIENT_ID`, `AUTH0_MANAGEMENT_CLIENT_SECRET` | **Delete both on staging, before the first deploy. Never add them back** (adding them back later deletes, for real, every login whose account was ever deleted on staging; see section 9). | Staging must never be able to delete or change a login in the Auth0 tenant the live site uses. With them in place, Delete account on staging deletes the real login. What staging loses without them is written under this table. |
 | `MAGIC_TOKEN_SECRET` | A new random value, made in your own terminal | So a staging link can never work on production. |
 | `FRONTEND_URL`, `ALLOWED_ORIGINS` | The preview site's address | The backend only answers the site named here, and builds its links from it. |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI` | Delete on staging | Connect Google Calendar fails on staging with a Google error, on purpose: Google Calendar stays off on staging (owner decision C1, 2026-11-19); it is tested on the local copy and on the live site. Do not report it as a bug. |
@@ -281,7 +281,7 @@ If you want to try the Delete account feature itself on staging, tell Claude fir
 - Never add the seed to a pre-deploy command, on staging or anywhere. It would wipe staging on every deploy.
 - Never paste command output into the Claude session, and never run the commands in section 6 there (see the top of this file).
 - Never try to get around a refused lock. A refusal is the guard working.
-- Never add `AUTH0_MANAGEMENT_CLIENT_ID` or `AUTH0_MANAGEMENT_CLIENT_SECRET` back to the staging backend service.
+- Never add `AUTH0_MANAGEMENT_CLIENT_ID` or `AUTH0_MANAGEMENT_CLIENT_SECRET` back to the staging backend service. Every Delete account ever pressed on staging leaves a deletion that staging keeps retrying every half hour and never gives up on. Add the two variables back and, within about half an hour, every one of those logins is deleted for real in Auth0, including any login you also use on the live site.
 - Never use Delete account on staging while either of those two variables exists there. It would delete the login in the Auth0 tenant the live site uses.
 - Never use Delete account on staging while signed in as one of the test logins from step (g).
 
