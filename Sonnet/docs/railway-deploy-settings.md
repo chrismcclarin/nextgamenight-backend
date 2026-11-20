@@ -18,11 +18,10 @@ Rules:
 - The pre-deploy command is what runs the database migrations before each deploy
   (`node scripts/log-db-resolution.js && npm run migrate:apply`). Do not remove it.
 
-## Until `railway.json` is deleted
+## History
 
-`Sonnet/railway.json` is the old way of setting the same three values. Railway stops reading it on
-2026-12-01. While it is still in the repo, Railway reads it on every deploy and it wins over the service's
-own settings, so there are two sources of truth: a change applied from `railway.ts` is silently overridden
-by `railway.json` on the next deploy. Until `railway.json` is deleted, change a setting in BOTH files or
-in neither. The deletion is a follow-up change, made only after the cutover
-(`railway config migrate cutover`), as Railway's migration guide requires.
+Until November 2026 these three values lived in `Sonnet/railway.json` (Railway "Config as Code"), which
+Railway stopped reading on 2026-12-01. They were applied to the service with `railway config apply` on
+2026-11-19 and the old file was deleted afterwards. Do not add a `railway.json` back: Railway would
+ignore it. Older comments in the code that say "railway.json's preDeployCommand" mean the pre-deploy
+command described above.

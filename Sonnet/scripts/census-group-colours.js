@@ -12,7 +12,7 @@
 // READ-ONLY: no write calls of any kind. Output to stdout only.
 //
 // WHY THIS IS A SIBLING SCRIPT AND NOT A `--dry-run` FLAG ON THE MIGRATION
-// (88.3.1-RESEARCH.md Pitfall 2 — this is the load-bearing part): railway.json's
+// (88.3.1-RESEARCH.md Pitfall 2 — this is the load-bearing part): Railway's
 // deploy.preDeployCommand runs `npm run migrate:apply` (= `npx sequelize-cli
 // db:migrate`) with NO ARGUMENTS on every deploy. A flag would therefore never be
 // passed, and the real UPDATE would run automatically the moment the PR merged —

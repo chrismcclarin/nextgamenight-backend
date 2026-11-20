@@ -74,7 +74,7 @@ class Auth0Service {
 
     // A silent fallback in production is exactly the failure mode that hid the 403 for
     // five months, so say it out loud ONCE, at construction. NEVER throw here: this
-    // module is required at boot, railway.json runs preDeployCommand and then health-
+    // module is required at boot, Railway runs the pre-deploy command and then health-
     // checks /health with a 120s timeout, and a constructor throw before /health can
     // answer fails the deploy outright — the 2026-09-02 incident class.
     if (!process.env.AUTH0_TENANT_DOMAIN && process.env.NODE_ENV === 'production') {
