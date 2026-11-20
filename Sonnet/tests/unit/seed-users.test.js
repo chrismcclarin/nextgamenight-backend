@@ -303,6 +303,21 @@ describe('S7: scripts/seed-sample-data.js awaits the guard before it touches the
     expect(seedSource).toMatch(/seedAddress\(\s*['"]pending-invitee['"]/);
   });
 
+  test('no log line prints a seeded address (on staging it is derived from SEED_EMAIL_BASE)', () => {
+    // Owner requirement (2026-11-19): nothing this work prints may reveal a variable's value.
+    // With SEED_EMAIL_BASE set, a seeded address IS that value plus a tag, so the seed's
+    // output names users by username and the invite by count, never by address.
+    const logLines = seedSource.split('\n').filter((line) => /console\.(log|error|warn)\(/.test(line));
+
+    expect(logLines.length).toBeGreaterThan(10); // anti-vacuity: the scan found the log lines
+    for (const line of logLines) {
+      expect({ line, printsAddress: /email|pendingInviteeEmail|SEED_EMAIL_BASE\}/i.test(line) }).toEqual({
+        line,
+        printsAddress: false,
+      });
+    }
+  });
+
   test('still exports seedDatabase and ALICE_PLACEHOLDER_SUB', () => {
     expect(seedSource).toMatch(/module\.exports\s*=\s*\{\s*seedDatabase,\s*ALICE_PLACEHOLDER_SUB\s*\};/);
   });

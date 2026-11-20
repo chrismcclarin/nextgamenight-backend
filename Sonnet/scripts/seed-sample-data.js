@@ -19,7 +19,8 @@ const {
   sequelize,
 } = require('../models');
 const heatmapService = require('../services/heatmapService');
-const { assertNotProductionDb } = require('./lib/assert-not-production-db');
+const { assertSeedTargetAllowed } = require('./lib/assert-not-production-db');
+const { ALICE_PLACEHOLDER_SUB, buildSampleUsers, seedAddress } = require('./lib/seed-users');
 const { softDeleteGroup } = require('../services/groupRecoveryService');
 // DECISION quick-261103-glx G4: Alice's RSVP links are minted by the route module's
 // own mintRsvpBatch / generateRsvpUrl — one definition of the HMAC payload and the
@@ -41,59 +42,16 @@ function seedErrorForLog(error) {
 }
 
 // Sample data arrays
-// NOTE: user_id should match your Auth0 'sub' claim value
-// To get your Auth0 sub: Log in to the app and check browser console
-// Or check Auth0 Dashboard > Users > [User] > User ID field
-// You can also set these via environment variables:
-//   AUTH0_ALICE_SUB, AUTH0_BOB_SUB, etc.
-// Alice's fallback sub, used when AUTH0_ALICE_SUB is unset. Named (quick 261103-glx,
-// scoped-check WR-02) so the RSVP-link notice at the end can compare the sub Alice was
-// actually seeded on against it; exported for the seed's tests.
-const ALICE_PLACEHOLDER_SUB = 'auth0|6959f749afc6f7d1e7fb1635';
-const sampleUsers = [
-  { 
-    user_id: process.env.AUTH0_ALICE_SUB || ALICE_PLACEHOLDER_SUB,
-    username: 'Alice', 
-    email: 'alice@example.com' 
-  },
-  { 
-    user_id: process.env.AUTH0_BOB_SUB || 'auth0|695a019d225a2081ca41297b', 
-    username: 'Bob', 
-    email: 'bob@example.com' 
-  },
-  { 
-    user_id: process.env.AUTH0_CHARLIE_SUB || 'auth0|695a0258225a2081ca4129d5', 
-    username: 'Charlie', 
-    email: 'charlie@example.com' 
-  },
-  { 
-    user_id: process.env.AUTH0_DIANA_SUB || 'auth0|695a02a92c3ca58370cd94c0', 
-    username: 'Diana', 
-    email: 'diana@example.com' 
-  },
-  { 
-    user_id: process.env.AUTH0_EVE_SUB || 'auth0|695a02f2f066d9582838c311', 
-    username: 'Eve', 
-    email: 'eve@example.com' 
-  },
-  { 
-    user_id: process.env.AUTH0_FRANK_SUB || 'auth0|695a0327b7305395a05774dc', 
-    username: 'Frank', 
-    email: 'frank@example.com' 
-  },
-  // Phase 88.9 round 1b (walk fixtures): a member who owns NO games, with a name
-  // long enough to wrap the 375px profile title (walk rows W152 / #29). The
-  // local walk signs in as this user for those two captures (the Alice-login
-  // runbook's repoint); nothing else references the account. CAUTION (quick
-  // 261103-glx): any repoint that moves Alice's sub breaks the RSVP links the seed
-  // prints — they carry and are signed over the sub as seeded — so walk the RSVP
-  // rows first, or reseed afterwards.
-  {
-    user_id: process.env.AUTH0_BART_SUB || 'auth0|695a0399c0ffee0000000001',
-    username: 'Bartholomew Featherstonehaugh-Cholmondeley',
-    email: 'bartholomew@example.com'
-  },
-];
+// The seven seed users (subs, names, addresses, and the one user who may receive texts) are
+// built in scripts/lib/seed-users.js; the comments that used to sit on the table moved
+// there with it. The three values below are read ONCE, here, when this module loads: the
+// WR-02 marker near the end of seedDatabase relies on sampleUsers being fixed at load, and
+// the guard is handed these same addresses, so what the seed writes and what lock 4 accepts
+// are read from the environment at one moment. A malformed SEED_EMAIL_BASE or an unknown
+// SEED_SMS_USER throws here, before anything connects.
+const sampleUsers = buildSampleUsers(process.env);
+const pendingInviteeEmail = seedAddress('pending-invitee', process.env);
+const stagingEmailBase = process.env.SEED_EMAIL_BASE;
 
 const sampleGroups = [
   { group_id: 'weekend-warriors', name: 'Weekend Warriors' },
@@ -224,9 +182,29 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
     // Phase 87.8 Plan 02 Task 0 (T-87.8-05): default-deny guard BEFORE the first
     // destructive statement. The sync({ alter: true }) below is itself
     // schema-destructive, not just the destroy({ where: {} }) block — so the guard
-    // must run before BOTH. Throws on NODE_ENV=production and on any non-local DB
-    // host unless ALLOW_DESTRUCTIVE_SEED=1 is explicitly set.
-    assertNotProductionDb(sequelize);
+    // must run before BOTH, and it is AWAITED: nothing below starts until it has answered.
+    // What it does (quick-261119-nv0, owner ruling G1; scripts/lib/assert-not-production-db.js):
+    //  - NODE_ENV is not production (local, CI): the local-host guard, as before. It throws
+    //    on any non-local DB host unless ALLOW_DESTRUCTIVE_SEED=1 is explicitly set, and it
+    //    runs no query.
+    //  - NODE_ENV is production (staging runs that way): the four-lock staging arm. It
+    //    refuses unless the Railway environment is named staging, ALLOW_STAGING_SEED is 1,
+    //    the database host is readable and not the one named in PROD_DB_HOST_DENY, and the
+    //    Users table holds nobody but seed users and plus-addresses of SEED_EMAIL_BASE.
+    // tests/unit/seed-users.test.js (S7) pins this call as the first statement of the try.
+    const seedTarget = await assertSeedTargetAllowed(sequelize, {
+      seedEmails: sampleUsers.map((user) => user.email),
+      stagingEmailBase,
+    });
+
+    // Which database this run is about to change, and what each lock found. Host, port and
+    // database name only: never a username, a password, or what a variable holds. A refused
+    // run carries the same database line inside its error message.
+    console.log(`🔒 Seed target: ${seedTarget.database}`);
+    for (const lockLine of seedTarget.locks) {
+      console.log(`   - ${lockLine}`);
+    }
+    console.log('');
 
     console.log('🌱 Starting database seeding...\n');
     console.log('📝 Note: Make sure your database exists and is configured in .env\n');
@@ -1174,12 +1152,19 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
     console.log('✉️  Seeding a pending group invite (88-34 WI-B4)...');
     const pendingInvite = await GroupInvite.create({
       group_id: weekendGroup.id,
-      invited_email: 'pending-invitee@example.com',
+      // The reserved pending-invitee address, or its plus-address when SEED_EMAIL_BASE is set
+      // (scripts/lib/seed-users.js, the E3 marker).
+      invited_email: pendingInviteeEmail,
       invited_by_uuid: users[0].id, // Alice, the Weekend Warriors owner
       token: crypto.randomBytes(32).toString('hex'), // runtime-generated, never a literal
       status: 'pending',
     });
-    console.log(`   ✓ 1 pending invite to ${pendingInvite.invited_email} (token generated at runtime)\n`);
+    // DECISION quick-261119-nv0 P1: this line names the invite's group, chosen OVER printing
+    // the invited address as it did before. With SEED_EMAIL_BASE set the address is that
+    // variable's value plus a tag, and nothing the seed prints may reveal a variable's value
+    // (owner requirement, 2026-11-19). Do not put the address back "for convenience": read
+    // the row instead. tests/unit/seed-users.test.js pins that no log line prints an address.
+    console.log(`   ✓ 1 pending invite to ${weekendGroup.name} (${pendingInvite.status}; token generated at runtime)\n`);
 
     // ────────────────────────────────────────────────────────────────────────
     // Token fixtures (Phase 88.9 round 2, quick 261103-glx). The two token states
