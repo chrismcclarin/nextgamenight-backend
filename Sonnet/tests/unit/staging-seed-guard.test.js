@@ -516,7 +516,7 @@ describe('lock 4: the Users table holds only staging-owned users', () => {
     ['the same local part at another domain', 'owner+walk@example.org'],
     ['a local part that only starts with the base local part', 'ownerx+walk@example.com'],
     ['a plus with an empty tag', 'owner+@example.com'],
-    ['a domain that only ends with the base domain', 'owner+walk@notexample.com'],
+    ['a domain that only ends with the base domain', 'owner+walk@mail.example.com'],
     ['a domain that only starts with the base domain', 'owner+walk@example.com.example.org'],
   ])('N7: lock 4 still rejects %s', async (_label, email) => {
     setEveryVariableRight();
@@ -603,7 +603,7 @@ describe('N9: parseStagingEmailBase', () => {
     ['an empty domain', 'owner@'],
     ['a "+" in the base', 'owner+tag@example.com'],
     ['whitespace inside the local part', 'own er@example.com'],
-    ['whitespace inside the domain', 'owner@exam ple.com'],
+    ['whitespace inside the domain', 'owner@example .com'],
   ])('throws for %s, naming SEED_EMAIL_BASE and never repeating the value', (_label, value) => {
     let error = null;
     try {
