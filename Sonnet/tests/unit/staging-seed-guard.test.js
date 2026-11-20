@@ -243,6 +243,57 @@ describe('lock 1: RAILWAY_ENVIRONMENT_NAME is exactly "staging"', () => {
   );
 });
 
+describe('the guard names variables and never repeats what they hold', () => {
+  // Owner requirement (2026-11-19): nothing this work prints may reveal a variable's value.
+  // A refusal names the variable and the rule; a passing line names the variable. The one
+  // thing printed from the environment is the database line (host, port, database name).
+  test('a lock 1 refusal does not repeat the value of RAILWAY_ENVIRONMENT_NAME', async () => {
+    setEveryVariableRight();
+    process.env.RAILWAY_ENVIRONMENT_NAME = 'some-other-environment-name';
+
+    const message = await refusalOf(() => assertSeedTargetAllowed(makeSequelize([]), opts()));
+
+    expect(message).toMatch(/lock 1\b/i);
+    expect(message).toContain('RAILWAY_ENVIRONMENT_NAME');
+    expect(message).not.toContain('some-other-environment-name');
+  });
+
+  test('a lock 2 refusal does not repeat the value of ALLOW_STAGING_SEED', async () => {
+    setEveryVariableRight();
+    process.env.ALLOW_STAGING_SEED = 'not-the-switch-value';
+
+    const message = await refusalOf(() => assertSeedTargetAllowed(makeSequelize([]), opts()));
+
+    expect(message).toMatch(/lock 2\b/i);
+    expect(message).not.toContain('not-the-switch-value');
+  });
+
+  test('the passing lock lines quote no value at all', async () => {
+    setEveryVariableRight();
+    process.env.PROD_DB_HOST_DENY = 'prod-db.example.org';
+
+    const result = await assertSeedTargetAllowed(makeSequelize([{ email: 'owner+alice@example.com' }]), opts());
+
+    expect(result.locks).toHaveLength(4);
+    for (const line of result.locks) {
+      expect(line).not.toMatch(/"/);
+      expect(line).not.toContain('prod-db.example.org');
+      expect(line).not.toContain('owner');
+      expect(line).not.toContain('example.com');
+    }
+  });
+
+  test('outside production mode the single line quotes no value either', async () => {
+    process.env.NODE_ENV = 'test';
+    process.env.DATABASE_URL = LOCAL_URL;
+
+    const result = await assertSeedTargetAllowed(makeSequelize(), opts());
+
+    expect(result.locks).toHaveLength(1);
+    expect(result.locks[0]).not.toMatch(/"/);
+  });
+});
+
 describe('lock 2: ALLOW_STAGING_SEED is exactly "1"', () => {
   test('N4: unset rejects', async () => {
     setEveryVariableRight();

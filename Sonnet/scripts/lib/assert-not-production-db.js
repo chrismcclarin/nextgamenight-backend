@@ -279,6 +279,12 @@ function seedRefusal(sequelize, detail) {
  * Every refusal names the database (never a credential), the lock, and what would make it
  * pass. A lock-4 refusal gives a COUNT of users and never an address, a username or an id.
  *
+ * NAMES VARIABLES, NEVER THEIR VALUES (owner requirement, 2026-11-19). A refusal and a
+ * passing line name the variable and the rule; neither repeats what a variable holds, not
+ * even a wrong RAILWAY_ENVIRONMENT_NAME. The one thing taken from the environment and
+ * printed is the database line (host, port, database name; see describeResolvedDb). Do not
+ * add a "found: <value>" to a message to make it friendlier: these lines reach logs.
+ *
  * @param {import('sequelize').Sequelize} sequelize
  * @param {{ seedEmails: string[], stagingEmailBase?: string }} opts
  *   seedEmails: the seed's own addresses. stagingEmailBase: the raw SEED_EMAIL_BASE value.
@@ -299,15 +305,17 @@ async function assertStagingSeedAllowed(sequelize, { seedEmails, stagingEmailBas
   // Lock 1: the Railway environment is named staging.
   const environmentName = process.env.RAILWAY_ENVIRONMENT_NAME;
   if (environmentName !== 'staging') {
-    const found = environmentName === undefined ? 'not set' : JSON.stringify(environmentName);
+    // Says only whether the variable is set. What it holds is never repeated (see the
+    // "names variables, never their values" note above assertStagingSeedAllowed).
+    const found = environmentName === undefined ? 'it is not set' : 'it holds something else';
     throw seedRefusal(
       sequelize,
       'Lock 1 of 4 failed. It checks that this is the Railway environment named staging: ' +
-        `RAILWAY_ENVIRONMENT_NAME must be exactly "staging" and it is ${found}. To pass, run ` +
+        `RAILWAY_ENVIRONMENT_NAME must be exactly "staging" and ${found}. To pass, run ` +
         'the seed inside the Railway environment whose name is exactly "staging".'
     );
   }
-  locks.push('lock 1 passed: RAILWAY_ENVIRONMENT_NAME is "staging"');
+  locks.push('lock 1 passed: RAILWAY_ENVIRONMENT_NAME names the staging environment');
 
   // Lock 2: seeding staging was switched on deliberately. ALLOW_DESTRUCTIVE_SEED plays no part
   // in production mode.
@@ -319,7 +327,7 @@ async function assertStagingSeedAllowed(sequelize, { seedEmails, stagingEmailBas
         'production mode). To pass, set ALLOW_STAGING_SEED to 1 on the staging service only.'
     );
   }
-  locks.push('lock 2 passed: ALLOW_STAGING_SEED is "1"');
+  locks.push('lock 2 passed: ALLOW_STAGING_SEED is switched on');
 
   // Lock 3: the host can be read and is not the one named in PROD_DB_HOST_DENY. Weak on
   // purpose (see the G1 marker above): same contains-match as scripts/ci/create-sync-db.js,
@@ -450,7 +458,7 @@ async function assertSeedTargetAllowed(sequelize, opts) {
   return {
     database: describeResolvedDb(sequelize),
     locks: [
-      'production mode is off (NODE_ENV is not "production"), so the staging locks do not ' +
+      'production mode is off (NODE_ENV is not production), so the staging locks do not ' +
         'apply; the local-host guard passed',
     ],
   };
