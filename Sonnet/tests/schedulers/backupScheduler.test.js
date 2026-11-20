@@ -7,7 +7,8 @@
 //     --testMatch '**/tests/schedulers/backupScheduler.test.js' --forceExit
 //
 // Strategy: backupScheduler.js wires its failure logic inside the cron callback
-// passed to node-cron's schedule(). We:
+// passed to node-cron's createTask() (quick-261119-w61 R-1: createTask, not schedule(),
+// which in node-cron 4 starts the task at require time). We:
 //   - mock node-cron to CAPTURE that callback (so we can invoke it directly),
 //   - mock child_process.execFile to force the backup child to fail (or succeed),
 //   - mock schedulerHealthService.recordRun to invoke the inner fn and CAPTURE its
@@ -25,7 +26,7 @@ const mockRecordRun = jest.fn(async (name, fn) => {
 
 // node-cron: capture the scheduled callback, return a no-op job handle.
 jest.mock('node-cron', () => ({
-  schedule: jest.fn((schedule, cb /* opts */) => {
+  createTask: jest.fn((schedule, cb /* opts */) => {
     mockCronState.cb = cb;
     return { start: jest.fn(), stop: jest.fn() };
   }),

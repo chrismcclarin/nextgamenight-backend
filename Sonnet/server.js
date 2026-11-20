@@ -76,6 +76,9 @@ const eventBringRoutes = require('./routes/eventBrings');
 const ballotRoutes = require('./routes/ballot');
 const suggestionRoutes = require('./routes/suggestions');
 
+// Loading these three does not start anything: each module builds its task with createTask
+// and leaves it stopped (DECISION quick-261119-w61 R1, in each scheduler file). The start
+// is .start(), in the listen callback below, behind schedulersOn.
 // Scheduler for deadline-based auto-scheduling
 const { deadlineJob } = require('./schedulers/deadlineScheduler');
 // Scheduler for auto-promoting pending members after 24h

@@ -13,7 +13,13 @@ const AUTO_PROMOTE_INTERVAL = process.env.AUTO_PROMOTE_INTERVAL || '*/15 * * * *
  * Finds all UserGroup records where role is 'pending', status is 'active',
  * and joined_at is more than 24 hours ago. Promotes them to 'member'.
  */
-const autoPromotionJob = cron.schedule(AUTO_PROMOTE_INTERVAL, async () => {
+// DECISION quick-261119-w61 R1: createTask chosen over cron.schedule. In node-cron 4,
+// schedule() always starts the task and the old "scheduled: false" option is ignored, so a
+// scheduler built with it runs from the moment this file is required, in every environment,
+// before any start gate is read (server.js requires this file at the top). createTask
+// registers the task and leaves it stopped; server.js calls .start() behind its gate.
+// Changing this back re-arms every cron at import. tests/unit/schedulerStart.test.js pins it.
+const autoPromotionJob = cron.createTask(AUTO_PROMOTE_INTERVAL, async () => {
   console.log(`[${new Date().toISOString()}] Running auto-promotion check...`);
 
   try {
@@ -51,7 +57,6 @@ const autoPromotionJob = cron.schedule(AUTO_PROMOTE_INTERVAL, async () => {
     console.error('Auto-promotion scheduler error:', error);
   }
 }, {
-  scheduled: false, // Don't start automatically - server.js will start it
   timezone: 'UTC',
 });
 

@@ -23,8 +23,9 @@ jest.mock('../../services/smsService', () => ({
 }));
 
 // Mock node-cron so it doesn't actually schedule anything
+// (quick-261119-w61 R-1: the scheduler builds its task with createTask, not schedule).
 jest.mock('node-cron', () => ({
-  schedule: jest.fn((interval, callback, options) => ({
+  createTask: jest.fn((interval, callback, options) => ({
     start: jest.fn(),
     stop: jest.fn(),
     _callback: callback
