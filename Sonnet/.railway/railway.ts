@@ -3,6 +3,8 @@
 // reading on 2026-12-01. Railway does NOT read this file during a deploy: a change here
 // takes effect only when someone runs `railway config plan` and then `railway config apply`
 // from this folder. Variables are unmanaged on purpose: this file never reads or writes them.
+// Until railway.json is deleted it still wins on every deploy: change a setting in both files or
+// in neither. How to change these settings: docs/railway-deploy-settings.md
 import { defineRailway, github, project, service } from "railway/iac";
 // This repository manages only its own resources in the environment. Other
 // repositories export their own partial name.
