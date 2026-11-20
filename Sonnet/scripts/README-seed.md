@@ -91,6 +91,7 @@ Things to know about the locks:
 - **Lock 4 is the one that protects production.** Production holds real people, so production always fails it, and it does not depend on any variable being set correctly. It is a read (one `SELECT`) and it runs before the first change.
 - **Lock 3 is weak, and known to be.** Inside Railway the staging and production database hosts very likely have the same name, so lock 3 cannot tell them apart. It only catches a staging variable that points at the host written in `PROD_DB_HOST_DENY`.
 - **`ALLOW_STAGING_SEED` belongs on the staging service only. Never set it on production.** `ALLOW_DESTRUCTIVE_SEED` does nothing in production mode.
+- **In production mode the seed does not change the schema.** Staging's tables are built by its migrations, the same way production's are, so the seed skips its schema sync there and prints a line saying so. It still empties and refills the tables. On your machine and in CI the seed keeps syncing the schema from the models.
 - A refusal names the lock that failed and what would make it pass. It names variables and never repeats what they hold; a lock 4 refusal gives a count of users, never an address.
 - The fixture script (`scripts/e2e-fixtures.js`) has no staging exception: it never runs in production mode.
 

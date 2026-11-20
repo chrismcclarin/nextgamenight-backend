@@ -322,3 +322,53 @@ describe('S7: scripts/seed-sample-data.js awaits the guard before it touches the
     expect(seedSource).toMatch(/module\.exports\s*=\s*\{\s*seedDatabase,\s*ALICE_PLACEHOLDER_SUB\s*\};/);
   });
 });
+
+describe('R2: in production mode the seed leaves the schema to the migrations', () => {
+  // Review finding R-2 (quick-261119-nv0). Staging's schema is built by its pre-deploy
+  // migrations. sync({ alter: true }) on top of it can re-add a unique constraint on every
+  // run and drift staging away from production's schema, so the seed must not sync there.
+  // The seed cannot be loaded in this DB-free lane (see S7), so this reads the source.
+  // The guard's side of it (productionMode true only in the four-lock arm) is pinned in
+  // tests/unit/staging-seed-guard.test.js.
+  const fnIndex = seedSource.indexOf('async function seedDatabase(');
+  const body = fnIndex > -1 ? seedSource.slice(fnIndex) : '';
+
+  // The whole schema step: the production-mode branch first, the sync in the branch after it.
+  const SCHEMA_STEP =
+    /if \(seedTarget\.productionMode\) \{\n([^}]*)\} else if \(syncSchema\) \{\n\s*await sequelize\.sync\(\{ alter: true \}\);/;
+
+  test('the only schema sync in the file sits behind the production-mode branch', () => {
+    expect(fnIndex).toBeGreaterThan(-1);
+    // ANTI-VACUITY: exactly one sync call exists, so there is no second, unguarded one.
+    expect(seedSource.split('sequelize.sync(')).toHaveLength(2);
+
+    const step = body.match(SCHEMA_STEP);
+    expect(step).not.toBeNull();
+
+    const productionBranch = step[1];
+    expect(productionBranch).not.toContain('sequelize.sync(');
+    expect(productionBranch).not.toContain('await ');
+  });
+
+  test('the production-mode branch says in the log that the migrations own the schema', () => {
+    const step = body.match(SCHEMA_STEP);
+    expect(step).not.toBeNull();
+
+    expect(step[1]).toMatch(/console\.log\(/);
+    expect(step[1]).toMatch(/owned by the migrations/);
+  });
+
+  test('the branch reads what the guard returned, after the guard has answered', () => {
+    const callIndex = body.indexOf('const seedTarget = await assertSeedTargetAllowed(');
+    const branchIndex = body.indexOf('if (seedTarget.productionMode) {');
+
+    expect(callIndex).toBeGreaterThan(-1);
+    expect(branchIndex).toBeGreaterThan(callIndex);
+    expect(branchIndex).toBeLessThan(body.indexOf('sequelize.sync('));
+  });
+
+  test('carries the decision marker, naming what was chosen and what was rejected', () => {
+    expect(seedSource).toMatch(/DECISION quick-261119-nv0 R2: migrations own the schema in production mode/);
+    expect(seedSource).toMatch(/chosen OVER\s+(\/\/\s+)?running sync\(\{ alter: true \}\) there/);
+  });
+});

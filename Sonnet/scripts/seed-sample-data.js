@@ -175,8 +175,9 @@ const sampleGames = [
 // Sequelize 6.37.8 source (postgres query-generator changeColumnQuery appends ADD UNIQUE
 // whenever the definition ends in UNIQUE), not measured here; the design does not depend
 // on it. The defaults keep `npm run seed`'s schema sync and connection close
-// exactly as before. The guard below stays the first statement in BOTH modes. Removing
-// the options is a decision, not a cleanup.
+// exactly as before, outside production mode (in production mode the sync is skipped whatever
+// syncSchema says: the R2 marker inside the function). The guard below stays the first
+// statement in BOTH modes. Removing the options is a decision, not a cleanup.
 async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) {
   try {
     // Phase 87.8 Plan 02 Task 0 (T-87.8-05): default-deny guard BEFORE the first
@@ -222,8 +223,25 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
       throw error;
     }
 
-    // Sync database (skipped only when the caller supplies the schema — G1 above)
-    if (syncSchema) {
+    // Sync database. Skipped in production mode (R2, next), and when the caller supplies the
+    // schema (G1 above).
+    //
+    // DECISION quick-261119-nv0 R2: migrations own the schema in production mode, chosen OVER
+    // running sync({ alter: true }) there, because alter can re-add unique constraints on every
+    // run and drift staging away from production's schema. Staging's tables are built by its
+    // pre-deploy migrations, the same way production's are (server.js never syncs in
+    // production mode either), so a seed that altered them from the models would leave staging
+    // with a schema production does not have, and a later migration that names a constraint
+    // could then fail on staging alone. Whether alter really re-adds them was read from
+    // Sequelize source, not measured (the G1 marker above); the skip does not depend on it.
+    // "Production mode" here is exactly "the guard took its four-lock arm"
+    // (seedTarget.productionMode), so the seed and the guard cannot disagree about it. Nothing
+    // below needs the sync to have run: lock 4 has already read the Users table, so the tables
+    // exist. Local and CI seeds keep their sync; those databases are sync-built on purpose.
+    // Syncing in production mode again is a decision, not a cleanup.
+    if (seedTarget.productionMode) {
+      console.log('⏭️  Schema sync skipped: in production mode the schema is owned by the migrations\n');
+    } else if (syncSchema) {
       await sequelize.sync({ alter: true });
       console.log('✅ Database synced\n');
     } else {

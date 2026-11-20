@@ -196,7 +196,7 @@ railway ssh -e staging -s GameCalendarbackendv2 -- ls package.json
 railway ssh -e staging -s GameCalendarbackendv2 -- npm run seed
 ```
 
-- You should see, in this order: the app's "Database connection info" lines; a line starting `Seed target:` that names the database; four lines, one for each lock, each saying it passed (lock 3 says it is "not armed" if you left `PROD_DB_HOST_DENY` out); the seeding steps; `Seeding complete!`; and a list of walk links built from the preview site's address.
+- You should see, in this order: the app's "Database connection info" lines; a line starting `Seed target:` that names the database; four lines, one for each lock, each saying it passed (lock 3 says it is "not armed" if you left `PROD_DB_HOST_DENY` out); a line saying the schema sync was skipped (on staging the tables belong to the migrations, so the seed fills them and never reshapes them); the seeding steps; `Seeding complete!`; and a list of walk links built from the preview site's address.
 - The first time, lock 4's line says there are 0 rows in the Users table.
 - Tell Claude "the seed finished", or which lock refused. Do not paste the output: it names the database host and the walk links sign a person in.
 

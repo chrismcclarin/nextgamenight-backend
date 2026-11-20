@@ -288,7 +288,8 @@ function seedRefusal(sequelize, detail) {
  * @param {import('sequelize').Sequelize} sequelize
  * @param {{ seedEmails: string[], stagingEmailBase?: string }} opts
  *   seedEmails: the seed's own addresses. stagingEmailBase: the raw SEED_EMAIL_BASE value.
- * @returns {Promise<{ database: string, locks: string[] }>} one plain line per lock
+ * @returns {Promise<{ database: string, locks: string[], productionMode: true }>} one plain
+ *   line per lock
  */
 async function assertStagingSeedAllowed(sequelize, { seedEmails, stagingEmailBase } = {}) {
   if (!Array.isArray(seedEmails) || seedEmails.length === 0) {
@@ -437,7 +438,9 @@ async function assertStagingSeedAllowed(sequelize, { seedEmails, stagingEmailBas
       ')'
   );
 
-  return { database: describeResolvedDb(sequelize), locks };
+  // productionMode: true tells the seed that this run went through the four-lock arm, where
+  // the migrations own the schema, so it must not sync (the R2 marker in the seed).
+  return { database: describeResolvedDb(sequelize), locks, productionMode: true };
 }
 
 /**
@@ -446,9 +449,12 @@ async function assertStagingSeedAllowed(sequelize, { seedEmails, stagingEmailBas
  *  - Any other value: assertNotProductionDb, unchanged, and NO query. Local and CI seeds
  *    behave exactly as before.
  *
+ * `productionMode` in the result says which of the two it was. The seed reads it to decide
+ * whether it may sync the schema (it may not in the four-lock arm).
+ *
  * @param {import('sequelize').Sequelize} sequelize
  * @param {{ seedEmails: string[], stagingEmailBase?: string }} opts
- * @returns {Promise<{ database: string, locks: string[] }>}
+ * @returns {Promise<{ database: string, locks: string[], productionMode: boolean }>}
  */
 async function assertSeedTargetAllowed(sequelize, opts) {
   if (process.env.NODE_ENV === 'production') {
@@ -461,6 +467,7 @@ async function assertSeedTargetAllowed(sequelize, opts) {
       'production mode is off (NODE_ENV is not production), so the staging locks do not ' +
         'apply; the local-host guard passed',
     ],
+    productionMode: false,
   };
 }
 

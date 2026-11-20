@@ -169,6 +169,15 @@ describe('assertSeedTargetAllowed: outside production mode the seed is unchanged
     expect(result.locks[0]).toMatch(/production mode is off/);
   });
 
+  test('R2: outside production mode the result says so (productionMode false), so the seed keeps its schema sync', async () => {
+    process.env.NODE_ENV = 'test';
+    process.env.DATABASE_URL = LOCAL_URL;
+
+    const result = await assertSeedTargetAllowed(makeSequelize(), opts());
+
+    expect(result.productionMode).toBe(false);
+  });
+
   test('N1: NODE_ENV unset (the CI seed) on localhost resolves and runs no query', async () => {
     process.env.DATABASE_URL = LOCAL_URL;
     const sequelize = makeSequelize();
@@ -679,6 +688,16 @@ describe('N10: all four locks pass', () => {
 
     expect(result.locks).toHaveLength(4);
     expect(result.database).toBe(describeResolvedDb(makeSequelize([])));
+  });
+
+  test('R2: the four-lock arm reports productionMode true, which is what makes the seed skip its schema sync', async () => {
+    setEveryVariableRight();
+
+    const viaEntry = await assertSeedTargetAllowed(makeSequelize([]), opts());
+    const viaArm = await assertStagingSeedAllowed(makeSequelize([]), opts());
+
+    expect(viaEntry.productionMode).toBe(true);
+    expect(viaArm.productionMode).toBe(true);
   });
 });
 
