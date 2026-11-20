@@ -118,7 +118,9 @@ function assertNotProductionDb(sequelize) {
 //   lock 3  the resolved database host can be read and, when PROD_DB_HOST_DENY is set, does
 //           not contain it;
 //   lock 4  the Users table holds nobody except the seed's own users and plus-addresses of
-//           SEED_EMAIL_BASE, checked by a query BEFORE the first destructive statement.
+//           SEED_EMAIL_BASE, and when it holds nobody at all the Groups and Events tables are
+//           empty too (the R6 marker in the arm), checked by reads BEFORE the first
+//           destructive statement.
 // All four are required because lock 1 cannot be trusted alone: Railway does not document
 // whether a user-defined variable can override RAILWAY_ENVIRONMENT_NAME.
 // Lock 3 is WEAK, and known to be (owner ruling S1): the Railway private host of the staging
@@ -300,6 +302,59 @@ function seedRefusal(sequelize, detail) {
   );
 }
 
+// The refusal for a lock-4 read of `table` that threw. One wording for all three tables lock 4
+// can read (Users, Groups, Events), so a missing table refuses the same way whichever it is.
+function lock4ReadFailure(sequelize, table, error) {
+  const code =
+    (error && error.parent && error.parent.code) ||
+    (error && error.original && error.original.code) ||
+    null;
+  if (code === '42P01') {
+    return seedRefusal(
+      sequelize,
+      `Lock 4 of 4 could not run: the ${table} table does not exist; staging's pre-deploy runs ` +
+        'the migrations, so this database is not the one expected. To pass, deploy the ' +
+        'staging service once so its pre-deploy step creates the tables, and check which ' +
+        'database its variables point at.'
+    );
+  }
+  // The driver's own message is not repeated: it can carry a username or a host.
+  const kind = [error && error.name, code].filter(Boolean).join(', ') || 'unknown error';
+  return seedRefusal(
+    sequelize,
+    `Lock 4 of 4 could not run: the query that reads the ${table} table failed ` +
+      `(${kind}). The seed does not run unless that check succeeds. To pass, fix the ` +
+      'database connection and run the seed again.'
+  );
+}
+
+// Lock 4's counting read (review finding R-6): how many rows `table` holds, soft-deleted rows
+// included, because the count is raw SQL. Resolves to a whole number or rejects with a
+// refusal; a count the guard cannot read as a whole number is a check that did not succeed.
+async function countRowsForLock4(sequelize, table) {
+  let rows;
+  try {
+    rows = await sequelize.query(`SELECT count(*) AS count FROM "${table}"`, {
+      type: sequelize.QueryTypes.SELECT,
+    });
+  } catch (error) {
+    throw lock4ReadFailure(sequelize, table, error);
+  }
+  // Postgres hands count(*) back as text (it is a bigint).
+  const raw = Array.isArray(rows) && rows[0] ? rows[0].count : undefined;
+  const isWholeNumber =
+    (typeof raw === 'number' && Number.isInteger(raw) && raw >= 0) ||
+    (typeof raw === 'string' && /^\d+$/.test(raw));
+  if (!isWholeNumber) {
+    throw seedRefusal(
+      sequelize,
+      `Lock 4 of 4 could not run: the query that counts the ${table} table did not return a ` +
+        'whole number. The seed does not run unless that check succeeds.'
+    );
+  }
+  return Number(raw);
+}
+
 // DECISION quick-261119-nv0 A1: the staging arm is a SEPARATE async function, chosen OVER
 // making assertNotProductionDb async. Lock 4 needs a query, so the arm has to be awaited; but
 // scripts/e2e-fixtures.js calls assertNotProductionDb(sequelize) as a bare statement with no
@@ -309,10 +364,12 @@ function seedRefusal(sequelize, detail) {
 /**
  * The production-mode arm for the seed (owner ruling G1). Resolves only when all four locks
  * hold; rejects at the first one that does not, before any later lock is looked at. The
- * lock-4 query runs only after locks 1 to 3 have passed.
+ * lock-4 reads run only after locks 1 to 3 have passed: one SELECT of the Users table, and
+ * two counts (Groups, Events) only when that table is empty.
  *
  * Every refusal names the database (never a credential), the lock, and what would make it
- * pass. A lock-4 refusal gives a COUNT of users and never an address, a username or an id.
+ * pass. A lock-4 refusal gives COUNTS (of users, or of rows) and never an address, a username
+ * or an id.
  *
  * NAMES VARIABLES, NEVER THEIR VALUES (owner requirement, 2026-11-19). A refusal and a
  * passing line name the variable and the rule; neither repeats what a variable holds, not
@@ -416,34 +473,15 @@ async function assertStagingSeedAllowed(sequelize, { seedEmails, stagingEmailBas
   }
 
   // Lock 4: the database holds no real user. A raw query, because the User model's default
-  // scope hides the email column. It is the only statement the guard ever runs, and it reads.
+  // scope hides the email column. Every statement the guard runs is a read: this SELECT and,
+  // only when it finds the Users table empty, the two counts further down.
   let rows;
   try {
     rows = await sequelize.query('SELECT "email" FROM "Users"', {
       type: sequelize.QueryTypes.SELECT,
     });
   } catch (error) {
-    const code =
-      (error && error.parent && error.parent.code) ||
-      (error && error.original && error.original.code) ||
-      null;
-    if (code === '42P01') {
-      throw seedRefusal(
-        sequelize,
-        'Lock 4 of 4 could not run: the Users table does not exist; staging\'s pre-deploy runs ' +
-          'the migrations, so this database is not the one expected. To pass, deploy the ' +
-          'staging service once so its pre-deploy step creates the tables, and check which ' +
-          'database its variables point at.'
-      );
-    }
-    // The driver's own message is not repeated: it can carry a username or a host.
-    const kind = [error && error.name, code].filter(Boolean).join(', ') || 'unknown error';
-    throw seedRefusal(
-      sequelize,
-      'Lock 4 of 4 could not run: the query that reads the Users table failed ' +
-        `(${kind}). The seed does not run unless that check succeeds. To pass, fix the ` +
-        'database connection and run the seed again.'
-    );
+    throw lock4ReadFailure(sequelize, 'Users', error);
   }
   if (!Array.isArray(rows)) {
     throw seedRefusal(
@@ -465,14 +503,46 @@ async function assertStagingSeedAllowed(sequelize, { seedEmails, stagingEmailBas
         'sign-ups.'
     );
   }
-  locks.push(
-    `lock 4 passed: ${rows.length} ${rows.length === 1 ? 'row' : 'rows'} in the Users table, ` +
-      'all staging-owned (' +
-      (base
-        ? 'seed users or plus-addresses of SEED_EMAIL_BASE'
-        : 'seed users; SEED_EMAIL_BASE is not set, so no plus-address counts') +
-      ')'
-  );
+
+  // DECISION quick-261119-nv0 R6: an EMPTY Users table passes lock 4 only when the Groups and
+  // Events tables are empty too. Chosen OVER reading Users alone (the first form), because "no
+  // users" does not prove "no real data": a partial copy or restore of production, done in
+  // table order, can hold real groups and game nights before it holds a single user, and the
+  // seed would then empty it. Chosen OVER checking that every Groups row carries one of the
+  // seed's group ids, which would tie the guard to the seed's fixture list and need a model.
+  // The two counts run ONLY when Users is empty. With users present the rows themselves are
+  // the evidence, and a seeded staging database always has groups, so counting there would
+  // refuse every reseed. The seed cannot lock itself out through this: it deletes Users LAST
+  // and creates them FIRST, so an interrupted seed never leaves groups behind with no users.
+  // The counts are raw SQL, so rows the app has soft-deleted count as well.
+  if (rows.length === 0) {
+    const groups = await countRowsForLock4(sequelize, 'Groups');
+    const events = await countRowsForLock4(sequelize, 'Events');
+    if (groups > 0 || events > 0) {
+      const holds = (count) => `holds ${count} ${count === 1 ? 'row' : 'rows'}`;
+      throw seedRefusal(
+        sequelize,
+        'Lock 4 of 4 failed. It checks that the database holds no real users and, when there ' +
+          'are no users at all, no other data: the Users table is empty, but the Groups table ' +
+          `${holds(groups)} and the Events table ${holds(events)}. A database with groups or ` +
+          'game nights and no users is not a fresh staging database; it may be a partial copy ' +
+          'of real data. To pass, this must be the staging database, either empty or holding ' +
+          'only seed users and your own plus-address sign-ups.'
+      );
+    }
+    locks.push(
+      'lock 4 passed: 0 rows in the Users table, and the Groups and Events tables are empty too'
+    );
+  } else {
+    locks.push(
+      `lock 4 passed: ${rows.length} ${rows.length === 1 ? 'row' : 'rows'} in the Users table, ` +
+        'all staging-owned (' +
+        (base
+          ? 'seed users or plus-addresses of SEED_EMAIL_BASE'
+          : 'seed users; SEED_EMAIL_BASE is not set, so no plus-address counts') +
+        ')'
+    );
+  }
 
   // productionMode: true tells the seed that this run went through the four-lock arm, where
   // the migrations own the schema, so it must not sync (the R2 marker in the seed).

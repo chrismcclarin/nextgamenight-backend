@@ -35,12 +35,12 @@ In production mode the seed refuses to run unless all four of these are true:
 1. **Lock 1:** Railway says the environment is named exactly `staging` (`RAILWAY_ENVIRONMENT_NAME`, which Railway sets itself).
 2. **Lock 2:** `ALLOW_STAGING_SEED` is exactly `1`.
 3. **Lock 3:** the database host can be read and, if `PROD_DB_HOST_DENY` is set, the host does not contain it.
-4. **Lock 4:** the Users table holds nobody except the seed's own seven users and plus-addresses of `SEED_EMAIL_BASE`.
+4. **Lock 4:** the Users table holds nobody except the seed's own seven users and plus-addresses of `SEED_EMAIL_BASE`. If the Users table holds nobody at all, the Groups and Events tables must be empty too.
 
 What to know about them:
 
 - **Lock 3 is weak.** Inside Railway, the staging database and the production database very likely have the same host name, letter for letter, so lock 3 cannot tell them apart. It only helps if a staging variable was pointed at a production address that you wrote into `PROD_DB_HOST_DENY`.
-- **Lock 4 is the one that protects production.** Production always holds real people, so production always fails lock 4, whatever the variables say. It is one read of the Users table, done before anything is changed.
+- **Lock 4 is the one that protects production.** Production always holds real people, so production always fails lock 4, whatever the variables say. It only reads, before anything is changed: one read of the Users table, and, when that table is empty, a count of the Groups table and of the Events table. The counts are there because a database with no users in it can still hold real groups and game nights (a half-finished copy of production, for example), and the seed must not empty that either.
 - **Inside Railway the four locks always decide.** The seed treats any run inside Railway as production mode, whatever `NODE_ENV` holds, and it also treats a mistyped `NODE_ENV` (`Production`, or `production` with a space) as production mode. `ALLOW_DESTRUCTIVE_SEED` never opens the seed inside Railway.
 - **The locks protect the seed only.** They do nothing about the staging *server*. A staging server pointed at the production database would serve and change real data without ever running the seed. That is what the STOP box in step (d) is for.
 - **If you change `SEED_EMAIL_BASE` after a seed, the next seed refuses at lock 4**, because the users from the last seed no longer match the new address. Change it back, seed, and only then change it.
@@ -198,7 +198,7 @@ railway ssh -e staging -s GameCalendarbackendv2 -- npm run seed
 ```
 
 - You should see, in this order: the app's "Database connection info" lines; a line starting `Seed target:` that names the database; four lines, one for each lock, each saying it passed (lock 3 says it is "not armed" if you left `PROD_DB_HOST_DENY` out); a line saying the schema sync was skipped (on staging the tables belong to the migrations, so the seed fills them and never reshapes them); the seeding steps; `Seeding complete!`; and a list of walk links built from the preview site's address.
-- The first time, lock 4's line says there are 0 rows in the Users table.
+- The first time, lock 4's line says there are 0 rows in the Users table, and that the Groups and Events tables are empty too.
 - Tell Claude "the seed finished", or which lock refused. Do not paste the output: it names the database host and the walk links sign a person in.
 
 If Railway says SSH is not available, or either check prints something else, **stop and tell Claude in words.** There is no workaround through a public database address, and none should be tried.
@@ -215,7 +215,8 @@ A refused seed changes nothing in the database. The message starts with `Refusin
 | Lock 2 of 4 failed | `ALLOW_STAGING_SEED` is not `1` on this service. | Set it on the **staging** backend service, deploy the change, run the seed again. Never set it on production. |
 | Lock 3 of 4 failed | The database address could not be read, or the host matches `PROD_DB_HOST_DENY`. | Stop. This service may be pointed at production's database. Go back to the STOP box in step (d) and tell Claude. |
 | Lock 4 of 4 failed, with a count of users | The database holds that many people who are not seed users and not your plus-addresses. | If you signed in on staging with another address, delete that account in the app and seed again. If you did not, **stop: this database may hold real people.** Tell Claude the count. Do not try to get around it. |
-| The Users table does not exist | The staging backend has not been deployed yet, so its tables were never created; or this is not the database you think it is. | Finish step (f) first. |
+| Lock 4 of 4 failed, and it says the Users table is empty but Groups or Events holds rows | The database has no users in it, but it does have groups or game nights. A fresh staging database has neither, so this may be a partial copy of real data. | **Stop.** Tell Claude the two counts. Do not try to get around it. |
+| The Users table does not exist (or the Groups table, or the Events table) | The staging backend has not been deployed yet, so its tables were never created; or this is not the database you think it is. | Finish step (f) first. |
 | `SEED_EMAIL_BASE` cannot be used, or `SEED_SMS_USER` does not name a seed user | A typing mistake in that variable. | Fix it on the staging service (section 4), deploy the change, run the seed again. |
 
 ## 8. The proof list

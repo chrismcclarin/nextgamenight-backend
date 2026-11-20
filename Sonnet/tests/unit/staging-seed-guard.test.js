@@ -11,7 +11,8 @@
 //   lock 3  the resolved database host is parseable and, when PROD_DB_HOST_DENY is set, does
 //           not contain it (weak on purpose, S1);
 //   lock 4  the Users table holds nobody except the seed's own users and plus-addresses of
-//           SEED_EMAIL_BASE (S2). Production always fails this one, because it holds real users.
+//           SEED_EMAIL_BASE (S2), and when it holds nobody at all the Groups and Events tables
+//           are empty too (R-6). Production always fails this one, because it holds real users.
 // The four locks are what stands between `npm run seed` and the production data.
 //
 // A RED TEST HERE MEANS THE GUARD LOST A LOCK. That is the finding. It is never a reason to
@@ -65,11 +66,26 @@ const DEFAULT_SEED_EMAILS = ['alice@example.com', 'bob@example.com'];
 
 let envSnapshot;
 
-function makeSequelize(rows = [], config = { host: 'localhost', port: 5432, database: 'boardgame_db' }) {
+const USERS_QUERY = 'SELECT "email" FROM "Users"';
+const countQuery = (table) => `SELECT count(*) AS count FROM "${table}"`;
+
+// `rows` is what the Users read returns. `counts` is what the two counting reads return
+// (lock 4 runs them only when the Users table is empty, review finding R-6); both default to
+// '0', as text, which is how Postgres hands a count(*) back.
+function makeSequelize(
+  rows = [],
+  config = { host: 'localhost', port: 5432, database: 'boardgame_db' },
+  counts = {}
+) {
+  const tableCounts = { Groups: '0', Events: '0', ...counts };
   return {
     config,
     QueryTypes: { SELECT: 'SELECT' },
-    query: jest.fn().mockResolvedValue(rows),
+    query: jest.fn(async (sql) => {
+      const counted = /^SELECT count\(\*\) AS count FROM "(\w+)"$/.exec(sql);
+      if (counted) return [{ count: tableCounts[counted[1]] }];
+      return rows;
+    }),
   };
 }
 
@@ -594,14 +610,14 @@ describe('lock 4: the Users table holds only staging-owned users', () => {
     expect(message).not.toContain('person');
   });
 
-  test('N6: lock 4 reads the table with one raw SELECT and nothing else', async () => {
+  test('N6: with users in the table, lock 4 reads it with one raw SELECT and nothing else', async () => {
     setEveryVariableRight();
-    const sequelize = makeSequelize([]);
+    const sequelize = makeSequelize([{ email: 'owner+alice@example.com' }]);
 
     await assertSeedTargetAllowed(sequelize, opts());
 
     expect(sequelize.query).toHaveBeenCalledTimes(1);
-    expect(sequelize.query).toHaveBeenCalledWith('SELECT "email" FROM "Users"', { type: 'SELECT' });
+    expect(sequelize.query).toHaveBeenCalledWith(USERS_QUERY, { type: 'SELECT' });
   });
 
   test.each([[null], [''], [undefined], [42]])('N6: a row whose email is %j rejects', async (email) => {
@@ -721,6 +737,171 @@ describe('lock 4: the Users table holds only staging-owned users', () => {
     expect(message).toContain('SEED_EMAIL_BASE');
     expect(message).not.toContain('owner+tag');
     expect(sequelize.query).not.toHaveBeenCalled();
+  });
+});
+
+describe('R6: an empty Users table passes lock 4 only when Groups and Events are empty too', () => {
+  // Review finding R-6 (quick-261119-nv0). Lock 4 read only the Users table, so a database
+  // with no users but with real groups or game nights (a partial copy or restore of
+  // production, done in table order) passed, and the seed then emptied it.
+  const emptyUsers = (counts) => makeSequelize([], undefined, counts);
+  const queriesOf = (sequelize) => sequelize.query.mock.calls.map(([sql]) => sql);
+
+  test.each([
+    ['Groups holds rows', { Groups: '3' }, /Groups table holds 3 rows/],
+    ['Events holds rows', { Events: '5' }, /Events table holds 5 rows/],
+    ['Groups holds one row', { Groups: '1' }, /Groups table holds 1 row\b/],
+    ['both hold rows', { Groups: '2', Events: '41' }, /Groups table holds 2 rows.*Events table holds 41 rows/],
+    ['the driver hands the count back as a number', { Events: 7 }, /Events table holds 7 rows/],
+  ])('Users is empty but %s: rejects at lock 4 with the counts', async (_label, counts, expected) => {
+    setEveryVariableRight();
+    const sequelize = emptyUsers(counts);
+
+    const message = await refusalOf(() => assertSeedTargetAllowed(sequelize, opts()));
+
+    expect(message).toMatch(/^\[assert-not-production-db\] Refusing to seed/);
+    expect(message).toMatch(/Lock 4 of 4 failed/);
+    expect(message).toMatch(/the Users table is empty/);
+    expect(message).toMatch(expected);
+  });
+
+  test('the refusal reports counts only: no address, and nothing read from a row', async () => {
+    setEveryVariableRight();
+    const sequelize = emptyUsers({ Groups: '2', Events: '41' });
+
+    const message = await refusalOf(() => assertSeedTargetAllowed(sequelize, opts()));
+
+    // The only "@" a refusal may carry is none at all: the database line has no credentials.
+    expect(message).not.toContain('@');
+    expect(message).not.toContain('owner');
+    expect(message).toMatch(/Groups table holds 2 rows/);
+    expect(message).toMatch(/Events table holds 41 rows/);
+  });
+
+  test('all three reads are counting or selecting reads, in order, through the same sequelize.query', async () => {
+    setEveryVariableRight();
+    const sequelize = emptyUsers();
+
+    await assertSeedTargetAllowed(sequelize, opts());
+
+    expect(queriesOf(sequelize)).toEqual([USERS_QUERY, countQuery('Groups'), countQuery('Events')]);
+    for (const [, options] of sequelize.query.mock.calls) expect(options).toEqual({ type: 'SELECT' });
+  });
+
+  test('Users, Groups and Events all empty: passes, and the lock 4 line says all three were empty', async () => {
+    setEveryVariableRight();
+
+    const result = await assertSeedTargetAllowed(emptyUsers(), opts());
+
+    expect(result.locks).toHaveLength(4);
+    expect(result.locks[3]).toMatch(/lock 4 passed: 0 rows in the Users table/);
+    expect(result.locks[3]).toMatch(/Groups and Events tables are empty too/);
+    expect(result.locks[3]).not.toMatch(/"/);
+  });
+
+  test('a count of 0 passes whether it comes back as text or as a number', async () => {
+    setEveryVariableRight();
+
+    await expect(assertSeedTargetAllowed(emptyUsers({ Groups: 0, Events: 0 }), opts())).resolves.toEqual(
+      expect.objectContaining({ productionMode: true })
+    );
+  });
+
+  test('with staging-owned users present, Groups and Events are not read at all (one query)', async () => {
+    setEveryVariableRight();
+    // Counts that would refuse, had they been read: a seeded staging database has groups.
+    const sequelize = makeSequelize([{ email: 'owner+alice@example.com' }], undefined, { Groups: '9', Events: '9' });
+
+    const result = await assertSeedTargetAllowed(sequelize, opts());
+
+    expect(queriesOf(sequelize)).toEqual([USERS_QUERY]);
+    expect(result.locks[3]).toMatch(/lock 4 passed: 1 row in the Users table, all staging-owned/);
+  });
+
+  test('with a real user present, the refusal needs one query only (Users is already failing)', async () => {
+    setEveryVariableRight();
+    const sequelize = makeSequelize([{ email: 'real.person@example.org' }], undefined, { Groups: '9' });
+
+    const message = await refusalOf(() => assertSeedTargetAllowed(sequelize, opts()));
+
+    expect(message).toMatch(/\b1 user\b/);
+    expect(queriesOf(sequelize)).toEqual([USERS_QUERY]);
+  });
+
+  test.each([
+    ['Groups', 'parent'],
+    ['Groups', 'original'],
+    ['Events', 'parent'],
+    ['Events', 'original'],
+  ])('a missing %s table (42P01 on the error %s) refuses the same way a missing Users table does', async (table, key) => {
+    setEveryVariableRight();
+    const sequelize = emptyUsers();
+    const inner = sequelize.query.getMockImplementation();
+    sequelize.query.mockImplementation(async (sql, options) => {
+      if (sql === countQuery(table)) {
+        const error = new Error(`relation "${table}" does not exist`);
+        error[key] = { code: '42P01' };
+        throw error;
+      }
+      return inner(sql, options);
+    });
+
+    const message = await refusalOf(() => assertSeedTargetAllowed(sequelize, opts()));
+
+    expect(message).toMatch(/^\[assert-not-production-db\] Refusing to seed/);
+    expect(message).toContain(`the ${table} table does not exist`);
+    expect(message).toMatch(/migrations/);
+  });
+
+  test.each(['Groups', 'Events'])(
+    'any other error on the %s count refuses naming lock 4, without repeating the driver message',
+    async (table) => {
+      setEveryVariableRight();
+      const sequelize = emptyUsers();
+      const inner = sequelize.query.getMockImplementation();
+      sequelize.query.mockImplementation(async (sql, options) => {
+        if (sql === countQuery(table)) throw new Error('password authentication failed for user "dbuser"');
+        return inner(sql, options);
+      });
+
+      const message = await refusalOf(() => assertSeedTargetAllowed(sequelize, opts()));
+
+      expect(message).toMatch(/^\[assert-not-production-db\] Refusing to seed/);
+      expect(message).toMatch(/lock 4\b/i);
+      expect(message).toContain(`the ${table} table`);
+      expect(message).not.toContain('dbuser');
+      expect(message).not.toContain('does not exist');
+    }
+  );
+
+  test.each([
+    ['undefined', undefined],
+    ['null', null],
+    ['text that is not a number', 'many'],
+    ['a negative number', '-1'],
+    ['a fraction', '1.5'],
+    ['an empty string', ''],
+  ])('a Groups count that comes back as %s refuses: the check did not succeed', async (_label, value) => {
+    setEveryVariableRight();
+    const sequelize = emptyUsers({ Groups: value });
+
+    const message = await refusalOf(() => assertSeedTargetAllowed(sequelize, opts()));
+
+    expect(message).toMatch(/^\[assert-not-production-db\] Refusing to seed/);
+    expect(message).toMatch(/lock 4\b/i);
+    expect(message).toContain('the Groups table');
+  });
+
+  test('a count query that returns no row at all refuses', async () => {
+    setEveryVariableRight();
+    const sequelize = emptyUsers();
+    const inner = sequelize.query.getMockImplementation();
+    sequelize.query.mockImplementation(async (sql, options) => (sql === countQuery('Events') ? [] : inner(sql, options)));
+
+    const message = await refusalOf(() => assertSeedTargetAllowed(sequelize, opts()));
+
+    expect(message).toMatch(/lock 4\b/i);
+    expect(message).toContain('the Events table');
   });
 });
 

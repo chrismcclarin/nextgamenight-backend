@@ -192,7 +192,8 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
     //    Railway, or a NODE_ENV that reads as production): the four-lock staging arm. It
     //    refuses unless the Railway environment is named staging, ALLOW_STAGING_SEED is 1,
     //    the database host is readable and not the one named in PROD_DB_HOST_DENY, and the
-    //    Users table holds nobody but seed users and plus-addresses of SEED_EMAIL_BASE.
+    //    Users table holds nobody but seed users and plus-addresses of SEED_EMAIL_BASE (and,
+    //    when it holds nobody at all, the Groups and Events tables are empty too).
     // tests/unit/seed-users.test.js (S7) pins this call as the first statement of the try.
     const seedTarget = await assertSeedTargetAllowed(sequelize, {
       seedEmails: sampleUsers.map((user) => user.email),
