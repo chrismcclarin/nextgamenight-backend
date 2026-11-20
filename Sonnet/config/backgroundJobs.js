@@ -30,8 +30,12 @@
 
 // One line, quoted word for word in docs/staging-environment.md (the unit test holds the
 // two in lockstep). The owner reads the deploy log for it.
+// Worded to share nothing with a real boot line (review R-3): it never says "started", and
+// it holds no beginning of a line the server prints when something starts ("BullMQ workers
+// started ...", workers/index.js). The owner tells the two apart by eye, so an off line that
+// says "started" reads like the thing he must not see. The same unit test holds this.
 const BACKGROUND_JOBS_OFF_MESSAGE =
-  'Background jobs are OFF (DISABLE_BACKGROUND_JOBS): no scheduled jobs, sweeps or BullMQ workers started; Bull Board not mounted';
+  'Background jobs are OFF (DISABLE_BACKGROUND_JOBS): scheduled jobs, sweeps and BullMQ workers are NOT running; Bull Board is not mounted';
 
 /**
  * True only when DISABLE_BACKGROUND_JOBS is exactly the string '1'.

@@ -17,7 +17,8 @@
 //   T2  switch exactly '1': nothing starts, production mode included;
 //   T3  only the exact string '1' is the switch;
 //   T4  called with no argument, the functions read process.env;
-//   T5  the helper loads nothing, and its message names the variable;
+//   T5  the helper loads nothing, and its message names the variable and shares no words
+//       with a real "started" boot line (review R-3);
 //   S1  server.js, read as TEXT and never loaded (loading it needs Postgres): the condition
 //       lives only in the helper, and every log line production prints today is still there,
 //       letter for letter;
@@ -234,6 +235,34 @@ const START_CALLS = [
 ];
 const NODE_CRON_REQUIRE = /require\(\s*['"]node-cron['"]\s*\)/;
 
+// The beginning of every line the server really prints when something starts, read from the
+// source: "Deadline scheduler started", "BullMQ workers started", and so on. The owner
+// compares deploy-log lines by eye against these in the staging runbook, step (f).
+const WORKERS_INDEX_PATH = path.join(APP_ROOT, 'workers', 'index.js');
+function realStartedLineBeginnings() {
+  const beginnings = [];
+  for (const file of [SERVER_PATH, WORKERS_INDEX_PATH]) {
+    const text = maskSource(fs.readFileSync(file, 'utf8')).noComments;
+    const pattern = /console\.log\(\s*'([^'\n]*?\bstarted)\b/g;
+    let m = pattern.exec(text);
+    while (m !== null) {
+      beginnings.push(m[1]);
+      m = pattern.exec(text);
+    }
+  }
+  return beginnings;
+}
+const KNOWN_STARTED_BEGINNINGS = [
+  'Deadline scheduler started',
+  'Backup scheduler started',
+  'Auto-promotion scheduler started',
+  'Reminder scheduler started',
+  'Scheduler anomaly sweep started',
+  'PendingAuth0Deletion reconciliation sweep started',
+  'Group purge sweep started',
+  'BullMQ workers started',
+];
+
 describe('T1: switch unset or a near-miss, every start decision is the old condition', () => {
   const cases = everyCase([UNSET, ...NEAR_MISSES]);
 
@@ -414,6 +443,27 @@ describe('T5: the helper is pure and its message names the variable', () => {
 
   it('carries the decision marker, so the strict compare is not tidied away', () => {
     expect(helperSource).toContain('DECISION quick-261119-w61');
+  });
+
+  it('found the eight real "started" boot lines in the source (anti-vacuity)', () => {
+    expect(realStartedLineBeginnings()).toEqual(KNOWN_STARTED_BEGINNINGS);
+  });
+
+  it('the off message does not say "started" and holds no beginning of a real boot line', () => {
+    // The owner is told: the off line must be there, and no line beginning "... started" may
+    // be. An off line that itself says "BullMQ workers started" reads, by eye, like the very
+    // thing he is looking for. Keep the two apart: describe the off state in other words.
+    expect(BACKGROUND_JOBS_OFF_MESSAGE).not.toMatch(/started/i);
+    const shared = [
+      ...realStartedLineBeginnings(),
+      'Deadline scheduler disabled',
+      'BullMQ workers disabled',
+    ].filter((beginning) => BACKGROUND_JOBS_OFF_MESSAGE.includes(beginning));
+    expect(shared).toEqual([]);
+    // And nothing the server prints when it starts something begins like the off line.
+    for (const beginning of realStartedLineBeginnings()) {
+      expect(beginning.startsWith('Background jobs')).toBe(false);
+    }
   });
 });
 
@@ -808,6 +858,15 @@ describe('R1: the staging runbook and the code say the same thing', () => {
       .split('\n')
       .some((line) => line.replace(/^>\s?/, '') === BACKGROUND_JOBS_OFF_MESSAGE);
     expect(ownLine).toBe(true);
+  });
+
+  it('step (f) names the beginning of every real "started" line the owner must not see', () => {
+    const listLine = runbook.split('\n').find((line) => line.startsWith('- You should **not** see any line that begins with'));
+    expect(listLine).toBeDefined();
+    const missing = realStartedLineBeginnings().filter((beginning) => !listLine.includes(`\`${beginning}\``));
+    expect(missing).toEqual([]);
+    // The list no longer has to explain away an off line that says "started".
+    expect(listLine).not.toContain('off line');
   });
 
   it('carries the Never entry for production', () => {

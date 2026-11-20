@@ -101,7 +101,7 @@ If Railway says the folder is not linked to a project, run `railway link` there,
 > **Then find the off line, in the same log.** After the two lines that start `Server is running on port` and `Environment:`, you should see this line, word for word:
 >
 > ```
-> Background jobs are OFF (DISABLE_BACKGROUND_JOBS): no scheduled jobs, sweeps or BullMQ workers started; Bull Board not mounted
+> Background jobs are OFF (DISABLE_BACKGROUND_JOBS): scheduled jobs, sweeps and BullMQ workers are NOT running; Bull Board is not mounted
 > ```
 >
 > If that line is **not** there, the switch did not take (see "exactly `1`" below) and staging's jobs and workers are running. **Stop at once: remove that staging deployment** (the three-dot menu on the deployment, then Remove), and tell Claude in words.
@@ -145,7 +145,7 @@ Then set the rest. See section 4 for the full table. Three of them need care:
 
 - You should see: the staging services build and go Active. In the backend's deploy log, the `=== Pre-Deploy DB Resolution Diagnostic ===` block with `SequelizeMeta probe failed` (see the STOP box), then the migrations running.
 - You should see, after the migrations: a line starting `Server is running on port`, a line starting `Environment:`, then the off line (it begins `Background jobs are OFF (DISABLE_BACKGROUND_JOBS)`; the STOP box quotes it in full).
-- You should **not** see any line that *begins* with `Deadline scheduler started`, `Backup scheduler started`, `Auto-promotion scheduler started`, `Reminder scheduler started`, `Scheduler anomaly sweep started`, `PendingAuth0Deletion reconciliation sweep started`, `Group purge sweep started` or `BullMQ workers started`. (The off line has the words "BullMQ workers started" in the middle of it. That is fine. What must not be there is a line that begins with them.)
+- You should **not** see any line that begins with `Deadline scheduler started`, `Backup scheduler started`, `Auto-promotion scheduler started`, `Reminder scheduler started`, `Scheduler anomaly sweep started`, `PendingAuth0Deletion reconciliation sweep started`, `Group purge sweep started` or `BullMQ workers started`.
 - If the off line is missing, or one of those "started" lines shows: **remove that staging deployment** (the three-dot menu on the deployment, then Remove), and tell Claude in words.
 - Then open the staging backend address followed by `/health` in a browser. You should see the health response.
 
