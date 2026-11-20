@@ -27,6 +27,7 @@ Staging is a second copy of the backend on Railway, in an environment named `sta
 - The seed (`npm run seed`) empties the database it runs against and refills it with seven sample users and their groups, games and game nights. On staging that is the point. It must never run against production, which is what the four locks below are for.
 - Staging runs in production mode (`NODE_ENV=production`, owner ruling G1), so it behaves like the live site: it sends reminder emails and runs the same scheduled jobs. Those emails go only to the people in staging's database, which are your own plus-addresses.
 - Staging shares three outside services with the live site: Auth0 (the same logins exist on both), the email sender and the text-message sender.
+- Because the logins are shared, **staging must never be able to delete or change a login in Auth0.** That is why two variables are deleted on staging before its first deploy (step (d) and section 4), and why Delete account on staging has its own rules (section 7).
 
 ## 2. The four locks on the seed
 
@@ -44,7 +45,7 @@ What to know about them:
 - **Inside Railway the four locks always decide.** The seed treats any run inside Railway as production mode, whatever `NODE_ENV` holds, and it also treats a mistyped `NODE_ENV` (`Production`, or `production` with a space) as production mode. `ALLOW_DESTRUCTIVE_SEED` never opens the seed inside Railway.
 - **The locks protect the seed only.** They do nothing about the staging *server*. A staging server pointed at the production database would serve and change real data without ever running the seed. That is what the STOP box in step (d) is for.
 - **If you change `SEED_EMAIL_BASE` after a seed, the next seed refuses at lock 4**, because the users from the last seed no longer match the new address. Change it back, seed, and only then change it.
-- **Sign in on staging only with the test logins from step (g).** If you sign in there with any other address (your Google login, for example), that creates a user who is not staging-owned, and the next seed refuses at lock 4. Delete that account from inside the app (its own Delete account button), then seed again. If lock 4 still refuses, tell Claude in words.
+- **Sign in on staging only with the test logins from step (g).** If you sign in there with any other address (your Google login, for example), that creates a user who is not staging-owned, and the next seed refuses at lock 4. Removing that user has its own steps: "Removing a stray user" in section 7. **Do not press Delete account on staging before you have read them.**
 
 ## 3. Order of work
 
@@ -92,12 +93,13 @@ If Railway says the folder is not linked to a project, run `railway link` there,
 >
 > **One thing that is not settled yet. Do not start step (f) until Claude has told you how it was settled.** The plan was to keep the scheduled jobs and the background workers switched off for the first staging deploy, using `ENABLE_SCHEDULER` and `ENABLE_WORKERS`, and to switch them on after the log check. In the code as it stands that is not possible: in production mode the jobs and workers always start, and those two variables are only looked at outside production mode (`server.js`, every `NODE_ENV === 'production' || ...` check where the jobs start). So today the variable check in points 1 to 4 is the **only** thing between a first staging deploy and production's data. There is no second safety net behind it.
 
-Then set the rest. See section 4 for the full table. Two of them need care:
+Then set the rest. See section 4 for the full table. Three of them need care:
 
+- `AUTH0_MANAGEMENT_CLIENT_ID` and `AUTH0_MANAGEMENT_CLIENT_SECRET`: **delete both on the staging backend service now, before the first deploy.** Staging must never be able to delete or change a login in the Auth0 tenant the live site uses. With these two in place, pressing Delete account on the preview site would delete that person's real login. If either one shows empty, do not fill it in: delete it. Section 4 says what staging loses without them.
 - `MAGIC_TOKEN_SECRET`: make a new random value in your own terminal with `openssl rand -hex 32`, and paste it straight into Railway. Never show it to anyone, and never type that command into the Claude session. A new value means a sign-in link made on staging can never work on the live site.
-- Anything that shows empty: Railway does not copy sealed variables into a duplicate. Enter those again by hand.
+- Anything that shows empty: Railway does not copy sealed variables into a duplicate. Enter those again by hand, except the ones the table in section 4 says to delete.
 
-- You should see: every row of the table in section 4 done, and the staged-changes banner still waiting.
+- You should see: every row of the table in section 4 done, neither `AUTH0_MANAGEMENT_CLIENT_ID` nor `AUTH0_MANAGEMENT_CLIENT_SECRET` in the staging backend's variable list, and the staged-changes banner still waiting.
 
 **(e) Give the staging backend its own address.** Still in `staging`, on the backend service: **Settings**, then **Networking**, then **Generate Domain**. Railway applies networking changes straight away, without waiting for Deploy.
 
@@ -116,6 +118,7 @@ Then open each new user in Auth0, copy its **user_id**, and paste it into the ma
 
 - You should see: one new Auth0 user per seed user, and the matching variables filled in on staging.
 - These logins also work on the live site, where signing in would create a real account. **Use them on the preview site only.**
+- **Never press Delete account while signed in as one of these test logins**, on the preview site or anywhere. Section 7 says why.
 
 **(h) Point the preview site at staging.** In Vercel, open the frontend project, **Settings**, **Environment Variables**. Give `NEXT_PUBLIC_API_URL` a value for the **Preview** environment only: the staging backend address from step (e), followed by `/api`. Leave the Production value exactly as it is. Then redeploy the preview deployment: this value is fixed into the site when it is built, so a change does nothing until the preview is rebuilt.
 
@@ -139,6 +142,7 @@ All of these are set on the **staging** backend service. Names only; the values 
 | `NODE_ENV` | Leave as `production` | Staging must behave like the live site (owner ruling G1). |
 | `POSTGRES_PRIVATE_URL`, `POSTGRES_URL`, `DATABASE_URL`, `PGDATABASE_URL`, `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | Each one that exists: a `${{ ... }}` reference to **staging's own** Postgres, or deleted. Never pasted text. | The STOP box in step (d). A pasted production address runs the staging server on real data. |
 | `REDIS_URL` | A `${{ ... }}` reference to **staging's own** Redis | The STOP box. Production's Redis holds the live site's queued reminders. |
+| `AUTH0_MANAGEMENT_CLIENT_ID`, `AUTH0_MANAGEMENT_CLIENT_SECRET` | **Delete both on staging, before the first deploy. Never add them back.** | Staging must never be able to delete or change a login in the Auth0 tenant the live site uses. With them in place, Delete account on staging deletes the real login. What staging loses without them is written under this table. |
 | `MAGIC_TOKEN_SECRET` | A new random value, made in your own terminal | So a staging link can never work on production. |
 | `FRONTEND_URL`, `ALLOWED_ORIGINS` | The preview site's address | The backend only answers the site named here, and builds its links from it. |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI` | Delete on staging | Connect Google Calendar fails on staging with a Google error, on purpose: Google Calendar stays off on staging (owner decision C1, 2026-11-19); it is tested on the local copy and on the live site. Do not report it as a bug. |
@@ -150,9 +154,22 @@ All of these are set on the **staging** backend service. Names only; the values 
 | `SEED_SMS_USER` | One seed tag; `alice` is recommended | The one seeded user who is allowed to receive texts. |
 | `PROD_DB_HOST_DENY` | Optional. Production Postgres's public address, if you already know it; otherwise leave it out | Lock 3. Weak; see section 2. |
 | `AUTH0_ALICE_SUB` and the other six | The user ids from step (g) | So signing in as a test login lands on that seeded user. |
-| Anything showing empty | Enter it again | Sealed variables are not copied into a duplicate. |
+| Anything showing empty | Enter it again, unless a row above says to delete it | Sealed variables are not copied into a duplicate. |
 
 `RAILWAY_ENVIRONMENT_NAME` is set by Railway. Do not create it yourself.
+
+### What staging loses without the two Auth0 Management variables
+
+Those two variables are the key the backend uses to ask Auth0 about a login, or to delete one. Without them staging has no such key, and it does not even try to reach Auth0 for those things. Signing in is not affected: checking a sign-in does not use them.
+
+What changes, on staging only:
+
+- **Delete account** removes the account from staging's database and leaves the Auth0 login alone. The details, and the rules for using it, are in section 7 ("Removing a stray user").
+- **A first sign-in whose login carries no email address** is stored with a made-up address ending in `@auth0.local`, because staging cannot look the real one up. The test logins from step (g) are not affected: the seed has already created their users. A user with a made-up address is not staging-owned, so the next seed refuses at lock 4, the same as for any other stray user.
+- **If a new sign-in's address is already held by another staging user**, staging cannot check whether that other login still exists. So it always gives the newcomer a made-up address, even when the other login is long gone and the address could have been handed over.
+- The account-hygiene report (`scripts/report-account-hygiene.js`) cannot run on staging. It is not part of this runbook.
+
+Expect lines in staging's log that say the Auth0 Management API credentials are not configured. On staging that is the intended state. Do not report it as a bug, and do not fix it by adding the variables back.
 
 ## 5. The seed users
 
@@ -214,10 +231,37 @@ A refused seed changes nothing in the database. The message starts with `Refusin
 | Lock 1 of 4 failed | Railway does not say this environment is named `staging`. | Check the top bar and the `-e staging` in your command. If the environment has another name, stop and tell Claude. |
 | Lock 2 of 4 failed | `ALLOW_STAGING_SEED` is not `1` on this service. | Set it on the **staging** backend service, deploy the change, run the seed again. Never set it on production. |
 | Lock 3 of 4 failed | The database address could not be read, or the host matches `PROD_DB_HOST_DENY`. | Stop. This service may be pointed at production's database. Go back to the STOP box in step (d) and tell Claude. |
-| Lock 4 of 4 failed, with a count of users | The database holds that many people who are not seed users and not your plus-addresses. | If you signed in on staging with another address, delete that account in the app and seed again. If you did not, **stop: this database may hold real people.** Tell Claude the count. Do not try to get around it. |
+| Lock 4 of 4 failed, with a count of users | The database holds that many people who are not seed users and not your plus-addresses. | If you signed in on staging with another address, follow "Removing a stray user" under this table. **Do not press Delete account before you have read it.** If you did not sign in with another address, **stop: this database may hold real people.** Tell Claude the count. Do not try to get around it. |
 | Lock 4 of 4 failed, and it says the Users table is empty but Groups or Events holds rows | The database has no users in it, but it does have groups or game nights. A fresh staging database has neither, so this may be a partial copy of real data. | **Stop.** Tell Claude the two counts. Do not try to get around it. |
 | The Users table does not exist (or the Groups table, or the Events table) | The staging backend has not been deployed yet, so its tables were never created; or this is not the database you think it is. | Finish step (f) first. |
 | `SEED_EMAIL_BASE` cannot be used, or `SEED_SMS_USER` does not name a seed user | A typing mistake in that variable. | Fix it on the staging service (section 4), deploy the change, run the seed again. |
+
+### Removing a stray user
+
+This is for one case only: lock 4 refused because you signed in on the preview site with a login that is not one of the test logins from step (g), your everyday Google login for example.
+
+> **STOP: never use Delete account on staging while `AUTH0_MANAGEMENT_CLIENT_ID` or `AUTH0_MANAGEMENT_CLIENT_SECRET` exists on the staging backend service.**
+>
+> Staging and the live site share one set of Auth0 logins. With those two variables in place, Delete account on staging deletes that login in Auth0 itself, which is the login you use on the live site, and deleting a login in Auth0 cannot be undone. Without the two variables staging cannot reach Auth0 to delete anything, and Delete account only removes the account from staging's database.
+
+Do these in order:
+
+1. **Check the two variables are gone.** In Railway, make sure the top bar says `staging`. Click the backend service, then **Variables**. Look for `AUTH0_MANAGEMENT_CLIENT_ID` and `AUTH0_MANAGEMENT_CLIENT_SECRET`.
+   - You should see: neither name anywhere in the list, and no staged-changes banner waiting to be deployed.
+   - If either name is there, or a banner is waiting: **stop. Do not press Delete account.** Tell Claude in words.
+2. **Delete the stray account.** On the preview site, sign in with the stray login, and use the app's own Delete account button (the Danger Zone card on your profile page).
+   - You should see: the app signs you out and shows its goodbye page. An email arrives at that login's address saying "Your Nextgamenight account has been deleted". That email is about the staging copy only. Your account on the live site has not been touched.
+   - If the app refuses because that account owns a group other people are in, stop and tell Claude in words.
+3. **Seed again** (section 6). If lock 4 still refuses, tell Claude in words, with the count.
+
+What to expect afterwards, all of it on staging only:
+
+- **That login cannot be used on staging again.** Staging keeps a note that the login was deleted, and anyone signing in with it on the preview site is told the account was deleted. Seeding again does not clear the note. It still works on the live site as before.
+- **Staging keeps trying to finish the Auth0 step and keeps failing, for good.** It tries about ten times over the first 17 hours and then once every half hour, and each try leaves an error line in staging's log about the Auth0 Management API. That is expected. Do not report it as a bug, and do not add the two variables back to make it stop.
+
+**Never use Delete account while signed in as one of the test logins from step (g).** The same note would shut that test login out of staging for good, and staging would then remove that seed user again within half an hour of every seed. If that has already happened, tell Claude in words. Nothing in the app can undo it.
+
+If you want to try the Delete account feature itself on staging, tell Claude first. It needs a design that does not exist yet.
 
 ## 8. The proof list
 
@@ -237,6 +281,9 @@ A refused seed changes nothing in the database. The message starts with `Refusin
 - Never add the seed to a pre-deploy command, on staging or anywhere. It would wipe staging on every deploy.
 - Never paste command output into the Claude session, and never run the commands in section 6 there (see the top of this file).
 - Never try to get around a refused lock. A refusal is the guard working.
+- Never add `AUTH0_MANAGEMENT_CLIENT_ID` or `AUTH0_MANAGEMENT_CLIENT_SECRET` back to the staging backend service.
+- Never use Delete account on staging while either of those two variables exists there. It would delete the login in the Auth0 tenant the live site uses.
+- Never use Delete account on staging while signed in as one of the test logins from step (g).
 
 ## 10. Cost
 
