@@ -27,6 +27,9 @@
 //       outside the callback nothing loads or calls a starter;
 //   S3  schedulers/ as text (review R-1, R-2): no module there can start its own task (no
 //       schedule(), no .start()), and node-cron is loaded only by those modules and server.js;
+//       and across the whole app (scoped check S-1): bullmq is loaded and a Worker is built
+//       only under workers/ (queues/ loads bullmq for its queues), and nothing outside
+//       workers/ loads a worker module except the one gated require in server.js;
 //   R1  docs/staging-environment.md quotes the off message word for word and carries the
 //       "Never on production" entry.
 //
@@ -245,7 +248,38 @@ const START_CALLS = [
   ['syncPromptSchedules...(', /\bsyncPromptSchedules\w*\s*\(/],
   ['upsertJobScheduler(', /\bupsertJobScheduler\s*\(/],
 ];
-const NODE_CRON_REQUIRE = /require\(\s*['"]node-cron['"]\s*\)/;
+// A require path may be written with either quote or as a template. All three count.
+const NODE_CRON_REQUIRE = /require\(\s*['"`]node-cron['"`]\s*\)/;
+const BULLMQ_REQUIRE = /require\(\s*['"`]bullmq['"`]\s*\)/;
+// './workers', '../workers', './workers/index.js', '../workers/emailNoticeWorker', and so on.
+const WORKERS_DIR_REQUIRE = /require\(\s*['"`](?:\.\.?\/)+workers(?:\/[^'"`\n]*)?['"`]\s*\)/;
+const NEW_WORKER = /\bnew\s+Worker\s*\(/;
+
+// App source the server can load: server.js and everything under these folders. Tests,
+// scripts and migrations are never loaded by the server and are not read here.
+const APP_DIRS = ['config', 'middleware', 'models', 'queues', 'routes', 'schedulers', 'services', 'utils', 'workers'];
+function appSourceFiles() {
+  const files = [SERVER_PATH];
+  for (const dir of APP_DIRS) files.push(...jsFilesUnder(path.join(APP_ROOT, dir)));
+  return files;
+}
+
+// The app files in which `pattern` occurs in real code, as paths from the app root, sorted.
+// `view` is the maskSource view to look in. A file that only mentions it in a comment does
+// not count. Fail-closed: a file whose raw text matches but which does not scan cleanly is
+// listed too, marked, because the scan cannot vouch for what it hid.
+function appFilesWithCode(pattern, view) {
+  const hits = [];
+  for (const file of appSourceFiles()) {
+    const text = fs.readFileSync(file, 'utf8');
+    if (!pattern.test(text)) continue;
+    const rel = path.relative(APP_ROOT, file).split(path.sep).join('/');
+    const scan = maskSource(text);
+    if (scan.problems.length > 0) hits.push(`${rel} (did not scan cleanly)`);
+    else if (pattern.test(scan[view])) hits.push(rel);
+  }
+  return hits.sort();
+}
 
 // The beginning of every line the server really prints when something starts, read from the
 // source: "Deadline scheduler started", "BullMQ workers started", and so on. The owner
@@ -763,10 +797,10 @@ describe('S2: nothing in server.js can start a job outside a gate (read as text)
     expect(outsideText).not.toContain('schedulersOn');
 
     const forbiddenLoads = [
-      ["require('./workers...')", /require\(\s*['"]\.\/workers/],
-      ["require('./routes/bullBoard')", /require\(\s*['"]\.\/routes\/bullBoard/],
+      ["require('./workers...')", WORKERS_DIR_REQUIRE],
+      ["require('./routes/bullBoard')", /require\(\s*['"`]\.\/routes\/bullBoard/],
       ["require('node-cron')", NODE_CRON_REQUIRE],
-      ["require('bullmq')", /require\(\s*['"]bullmq['"]\s*\)/],
+      ["require('bullmq')", BULLMQ_REQUIRE],
     ];
     const hits = [];
     for (const [label, pattern] of forbiddenLoads) {
@@ -785,7 +819,7 @@ describe('S2: nothing in server.js can start a job outside a gate (read as text)
     // be read first, then added here.
     const outsideText = outsideListen(noComments);
     const loaded = [];
-    const pattern = /require\(\s*['"]\.\/schedulers\/([\w-]+)(?:\.js)?['"]\s*\)/g;
+    const pattern = /require\(\s*['"`]\.\/schedulers\/([\w-]+)(?:\.js)?['"`]\s*\)/g;
     let m = pattern.exec(outsideText);
     while (m !== null) {
       loaded.push(m[1]);
@@ -823,7 +857,7 @@ describe('S3: no scheduler module can start its own task (read as text)', () => 
       // cron.schedule(...), require('node-cron').schedule(...), anything.schedule(...)
       for (const at of findAll(file.code, /\.schedule\s*\(/)) offenders.push(`${file.name} ${whereIs(file.text, at)}`);
       // const { schedule } = require('node-cron')
-      for (const at of findAll(file.noComments, /\{[^{}]*\bschedule\b[^{}]*\}\s*=\s*require\(\s*['"]node-cron['"]\s*\)/)) {
+      for (const at of findAll(file.noComments, /\{[^{}]*\bschedule\b[^{}]*\}\s*=\s*require\(\s*['"`]node-cron['"`]\s*\)/)) {
         offenders.push(`${file.name} ${whereIs(file.text, at)}`);
       }
     }
@@ -849,23 +883,50 @@ describe('S3: no scheduler module can start its own task (read as text)', () => 
     }
   });
 
+  it('read the whole app, more than fifty files (anti-vacuity for the four app-wide checks)', () => {
+    const files = appSourceFiles();
+    expect(files.length).toBeGreaterThan(50);
+    expect(files).toContain(SERVER_PATH);
+    expect(files).toContain(WORKERS_INDEX_PATH);
+    expect(files).toContain(path.join(APP_ROOT, 'routes', 'ballot.js'));
+  });
+
   it('node-cron is loaded only by server.js and those four files', () => {
     // A cron built anywhere else (a route, a service) would run from the moment server.js
     // loads that file. If one is ever needed, build it with createTask, start it behind a
     // gate in server.js, and add the file here.
-    const APP_DIRS = ['config', 'middleware', 'models', 'queues', 'routes', 'schedulers', 'services', 'utils', 'workers'];
-    const appFiles = [SERVER_PATH];
-    for (const dir of APP_DIRS) appFiles.push(...jsFilesUnder(path.join(APP_ROOT, dir)));
-    expect(appFiles.length).toBeGreaterThan(50);
+    expect(appFilesWithCode(NODE_CRON_REQUIRE, 'noComments')).toEqual([
+      ...CRON_FILES.map((name) => `schedulers/${name}`),
+      'server.js',
+    ]);
+  });
 
-    const loaders = appFiles
-      .filter((file) => {
-        const text = fs.readFileSync(file, 'utf8');
-        return text.includes('node-cron') && NODE_CRON_REQUIRE.test(maskSource(text).noComments);
-      })
-      .map((file) => path.relative(APP_ROOT, file).split(path.sep).join('/'))
-      .sort();
-    expect(loaders).toEqual([...CRON_FILES.map((name) => `schedulers/${name}`), 'server.js']);
+  it('bullmq is loaded only by files under queues/ and workers/', () => {
+    // Worker comes from bullmq. A file that loads bullmq can build one under any name, so
+    // this check is what backs the next one against a renamed import.
+    const loaders = appFilesWithCode(BULLMQ_REQUIRE, 'noComments');
+    expect(loaders.filter((file) => file.startsWith('workers/')).length).toBeGreaterThanOrEqual(6);
+    expect(loaders.filter((file) => file.startsWith('queues/')).length).toBeGreaterThanOrEqual(6);
+    expect(loaders.filter((file) => !file.startsWith('workers/') && !file.startsWith('queues/'))).toEqual([]);
+  });
+
+  it('a BullMQ Worker is built only by files under workers/', () => {
+    // Every worker file builds its Worker, and opens its Redis connection, the moment it is
+    // loaded. That is safe only because the one way into workers/ is the gated require in
+    // server.js. A Worker built in a route or a service would start whenever server.js
+    // loads that file, switch or no switch.
+    const builders = appFilesWithCode(NEW_WORKER, 'code');
+    expect(builders.filter((file) => file.startsWith('workers/')).length).toBeGreaterThanOrEqual(6);
+    expect(builders.filter((file) => !file.startsWith('workers/'))).toEqual([]);
+  });
+
+  it('nothing outside workers/ loads a worker module, except the one require in server.js', () => {
+    // Loading any file under workers/ builds a Worker (see above), so a route that requires
+    // one for a helper it exports starts that worker at boot. server.js is the one allowed
+    // loader, and S1 and S2 hold its require behind workersOn. If a helper is needed
+    // elsewhere, move it out of the worker file.
+    const loaders = appFilesWithCode(WORKERS_DIR_REQUIRE, 'noComments').filter((file) => !file.startsWith('workers/'));
+    expect(loaders).toEqual(['server.js']);
   });
 });
 
