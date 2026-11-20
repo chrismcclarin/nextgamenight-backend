@@ -205,6 +205,18 @@ function findAll(text, pattern, from = 0, to = text.length) {
   return found;
 }
 
+// Every index at which the plain text `needle` occurs in `text`, between `from` and `to`.
+// Plain text on purpose: no pattern is built from a string, so nothing needs escaping.
+function findAllText(text, needle, from = 0, to = text.length) {
+  const found = [];
+  let at = text.indexOf(needle, from);
+  while (at !== -1 && at < to) {
+    found.push(at);
+    at = text.indexOf(needle, at + 1);
+  }
+  return found;
+}
+
 // "line 12: the line's text", for a failure message a person can act on.
 function whereIs(text, index) {
   const lineNumber = text.slice(0, index).split('\n').length;
@@ -641,7 +653,7 @@ describe('S2: nothing in server.js can start a job outside a gate (read as text)
 
   const gates = [];
   for (const [kind, opener] of [['scheduler', 'if (schedulersOn) {'], ['worker', 'if (workersOn) {']]) {
-    for (const at of findAll(code, new RegExp(opener.replace(/[(){}]/g, '\\$&')), bodyOpen, bodyClose)) {
+    for (const at of findAllText(code, opener, bodyOpen, bodyClose)) {
       const open = at + opener.length - 1;
       gates.push({ kind, open, close: matchBrace(code, open) });
     }
