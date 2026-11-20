@@ -13,7 +13,9 @@
 //    NODE_ENV is 'production'. scripts/e2e-fixtures.js uses it and gains nothing here.
 //  - assertSeedTargetAllowed(sequelize, opts): async, for scripts/seed-sample-data.js ALONE.
 //    Outside production mode it is assertNotProductionDb, unchanged. In production mode it
-//    is the four-lock staging arm (assertStagingSeedAllowed) further down this file.
+//    is the four-lock staging arm (assertStagingSeedAllowed) further down this file. For the
+//    seed, production mode means inside Railway OR a NODE_ENV that reads as production (the
+//    R3 marker beside assertSeedTargetAllowed).
 //
 // This module has no `require` on purpose: tests re-require the seed with the models mocked
 // and rely on its lib helpers being dependency-free. The SELECT query type is read from the
@@ -108,8 +110,10 @@ function assertNotProductionDb(sequelize) {
 // to behave like the live site; and OVER running staging under another NODE_ENV value, because
 // about 30 backend behaviours key on that value (schedulers, webhook signature checks, origin
 // rules, rate limits), so a staging that is not in production mode proves little.
-// With NODE_ENV=production the seed is refused unless ALL FOUR locks hold:
-//   lock 1  RAILWAY_ENVIRONMENT_NAME is exactly 'staging';
+// Which runs count as production mode was widened by review finding R-3: inside Railway, or a
+// NODE_ENV that reads as production (DECISION quick-261119-nv0 R3, beside
+// assertSeedTargetAllowed). In production mode the seed is refused unless ALL FOUR locks hold:
+//   lock 1 RAILWAY_ENVIRONMENT_NAME is exactly 'staging';
 //   lock 2  ALLOW_STAGING_SEED is exactly '1';
 //   lock 3  the resolved database host can be read and, when PROD_DB_HOST_DENY is set, does
 //           not contain it;
@@ -443,11 +447,37 @@ async function assertStagingSeedAllowed(sequelize, { seedEmails, stagingEmailBas
   return { database: describeResolvedDb(sequelize), locks, productionMode: true };
 }
 
+// Railway sets these three itself in every service it runs (and in a local `railway run`).
+// Any one of them holding a non-empty value means the seed is running inside Railway.
+const RAILWAY_MARKER_VARIABLES = ['RAILWAY_ENVIRONMENT_NAME', 'RAILWAY_ENVIRONMENT_ID', 'RAILWAY_PROJECT_ID'];
+
+// DECISION quick-261119-nv0 R3: for the SEED, "production mode" is the process being inside
+// Railway (any of the three variables above set to a non-empty value) OR a NODE_ENV that reads
+// as production once trimmed and lower-cased. Chosen OVER the strict
+// `NODE_ENV === 'production'` this entry used first, because a NODE_ENV that only looks like
+// production ('Production', ' production', 'PRODUCTION') then fell through to the local-host
+// arm, where ALLOW_DESTRUCTIVE_SEED=1 waves any remote host through: two mistakes on a Railway
+// service and the seed would empty a database holding real users without lock 4 ever reading
+// it. The seed now runs inside Railway, right next to production, so inside Railway the four
+// locks ALWAYS decide and ALLOW_DESTRUCTIVE_SEED never does.
+// REJECTED: making assertNotProductionDb read NODE_ENV this way too. scripts/e2e-fixtures.js
+// calls that function un-awaited and must behave exactly as before (the A1 marker above), so
+// this test lives in the seed's entry only. That function still compares strictly.
+// Local development and CI set none of the three variables and leave NODE_ENV unset or
+// 'test', so they take the local-host arm exactly as before.
+// Narrowing this back to the strict compare is a decision, not a cleanup.
+function seedRunsInProductionMode() {
+  const insideRailway = RAILWAY_MARKER_VARIABLES.some((name) => (process.env[name] || '') !== '');
+  const nodeEnv = String(process.env.NODE_ENV || '').trim().toLowerCase();
+  return insideRailway || nodeEnv === 'production';
+}
+
 /**
  * The seed's single entry (scripts/seed-sample-data.js awaits it as its first statement).
- *  - NODE_ENV strictly 'production': the four-lock staging arm above.
- *  - Any other value: assertNotProductionDb, unchanged, and NO query. Local and CI seeds
- *    behave exactly as before.
+ *  - Production mode (inside Railway, or NODE_ENV reads as production; see the R3 marker
+ *    above): the four-lock staging arm.
+ *  - Otherwise: assertNotProductionDb, unchanged, and NO query. Local and CI seeds behave
+ *    exactly as before.
  *
  * `productionMode` in the result says which of the two it was. The seed reads it to decide
  * whether it may sync the schema (it may not in the four-lock arm).
@@ -457,15 +487,15 @@ async function assertStagingSeedAllowed(sequelize, { seedEmails, stagingEmailBas
  * @returns {Promise<{ database: string, locks: string[], productionMode: boolean }>}
  */
 async function assertSeedTargetAllowed(sequelize, opts) {
-  if (process.env.NODE_ENV === 'production') {
+  if (seedRunsInProductionMode()) {
     return assertStagingSeedAllowed(sequelize, opts);
   }
   assertNotProductionDb(sequelize);
   return {
     database: describeResolvedDb(sequelize),
     locks: [
-      'production mode is off (NODE_ENV is not production), so the staging locks do not ' +
-        'apply; the local-host guard passed',
+      'production mode is off (NODE_ENV is not production and this is not running inside ' +
+        'Railway), so the staging locks do not apply; the local-host guard passed',
     ],
     productionMode: false,
   };

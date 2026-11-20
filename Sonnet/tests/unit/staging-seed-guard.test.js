@@ -47,6 +47,8 @@ const GUARD_ENV = [
   'ALLOW_DESTRUCTIVE_SEED',
   'ALLOW_STAGING_SEED',
   'RAILWAY_ENVIRONMENT_NAME',
+  'RAILWAY_ENVIRONMENT_ID',
+  'RAILWAY_PROJECT_ID',
   'PROD_DB_HOST_DENY',
 ];
 
@@ -206,14 +208,175 @@ describe('assertSeedTargetAllowed: outside production mode the seed is unchanged
     expect(sequelize.query).not.toHaveBeenCalled();
   });
 
-  test('N2: the staging variables do not stand in for ALLOW_DESTRUCTIVE_SEED outside production mode', async () => {
+  test('N2: ALLOW_STAGING_SEED does not stand in for ALLOW_DESTRUCTIVE_SEED outside production mode', async () => {
+    // No Railway variable here. Since R-3 any of them puts the run in production mode (the
+    // R3 block below), where the four locks decide and neither flag stands in for the other.
     process.env.NODE_ENV = 'test';
     process.env.DATABASE_URL = STAGING_URL;
-    process.env.RAILWAY_ENVIRONMENT_NAME = 'staging';
     process.env.ALLOW_STAGING_SEED = '1';
+    process.env.PROD_DB_HOST_DENY = 'prod-db.example.org';
 
     const message = await refusalOf(() => assertSeedTargetAllowed(makeSequelize(), opts()));
     expect(message).toMatch(/non-local database host/);
+  });
+});
+
+describe('R3: production mode is "inside Railway" OR a NODE_ENV that reads as production', () => {
+  // Review finding R-3 (quick-261119-nv0). Before it, only NODE_ENV === 'production' (strict)
+  // reached the four locks. A Railway service whose NODE_ENV was mistyped ('Production',
+  // ' production') and that had ALLOW_DESTRUCTIVE_SEED=1 took the local-host arm instead: the
+  // seed ran against a database holding real users and lock 4 never queried.
+  const NEAR_PRODUCTION = ['Production', 'PRODUCTION', ' production', 'production ', '\tproduction\n'];
+  const RAILWAY_MARKERS = ['RAILWAY_ENVIRONMENT_NAME', 'RAILWAY_ENVIRONMENT_ID', 'RAILWAY_PROJECT_ID'];
+  const REAL_USER = [{ email: 'real.person@example.org' }];
+
+  test.each(NEAR_PRODUCTION)(
+    'NODE_ENV %j with ALLOW_DESTRUCTIVE_SEED=1 and a real user: refused, and no longer waved through',
+    async (nodeEnv) => {
+      process.env.NODE_ENV = nodeEnv;
+      process.env.DATABASE_URL = STAGING_URL;
+      process.env.ALLOW_DESTRUCTIVE_SEED = '1';
+      const sequelize = makeSequelize(REAL_USER);
+
+      const message = await refusalOf(() => assertSeedTargetAllowed(sequelize, opts()));
+
+      expect(message).toMatch(/^\[assert-not-production-db\] Refusing to seed/);
+      // No Railway environment name here, so lock 1 is the one that answers.
+      expect(message).toMatch(/lock 1\b/i);
+    }
+  );
+
+  test.each(NEAR_PRODUCTION)(
+    'NODE_ENV %j with locks 1 to 3 holding: lock 4 queries and refuses the real user',
+    async (nodeEnv) => {
+      setEveryVariableRight();
+      process.env.NODE_ENV = nodeEnv;
+      process.env.ALLOW_DESTRUCTIVE_SEED = '1';
+      const sequelize = makeSequelize(REAL_USER);
+
+      const message = await refusalOf(() => assertSeedTargetAllowed(sequelize, opts()));
+
+      expect(message).toMatch(/lock 4\b/i);
+      expect(message).toMatch(/\b1 user\b/);
+      expect(sequelize.query).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  test.each(RAILWAY_MARKERS)(
+    '%s set, NODE_ENV=test, ALLOW_DESTRUCTIVE_SEED=1, a real user: the four locks decide and refuse',
+    async (marker) => {
+      process.env.NODE_ENV = 'test';
+      process.env.DATABASE_URL = STAGING_URL;
+      process.env.ALLOW_DESTRUCTIVE_SEED = '1';
+      process.env[marker] = 'unit-test-only-value';
+      const sequelize = makeSequelize(REAL_USER);
+
+      const message = await refusalOf(() => assertSeedTargetAllowed(sequelize, opts()));
+
+      expect(message).toMatch(/^\[assert-not-production-db\] Refusing to seed/);
+      expect(message).toMatch(/lock 1\b/i);
+      expect(message).not.toContain('unit-test-only-value');
+    }
+  );
+
+  test.each([[undefined], ['test'], ['development']])(
+    'inside the Railway staging environment with NODE_ENV %j: lock 4 queries and refuses the real user',
+    async (nodeEnv) => {
+      setEveryVariableRight();
+      if (nodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = nodeEnv;
+      process.env.ALLOW_DESTRUCTIVE_SEED = '1';
+      const sequelize = makeSequelize(REAL_USER);
+
+      const message = await refusalOf(() => assertSeedTargetAllowed(sequelize, opts()));
+
+      expect(message).toMatch(/lock 4\b/i);
+      expect(sequelize.query).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  test('inside Railway on a local database host the four locks still decide (the host is not an excuse)', async () => {
+    process.env.DATABASE_URL = LOCAL_URL;
+    process.env.RAILWAY_PROJECT_ID = 'unit-test-only-value';
+
+    const message = await refusalOf(() => assertSeedTargetAllowed(makeSequelize(), opts()));
+    expect(message).toMatch(/lock 1\b/i);
+  });
+
+  test('inside the Railway staging environment with NODE_ENV=test and all four locks holding: allowed, in production mode', async () => {
+    setEveryVariableRight();
+    process.env.NODE_ENV = 'test';
+
+    const result = await assertSeedTargetAllowed(makeSequelize([{ email: 'owner+alice@example.com' }]), opts());
+
+    expect(result.locks).toHaveLength(4);
+    expect(result.productionMode).toBe(true);
+  });
+
+  test.each(RAILWAY_MARKERS)('%s set to an empty value does not count as inside Railway', async (marker) => {
+    process.env.NODE_ENV = 'test';
+    process.env.DATABASE_URL = LOCAL_URL;
+    process.env[marker] = '';
+    const sequelize = makeSequelize();
+
+    const result = await assertSeedTargetAllowed(sequelize, opts());
+
+    expect(result.productionMode).toBe(false);
+    expect(result.locks).toHaveLength(1);
+    expect(sequelize.query).not.toHaveBeenCalled();
+  });
+
+  test.each([[undefined], ['test'], ['development'], ['prod'], ['production-like'], ['staging'], ['']])(
+    'UNCHANGED: with no Railway variable, NODE_ENV %j on localhost takes the local-host arm and runs no query',
+    async (nodeEnv) => {
+      if (nodeEnv !== undefined) process.env.NODE_ENV = nodeEnv;
+      process.env.DATABASE_URL = LOCAL_URL;
+      const sequelize = makeSequelize(REAL_USER);
+
+      const result = await assertSeedTargetAllowed(sequelize, opts());
+
+      expect(result.productionMode).toBe(false);
+      expect(result.locks).toHaveLength(1);
+      expect(result.locks[0]).toMatch(/production mode is off/);
+      expect(sequelize.query).not.toHaveBeenCalled();
+    }
+  );
+
+  test('UNCHANGED: with no Railway variable and NODE_ENV=test, a remote host still needs ALLOW_DESTRUCTIVE_SEED=1', async () => {
+    process.env.NODE_ENV = 'test';
+    process.env.DATABASE_URL = STAGING_URL;
+
+    const message = await refusalOf(() => assertSeedTargetAllowed(makeSequelize(), opts()));
+    expect(message).toMatch(/non-local database host/);
+
+    process.env.ALLOW_DESTRUCTIVE_SEED = '1';
+    const result = await assertSeedTargetAllowed(makeSequelize(), opts());
+    expect(result.productionMode).toBe(false);
+  });
+
+  describe('assertNotProductionDb itself is untouched (scripts/e2e-fixtures.js calls it un-awaited)', () => {
+    test.each(NEAR_PRODUCTION)('NODE_ENV %j on localhost still returns, exactly as before', (nodeEnv) => {
+      process.env.NODE_ENV = nodeEnv;
+      process.env.DATABASE_URL = LOCAL_URL;
+
+      expect(assertNotProductionDb(makeSequelize())).toBeUndefined();
+    });
+
+    test.each(RAILWAY_MARKERS)('%s set does not change it: localhost returns, a remote host follows ALLOW_DESTRUCTIVE_SEED', (marker) => {
+      process.env.NODE_ENV = 'test';
+      process.env[marker] = 'unit-test-only-value';
+      const sequelize = makeSequelize();
+
+      process.env.DATABASE_URL = LOCAL_URL;
+      expect(assertNotProductionDb(sequelize)).toBeUndefined();
+
+      process.env.DATABASE_URL = STAGING_URL;
+      expect(() => assertNotProductionDb(sequelize)).toThrow(/non-local database host/);
+
+      process.env.ALLOW_DESTRUCTIVE_SEED = '1';
+      expect(assertNotProductionDb(sequelize)).toBeUndefined();
+      expect(sequelize.query).not.toHaveBeenCalled();
+    });
   });
 });
 

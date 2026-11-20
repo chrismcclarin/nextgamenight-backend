@@ -185,10 +185,11 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
     // schema-destructive, not just the destroy({ where: {} }) block — so the guard
     // must run before BOTH, and it is AWAITED: nothing below starts until it has answered.
     // What it does (quick-261119-nv0, owner ruling G1; scripts/lib/assert-not-production-db.js):
-    //  - NODE_ENV is not production (local, CI): the local-host guard, as before. It throws
+    //  - Not production mode (local, CI): the local-host guard, as before. It throws
     //    on any non-local DB host unless ALLOW_DESTRUCTIVE_SEED=1 is explicitly set, and it
     //    runs no query.
-    //  - NODE_ENV is production (staging runs that way): the four-lock staging arm. It
+    //  - Production mode (staging runs that way; since review finding R-3 this means inside
+    //    Railway, or a NODE_ENV that reads as production): the four-lock staging arm. It
     //    refuses unless the Railway environment is named staging, ALLOW_STAGING_SEED is 1,
     //    the database host is readable and not the one named in PROD_DB_HOST_DENY, and the
     //    Users table holds nobody but seed users and plus-addresses of SEED_EMAIL_BASE.

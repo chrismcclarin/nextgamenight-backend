@@ -78,9 +78,9 @@ Exceptions — the row stays escalated, with the reason written beside it:
 
 The seed changes the schema and deletes every row in the database it is pointed at. Before it does anything it asks a guard (`scripts/lib/assert-not-production-db.js`), and it prints which database it resolved (host, port and database name, never a username or password) and what the guard found.
 
-**On your machine and in CI (`NODE_ENV` is not `production`).** The database host must be `localhost`, `127.0.0.1` or `::1`. Any other host is refused unless `ALLOW_DESTRUCTIVE_SEED=1` is set on purpose for a database that is safe to wipe.
+**On your machine and in CI (`NODE_ENV` is not `production`, and the seed is not running inside Railway).** The database host must be `localhost`, `127.0.0.1` or `::1`. Any other host is refused unless `ALLOW_DESTRUCTIVE_SEED=1` is set on purpose for a database that is safe to wipe.
 
-**With `NODE_ENV=production`** the seed is refused, with one exception: the staging environment on Railway, which runs in production mode so that it behaves like the live site (owner ruling G1, 2026-11-19). The exception opens only when all four locks hold:
+**In production mode** the seed is refused, with one exception. Production mode means either of two things: the seed is running inside Railway (Railway has set `RAILWAY_ENVIRONMENT_NAME`, `RAILWAY_ENVIRONMENT_ID` or `RAILWAY_PROJECT_ID`), or `NODE_ENV` reads as `production` once spaces and letter case are ignored. So a mistyped `NODE_ENV` on a Railway service cannot take the seed around the locks. The one exception is the staging environment on Railway, which runs in production mode so that it behaves like the live site (owner ruling G1, 2026-11-19). The exception opens only when all four locks hold:
 
 1. `RAILWAY_ENVIRONMENT_NAME` is exactly `staging` (Railway sets this itself).
 2. `ALLOW_STAGING_SEED` is exactly `1`.
