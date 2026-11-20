@@ -928,6 +928,84 @@ describe('describeResolvedDb: names the database, never a credential', () => {
     expect(sequelize.query).not.toHaveBeenCalled();
   });
 
+  // Review finding R-4 (quick-261119-nv0). A password holding an unencoded "/", "?" or "#"
+  // ends the URL's host section early: the parser then reads the USER NAME as the host, the
+  // leading digits of the password as the port, and the rest of the password plus the REAL
+  // host as the path or the query. Printing that as "the database" put part of a password
+  // and the real host into the seed's log and into every refusal. Such a string does not
+  // read back as host, port and one database name, so it is unparseable: lock 3 refuses,
+  // and the line prints none of it. Every value below is a fake on a reserved domain.
+  const LEAKY = [
+    ['an unencoded "/" in the password', 'postgres://dbuser:1234/SECRETPART@host.example.net:5432/railway'],
+    ['an unencoded "?" in the password', 'postgres://dbuser:1234?SECRETPART@host.example.net:5432/railway'],
+    ['an unencoded "#" in the password', 'postgres://dbuser:1234#SECRETPART@host.example.net:5432/railway'],
+    ['an "@" and then a "/" in the password', 'postgres://dbuser:pa@1234/SECRETPART@host.example.net:5432/railway'],
+    ['an "@" and then a "?" in the password', 'postgres://dbuser:pa@1234?SECRETPART@host.example.net:5432/railway'],
+    ['a ":" in the database name', 'postgres://dbuser:s3cretpw@host.example.net:5432/rail:way'],
+    ['an "@" in the database name', 'postgres://dbuser:s3cretpw@host.example.net:5432/rail@way'],
+    ['two path segments', 'postgres://dbuser:s3cretpw@host.example.net:5432/railway/extra'],
+    ['a database name with a trailing "/"', 'postgres://dbuser:s3cretpw@host.example.net:5432/railway/'],
+  ];
+  const PIECES = ['SECRETPART', 's3cretpw', 'dbuser', '1234', 'host.example.net', 'railway', 'rail', 'extra', '5432'];
+
+  test.each(LEAKY)('R4: %s is unparseable, and the line prints none of the string', (_label, url) => {
+    process.env.DATABASE_URL = url;
+
+    const line = describeResolvedDb(makeSequelize([], { host: 'config.example.org', port: 6543, database: 'configdb' }));
+
+    expect(line).toMatch(/could not be parsed/);
+    expect(line).toContain('DATABASE_URL');
+    for (const piece of PIECES) expect({ piece, printed: line.includes(piece) }).toEqual({ piece, printed: false });
+    // And it does not fall back to the sequelize config, which is not what the seed would hit.
+    expect(line).not.toContain('config.example.org');
+  });
+
+  test.each(LEAKY)('R4: %s is refused by lock 3, before any query, and the refusal prints none of it', async (_label, url) => {
+    setEveryVariableRight();
+    process.env.DATABASE_URL = url;
+    const sequelize = makeSequelize([], { host: 'config.example.org', port: 6543, database: 'configdb' });
+
+    const message = await refusalOf(() => assertSeedTargetAllowed(sequelize, opts()));
+
+    expect(message).toMatch(/^\[assert-not-production-db\] Refusing to seed/);
+    expect(message).toMatch(/lock 3\b/i);
+    expect(message).toMatch(/could not be parsed, so its host cannot be checked/);
+    for (const piece of PIECES) expect({ piece, printed: message.includes(piece) }).toEqual({ piece, printed: false });
+    expect(sequelize.query).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ['the usual form', 'postgres://dbuser:s3cretpw@host.example.net:5432/railway', 'host.example.net', '5432', 'railway'],
+    ['the postgresql scheme', 'postgresql://dbuser:s3cretpw@host.example.net:6543/stagingdb', 'host.example.net', '6543', 'stagingdb'],
+    ['no port', 'postgres://dbuser:s3cretpw@host.example.net/railway', 'host.example.net', '5432', 'railway'],
+    ['no password', 'postgres://dbuser@host.example.net:5432/railway', 'host.example.net', '5432', 'railway'],
+    ['no credentials', 'postgres://localhost:5433/boardgame_db', 'localhost', '5433', 'boardgame_db'],
+    ['a query string', 'postgres://dbuser:s3cretpw@host.example.net:5432/railway?sslmode=require', 'host.example.net', '5432', 'railway'],
+    ['an encoded "/" and "@" in the password', 'postgres://dbuser:12%2FSECRET%40PART@host.example.net:5432/railway', 'host.example.net', '5432', 'railway'],
+    ['an unencoded "@" in the password', 'postgres://dbuser:SECRET@PART@host.example.net:5432/railway', 'host.example.net', '5432', 'railway'],
+    ['an upper-case host', 'postgres://dbuser:s3cretpw@HOST.Example.NET:5432/railway', 'host.example.net', '5432', 'railway'],
+    ['space around the whole string', '  postgres://dbuser:s3cretpw@host.example.net:5432/railway \n', 'host.example.net', '5432', 'railway'],
+  ])('R4 UNCHANGED: %s still reads as host, port and database', (_label, url, host, port, database) => {
+    process.env.DATABASE_URL = url;
+
+    const line = describeResolvedDb(makeSequelize()).toLowerCase();
+
+    expect(line).not.toMatch(/could not be parsed/);
+    expect(line).toContain(`database "${database}" on host "${host}" port ${port}`);
+    expect(line).not.toContain('secret');
+    expect(line).not.toContain('s3cretpw');
+    expect(line).not.toContain('dbuser');
+  });
+
+  test('R4 UNCHANGED: a URL with no database name still reads, and says the database is not named', () => {
+    for (const url of ['postgres://dbuser:s3cretpw@host.example.net:5432', 'postgres://dbuser:s3cretpw@host.example.net:5432/']) {
+      process.env.DATABASE_URL = url;
+
+      const line = describeResolvedDb(makeSequelize());
+      expect(line).toContain('database "(not named)" on host "host.example.net" port 5432');
+    }
+  });
+
   test('with no URL it names the sequelize config host, port and database', () => {
     const line = describeResolvedDb(makeSequelize([], { host: 'localhost', port: 5433, database: 'boardgame_db' }));
 

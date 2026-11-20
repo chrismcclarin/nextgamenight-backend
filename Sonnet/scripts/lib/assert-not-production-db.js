@@ -135,33 +135,64 @@ function assertNotProductionDb(sequelize) {
 
 const DB_URL_VARIABLES = ['POSTGRES_PRIVATE_URL', 'POSTGRES_URL', 'DATABASE_URL', 'PGDATABASE_URL'];
 
+// Reads one connection string. Returns its host, port and database name ONLY when the string
+// reads back as exactly that: host, optional port, at most one database name. Returns null
+// for anything else, and the caller then prints none of it.
+//
+// Why the read-back (review finding R-4): `new URL` does not throw on a password that holds
+// an unencoded "/", "?" or "#". It ends the host section there instead, so
+// "scheme://user:1234/REST-OF-PASSWORD@real-host:5432/db" parses with the USER NAME as the
+// host, "1234" as the port, and the rest of the password plus the real host as the path.
+// Copying hostname, port and pathname out of that put part of a password and the real host
+// into the seed's log line and into every refusal. Three checks close it:
+//   1. a hostname was parsed at all ("postgres:user:password@host/db", with no "//", parses
+//      with none, and with the credentials inside the pathname);
+//   2. the path is at most ONE segment, and that segment holds no "@" and no ":";
+//   3. what the string says after its LAST "@" (up to any "?" or "#") is exactly the parsed
+//      host, port and database name. In every mis-split shape the real host sits after the
+//      last "@" while the parser's "host" came from in front of it, so the two differ.
+// Check 3 also refuses a well-formed string whose query string holds an "@". That is the safe
+// direction (a refusal, never a print), and a database connection string has no reason to.
+// NOT caught, because it cannot be told apart from a host and a port: a string with no "@"
+// at all whose "host:port" is really "user:numeric-password".
+function readConnectionString(text) {
+  const raw = String(text).trim();
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch (e) {
+    return null;
+  }
+  if (!parsed.hostname) return null;
+
+  const database = parsed.pathname.replace(/^\//, '');
+  if (/[/@:]/.test(database)) return null;
+
+  const afterScheme = raw.slice(raw.indexOf('//') + 2);
+  const afterCredentials = afterScheme.slice(afterScheme.lastIndexOf('@') + 1);
+  const written = afterCredentials.split(/[?#]/)[0].toLowerCase();
+  const hostAndPort = `${parsed.hostname}${parsed.port ? `:${parsed.port}` : ''}`.toLowerCase();
+  const expected = database ? `${hostAndPort}/${database.toLowerCase()}` : hostAndPort;
+  // "host:port/" with nothing after the slash names no database; that still reads back.
+  if (written !== expected && !(database === '' && written === `${hostAndPort}/`)) return null;
+
+  return { host: parsed.hostname, port: parsed.port || '5432', database };
+}
+
 // The same target resolveDbHost resolves (same variable order), with the detail the staging
 // arm needs: which variable it came from, and whether that variable could be read as a URL.
-// Only the URL's hostname, port and pathname are ever copied out. The username, password and
-// query string are never touched, so no credential can reach a log line or an error message
-// and there is nothing to mask.
+// Only the host, port and database name are ever copied out, and only from a string that
+// reads back as exactly those (readConnectionString above). The username, password and query
+// string are never copied. A string that does not read back is "could not be parsed": none
+// of its text is printed, and lock 3 refuses it.
 function resolveDbTarget(sequelize) {
   const variable = DB_URL_VARIABLES.find((name) => process.env[name]);
   if (variable) {
-    let parsed = null;
-    try {
-      parsed = new URL(process.env[variable]);
-    } catch (e) {
-      parsed = null;
-    }
-    // A string such as "postgres:user:password@host/db" (no "//") parses WITHOUT a hostname
-    // and with the credentials inside the pathname. No hostname means "could not be parsed",
-    // and the pathname is never read in that case.
-    if (!parsed || !parsed.hostname) {
+    const target = readConnectionString(process.env[variable]);
+    if (!target) {
       return { variable, readable: false, host: '', port: '', database: '' };
     }
-    return {
-      variable,
-      readable: true,
-      host: parsed.hostname,
-      port: parsed.port || '5432',
-      database: parsed.pathname.replace(/^\/+/, ''),
-    };
+    return { variable, readable: true, ...target };
   }
   const config = (sequelize && sequelize.config) || {};
   return {
@@ -344,7 +375,8 @@ async function assertStagingSeedAllowed(sequelize, { seedEmails, stagingEmailBas
       'Lock 3 of 4 failed. It checks that the database host can be read and is not the host ' +
         `named in PROD_DB_HOST_DENY: the connection string from ${target.variable} could not ` +
         'be parsed, so its host cannot be checked. To pass, that variable must hold a ' +
-        'connection URL of the form postgres://user:password@host:port/database.'
+        'connection URL of the form postgres://user:password@host:port/database, with one ' +
+        'database name, and with any "/", "?", "#" or "@" inside the password percent-encoded.'
     );
   }
   const host = (target.host || '').toLowerCase();
