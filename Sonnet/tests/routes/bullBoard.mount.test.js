@@ -3,7 +3,7 @@
 // Guards the middleware ORDER on the /admin/queues mount.
 //
 // CodeQL js/missing-rate-limiting (first scan, 2026-09-08): the global apiLimiter is
-// mounted on `/api/` only (server.js, "app.use('/api/', apiLimiter)"), and this board lives at `/admin/queues` —
+// mounted on `/api/` only, at Sonnet/server.js ("app.use('/api/', apiLimiter)"), and this board lives at `/admin/queues` —
 // outside that prefix — so it had no limiter at all and unauthenticated traffic reached
 // JWT verification unthrottled. The fix is one line in routes/bullBoard.js, and it is
 // exactly the kind of line a later refactor drops without noticing, so assert it here.

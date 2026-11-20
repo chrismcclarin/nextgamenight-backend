@@ -17,7 +17,7 @@
 //     the staging side: a typo there leaves the jobs ON. That is why server.js prints
 //     BACKGROUND_JOBS_OFF_MESSAGE at boot and the staging runbook
 //     (docs/staging-environment.md, step (f)) makes the owner look for that line.
-//   - Named trade-off with Phase 88.2 D-05 (server.js, "flip a switch"): D-05 turned down
+//   - Named trade-off with Phase 88.2 D-05, Sonnet/server.js ("flip a switch"): D-05 turned down
 //     a log-only purge month because a switch somebody has to remember to flip gets
 //     forgotten. This switch is bounded instead: staging only, its first deploy only, a
 //     runbook step that deletes it, a Sentry warning wherever Sentry runs, and a "Never"
