@@ -265,9 +265,10 @@ describe('production wiring', () => {
   });
 
   it('workers/index.js requires, closes and exports the new worker', () => {
-    // server.js:520-522 gates on NODE_ENV/ENABLE_WORKERS and then does
+    // server.js gates on `workersOn` (workersEnabled() from config/backgroundJobs.js:
+    // NODE_ENV/ENABLE_WORKERS, unless DISABLE_BACKGROUND_JOBS is set) and then does
     // `require('./workers')`. That REQUIRE is what constructs every Worker — the
-    // destructure at :522 names only three and is not a start list. So a require
+    // destructure on that line names only three and is not a start list. So a require
     // line here is what starts this worker in production.
     const src = fs.readFileSync(
       path.join(__dirname, '..', '..', 'workers', 'index.js'),
