@@ -1,6 +1,6 @@
 # Staging: setting it up, seeding it, and proving the live site was not touched
 
-Written 2026-11-19 (quick task 261119-nv0). This is a step-by-step runbook for the owner.
+Written 2026-11-19 (quick task 261119-nv0). Amended 2026-11-19 (quick task 261119-w61): the off switch for background jobs, `DISABLE_BACKGROUND_JOBS`. This is a step-by-step runbook for the owner.
 
 How to read it:
 
@@ -26,6 +26,7 @@ Staging is a second copy of the backend on Railway, in an environment named `sta
 - Production data is never touched by anything in this runbook.
 - The seed (`npm run seed`) empties the database it runs against and refills it with seven sample users and their groups, games and game nights. On staging that is the point. It must never run against production, which is what the four locks below are for.
 - Staging runs in production mode (`NODE_ENV=production`, owner ruling G1), so it behaves like the live site: it sends reminder emails and runs the same scheduled jobs. Those emails go only to the people in staging's database, which are your own plus-addresses.
+- On the **first** staging deploy only, one extra variable, `DISABLE_BACKGROUND_JOBS`, keeps every scheduled job and background worker switched off until you have done the log check in step (f). After that check you delete it, and staging runs its jobs like the live site does.
 - Staging shares three outside services with the live site: Auth0 (the same logins exist on both), the email sender and the text-message sender.
 - Because the logins are shared, **staging must never be able to delete or change a login in Auth0.** That is why two variables are deleted on staging before its first deploy (step (d) and section 4), and why Delete account on staging has its own rules (section 7).
 
@@ -49,9 +50,14 @@ What to know about them:
 
 ## 3. Order of work
 
-**(a) The backend pull request is merged, on your go.** Production redeploys. It behaves exactly as before: the change adds scripts, tests and documents, and the server never loads the seed.
+**(a) The two backend pull requests are merged, each on your go.** There are two: the seed guard, and the off switch for background jobs (`DISABLE_BACKGROUND_JOBS`). Production redeploys after each one, and behaves exactly as before:
+
+- The seed guard adds scripts, tests and documents, and the server never loads the seed.
+- The off switch does nothing unless `DISABLE_BACKGROUND_JOBS` is set, and production never has that variable.
 
 - You should see: the production deploy goes Active in Railway, and the live site works as usual.
+- You should see, after the off-switch pull request: production's deploy log shows the same "started" lines as before (`Deadline scheduler started (node-cron)` and the others) and **no** line beginning `Background jobs are OFF`.
+- If production's log ever does show a line beginning `Background jobs are OFF`, that variable is on production by mistake. Delete it there, deploy, and tell Claude in words.
 
 **(b) Count production, before.** In your own terminal, in the backend folder on your Mac (`periodictabletopbackend_v2/Sonnet`), run:
 
@@ -83,7 +89,8 @@ If Railway says the folder is not linked to a project, run `railway link` there,
 > 2. For each database one: either delete it, or replace what it holds with a **reference** to staging's own Postgres service. In the value box, type `${{` and pick staging's Postgres service and its variable from the list Railway offers. At least one of the four `..._URL` names must remain, as a reference. The backend uses the first of those four that is set, in the order written above, so none of them may be left holding pasted text.
 > 3. For `REDIS_URL`: replace what it holds with a reference to staging's own Redis service, the same way.
 > 4. Look at each one again. **Each must show the `${{ ... }}` form**, not a pasted address. Count them off against the list in point 1.
-> 5. Only then go on to the rest of step (d), and then to steps (e) and (f).
+> 5. Add `DISABLE_BACKGROUND_JOBS` with the value `1`: the digit one, no spaces, not `true`. It keeps the scheduled jobs and the background workers off for this first deploy ("What the switch does and does not do", below).
+> 6. Only then go on to the rest of step (d), and then to steps (e) and (f).
 >
 > **After the first deploy, before doing anything else,** open that deployment's log and find the block that starts `=== Pre-Deploy DB Resolution Diagnostic ===`. On the very first staging deploy you should see a line saying the `SequelizeMeta probe failed`. That is the good sign: staging's database is brand new and empty, so the table that check looks for does not exist yet. The migration step right after it then creates the tables.
 >
@@ -91,7 +98,35 @@ If Railway says the folder is not linked to a project, run `railway link` there,
 >
 > The host name in that block is worth reading, but it does not settle the question by itself: staging's and production's private host names are very likely the same text (see lock 3).
 >
-> **One thing that is not settled yet. Do not start step (f) until Claude has told you how it was settled.** The plan was to keep the scheduled jobs and the background workers switched off for the first staging deploy, using `ENABLE_SCHEDULER` and `ENABLE_WORKERS`, and to switch them on after the log check. In the code as it stands that is not possible: in production mode the jobs and workers always start, and those two variables are only looked at outside production mode (`server.js`, every `NODE_ENV === 'production' || ...` check where the jobs start). So today the variable check in points 1 to 4 is the **only** thing between a first staging deploy and production's data. There is no second safety net behind it.
+> **Then find the off line, in the same log.** After the two lines that start `Server is running on port` and `Environment:`, you should see this line, word for word:
+>
+> ```
+> Background jobs are OFF (DISABLE_BACKGROUND_JOBS): no scheduled jobs, sweeps or BullMQ workers started; Bull Board not mounted
+> ```
+>
+> If that line is **not** there, the switch did not take (see "exactly `1`" below) and staging's jobs and workers are running. **Stop at once: remove that staging deployment** (the three-dot menu on the deployment, then Remove), and tell Claude in words.
+>
+> ### What the switch does and does not do
+>
+> **What `DISABLE_BACKGROUND_JOBS` set to `1` does.** The server starts and answers the preview site as usual, but:
+>
+> - No scheduled jobs start: the deadline checks, the reminders, the auto-promotion of pending members, the weekly backup.
+> - No sweeps start: the two that run every half hour, and the daily group purge.
+> - No background workers start. The workers are what send queued emails and texts.
+> - The queue dashboard (`/admin/queues`) is not there.
+> - The log shows the one line quoted above.
+>
+> It works **only** when the value is exactly `1`. Anything else (`true`, `yes`, `1` with a space after it) counts as not set, and everything starts. That is why a missing off line means it did not take.
+>
+> **What it does NOT cover.** The switch is a second safety net behind points 1 to 4. It does not replace them:
+>
+> 1. **The migration step that runs before the server starts.** It runs against whatever database the variables name, switch or no switch. Only points 1 to 4 protect that.
+> 2. **Anything a person sets off by using staging:** sign-in links, invites, poll invitations, verification texts. Those are sent by the server itself when the person presses the button, not by a background job. Nobody uses staging before step (h), because the preview site is not pointed at it until then.
+> 3. **Messages that were queued while the switch was on,** such as a poll's reminders or an email-change notice. They wait in Redis, and they are sent after you delete the switch. On staging's own Redis they go to your plus-addresses.
+> 4. **Outside services calling staging** (the email and text senders reporting back, for example). Staging still answers them.
+> 5. **The seed.** The four locks in section 2 guard that, not this switch.
+>
+> **Why the order matters.** If production's Redis address were still in `REDIS_URL`, deleting the switch would let staging's workers take the live site's queued reminders. The log check cannot catch that: with the switch on, the server does not connect to Redis when it starts. So the order is: the variable check (points 1 to 4), then the log check, and only then deleting the switch (step (f)).
 
 Then set the rest. See section 4 for the full table. Three of them need care:
 
@@ -106,10 +141,21 @@ Then set the rest. See section 4 for the full table. Three of them need care:
 - You should see: a new Railway address for the staging backend. That is the "staging backend address" used in step (h).
 - If the staging service lists the live API's custom domain (the one named in `.railway/railway.ts`), **stop, remove nothing, and tell Claude in words.**
 
-**(f) Deploy staging for the first time.** Only after the STOP box is fully done and the open point in it has been settled. Click **Details** on the staged-changes banner, read the list, then **Deploy**.
+**(f) Deploy staging for the first time.** Only after the STOP box is fully done, all six points, `DISABLE_BACKGROUND_JOBS` included. Click **Details** on the staged-changes banner, read the list, then **Deploy**.
 
 - You should see: the staging services build and go Active. In the backend's deploy log, the `=== Pre-Deploy DB Resolution Diagnostic ===` block with `SequelizeMeta probe failed` (see the STOP box), then the migrations running.
+- You should see, after the migrations: a line starting `Server is running on port`, a line starting `Environment:`, then the off line (it begins `Background jobs are OFF (DISABLE_BACKGROUND_JOBS)`; the STOP box quotes it in full).
+- You should **not** see any line that *begins* with `Deadline scheduler started`, `Backup scheduler started`, `Auto-promotion scheduler started`, `Reminder scheduler started`, `Scheduler anomaly sweep started`, `PendingAuth0Deletion reconciliation sweep started`, `Group purge sweep started` or `BullMQ workers started`. (The off line has the words "BullMQ workers started" in the middle of it. That is fine. What must not be there is a line that begins with them.)
+- If the off line is missing, or one of those "started" lines shows: **remove that staging deployment** (the three-dot menu on the deployment, then Remove), and tell Claude in words.
 - Then open the staging backend address followed by `/health` in a browser. You should see the health response.
+
+**Switch the background jobs on.** Do this only once both log checks have passed (the database block and the off line) and `/health` answers.
+
+1. On the staging backend service, open **Variables** and look at `REDIS_URL` one more time. It must show the `${{ ... }}` form (point 3 of the STOP box). The log check could not see Redis: with the switch on, the server does not connect to it when it starts.
+2. Delete `DISABLE_BACKGROUND_JOBS` there, then **Deploy**.
+
+- You should see, in the new deployment's log: no off line, and lines such as `Deadline scheduler started (node-cron)` and `BullMQ workers started (prompts, deadlines, reminders, gcal-sync, auth0-cleanup, email-notice)`.
+- If the off line is still there, the variable was not deleted or the change was not deployed. Staging is safe in that state, but its reminders do not run. Check the variable list again.
 - From now on, staging redeploys by itself each time the backend's `main` branch changes, and its pre-deploy step runs the migrations on staging's database. The seed is never run automatically.
 
 **(g) Make the Auth0 test logins.** Auth0 Dashboard, **User Management**, **Users**, **Create User**. Connection: **Username-Password-Authentication**. Make one for each seed user you want to sign in as, each with that user's plus-address from the table in section 5 (for Alice, `you+alice@example.com` with your own address in place of `you@example.com`). These are password logins on purpose: a Google login and a password login with the same address are two different users to Auth0.
@@ -148,7 +194,8 @@ All of these are set on the **staging** backend service. Names only; the values 
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI` | Delete on staging | Connect Google Calendar fails on staging with a Google error, on purpose: Google Calendar stays off on staging (owner decision C1, 2026-11-19); it is tested on the local copy and on the live site. Do not report it as a bug. |
 | `SENTRY_DSN` | Delete on staging | Errors are labelled with `NODE_ENV`, so staging's errors would be mixed into the live site's reports. |
 | `GITHUB_TOKEN` | Delete on staging | Feedback sent from staging is then kept in staging's database and never opens an issue in the real queue. |
-| `ENABLE_SCHEDULER`, `ENABLE_WORKERS` | Leave as copied | In production mode these do nothing: the scheduled jobs and workers always run. See the open point in the STOP box. |
+| `DISABLE_BACKGROUND_JOBS` | `1` (the digit one) **before the first deploy**. Deleted after the log check in step (f). | Keeps the scheduled jobs, sweeps and workers off for the first deploy (the STOP box in step (d)). **Staging only, and only for that first deploy. Never on production:** there it stops the live reminders, the sweeps and the alarm for silent jobs. |
+| `ENABLE_SCHEDULER`, `ENABLE_WORKERS` | Leave as copied | In production mode these do nothing: the scheduled jobs and workers run unless `DISABLE_BACKGROUND_JOBS` is set. |
 | `ALLOW_STAGING_SEED` | `1` | Lock 2. **Staging only. Never add `ALLOW_STAGING_SEED` to production.** |
 | `SEED_EMAIL_BASE` | Your own plain address, with no `+` in it | Every seeded user gets a plus-address of it, so all staging mail lands in your mailbox. |
 | `SEED_SMS_USER` | One seed tag; `alice` is recommended | The one seeded user who is allowed to receive texts. |
@@ -268,13 +315,14 @@ If you want to try the Delete account feature itself on staging, tell Claude fir
 1. Signed in on the preview site as one of the test logins, you see the seeded groups (Weekend Warriors and the others).
 2. A change you make there (rename a group, add a game night) does not appear on the live site.
 3. The production counts from steps (b) and (j) match, or went up slightly. They did not drop, and Users is not 7.
-4. An email arrives at one of your plus-addresses (reminders are sent for the seeded upcoming game nights).
+4. An email arrives at one of your plus-addresses (reminders are sent for the seeded upcoming game nights). This needs the background jobs switched on, the last part of step (f).
 5. Texts: signed in as the SMS user, add your phone number in the app. A verification text arrives. Enter the code and turn on one text notification. No other seed user can receive notification texts.
 6. Connect Google Calendar fails on staging with a Google error. That is expected (section 4, owner decision C1).
 
 ## 9. Never
 
 - Never add `ALLOW_STAGING_SEED` to production.
+- Never add `DISABLE_BACKGROUND_JOBS` to production. It stops the live site's reminders, its sweeps and the alarm that reports silent jobs.
 - Never run the seed with `-e production`.
 - Never point staging's database or Redis variables at production, and never leave a pasted address in them.
 - Never run `railway config plan` or `railway config apply` without `--environment production` (see `docs/railway-deploy-settings.md`).

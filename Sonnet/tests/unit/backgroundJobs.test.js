@@ -20,7 +20,9 @@
 //   T5  the helper loads nothing, and its message names the variable;
 //   S1  server.js, read as TEXT and never loaded (loading it needs Postgres): the condition
 //       lives only in the helper, and every log line production prints today is still there,
-//       letter for letter.
+//       letter for letter;
+//   R1  docs/staging-environment.md quotes the off message word for word and carries the
+//       "Never on production" entry.
 //
 // DB-free lane: no database, no Redis, no network.
 
@@ -406,5 +408,37 @@ describe('S1: server.js start sites (read as text, never loaded)', () => {
     const end = src.indexOf("console.error('Unable to start server:'");
     expect(end).toBeGreaterThan(listenAt);
     expect(src.slice(listenAt, end)).not.toMatch(/\} else \{/);
+  });
+});
+
+describe('R1: the staging runbook and the code say the same thing', () => {
+  // The owner reads the staging deploy log for ONE line and compares it with the runbook by
+  // eye. If the message in the code and the line quoted in the runbook drift apart, he is
+  // told to look for a line that never appears, and removes a healthy deployment (or, worse,
+  // stops trusting the check). Change the message and the runbook together.
+  const RUNBOOK_PATH = path.join(__dirname, '..', '..', 'docs', 'staging-environment.md');
+  const runbook = fs.readFileSync(RUNBOOK_PATH, 'utf8');
+
+  it('is the staging runbook (anti-vacuity)', () => {
+    expect(runbook).toContain('# Staging: setting it up, seeding it, and proving the live site was not touched');
+  });
+
+  it('quotes the off message word for word', () => {
+    expect(runbook).toContain(BACKGROUND_JOBS_OFF_MESSAGE);
+  });
+
+  it('quotes the off message on a line of its own, as the log prints it', () => {
+    const ownLine = runbook
+      .split('\n')
+      .some((line) => line.replace(/^>\s?/, '') === BACKGROUND_JOBS_OFF_MESSAGE);
+    expect(ownLine).toBe(true);
+  });
+
+  it('carries the Never entry for production', () => {
+    expect(runbook).toContain('- Never add `DISABLE_BACKGROUND_JOBS` to production.');
+  });
+
+  it('tells the owner the exact value', () => {
+    expect(runbook).toContain('Add `DISABLE_BACKGROUND_JOBS` with the value `1`');
   });
 });
