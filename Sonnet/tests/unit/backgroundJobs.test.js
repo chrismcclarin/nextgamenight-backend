@@ -387,6 +387,24 @@ function realJobRunLines() {
 }
 const KNOWN_JOB_RUN_LINES = ['Running deadline check', 'Running reminder check', 'Running auto-promotion check'];
 
+// The variable each of those three files reads for its schedule, from the source. When one
+// is set, its job no longer runs every five (or fifteen) minutes, and the runbook's
+// ten-minute check may see no job line simply because none was due (scoped check S-3).
+function realIntervalVariableNames() {
+  const names = [];
+  for (const name of JOB_RUN_FILES) {
+    const text = maskSource(fs.readFileSync(path.join(SCHEDULERS_DIR, name), 'utf8')).noComments;
+    const pattern = /process\.env\.([A-Z][A-Z0-9_]*)/g;
+    let m = pattern.exec(text);
+    while (m !== null) {
+      if (m[1].endsWith('_INTERVAL')) names.push(m[1]);
+      m = pattern.exec(text);
+    }
+  }
+  return names;
+}
+const KNOWN_INTERVAL_VARIABLES = ['DEADLINE_CHECK_INTERVAL', 'REMINDER_CHECK_INTERVAL', 'AUTO_PROMOTE_INTERVAL'];
+
 const KNOWN_STARTED_BEGINNINGS = [
   'Deadline scheduler started',
   'Backup scheduler started',
@@ -1164,6 +1182,23 @@ describe('R1: the staging runbook and the code say the same thing', () => {
     expect(missing).toEqual([]);
     expect(bullet).toContain('**remove that staging deployment**');
     expect(bullet).toContain('tell Claude in words');
+  });
+
+  it('found the three schedule variables in the scheduler sources, one per file (anti-vacuity)', () => {
+    expect(realIntervalVariableNames()).toEqual(KNOWN_INTERVAL_VARIABLES);
+  });
+
+  it('the ten-minute bullet names every schedule variable that would make ten minutes too short', () => {
+    const stepF = runbook.slice(
+      runbook.indexOf('**(f) Deploy staging for the first time.**'),
+      runbook.indexOf('**Switch the background jobs on.**')
+    );
+    const bullet = stepF.split('\n').find((line) => line.startsWith('- ') && line.includes('ten minutes'));
+    expect(bullet).toBeDefined();
+    const missing = realIntervalVariableNames().filter((name) => !bullet.includes(`\`${name}\``));
+    expect(missing).toEqual([]);
+    // Names only: the owner is never asked to read out what a variable holds.
+    expect(bullet).toContain('never what they hold');
   });
 
   it('carries the Never entry for production', () => {
