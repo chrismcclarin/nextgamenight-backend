@@ -5,8 +5,8 @@ The backend's deploy settings live in `Sonnet/.railway/railway.ts` (Railway "Inf
 **Railway does not read that file when it deploys.** Merging a change to it does nothing by itself.
 A change takes effect only when someone applies it from this folder:
 
-1. `railway config plan` — shows what would change on Railway. It changes nothing. Read it.
-2. `railway config apply` — applies exactly that plan, after a confirmation.
+1. `railway config plan --environment production` — shows what would change on Railway. It changes nothing. Read it.
+2. `railway config apply --environment production` — applies exactly that plan, after a confirmation.
 
 Rules:
 
@@ -17,6 +17,14 @@ Rules:
 - Keep the `partial` export. It limits what this file owns to the backend service.
 - The pre-deploy command is what runs the database migrations before each deploy
   (`node scripts/log-db-resolution.js && npm run migrate:apply`). Do not remove it.
+- **Always name the environment: `railway config plan --environment production` and
+  `railway config apply --environment production`.** Since November 2026 the project also has a
+  `staging` environment (`docs/staging-environment.md`). Without the option the CLI uses whichever
+  environment the folder is linked to, and this file names production's custom domain and the `main`
+  branch, so applying it to staging would aim both at staging. Never apply this file to staging:
+  staging's settings are set on its own service in the dashboard.
+- Nothing about the seed belongs in the pre-deploy command, in any environment. The seed empties
+  the database it runs against; staging is seeded by hand, on demand (`docs/staging-environment.md`).
 
 ## History
 

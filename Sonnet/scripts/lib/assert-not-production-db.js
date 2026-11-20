@@ -7,6 +7,19 @@
 // resolves — it is an npm entry point anyone can run with a prod DATABASE_URL.
 // This guard throws BEFORE the first destructive statement unless the target is
 // provably local (or the caller explicitly opts out via ALLOW_DESTRUCTIVE_SEED=1).
+//
+// TWO ENTRIES, ON PURPOSE (quick-261119-nv0, owner ruling G1 of 2026-11-19):
+//  - assertNotProductionDb(sequelize): synchronous, and it STILL has no override when
+//    NODE_ENV is 'production'. scripts/e2e-fixtures.js uses it and gains nothing here.
+//  - assertSeedTargetAllowed(sequelize, opts): async, for scripts/seed-sample-data.js ALONE.
+//    Outside production mode it is assertNotProductionDb, unchanged. In production mode it
+//    is the four-lock staging arm (assertStagingSeedAllowed) further down this file. For the
+//    seed, production mode means inside Railway OR a NODE_ENV that reads as production (the
+//    R3 marker beside assertSeedTargetAllowed).
+//
+// This module has no `require` on purpose: tests re-require the seed with the models mocked
+// and rely on its lib helpers being dependency-free. The SELECT query type is read from the
+// sequelize instance (`sequelize.QueryTypes`), not from the sequelize package.
 
 const LOCAL_HOSTS = ['localhost', '127.0.0.1', '::1'];
 
@@ -51,6 +64,11 @@ function resolveDbHostSource() {
  *  - Throws when the resolved host is not localhost/127.0.0.1/::1, unless
  *    ALLOW_DESTRUCTIVE_SEED=1 is explicitly set.
  *
+ * "No override" is still true of THIS function for every caller (quick-261119-nv0, NV0-2).
+ * The staging arm lives in assertStagingSeedAllowed below and is reachable only through
+ * assertSeedTargetAllowed, which only scripts/seed-sample-data.js calls. Do not add a
+ * staging branch here: scripts/e2e-fixtures.js calls this function without `await`.
+ *
  * Outcomes by environment (stated so none is discovered in CI):
  *  (a) local dev — host resolves to localhost, guard passes silently;
  *  (b) CI — ci.yml leaves NODE_ENV unset and the Postgres service container is
@@ -83,4 +101,514 @@ function assertNotProductionDb(sequelize) {
   }
 }
 
-module.exports = { resolveDbHost, assertNotProductionDb };
+// ─────────────────────────────────────────────────────────────────────────────────────────
+// THE SEED'S STAGING ARM (quick-261119-nv0)
+//
+// DECISION quick-261119-nv0 G1: the production-mode refusal is amended NARROWLY, for the seed
+// only, by owner ruling G1 (2026-11-19). Chosen OVER keeping Phase 87.8's "no override in
+// production mode" (T-87.8-05) as it stood, because staging must run with NODE_ENV=production
+// to behave like the live site; and OVER running staging under another NODE_ENV value, because
+// about 30 backend behaviours key on that value (schedulers, webhook signature checks, origin
+// rules, rate limits), so a staging that is not in production mode proves little.
+// Which runs count as production mode was widened by review finding R-3: inside Railway, or a
+// NODE_ENV that reads as production (DECISION quick-261119-nv0 R3, beside
+// assertSeedTargetAllowed). In production mode the seed is refused unless ALL FOUR locks hold:
+//   lock 1 RAILWAY_ENVIRONMENT_NAME is exactly 'staging';
+//   lock 2  ALLOW_STAGING_SEED is exactly '1';
+//   lock 3  the resolved database host can be read and, when PROD_DB_HOST_DENY is set, does
+//           not contain it;
+//   lock 4  the Users table holds nobody except the seed's own users and plus-addresses of
+//           SEED_EMAIL_BASE, and when it holds nobody at all the Groups and Events tables are
+//           empty too (the R6 marker in the arm), checked by reads BEFORE the first
+//           destructive statement.
+// All four are required because lock 1 cannot be trusted alone: Railway does not document
+// whether a user-defined variable can override RAILWAY_ENVIRONMENT_NAME.
+// Lock 3 is WEAK, and known to be (owner ruling S1): the Railway private host of the staging
+// database is very likely the same text as production's, so lock 3 catches only a staging
+// variable that points at a host named in PROD_DB_HOST_DENY. The PROD_HOST_PATTERNS list in
+// scripts/ci/create-sync-db.js is REJECTED here, because 'railway.internal' matches staging
+// too and would refuse it always.
+// Lock 4 carries the weight: production always holds real users, so production always fails
+// it, and it needs no variable to be set correctly. Per owner ruling S2 it counts
+// plus-addresses of the staging base address as staging-owned, so the owner's own throwaway
+// sign-ups on staging do not block the next seed.
+// Changing, reordering or removing any lock is a decision, not a cleanup.
+// ─────────────────────────────────────────────────────────────────────────────────────────
+
+const DB_URL_VARIABLES = ['POSTGRES_PRIVATE_URL', 'POSTGRES_URL', 'DATABASE_URL', 'PGDATABASE_URL'];
+
+// Reads one connection string. Returns its host, port and database name ONLY when the string
+// reads back as exactly that: host, optional port, at most one database name. Returns null
+// for anything else, and the caller then prints none of it.
+//
+// Why the read-back (review finding R-4): `new URL` does not throw on a password that holds
+// an unencoded "/", "?" or "#". It ends the host section there instead, so
+// "scheme://user:1234/REST-OF-PASSWORD@real-host:5432/db" parses with the USER NAME as the
+// host, "1234" as the port, and the rest of the password plus the real host as the path.
+// Copying hostname, port and pathname out of that put part of a password and the real host
+// into the seed's log line and into every refusal. Three checks close it:
+//   1. a hostname was parsed at all ("postgres:user:password@host/db", with no "//", parses
+//      with none, and with the credentials inside the pathname);
+//   2. the path is at most ONE segment, and that segment holds no "@" and no ":";
+//   3. what the string says after its LAST "@" (up to any "?" or "#") is exactly the parsed
+//      host, port and database name. In every mis-split shape the real host sits after the
+//      last "@" while the parser's "host" came from in front of it, so the two differ.
+// Check 3 also refuses a well-formed string whose query string holds an "@". That is the safe
+// direction (a refusal, never a print), and a database connection string has no reason to.
+// NOT caught, because it cannot be told apart from a host and a port: a string with no "@"
+// at all whose "host:port" is really "user:numeric-password".
+function readConnectionString(text) {
+  const raw = String(text).trim();
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch (e) {
+    return null;
+  }
+  if (!parsed.hostname) return null;
+
+  const database = parsed.pathname.replace(/^\//, '');
+  if (/[/@:]/.test(database)) return null;
+
+  const afterScheme = raw.slice(raw.indexOf('//') + 2);
+  const afterCredentials = afterScheme.slice(afterScheme.lastIndexOf('@') + 1);
+  const written = afterCredentials.split(/[?#]/)[0].toLowerCase();
+  const hostAndPort = `${parsed.hostname}${parsed.port ? `:${parsed.port}` : ''}`.toLowerCase();
+  const expected = database ? `${hostAndPort}/${database.toLowerCase()}` : hostAndPort;
+  // "host:port/" with nothing after the slash names no database; that still reads back.
+  if (written !== expected && !(database === '' && written === `${hostAndPort}/`)) return null;
+
+  return { host: parsed.hostname, port: parsed.port || '5432', database };
+}
+
+// The same target resolveDbHost resolves (same variable order), with the detail the staging
+// arm needs: which variable it came from, and whether that variable could be read as a URL.
+// Only the host, port and database name are ever copied out, and only from a string that
+// reads back as exactly those (readConnectionString above). The username, password and query
+// string are never copied. A string that does not read back is "could not be parsed": none
+// of its text is printed, and lock 3 refuses it.
+function resolveDbTarget(sequelize) {
+  const variable = DB_URL_VARIABLES.find((name) => process.env[name]);
+  if (variable) {
+    const target = readConnectionString(process.env[variable]);
+    if (!target) {
+      return { variable, readable: false, host: '', port: '', database: '' };
+    }
+    return { variable, readable: true, ...target };
+  }
+  const config = (sequelize && sequelize.config) || {};
+  return {
+    variable: null,
+    readable: true,
+    host: config.host || '',
+    port: config.port || '5432',
+    database: config.database || '',
+  };
+}
+
+/**
+ * One line naming the database the environment resolves: host, port, database name and the
+ * variable it came from. Never a username, a password or a query string.
+ *
+ * @param {import('sequelize').Sequelize} sequelize
+ * @returns {string}
+ */
+function describeResolvedDb(sequelize) {
+  const target = resolveDbTarget(sequelize);
+  if (!target.readable) {
+    return (
+      `a database that could not be identified (the connection string from ` +
+      `${target.variable} could not be parsed)`
+    );
+  }
+  const source = target.variable ? target.variable : resolveDbHostSource();
+  return (
+    `database "${target.database || '(not named)'}" on host "${target.host || '(unresolvable)'}" ` +
+    `port ${target.port} (resolved from ${source})`
+  );
+}
+
+/**
+ * Reads SEED_EMAIL_BASE: the one plain address whose plus-addresses the staging seed writes
+ * and lock 4 accepts. The seed's address builder and lock 4 both go through this parser, so
+ * the addresses the seed writes and the addresses lock 4 accepts cannot disagree.
+ *
+ * The messages never repeat the value: it is a real address and these lines reach logs.
+ *
+ * @param {string|undefined|null} value
+ * @returns {{ local: string, domain: string } | null} null when unset or blank
+ */
+function parseStagingEmailBase(value) {
+  if (value === undefined || value === null) return null;
+  const text = String(value).trim();
+  if (text === '') return null;
+
+  const broken = (rule) =>
+    new Error(
+      `SEED_EMAIL_BASE is set but cannot be used: ${rule}. It must be one plain address ` +
+        `(name@domain, with no "+" tag and no spaces).`
+    );
+
+  if (/\s/.test(text)) throw broken('it contains a space');
+  const parts = text.split('@');
+  if (parts.length !== 2) throw broken('it must contain exactly one "@"');
+  const [local, domain] = parts;
+  if (local === '') throw broken('nothing comes before the "@"');
+  if (domain === '') throw broken('nothing comes after the "@"');
+  if (text.includes('+')) throw broken('it contains a "+"');
+
+  return { local: local.toLowerCase(), domain: domain.toLowerCase() };
+}
+
+/**
+ * Lock 4's test for one Users row: is this address the staging environment's own?
+ *  - true when it equals one of the seed's own addresses (any letter case);
+ *  - true when `base` is given and it is a plus-address of the base: same domain, and a local
+ *    part that is the base's local part, then "+", then a non-empty tag (owner ruling S2);
+ *  - false for everything else, including the bare base address, a missing address, and
+ *    anything that is not a string.
+ *
+ * @param {unknown} email
+ * @param {{ seedEmails?: string[], base?: { local: string, domain: string } | null }} owned
+ * @returns {boolean}
+ */
+function isStagingOwnedEmail(email, { seedEmails, base } = {}) {
+  if (typeof email !== 'string' || email === '') return false;
+  const lower = email.toLowerCase();
+
+  if (
+    Array.isArray(seedEmails) &&
+    seedEmails.some((seedEmail) => typeof seedEmail === 'string' && seedEmail.toLowerCase() === lower)
+  ) {
+    return true;
+  }
+
+  if (!base || !base.local || !base.domain) return false;
+  const at = lower.lastIndexOf('@');
+  if (at <= 0) return false;
+  const local = lower.slice(0, at);
+  const domain = lower.slice(at + 1);
+  const prefix = `${String(base.local).toLowerCase()}+`;
+  return (
+    domain === String(base.domain).toLowerCase() &&
+    local.startsWith(prefix) &&
+    local.length > prefix.length
+  );
+}
+
+function seedRefusal(sequelize, detail) {
+  return new Error(
+    `[assert-not-production-db] Refusing to seed ${describeResolvedDb(sequelize)}. ${detail}`
+  );
+}
+
+// The refusal for a lock-4 read of `table` that threw. One wording for all three tables lock 4
+// can read (Users, Groups, Events), so a missing table refuses the same way whichever it is.
+function lock4ReadFailure(sequelize, table, error) {
+  const code =
+    (error && error.parent && error.parent.code) ||
+    (error && error.original && error.original.code) ||
+    null;
+  if (code === '42P01') {
+    return seedRefusal(
+      sequelize,
+      `Lock 4 of 4 could not run: the ${table} table does not exist; staging's pre-deploy runs ` +
+        'the migrations, so this database is not the one expected. To pass, deploy the ' +
+        'staging service once so its pre-deploy step creates the tables, and check which ' +
+        'database its variables point at.'
+    );
+  }
+  // The driver's own message is not repeated: it can carry a username or a host.
+  const kind = [error && error.name, code].filter(Boolean).join(', ') || 'unknown error';
+  return seedRefusal(
+    sequelize,
+    `Lock 4 of 4 could not run: the query that reads the ${table} table failed ` +
+      `(${kind}). The seed does not run unless that check succeeds. To pass, fix the ` +
+      'database connection and run the seed again.'
+  );
+}
+
+// Lock 4's counting read (review finding R-6): how many rows `table` holds, soft-deleted rows
+// included, because the count is raw SQL. Resolves to a whole number or rejects with a
+// refusal; a count the guard cannot read as a whole number is a check that did not succeed.
+async function countRowsForLock4(sequelize, table) {
+  let rows;
+  try {
+    rows = await sequelize.query(`SELECT count(*) AS count FROM "${table}"`, {
+      type: sequelize.QueryTypes.SELECT,
+    });
+  } catch (error) {
+    throw lock4ReadFailure(sequelize, table, error);
+  }
+  // Postgres hands count(*) back as text (it is a bigint).
+  const raw = Array.isArray(rows) && rows[0] ? rows[0].count : undefined;
+  const isWholeNumber =
+    (typeof raw === 'number' && Number.isInteger(raw) && raw >= 0) ||
+    (typeof raw === 'string' && /^\d+$/.test(raw));
+  if (!isWholeNumber) {
+    throw seedRefusal(
+      sequelize,
+      `Lock 4 of 4 could not run: the query that counts the ${table} table did not return a ` +
+        'whole number. The seed does not run unless that check succeeds.'
+    );
+  }
+  return Number(raw);
+}
+
+// DECISION quick-261119-nv0 A1: the staging arm is a SEPARATE async function, chosen OVER
+// making assertNotProductionDb async. Lock 4 needs a query, so the arm has to be awaited; but
+// scripts/e2e-fixtures.js calls assertNotProductionDb(sequelize) as a bare statement with no
+// `await`, and an async guard there would become a floating promise that blocks nothing: the
+// fixture writes would start before the guard had answered. Keeping the old function
+// synchronous and untouched is what keeps that caller guarded. Do not merge the two.
+/**
+ * The production-mode arm for the seed (owner ruling G1). Resolves only when all four locks
+ * hold; rejects at the first one that does not, before any later lock is looked at. The
+ * lock-4 reads run only after locks 1 to 3 have passed: one SELECT of the Users table, and
+ * two counts (Groups, Events) only when that table is empty.
+ *
+ * Every refusal names the database (never a credential), the lock, and what would make it
+ * pass. A lock-4 refusal gives COUNTS (of users, or of rows) and never an address, a username
+ * or an id.
+ *
+ * NAMES VARIABLES, NEVER THEIR VALUES (owner requirement, 2026-11-19). A refusal and a
+ * passing line name the variable and the rule; neither repeats what a variable holds, not
+ * even a wrong RAILWAY_ENVIRONMENT_NAME. The one thing taken from the environment and
+ * printed is the database line (host, port, database name; see describeResolvedDb). Do not
+ * add a "found: <value>" to a message to make it friendlier: these lines reach logs.
+ *
+ * @param {import('sequelize').Sequelize} sequelize
+ * @param {{ seedEmails: string[], stagingEmailBase?: string }} opts
+ *   seedEmails: the seed's own addresses. stagingEmailBase: the raw SEED_EMAIL_BASE value.
+ * @returns {Promise<{ database: string, locks: string[], productionMode: true }>} one plain
+ *   line per lock
+ */
+async function assertStagingSeedAllowed(sequelize, { seedEmails, stagingEmailBase } = {}) {
+  if (!Array.isArray(seedEmails) || seedEmails.length === 0) {
+    throw seedRefusal(
+      sequelize,
+      'The guard was called without seedEmails (the list of the seed\'s own addresses), so it ' +
+        'cannot tell seed users from real ones. To pass, the seed must hand the guard its own ' +
+        'addresses as a non-empty list.'
+    );
+  }
+
+  const locks = [];
+
+  // Lock 1: the Railway environment is named staging.
+  const environmentName = process.env.RAILWAY_ENVIRONMENT_NAME;
+  if (environmentName !== 'staging') {
+    // Says only whether the variable is set. What it holds is never repeated (see the
+    // "names variables, never their values" note above assertStagingSeedAllowed).
+    const found = environmentName === undefined ? 'it is not set' : 'it holds something else';
+    throw seedRefusal(
+      sequelize,
+      'Lock 1 of 4 failed. It checks that this is the Railway environment named staging: ' +
+        `RAILWAY_ENVIRONMENT_NAME must be exactly "staging" and ${found}. To pass, run ` +
+        'the seed inside the Railway environment whose name is exactly "staging".'
+    );
+  }
+  locks.push('lock 1 passed: RAILWAY_ENVIRONMENT_NAME names the staging environment');
+
+  // Lock 2: seeding staging was switched on deliberately. ALLOW_DESTRUCTIVE_SEED plays no part
+  // in production mode.
+  if (process.env.ALLOW_STAGING_SEED !== '1') {
+    throw seedRefusal(
+      sequelize,
+      'Lock 2 of 4 failed. It checks that seeding staging was switched on deliberately: ' +
+        'ALLOW_STAGING_SEED must be exactly "1" (ALLOW_DESTRUCTIVE_SEED does not count in ' +
+        'production mode). To pass, set ALLOW_STAGING_SEED to 1 on the staging service only.'
+    );
+  }
+  locks.push('lock 2 passed: ALLOW_STAGING_SEED is switched on');
+
+  // Lock 3: the host can be read and is not the one named in PROD_DB_HOST_DENY. Weak on
+  // purpose (see the G1 marker above): same contains-match as scripts/ci/create-sync-db.js,
+  // without its pattern list.
+  const target = resolveDbTarget(sequelize);
+  if (!target.readable) {
+    throw seedRefusal(
+      sequelize,
+      'Lock 3 of 4 failed. It checks that the database host can be read and is not the host ' +
+        `named in PROD_DB_HOST_DENY: the connection string from ${target.variable} could not ` +
+        'be parsed, so its host cannot be checked. To pass, that variable must hold a ' +
+        'connection URL of the form postgres://user:password@host:port/database, with one ' +
+        'database name, and with any "/", "?", "#" or "@" inside the password percent-encoded.'
+    );
+  }
+  const host = (target.host || '').toLowerCase();
+  if (host === '') {
+    throw seedRefusal(
+      sequelize,
+      'Lock 3 of 4 failed. It checks that the database host can be read and is not the host ' +
+        'named in PROD_DB_HOST_DENY: no database host could be resolved. To pass, the staging ' +
+        'service must have a database connection URL set.'
+    );
+  }
+  const denyHost = (process.env.PROD_DB_HOST_DENY || '').trim().toLowerCase();
+  if (denyHost && host.includes(denyHost)) {
+    throw seedRefusal(
+      sequelize,
+      'Lock 3 of 4 failed. It checks that the database host can be read and is not the host ' +
+        'named in PROD_DB_HOST_DENY: the resolved host contains the text set in ' +
+        'PROD_DB_HOST_DENY, which names the production database host. To pass, the staging ' +
+        'service\'s database variable must point at the staging database.'
+    );
+  }
+  locks.push(
+    denyHost
+      ? 'lock 3 passed: the database host does not contain the text set in PROD_DB_HOST_DENY'
+      : 'lock 3: PROD_DB_HOST_DENY not set; lock 3 not armed (the host could be read, and it was compared with nothing)'
+  );
+
+  let base;
+  try {
+    base = parseStagingEmailBase(stagingEmailBase);
+  } catch (error) {
+    throw seedRefusal(
+      sequelize,
+      `Lock 4 of 4 was not run: ${error.message} To pass, correct SEED_EMAIL_BASE on the ` +
+        'staging service, or remove it to seed the default addresses.'
+    );
+  }
+
+  // Lock 4: the database holds no real user. A raw query, because the User model's default
+  // scope hides the email column. Every statement the guard runs is a read: this SELECT and,
+  // only when it finds the Users table empty, the two counts further down.
+  let rows;
+  try {
+    rows = await sequelize.query('SELECT "email" FROM "Users"', {
+      type: sequelize.QueryTypes.SELECT,
+    });
+  } catch (error) {
+    throw lock4ReadFailure(sequelize, 'Users', error);
+  }
+  if (!Array.isArray(rows)) {
+    throw seedRefusal(
+      sequelize,
+      'Lock 4 of 4 could not run: the query that reads the Users table did not return a list ' +
+        'of rows. The seed does not run unless that check succeeds.'
+    );
+  }
+
+  const notOwned = rows.filter((row) => !isStagingOwnedEmail(row && row.email, { seedEmails, base })).length;
+  if (notOwned > 0) {
+    throw seedRefusal(
+      sequelize,
+      'Lock 4 of 4 failed. It checks that the database holds no real users: ' +
+        `${notOwned} ${notOwned === 1 ? 'user' : 'users'} out of ${rows.length} in the Users ` +
+        `table ${notOwned === 1 ? 'is' : 'are'} neither one of the seed's own users nor a ` +
+        'plus-address of SEED_EMAIL_BASE. Production always fails this lock. To pass, this ' +
+        'must be the staging database, holding only seed users and your own plus-address ' +
+        'sign-ups.'
+    );
+  }
+
+  // DECISION quick-261119-nv0 R6: an EMPTY Users table passes lock 4 only when the Groups and
+  // Events tables are empty too. Chosen OVER reading Users alone (the first form), because "no
+  // users" does not prove "no real data": a partial copy or restore of production, done in
+  // table order, can hold real groups and game nights before it holds a single user, and the
+  // seed would then empty it. Chosen OVER checking that every Groups row carries one of the
+  // seed's group ids, which would tie the guard to the seed's fixture list and need a model.
+  // The two counts run ONLY when Users is empty. With users present the rows themselves are
+  // the evidence, and a seeded staging database always has groups, so counting there would
+  // refuse every reseed. The seed cannot lock itself out through this: it deletes Users LAST
+  // and creates them FIRST, so an interrupted seed never leaves groups behind with no users.
+  // The counts are raw SQL, so rows the app has soft-deleted count as well.
+  if (rows.length === 0) {
+    const groups = await countRowsForLock4(sequelize, 'Groups');
+    const events = await countRowsForLock4(sequelize, 'Events');
+    if (groups > 0 || events > 0) {
+      const holds = (count) => `holds ${count} ${count === 1 ? 'row' : 'rows'}`;
+      throw seedRefusal(
+        sequelize,
+        'Lock 4 of 4 failed. It checks that the database holds no real users and, when there ' +
+          'are no users at all, no other data: the Users table is empty, but the Groups table ' +
+          `${holds(groups)} and the Events table ${holds(events)}. A database with groups or ` +
+          'game nights and no users is not a fresh staging database; it may be a partial copy ' +
+          'of real data. To pass, this must be the staging database, either empty or holding ' +
+          'only seed users and your own plus-address sign-ups.'
+      );
+    }
+    locks.push(
+      'lock 4 passed: 0 rows in the Users table, and the Groups and Events tables are empty too'
+    );
+  } else {
+    locks.push(
+      `lock 4 passed: ${rows.length} ${rows.length === 1 ? 'row' : 'rows'} in the Users table, ` +
+        'all staging-owned (' +
+        (base
+          ? 'seed users or plus-addresses of SEED_EMAIL_BASE'
+          : 'seed users; SEED_EMAIL_BASE is not set, so no plus-address counts') +
+        ')'
+    );
+  }
+
+  // productionMode: true tells the seed that this run went through the four-lock arm, where
+  // the migrations own the schema, so it must not sync (the R2 marker in the seed).
+  return { database: describeResolvedDb(sequelize), locks, productionMode: true };
+}
+
+// Railway sets these three itself in every service it runs (and in a local `railway run`).
+// Any one of them holding a non-empty value means the seed is running inside Railway.
+const RAILWAY_MARKER_VARIABLES = ['RAILWAY_ENVIRONMENT_NAME', 'RAILWAY_ENVIRONMENT_ID', 'RAILWAY_PROJECT_ID'];
+
+// DECISION quick-261119-nv0 R3: for the SEED, "production mode" is the process being inside
+// Railway (any of the three variables above set to a non-empty value) OR a NODE_ENV that reads
+// as production once trimmed and lower-cased. Chosen OVER the strict
+// `NODE_ENV === 'production'` this entry used first, because a NODE_ENV that only looks like
+// production ('Production', ' production', 'PRODUCTION') then fell through to the local-host
+// arm, where ALLOW_DESTRUCTIVE_SEED=1 waves any remote host through: two mistakes on a Railway
+// service and the seed would empty a database holding real users without lock 4 ever reading
+// it. The seed now runs inside Railway, right next to production, so inside Railway the four
+// locks ALWAYS decide and ALLOW_DESTRUCTIVE_SEED never does.
+// REJECTED: making assertNotProductionDb read NODE_ENV this way too. scripts/e2e-fixtures.js
+// calls that function un-awaited and must behave exactly as before (the A1 marker above), so
+// this test lives in the seed's entry only. That function still compares strictly.
+// Local development and CI set none of the three variables and leave NODE_ENV unset or
+// 'test', so they take the local-host arm exactly as before.
+// Narrowing this back to the strict compare is a decision, not a cleanup.
+function seedRunsInProductionMode() {
+  const insideRailway = RAILWAY_MARKER_VARIABLES.some((name) => (process.env[name] || '') !== '');
+  const nodeEnv = String(process.env.NODE_ENV || '').trim().toLowerCase();
+  return insideRailway || nodeEnv === 'production';
+}
+
+/**
+ * The seed's single entry (scripts/seed-sample-data.js awaits it as its first statement).
+ *  - Production mode (inside Railway, or NODE_ENV reads as production; see the R3 marker
+ *    above): the four-lock staging arm.
+ *  - Otherwise: assertNotProductionDb, unchanged, and NO query. Local and CI seeds behave
+ *    exactly as before.
+ *
+ * `productionMode` in the result says which of the two it was. The seed reads it to decide
+ * whether it may sync the schema (it may not in the four-lock arm).
+ *
+ * @param {import('sequelize').Sequelize} sequelize
+ * @param {{ seedEmails: string[], stagingEmailBase?: string }} opts
+ * @returns {Promise<{ database: string, locks: string[], productionMode: boolean }>}
+ */
+async function assertSeedTargetAllowed(sequelize, opts) {
+  if (seedRunsInProductionMode()) {
+    return assertStagingSeedAllowed(sequelize, opts);
+  }
+  assertNotProductionDb(sequelize);
+  return {
+    database: describeResolvedDb(sequelize),
+    locks: [
+      'production mode is off (NODE_ENV is not production and this is not running inside ' +
+        'Railway), so the staging locks do not apply; the local-host guard passed',
+    ],
+    productionMode: false,
+  };
+}
+
+module.exports = {
+  resolveDbHost,
+  assertNotProductionDb,
+  describeResolvedDb,
+  parseStagingEmailBase,
+  isStagingOwnedEmail,
+  assertStagingSeedAllowed,
+  assertSeedTargetAllowed,
+};

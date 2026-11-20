@@ -8,6 +8,12 @@ This script populates your database with realistic sample data for testing and d
 - Alice, Bob, Charlie, Diana, Eve, Frank
 - Bartholomew Featherstonehaugh-Cholmondeley — owns no games; the long name wraps a 375px profile title (Phase 88.9 walk, rows W152 / #29)
 
+**Addresses and the one SMS user (quick 261119-nv0).** The user table lives in `scripts/lib/seed-users.js`. Each user has a tag: `alice`, `bob`, `charlie`, `diana`, `eve`, `frank`, `bartholomew`; the pending invite uses `pending-invitee`.
+- With `SEED_EMAIL_BASE` unset (local development, CI), every address is the tag at `example.com`, a reserved domain that delivers nowhere. This is what the seed has always written.
+- With `SEED_EMAIL_BASE` set to one plain address (staging), every address becomes a plus-address of it: the part before the `@`, then `+`, then the tag, then the same domain. All seeded mail then lands in that one mailbox. The base itself must have no `+` in it.
+- `SEED_SMS_USER`, when set to one tag, gives that one user `sms_enabled` and leaves the other six without it. Unset means nobody has it. A value that is not a tag stops the seed before it connects. The seed never writes a phone number: add and verify the phone in the app, and do it again after each reseed.
+- The seed's output names users by username and never prints an address.
+
 ### Groups (7)
 - **Weekend Warriors** - 4 members (Alice owner, Bob, Charlie, Diana); two prompt schedules (Thursday check-in active, Sunday afternoon paused)
 - **Strategy Squad** - 7 members (Frank owner, Bob, Charlie, Eve, Alice, Diana, Bartholomew); the one group where Alice sees more than 4 other members, so her home card shows four chips and a "+2" overflow chip (Phase 88.9 round 2, pick row D2 / #77). Consequence: create-event pre-fills all 7 as participants and no owned game allows 7 players, so its Suggestions slot shows the empty hint — Weekend Warriors (4 players) is the group whose slot shows suggestions. It stores the colour preset `green` and has no header image (88.9-R2 fixture, quick 261110-ugi): it is the coloured, image-less group Alice belongs to (N16b, and the tint on N12's day-modal rows), so its +N chip now sits on a green card. It also holds three status nights (see Events)
@@ -68,6 +74,29 @@ Exceptions — the row stays escalated, with the reason written beside it:
 - Device-only checks the seed cannot reach (iPhone VoiceOver).
 - A state that needs a secret the seed does not have (the RSVP links are skipped with a notice when `MAGIC_TOKEN_SECRET` is unset).
 
+## Where the seed may run (the guard)
+
+The seed changes the schema and deletes every row in the database it is pointed at. Before it does anything it asks a guard (`scripts/lib/assert-not-production-db.js`), and it prints which database it resolved (host, port and database name, never a username or password) and what the guard found.
+
+**On your machine and in CI (`NODE_ENV` is not `production`, and the seed is not running inside Railway).** The database host must be `localhost`, `127.0.0.1` or `::1`. Any other host is refused unless `ALLOW_DESTRUCTIVE_SEED=1` is set on purpose for a database that is safe to wipe.
+
+**In production mode** the seed is refused, with one exception. Production mode means either of two things: the seed is running inside Railway (Railway has set `RAILWAY_ENVIRONMENT_NAME`, `RAILWAY_ENVIRONMENT_ID` or `RAILWAY_PROJECT_ID`), or `NODE_ENV` reads as `production` once spaces and letter case are ignored. So a mistyped `NODE_ENV` on a Railway service cannot take the seed around the locks. The one exception is the staging environment on Railway, which runs in production mode so that it behaves like the live site (owner ruling G1, 2026-11-19). The exception opens only when all four locks hold:
+
+1. `RAILWAY_ENVIRONMENT_NAME` is exactly `staging` (Railway sets this itself).
+2. `ALLOW_STAGING_SEED` is exactly `1`.
+3. The database host can be read and, when `PROD_DB_HOST_DENY` is set, does not contain it.
+4. The Users table holds nobody except the seed's own users and plus-addresses of `SEED_EMAIL_BASE`. When the Users table holds nobody at all, the Groups and Events tables must be empty too.
+
+Things to know about the locks:
+- **Lock 4 is the one that protects production.** Production holds real people, so production always fails it, and it does not depend on any variable being set correctly. It only reads (one `SELECT` of the Users table, and a count of Groups and of Events when the Users table is empty) and it runs before the first change. The two counts are there because a database with no users can still hold real groups and game nights, for example a half-finished copy of production.
+- **Lock 3 is weak, and known to be.** Inside Railway the staging and production database hosts very likely have the same name, so lock 3 cannot tell them apart. It only catches a staging variable that points at the host written in `PROD_DB_HOST_DENY`.
+- **`ALLOW_STAGING_SEED` belongs on the staging service only. Never set it on production.** `ALLOW_DESTRUCTIVE_SEED` does nothing in production mode.
+- **In production mode the seed does not change the schema.** Staging's tables are built by its migrations, the same way production's are, so the seed skips its schema sync there and prints a line saying so. It still empties and refills the tables. On your machine and in CI the seed keeps syncing the schema from the models.
+- A refusal names the lock that failed and what would make it pass. It names variables and never repeats what they hold; a lock 4 refusal gives counts (of users, or of rows in Groups and Events), never an address.
+- The fixture script (`scripts/e2e-fixtures.js`) has no staging exception: it never runs in production mode.
+
+Setting staging up, and seeding it, is written out step by step in [`docs/staging-environment.md`](../docs/staging-environment.md).
+
 ## Usage
 
 ```bash
@@ -84,7 +113,7 @@ npm run seed
 
 To modify the sample data:
 1. Edit `scripts/seed-sample-data.js`
-2. Modify the arrays at the top (sampleUsers, sampleGroups, sampleGames)
+2. Modify the arrays at the top (sampleGroups, sampleGames); the users are in `scripts/lib/seed-users.js`
 3. Adjust the events, participations, and reviews as needed
 
 ## Data Relationships
