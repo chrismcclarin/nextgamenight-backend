@@ -305,7 +305,7 @@ describe('lock 3: the resolved host parses and is not named by PROD_DB_HOST_DENY
     const message = await refusalOf(() => assertSeedTargetAllowed(sequelize, opts()));
 
     expect(message).toMatch(/lock 3\b/i);
-    expect(message).toMatch(/could not be parsed/);
+    expect(message).toMatch(/could not be parsed, so its host cannot be checked/);
     expect(sequelize.query).not.toHaveBeenCalled();
   });
 
@@ -422,9 +422,13 @@ describe('lock 4: the Users table holds only staging-owned users', () => {
 
   test('N6: a query result that is not a list of rows rejects naming lock 4', async () => {
     setEveryVariableRight();
-    const sequelize = makeSequelize(undefined);
+    const sequelize = makeSequelize([]);
+    // Set on the mock itself: passing undefined to makeSequelize would fall back to its
+    // default of an empty list, which is a passing table.
+    sequelize.query.mockResolvedValue(undefined);
 
     const message = await refusalOf(() => assertSeedTargetAllowed(sequelize, opts()));
+    expect(message).toMatch(/^\[assert-not-production-db\] Refusing to seed/);
     expect(message).toMatch(/lock 4\b/i);
   });
 
@@ -667,6 +671,28 @@ describe('describeResolvedDb: names the database, never a credential', () => {
     expect(line).toContain('POSTGRES_URL');
     expect(line).not.toContain('s3cretpw');
     expect(line).not.toContain('dbuser');
+  });
+
+  test('a connection string with no "//" parses with the credentials in its path: treated as unparseable', async () => {
+    // new URL('postgres:user:password@host/db') does not throw. It returns an empty hostname
+    // and a pathname that still holds the user and the password. Printing that pathname as
+    // the "database name" would put a credential in the log, so no hostname means unparseable.
+    process.env.DATABASE_URL = 'postgres:dbuser:s3cretpw@host.example.net/railway';
+
+    const line = describeResolvedDb(makeSequelize());
+    expect(line).toMatch(/could not be parsed/);
+    expect(line).not.toContain('s3cretpw');
+    expect(line).not.toContain('dbuser');
+
+    // And lock 3 refuses it, even though sequelize.config carries a host.
+    process.env.NODE_ENV = 'production';
+    process.env.RAILWAY_ENVIRONMENT_NAME = 'staging';
+    process.env.ALLOW_STAGING_SEED = '1';
+    const sequelize = makeSequelize([], { host: 'host.example.net', port: 5432, database: 'railway' });
+    const message = await refusalOf(() => assertSeedTargetAllowed(sequelize, opts()));
+    expect(message).toMatch(/lock 3\b/i);
+    expect(message).not.toContain('s3cretpw');
+    expect(sequelize.query).not.toHaveBeenCalled();
   });
 
   test('with no URL it names the sequelize config host, port and database', () => {
