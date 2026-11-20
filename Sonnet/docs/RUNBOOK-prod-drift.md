@@ -88,7 +88,8 @@ A migration was committed to the repo but never ran against production for ~2.5 
 - `.sequelizerc` + `config/sequelize-cli.config.js` — sequelize-cli wiring (added in Phase 74)
 - `.github/workflows/ci.yml` (repo ROOT, not `Sonnet/`) — the `migrate-cli-replay` job is the
   PR-time check that migrations apply cleanly and are idempotent on a second run
-- `railway.json` — the Railway deploy contract, including the pre-deploy command (config-as-code)
+- `.railway/railway.ts` — the Railway deploy settings, including the pre-deploy command; applied with
+  `railway config apply`, not read on deploy (see `docs/railway-deploy-settings.md`)
 
 > **Parked CI idea — not yet wired up:** [`docs/migrations-check.ci.yml.disabled`](migrations-check.ci.yml.disabled)
 > is a GitHub Actions workflow that smoke-tests migrations on PRs (fresh Postgres → apply all
