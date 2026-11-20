@@ -252,6 +252,26 @@ function realStartedLineBeginnings() {
   }
   return beginnings;
 }
+// What each cron job prints every time its body actually runs, read from the three scheduler
+// files that server.js loads at the top. These are the only trace in a deploy log of a job
+// running in spite of the off switch (review R-1), so the staging runbook, step (f), tells
+// the owner to look for them.
+const JOB_RUN_FILES = ['deadlineScheduler.js', 'reminderScheduler.js', 'autoPromotionScheduler.js'];
+function realJobRunLines() {
+  const lines = [];
+  for (const name of JOB_RUN_FILES) {
+    const text = maskSource(fs.readFileSync(path.join(SCHEDULERS_DIR, name), 'utf8')).noComments;
+    const pattern = /console\.log\([^\n]*?(Running [a-z-]+ check)\b/g;
+    let m = pattern.exec(text);
+    while (m !== null) {
+      lines.push(m[1]);
+      m = pattern.exec(text);
+    }
+  }
+  return lines;
+}
+const KNOWN_JOB_RUN_LINES = ['Running deadline check', 'Running reminder check', 'Running auto-promotion check'];
+
 const KNOWN_STARTED_BEGINNINGS = [
   'Deadline scheduler started',
   'Backup scheduler started',
@@ -867,6 +887,27 @@ describe('R1: the staging runbook and the code say the same thing', () => {
     expect(missing).toEqual([]);
     // The list no longer has to explain away an off line that says "started".
     expect(listLine).not.toContain('off line');
+  });
+
+  it('found the three job-run lines in the scheduler sources, one per file (anti-vacuity)', () => {
+    expect(realJobRunLines()).toEqual(KNOWN_JOB_RUN_LINES);
+  });
+
+  it('step (f) tells the owner that no job-run line may appear while the switch is on', () => {
+    // The off line and the missing "started" lines say what server.js decided. These lines say
+    // what a job actually did. A job that runs in spite of the switch prints one of them and
+    // nothing else, so the runbook has to name them exactly as the code prints them.
+    const stepF = runbook.slice(
+      runbook.indexOf('**(f) Deploy staging for the first time.**'),
+      runbook.indexOf('**Switch the background jobs on.**')
+    );
+    expect(stepF.length).toBeGreaterThan(0);
+    const bullet = stepF.split('\n').find((line) => line.startsWith('- ') && line.includes('ten minutes'));
+    expect(bullet).toBeDefined();
+    const missing = realJobRunLines().filter((jobLine) => !bullet.includes(`\`${jobLine}\``));
+    expect(missing).toEqual([]);
+    expect(bullet).toContain('**remove that staging deployment**');
+    expect(bullet).toContain('tell Claude in words');
   });
 
   it('carries the Never entry for production', () => {

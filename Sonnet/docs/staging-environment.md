@@ -148,8 +148,9 @@ Then set the rest. See section 4 for the full table. Three of them need care:
 - You should **not** see any line that begins with `Deadline scheduler started`, `Backup scheduler started`, `Auto-promotion scheduler started`, `Reminder scheduler started`, `Scheduler anomaly sweep started`, `PendingAuth0Deletion reconciliation sweep started`, `Group purge sweep started` or `BullMQ workers started`.
 - If the off line is missing, or one of those "started" lines shows: **remove that staging deployment** (the three-dot menu on the deployment, then Remove), and tell Claude in words.
 - Then open the staging backend address followed by `/health` in a browser. You should see the health response.
+- Then leave it alone, switch still on, until the deployment has been up for ten minutes, and read the log once more. There must be no line containing `Running deadline check`, `Running reminder check` or `Running auto-promotion check`. A scheduled job prints one of those each time it actually runs: the first two every five minutes, the third every fifteen. If one is there, a job is running in spite of the switch: **remove that staging deployment** (the three-dot menu on the deployment, then Remove), and tell Claude in words.
 
-**Switch the background jobs on.** Do this only once both log checks have passed (the database block and the off line) and `/health` answers.
+**Switch the background jobs on.** Do this only once the three log checks have passed (the database block, the off line, and no job line after ten minutes) and `/health` answers.
 
 1. On the staging backend service, open **Variables** and look at `REDIS_URL` one more time. It must show the `${{ ... }}` form (point 3 of the STOP box). The log check could not see Redis: with the switch on, the server does not connect to it when it starts.
 2. Delete `DISABLE_BACKGROUND_JOBS` there, then **Deploy**.
