@@ -30,6 +30,8 @@
 //       and across the whole app (scoped check S-1): bullmq is loaded and a Worker is built
 //       only under workers/ (queues/ loads bullmq for its queues), and nothing outside
 //       workers/ loads a worker module except the one gated require in server.js;
+//   M   the text scanner S2 and S3 rest on reads what it says it reads, and its one blind
+//       spot is pinned as a known limit (scoped check S-2);
 //   R1  docs/staging-environment.md quotes the off message word for word and carries the
 //       "Never on production" entry.
 //
@@ -111,11 +113,25 @@ function count(haystack, needle) {
 // Returns the text twice more, each the same length with the same line breaks, so that an
 // index in one is the same place in the others:
 //   noComments  comments blanked out, strings kept (a require path is a string);
-//   code        comments AND the contents of strings and templates blanked out, which is
-//               what matching braces and finding calls need.
-// It knows line comments, block comments, the two quote styles and templates. It does NOT
-// know regex literals. `problems` lists what did not scan cleanly; the anti-vacuity tests
-// below fail on a non-empty list, so a misread file is a red run and never a quiet pass.
+//   code        comments AND the contents of strings, templates and regex literals blanked
+//               out, which is what matching braces and finding calls need.
+// What it reads: line comments, block comments, the two quote styles, templates (the code
+// inside a template's interpolation is read as code, to any depth), and regex literals.
+// `problems` lists what did not scan cleanly (a string or a regex literal that runs past its
+// line, text that ends inside a string or a template, braces that do not balance). The
+// anti-vacuity tests fail on a non-empty list for server.js and schedulers/, and the app-wide
+// checks count such a file as a hit.
+// What it can still NOT see, stated exactly (group M below pins this, so the sentence stays
+// true): whether a slash starts a regex literal or is a division is decided by what stands
+// before it. After a closing round or square bracket, a name that is not a keyword, a number,
+// or a string, it is taken for a division. A regex literal written in such a place, as in
+// "if (x) /re/.test(y)", is read as code, and if it holds two slashes in a row the rest of
+// that line is taken for a comment and hidden with no problem reported. Nothing in the app
+// is written that way today.
+const REGEX_AFTER_CHARS = '(,=:[!&|?{};+-*%<>~^';
+const REGEX_AFTER_WORDS = new Set([
+  'return', 'typeof', 'case', 'do', 'else', 'in', 'of', 'void', 'delete', 'throw', 'new', 'yield', 'await', 'instanceof',
+]);
 function maskSource(text) {
   const noComments = text.split('');
   const code = text.split('');
@@ -123,11 +139,27 @@ function maskSource(text) {
   const blank = (chars, at) => {
     if (at < text.length && text[at] !== '\n') chars[at] = ' ';
   };
+  const lineOf = (at) => text.slice(0, at).split('\n').length;
+  // Does the slash at `at` start a regex literal? Decided by the code read so far.
+  const startsRegex = (at) => {
+    let j = at - 1;
+    while (j >= 0 && /\s/.test(code[j])) j--;
+    if (j < 0) return true;
+    if (REGEX_AFTER_CHARS.includes(code[j])) return true;
+    if (!/[\w$]/.test(code[j])) return false;
+    let k = j;
+    while (k >= 0 && /[\w$]/.test(code[k])) k--;
+    return REGEX_AFTER_WORDS.has(code.slice(k + 1, j + 1).join(''));
+  };
   const CLOSER = { single: "'", double: '"', template: '`' };
+  // One entry per template interpolation being read: how many braces are open inside it.
+  const interpolations = [];
+  let inClass = false;
   let state = 'code';
   for (let i = 0; i < text.length; i++) {
     const ch = text[i];
     const next = text[i + 1];
+    const top = interpolations.length - 1;
     if (state === 'code') {
       if (ch === '/' && (next === '/' || next === '*')) {
         state = next === '/' ? 'line' : 'block';
@@ -136,9 +168,21 @@ function maskSource(text) {
           blank(code, at);
         }
         i++;
+      } else if (ch === '/' && startsRegex(i)) {
+        state = 'regex';
+        inClass = false;
       } else if (ch === "'") state = 'single';
       else if (ch === '"') state = 'double';
       else if (ch === '`') state = 'template';
+      else if (top >= 0 && ch === '{') interpolations[top]++;
+      else if (top >= 0 && ch === '}') {
+        if (interpolations[top] === 0) {
+          // The brace that ends the interpolation: back to the template's own text.
+          interpolations.pop();
+          blank(code, i);
+          state = 'template';
+        } else interpolations[top]--;
+      }
     } else if (state === 'line') {
       if (ch === '\n') state = 'code';
       else {
@@ -154,18 +198,43 @@ function maskSource(text) {
         i++;
         state = 'code';
       }
+    } else if (state === 'regex') {
+      if (ch === '\n') {
+        problems.push(`a regex literal that does not end on its line (line ${lineOf(i)})`);
+        state = 'code';
+      } else if (ch === '\\') {
+        blank(code, i);
+        blank(code, i + 1);
+        i++;
+      } else if (ch === '/' && !inClass) {
+        state = 'code';
+      } else {
+        if (ch === '[') inClass = true;
+        if (ch === ']') inClass = false;
+        blank(code, i);
+      }
     } else if (ch === '\\') {
       blank(code, i);
       blank(code, i + 1);
       i++;
+    } else if (state === 'template' && ch === '$' && next === '{') {
+      // An interpolation: what is inside is code, and is read as code.
+      blank(code, i);
+      blank(code, i + 1);
+      i++;
+      interpolations.push(0);
+      state = 'code';
     } else if (ch === CLOSER[state]) {
       state = 'code';
     } else {
-      if (ch === '\n' && state !== 'template') problems.push(`line break inside a quoted string at index ${i}`);
+      if (ch === '\n' && state !== 'template') {
+        problems.push(`a quoted string that does not end on its line (line ${lineOf(i)})`);
+      }
       blank(code, i);
     }
   }
   if (state !== 'code' && state !== 'line') problems.push(`the text ends inside a ${state}`);
+  if (interpolations.length > 0) problems.push('the text ends inside a template interpolation');
   let depth = 0;
   for (const ch of code) {
     if (ch === '{') depth++;
@@ -667,6 +736,120 @@ describe('S1: server.js start sites (read as text, never loaded)', () => {
     const end = src.indexOf("console.error('Unable to start server:'");
     expect(end).toBeGreaterThan(listenAt);
     expect(src.slice(listenAt, end)).not.toMatch(/\} else \{/);
+  });
+});
+
+describe('M: the text scanner reads what it says it reads', () => {
+  // S2 and S3 only see what maskSource shows them. Each case here is a line of source and
+  // what must still be visible, or hidden, in the two views. "go();" stands for the code a
+  // scan would be looking for after the tricky part.
+  const visible = (source) => maskSource(source).code;
+
+  it('keeps every position and line break in both views', () => {
+    const source = "const a = 'x'; // note\n/* block\n   two */ go(`t ${a} t`);\nconst r = /a\\/b/;\n";
+    const { noComments, code, problems } = maskSource(source);
+    expect(problems).toEqual([]);
+    expect(noComments).toHaveLength(source.length);
+    expect(code).toHaveLength(source.length);
+    for (let i = 0; i < source.length; i++) {
+      if (source[i] === '\n') {
+        expect(noComments[i]).toBe('\n');
+        expect(code[i]).toBe('\n');
+      }
+    }
+  });
+
+  it('blanks comments in both views, and string contents in the code view only', () => {
+    const { noComments, code, problems } = maskSource("load('./workers'); // start()\n/* stop() */ go();");
+    expect(problems).toEqual([]);
+    expect(noComments).toContain("load('./workers');");
+    expect(noComments).not.toContain('start()');
+    expect(noComments).not.toContain('stop()');
+    expect(code).toContain('load(');
+    expect(code).not.toContain('workers');
+    expect(code).toContain('go();');
+  });
+
+  it('two slashes inside a string are not a comment', () => {
+    const { noComments, code, problems } = maskSource("const u = 'http://localhost'; go();");
+    expect(problems).toEqual([]);
+    expect(noComments).toContain("'http://localhost'");
+    expect(code).toContain('go();');
+  });
+
+  it('a regex literal holding two slashes does not hide the rest of its line', () => {
+    const { code, problems } = maskSource('console.log(/\\/\\//); cron.schedule(x);');
+    expect(problems).toEqual([]);
+    expect(code).toContain('cron.schedule(x);');
+  });
+
+  it('a regex literal holding quotes, a brace or a slash in a class does not derail the scan', () => {
+    const source = "const q = /['\"`{]/; const c = /[/]x/g; go();\nnext('a');";
+    const { code, problems } = maskSource(source);
+    expect(problems).toEqual([]);
+    expect(code).toContain('go();');
+    expect(code).toContain('next(');
+  });
+
+  it('a regex literal after a keyword is read as one', () => {
+    expect(visible('function f(s) { return /\\/\\//.test(s); } go();')).toContain('go();');
+  });
+
+  it('a division is not a regex literal', () => {
+    const { code, problems } = maskSource('const half = total / 2; const r = (a + b) / c / d[0] / 3; go(); // done');
+    expect(problems).toEqual([]);
+    expect(code).toContain('total / 2');
+    expect(code).toContain('(a + b) / c / d[0] / 3');
+    expect(code).toContain('go();');
+    expect(code).not.toContain('done');
+  });
+
+  it('code inside a template interpolation is read as code', () => {
+    const { code, problems } = maskSource('console.log(`before ${job.start()} after`); go();');
+    expect(problems).toEqual([]);
+    expect(code).toContain('job.start()');
+    expect(code).not.toContain('before');
+    expect(code).not.toContain('after');
+    expect(code).toContain('go();');
+  });
+
+  it('an interpolation may hold an object, a string, or another template', () => {
+    const source = "log(`a ${JSON.stringify({ b: '}' })} c ${fn(`d ${e.start()} f`)} g`); go();";
+    const { code, problems } = maskSource(source);
+    expect(problems).toEqual([]);
+    expect(code).toContain('JSON.stringify({ b:');
+    expect(code).toContain('fn(');
+    expect(code).toContain('e.start()');
+    expect(code).toContain('go();');
+    expect(code).not.toMatch(/[acdfg] /);
+  });
+
+  it('reports what it could not read, never passes it quietly', () => {
+    expect(maskSource('const r = /abc\nnext();').problems).not.toEqual([]);
+    expect(maskSource("const s = 'abc\nnext();").problems).not.toEqual([]);
+    expect(maskSource('const t = `abc ${x').problems).not.toEqual([]);
+    expect(maskSource('const t = `abc').problems).not.toEqual([]);
+    expect(maskSource('function f() { if (x) { go(); }').problems).not.toEqual([]);
+  });
+
+  it('KNOWN LIMIT: a regex literal right after a closing bracket is taken for a division', () => {
+    // This is the blind spot the comment on maskSource describes. The regex below stands
+    // where a division could stand, so it is read as code; its two slashes in a row then
+    // look like a comment, and hidden() is hidden with no problem reported. If the scanner
+    // is ever taught this case, this test goes red: then update that comment too.
+    const { code, problems } = maskSource('if (x) /a\\/\\//.test(y); hidden();');
+    expect(problems).toEqual([]);
+    expect(code).not.toContain('hidden();');
+  });
+
+  it('server.js holds regex literals today, and they are read as such (anti-vacuity)', () => {
+    const src = fs.readFileSync(SERVER_PATH, 'utf8');
+    const { code, problems } = maskSource(src);
+    expect(problems).toEqual([]);
+    // The public-route table: its patterns are blanked like strings, its code is kept.
+    expect(src).toContain('re: /^\\/games\\/search-all$/');
+    expect(code).not.toContain('search-all');
+    expect(count(code, "{ method: '   ', re: /")).toBeGreaterThanOrEqual(5);
   });
 });
 
