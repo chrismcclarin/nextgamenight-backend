@@ -12,8 +12,11 @@
 // contains no writing verb at all, comments included, so keep such words out of this text.
 //
 // The counts are raw SQL on purpose. Three of the four models hide rows that the app has
-// marked as removed; a raw count sees every row, so a wipe shows, and an ordinary removal
-// made by a user between the two runs does not move the number.
+// marked as removed; a raw count sees every row, so a wipe shows. Small moves between two
+// runs are normal and are not a wipe: people join, which adds rows; people leave a group,
+// cancel a game night or close an account, and those rows are gone at once; the daily group
+// purge also clears the groups whose 30-day recovery window has closed
+// (docs/staging-environment.md, step (j)).
 //
 // What it prints: the app's own "Database connection info" lines (printed by
 // config/database.js whenever it loads), then one line naming the database (host, port and
