@@ -187,7 +187,7 @@ Then redeploy the preview deployment: this value is fixed into the site when it 
 **(j) Count production, after.** Run the command from step (b) again.
 
 - You should see: the same four numbers as before, or close to them. They can be slightly higher, because real people may have joined or scheduled something in between. They can also be slightly lower, for two ordinary reasons: real people may have deleted a game night, left a group or deleted their account in between (those are removed for good at once); and once a day, at 03:00 UTC (7:00 PM Pacific in winter, 8:00 PM Pacific in summer), production erases for good the groups that were deleted more than 30 days ago, with their memberships and game nights. If that time fell between the two counts, production's log at that time says how many groups it erased, in a line containing `Sweep completed`.
-- What a seed on production would look like is different: `Users: 7` exactly. The other three numbers would change too, but not always by much (the seed makes only a few groups and about two dozen memberships), so Users is the number that tells. A small drop of one or two in the others is not a seed.
+- What a seed on production would look like is different: `Users: 7` exactly. The other three numbers may barely move (the seed makes only a few groups and about two dozen memberships), so Users is the number that tells. If Users is not 7, a small drop of one or two in the others is not a seed.
 - If Users is 7, or any number fell by more than a handful, **stop and tell Claude in words.**
 - Tell Claude the four numbers.
 
