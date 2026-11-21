@@ -65,7 +65,7 @@ What to know about them:
 railway ssh -e production -s GameCalendarbackendv2 -- node scripts/count-rows.js
 ```
 
-If Railway says the folder is not linked to a project, run `railway link` there, pick the project, and run the command again. The first use of `railway ssh` may ask you to set up an SSH key; follow its prompt. Your Mac then asks once whether you are sure you want to connect, because it has never met Railway's SSH server before. Read the host name in that question: it must be `ssh.railway.com`. If it is, type `yes` in full. If it names any other host, type `no` and tell Claude in words. Railway's documentation does not publish a fingerprint to compare against, so do this on a network you trust, not on public wifi.
+If Railway says the folder is not linked to a project, run `railway link` there, pick the project, and run the command again. The first use of `railway ssh` may ask you to set up an SSH key; follow its prompt. Your Mac then asks once whether you are sure you want to connect, because it has never met Railway's SSH server before. Read the host name in that question: it must be `ssh.railway.com`. If it is, type `yes` in full. If it names any other host, type `no` and tell Claude in words. Railway's documentation pages checked on 2026-11-20 publish no fingerprint to compare against, so do this on a network you trust, not on public wifi.
 
 - You should see: the app's "Database connection info" lines, then a line starting `Row counts for database`, then four lines: `Users: <number>`, `Groups: <number>`, `UserGroups: <number>`, `Events: <number>`.
 - Write the four numbers down. Tell Claude the four numbers, not the output.
@@ -74,7 +74,7 @@ If Railway says the folder is not linked to a project, run `railway link` there,
 **(c) Duplicate production into a new environment.** In Railway, open the project. Click the environment name in the top bar, then **+ New Environment**, then **Duplicate Environment**. Choose production as the one to copy. Name the new environment exactly `staging`, all lowercase. Lock 1 compares the name letter for letter.
 
 - You should see: a new environment named `staging` with the same services.
-- **Railway may start building the copy straight away, without waiting for you.** It did on the first walk (2026-11-20): the backend began building and the new Postgres and Redis came online. The new Postgres and Redis are staging's own and can stay. **The backend must not finish deploying before step (d) is done,** so if it is building: make sure the top bar says `staging`, click the backend service, open **Deployments**, click the three-dot menu on the deployment that is building, and choose **Abort**. If it already shows Active, choose **Remove** from the same menu, and tell Claude in words how long it was Active.
+- **Railway may start building the copy straight away, without waiting for you.** It did on the first walk (2026-11-20): the backend began building and the new Postgres and Redis came online. The new Postgres and Redis are staging's own and can stay. **The backend must not finish deploying before step (d) is done,** so if it is building: make sure the top bar says `staging`, click the backend service, open **Deployments**, click the three-dot menu on the deployment that is building, and choose **Abort**. If it already shows Active, choose **Remove** from the same menu, then stop and tell Claude in words how long it was Active before going on to step (d).
 - You should then see: the staging backend service offline, with no active deployment.
 - **Do not press Deploy yet.** Step (d) comes first.
 
@@ -88,7 +88,7 @@ If Railway says the folder is not linked to a project, run `railway link` there,
 >
 > **What to do, on the STAGING backend service, before pressing Deploy:**
 >
-> Do point 5 (the off switch) **first**, then points 1 to 4. Saving a variable should only add to the staged-changes banner and start nothing. If saving a variable starts a build by itself, abort it (step (c) says how) and tell Claude in words.
+> Do point 5 (the off switch) **first**, then points 1 to 4, so that if a save does start a build, the jobs and workers are already off. Each saved variable should only be held as a staged change: a banner appears saying there are staged changes waiting to be deployed, and nothing builds. If saving a variable starts a build by itself, abort it (step (c) says how) and tell Claude in words.
 >
 > 1. Find every one of these variable names that exists there: `POSTGRES_PRIVATE_URL`, `POSTGRES_URL`, `DATABASE_URL`, `PGDATABASE_URL`, `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`, and `REDIS_URL`.
 > 2. For each database one: either delete it, or replace what it holds with a **reference** to staging's own Postgres service. In the value box, type `${{` and pick staging's Postgres service and its variable from the list Railway offers. At least one of the four `..._URL` names must remain, as a reference. The backend uses the first of those four that is set, in the order written above, so none of them may be left holding pasted text.
@@ -168,7 +168,7 @@ Then set the rest. See section 4 for the full table. Three of them need care:
 
 If the Create User form asks you to pick a domain, pick your custom login domain, the one the app signs people in through. Both choices are the same Auth0 tenant, and the user is the same whichever you pick.
 
-Then open each new user in Auth0, copy its **user_id**, and paste it into that user's variable on the staging backend. The seven names are exactly: `AUTH0_ALICE_SUB`, `AUTH0_BOB_SUB`, `AUTH0_CHARLIE_SUB`, `AUTH0_DIANA_SUB`, `AUTH0_EVE_SUB`, `AUTH0_FRANK_SUB` and `AUTH0_BART_SUB`. **The last one is `AUTH0_BART_SUB`, not `AUTH0_BARTHOLOMEW_SUB`**, although his email tag is the full `bartholomew` (section 5). The seed reads only these names: a variable under any other name is ignored without a warning, and that user gets a placeholder id that no login matches. Deploy that change.
+Then open each new user in Auth0, copy its **user_id**, and paste it into that user's variable on the staging backend. The seven names are exactly: `AUTH0_ALICE_SUB`, `AUTH0_BOB_SUB`, `AUTH0_CHARLIE_SUB`, `AUTH0_DIANA_SUB`, `AUTH0_EVE_SUB`, `AUTH0_FRANK_SUB` and `AUTH0_BART_SUB`. **The last one is `AUTH0_BART_SUB`, not `AUTH0_BARTHOLOMEW_SUB`**, although his email tag is the full `bartholomew` (section 5). The seed reads only these names: a variable under any other name is skipped, and that seed user is created with a built-in stand-in id instead of your test login's, so signing in as that test login will not land on that seeded user. Deploy that change.
 
 - You should see: one new Auth0 user per seed user, and the matching variables filled in on staging.
 - These logins also work on the live site, where signing in would create a real account. **Use them on the preview site only.**
@@ -176,7 +176,7 @@ Then open each new user in Auth0, copy its **user_id**, and paste it into that u
 
 **(h) Point the preview site at staging.** In Vercel, open the frontend project, **Settings**, **Environment Variables**. Give `NEXT_PUBLIC_API_URL` a value for the **Preview** environment only: the staging backend address from step (e), followed by `/api`. Add it as a new entry with only **Preview** ticked. If Vercel asks for a type, choose the plain, readable one (Config), not Secret: the value is a public address that is built into the site. Leave the Production value exactly as it is.
 
-If Vercel refuses because the name already exists for Preview, the existing entry covers Preview as well as Production. Edit that entry and untick **Preview** (that one box only), leaving Production ticked and the value alone; save; then add the new Preview-only entry. Afterwards look at the list: the original entry must still show Production. A Production variable that goes missing here breaks the live site at its next deploy, not today, so tell Claude this split was made.
+If Vercel refuses because the name already exists for Preview, open the existing entry and see which boxes are ticked. If it shows only **Preview**, change its value to the staging address followed by `/api` and save, and skip the rest of this paragraph. If it also shows **Production**, edit that entry and untick **Preview** (that one box only), leaving Production ticked and the value alone; save; then add the new Preview-only entry. Afterwards look at the list: the original entry must still show Production. A Production variable that goes missing here breaks the live site at its next deploy, not today, so tell Claude this split was made.
 
 Then redeploy the preview deployment: this value is fixed into the site when it is built, so a change does nothing until the preview is rebuilt.
 
@@ -186,8 +186,9 @@ Then redeploy the preview deployment: this value is fixed into the site when it 
 
 **(j) Count production, after.** Run the command from step (b) again.
 
-- You should see: the same four numbers as before, or nearly. They can be slightly higher, because real people may have joined or scheduled something in between. Groups, UserGroups and Events can also be slightly **lower** if 7:00 PM Pacific (03:00 UTC) fell between the two counts: once a day at that time, production erases for good the groups that were deleted more than 30 days ago, with their memberships and game nights. Production's log at that time says how many it erased, in a line containing `Sweep completed`. A seed that had hit production would show `Users: 7`.
-- If a number dropped and that log line does not account for it, **stop and tell Claude in words.**
+- You should see: the same four numbers as before, or close to them. They can be slightly higher, because real people may have joined or scheduled something in between. They can also be slightly lower, for two ordinary reasons: real people may have deleted a game night, left a group or deleted their account in between (those are removed for good at once); and once a day, at 03:00 UTC (7:00 PM Pacific in winter, 8:00 PM Pacific in summer), production erases for good the groups that were deleted more than 30 days ago, with their memberships and game nights. If that time fell between the two counts, production's log at that time says how many groups it erased, in a line containing `Sweep completed`.
+- What a seed on production would look like is different: `Users: 7`, and every other number far lower. A small drop of one or two is not that.
+- If Users is 7, or any number fell by more than a handful, **stop and tell Claude in words.**
 - Tell Claude the four numbers.
 
 **(k) Walk the proof list.** Section 8.
@@ -326,8 +327,8 @@ If you want to try the Delete account feature itself on staging, tell Claude fir
 ## 8. The proof list
 
 1. Signed in on the preview site as one of the test logins, you see the seeded groups (Weekend Warriors and the others).
-2. A change you make there does not reach production. The test logins have no account on the live site, so there is nothing to look at there, and you must not sign in on the live site as one of them to look. Do this: on the preview site, create a new group; then run the count from step (b) again. Production's Groups and UserGroups numbers have not moved.
-3. The production counts from steps (b) and (j) match, or went up slightly. They did not drop, and Users is not 7.
+2. A change you make there does not reach production. The test logins have no account on the live site, so there is nothing to look at there, and you must not sign in on the live site as one of them to look. Do this instead: run the count from step (b); straight away, on the preview site, create a new group; then run the count again at once. Production's Groups and UserGroups are the same both times. If the change had reached production, each would be exactly one higher.
+3. The production counts from steps (b) and (j) match, or moved only slightly for the ordinary reasons step (j) gives. Users is not 7.
 4. An email arrives at one of your plus-addresses (reminders are sent for the seeded upcoming game nights). This needs the background jobs switched on, the last part of step (f).
 5. Texts: signed in as the SMS user, add your phone number in the app. A verification text arrives. Enter the code and turn on one text notification. No other seed user can receive notification texts.
 6. Connect Google Calendar fails on staging with a Google error. That is expected (section 4, owner decision C1).
