@@ -205,7 +205,7 @@ router.post(
     // present — the count is enforced in the handler (see inviteeSelectors).
     // DECISION quick-261121-inv I1 (owner go, 2026-11-21): the address is kept AS TYPED (trimmed here,
     // lower-cased in the handler), chosen OVER express-validator's normalizeEmail(), which shipped
-    // here. Its defaults cut a "+tag" off Gmail, Outlook, Yahoo and iCloud addresses and remove the
+    // here. Its defaults cut the sub-address tag off Gmail, Outlook, Yahoo and iCloud addresses and remove the
     // dots from a Gmail address, so the invite was stored and mailed under an address the invited
     // account does not have: GET /pending and all three accept / decline routes below compare the
     // account's own address with the stored one, and every one of them missed. The owner found it on

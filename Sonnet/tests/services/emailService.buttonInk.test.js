@@ -27,17 +27,17 @@ function htmlOf(out) {
 }
 
 const TEMPLATES = [
-  ['no consensus', () => emailService.generateNoConsensusEmailTemplate({ groupName: 'G', promptId: 'p1', dashboardUrl: URL })],
-  ['group invite', () => emailService.generateGroupInviteEmailTemplate({ inviterName: 'A', groupName: 'G', memberCount: 3, inviteUrl: URL })],
-  ['ownership offer', () => emailService.generateGroupOwnershipOfferEmailTemplate({ recipientName: 'A', groupName: 'G', deadlineDate: WHEN, restoreUrl: URL, memberCount: 3 })],
-  ['new game night', () => emailService.generateGameSessionEmailTemplate({ gameName: 'Catan', groupName: 'G', startDate: WHEN, durationMinutes: 90, eventUrl: URL, recipientName: 'A', timezone: 'UTC' })],
-  ['date change', () => emailService.generateDateChangeEmailTemplate({ gameName: 'Catan', groupName: 'G', newDate: WHEN, durationMinutes: 90, eventUrl: URL, recipientName: 'A', timezone: 'UTC' })],
-  ['cancellation', () => emailService.generateCancellationEmailTemplate({ gameName: 'Catan', groupName: 'G', eventDate: WHEN, recipientName: 'A', groupUrl: URL, timezone: 'UTC' })],
-  ['event confirmation', () => generateEventConfirmationEmailTemplate({ gameName: 'Catan', groupName: 'G', startDate: WHEN, durationMinutes: 90, eventUrl: URL, recipientName: 'A', participants: ['A', 'B'], timezone: 'UTC' })],
+  ['no consensus', '#F59E0B', () => emailService.generateNoConsensusEmailTemplate({ groupName: 'G', promptId: 'p1', dashboardUrl: URL })],
+  ['group invite', '#28a745', () => emailService.generateGroupInviteEmailTemplate({ inviterName: 'A', groupName: 'G', memberCount: 3, inviteUrl: URL })],
+  ['ownership offer', '#2563EB', () => emailService.generateGroupOwnershipOfferEmailTemplate({ recipientName: 'A', groupName: 'G', deadlineDate: WHEN, restoreUrl: URL, memberCount: 3 })],
+  ['new game night', '#4F46E5', () => emailService.generateGameSessionEmailTemplate({ gameName: 'Catan', groupName: 'G', startDate: WHEN, durationMinutes: 90, eventUrl: URL, recipientName: 'A', timezone: 'UTC' })],
+  ['date change', '#F59E0B', () => emailService.generateDateChangeEmailTemplate({ gameName: 'Catan', groupName: 'G', newDate: WHEN, durationMinutes: 90, eventUrl: URL, recipientName: 'A', timezone: 'UTC' })],
+  ['cancellation', '#4F46E5', () => emailService.generateCancellationEmailTemplate({ gameName: 'Catan', groupName: 'G', eventDate: WHEN, recipientName: 'A', groupUrl: URL, timezone: 'UTC' })],
+  ['event confirmation', '#10B981', () => generateEventConfirmationEmailTemplate({ gameName: 'Catan', groupName: 'G', startDate: WHEN, durationMinutes: 90, eventUrl: URL, recipientName: 'A', participants: ['A', 'B'], timezone: 'UTC' })],
 ];
 
 describe('email button links carry their own text colour (quick-261121-inv E1/E2)', () => {
-  it.each(TEMPLATES)('%s', (_name, render) => {
+  it.each(TEMPLATES)('%s', (_name, fill, render) => {
     const html = htmlOf(render());
     const buttons = html.match(/<a\b[^>]*class="button"[^>]*>/g) || [];
     expect(buttons.length).toBeGreaterThan(0);
@@ -46,7 +46,8 @@ describe('email button links carry their own text colour (quick-261121-inv E1/E2
       expect(style).toMatch(/(^|;)\s*color:\s*(white|#fff(fff)?)\b/i);
       // Review MED-1: the fill and the padding travel with the ink. A mail app that drops the
       // <style> block would otherwise show white words on no fill at all.
-      expect(style).toMatch(/(^|;)\s*background-color:\s*#[0-9a-f]{6}\b/i);
+      // Scoped check LOW-B: the fill is THIS template's own, so a neighbour's colour or white fails.
+      expect(style.toLowerCase()).toContain(`background-color: ${fill.toLowerCase()}`);
       expect(style).toMatch(/(^|;)\s*padding:/i);
     }
   });
