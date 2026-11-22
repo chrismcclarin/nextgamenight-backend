@@ -438,7 +438,7 @@ function generateEventConfirmationEmailTemplate(data) {
     .participants-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
     .participant-badge { background-color: #D1FAE5; color: #065F46; padding: 4px 12px; border-radius: 16px; font-size: 14px; }
     .button { display: inline-block; padding: 14px 28px; background-color: #10B981; color: white; text-decoration: none; border-radius: 8px; margin: 24px 0; font-weight: 600; text-align: center; }
-    .button:hover { background-color: #059669; }
+    .button:hover { background-color: #059669 !important; }
     .footer { text-align: center; color: #6B7280; font-size: 12px; margin-top: 24px; padding-top: 24px; border-top: 1px solid #E5E7EB; }
     .footer a { color: #10B981; text-decoration: none; }
     .checkmark { display: inline-block; width: 24px; height: 24px; background-color: white; border-radius: 50%; margin-right: 8px; vertical-align: middle; }
@@ -487,7 +487,7 @@ function generateEventConfirmationEmailTemplate(data) {
       </div>
 
       <div style="text-align: center;">
-        <a href="${eventUrl}" class="button">View Event Details</a>
+        <a href="${eventUrl}" class="button" style="display: inline-block; padding: 14px 28px; background-color: #10B981; color: #ffffff; text-decoration: none; border-radius: 8px; margin: 24px 0; font-weight: 600; text-align: center;">View Event Details</a>
       </div>
 
       <p style="color: #6B7280; font-size: 14px;">

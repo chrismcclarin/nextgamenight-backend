@@ -203,7 +203,19 @@ router.post(
   [
     // Exactly one of `email` / `friend_user_id` / `participant_user_id` must be
     // present — the count is enforced in the handler (see inviteeSelectors).
-    body('email').optional().isEmail().normalizeEmail().withMessage('Valid email is required'),
+    // DECISION quick-261121-inv I1 (owner go, 2026-11-21): the address is kept AS TYPED (trimmed here,
+    // lower-cased in the handler), chosen OVER express-validator's normalizeEmail(), which shipped
+    // here. Its defaults cut the sub-address tag off Gmail, Outlook, Yahoo and iCloud addresses and remove the
+    // dots from a Gmail address, so the invite was stored and mailed under an address the invited
+    // account does not have: GET /pending and all three accept / decline routes below compare the
+    // account's own address with the stored one, and every one of them missed. The owner found it on
+    // staging with a "+bob" address. Named cost (review LOW-1): an inviter who types a DIFFERENT
+    // spelling of a Gmail address than the account holds (john.doe@ for an account stored as
+    // johndoe@) used to match and no longer does; the mail still arrives, the invite cannot be
+    // accepted. Rarer than the case fixed, and a full cure is matching on a canonical form on both
+    // sides, which this change does not attempt. Putting normalizeEmail() back is a decision, not a cleanup;
+    // tests/routes/invites.test.js ("the typed address is kept") pins it.
+    body('email').optional().trim().isEmail().withMessage('Valid email is required'),
     body('friend_user_id').optional().isString().trim().notEmpty().withMessage('friend_user_id must be a non-empty string'),
     body('participant_user_id').optional().isUUID().withMessage('participant_user_id must be a valid User id'),
     body('group_id').isUUID().withMessage('Valid group_id is required'),

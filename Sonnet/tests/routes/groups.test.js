@@ -891,3 +891,33 @@ describe('PUT /:group_id/settings — colour preset storage (SPEC Req 5, D-01/D-
     expect(fresh.name).toBe(originalName);     // the undeclared one did not
   });
 });
+
+// quick-261121-inv (G1): the home group list has one fixed order. The owner saved a group's
+// settings with nothing changed and the group moved to the end of his list: the query gave no
+// order, so the rows came back in storage order and a saved row is rewritten last.
+describe('GET /api/groups/user/:user_id — name order, A to Z (quick-261121-inv G1)', () => {
+  it('lists groups by name without regard to case, and a settings save does not move a group', async () => {
+    const owner = await makeUser({ user_id: 'order-owner', username: 'orderowner' });
+    const names = ['mango Club', 'Apple Night', 'Zebra Squad', 'banana Bunch'];
+    const groups = [];
+    for (const [i, name] of names.entries()) {
+      const g = await Group.create({ group_id: `order-group-${i}`, name });
+      await addToGroup(owner, g, 'owner');
+      groups.push(g);
+    }
+    const app = makeApp(owner);
+    const expected = ['Apple Night', 'banana Bunch', 'mango Club', 'Zebra Squad'];
+
+    const before = await request(app).get(`/api/groups/user/${owner.user_id}`).expect(200);
+    expect(before.body.map((g) => g.name)).toEqual(expected);
+
+    // The owner's exact steps: Save Changes on the first-listed group, nothing changed.
+    await request(app)
+      .put(`/api/groups/${groups[1].id}/settings`)
+      .send({ name: 'Apple Night' })
+      .expect(200);
+
+    const after = await request(app).get(`/api/groups/user/${owner.user_id}`).expect(200);
+    expect(after.body.map((g) => g.name)).toEqual(expected);
+  });
+});
