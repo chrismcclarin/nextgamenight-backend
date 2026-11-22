@@ -487,7 +487,7 @@ function generateEventConfirmationEmailTemplate(data) {
       </div>
 
       <div style="text-align: center;">
-        <a href="${eventUrl}" class="button" style="color: #ffffff; text-decoration: none;">View Event Details</a>
+        <a href="${eventUrl}" class="button" style="display: inline-block; padding: 14px 28px; background-color: #10B981; color: #ffffff; text-decoration: none; border-radius: 8px; margin: 24px 0; font-weight: 600; text-align: center;">View Event Details</a>
       </div>
 
       <p style="color: #6B7280; font-size: 14px;">

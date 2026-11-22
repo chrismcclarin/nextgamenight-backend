@@ -44,6 +44,10 @@ describe('email button links carry their own text colour (quick-261121-inv E1/E2
     for (const tag of buttons) {
       const style = (tag.match(/style="([^"]*)"/) || [])[1] || '';
       expect(style).toMatch(/(^|;)\s*color:\s*(white|#fff(fff)?)\b/i);
+      // Review MED-1: the fill and the padding travel with the ink. A mail app that drops the
+      // <style> block would otherwise show white words on no fill at all.
+      expect(style).toMatch(/(^|;)\s*background-color:\s*#[0-9a-f]{6}\b/i);
+      expect(style).toMatch(/(^|;)\s*padding:/i);
     }
   });
 });
