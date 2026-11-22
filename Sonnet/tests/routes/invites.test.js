@@ -1281,3 +1281,59 @@ describe('Phase 88-34 Task 4 — invite 409 machine-readable codes (fork F)', ()
     expect(memberRes.status).toBe(ERROR_REGISTRY[memberRes.body.code].httpStatus);
   });
 });
+
+// quick-261121-inv (I1): the invite-by-email path stores, mails and matches the address the
+// inviter TYPED. The owner found it on staging: an invite typed to a "+bob" address was saved
+// and mailed under the bare address, so the invited account never saw it in the bell and the
+// emailed link refused it (every accept route compares the account address with the stored one).
+describe('POST /invites/send — the typed address is kept (quick-261121-inv I1)', () => {
+  let owner;
+  let group;
+
+  beforeEach(async () => {
+    owner = await User.create({
+      user_id: 'auth0|typed-owner',
+      username: 'typed-owner',
+      email: 'typed-owner@example.com',
+    });
+    group = await Group.create({ group_id: 'typed-address-group', name: 'Typed Address Group' });
+    await UserGroup.create({ user_uuid: owner.id, group_id: group.id, role: 'owner', status: 'active' });
+    currentActor = owner.user_id;
+  });
+
+  it.each([
+    ['a Gmail +tag', 'someone+bob@gmail.com', 'someone+bob@gmail.com'],
+    ['Gmail dots', 'first.last@gmail.com', 'first.last@gmail.com'],
+    ['an Outlook +tag', 'someone+games@outlook.com', 'someone+games@outlook.com'],
+    ['capital letters (lower-cased, nothing else)', 'First.Last+Tag@Gmail.com', 'first.last+tag@gmail.com'],
+  ])('stores %s as typed', async (_name, typed, stored) => {
+    await request(app)
+      .post('/api/invites/send')
+      .send({ group_id: group.id, email: typed })
+      .expect(201);
+
+    const invite = await GroupInvite.findOne({ where: { group_id: group.id, status: 'pending' } });
+    expect(invite.invited_email).toBe(stored);
+  });
+
+  it('an account whose address has a +tag sees the invite in GET /pending and can accept it', async () => {
+    const invitee = await User.create({
+      user_id: 'auth0|typed-invitee',
+      username: 'typed-invitee',
+      email: 'someone+bob@gmail.com',
+    });
+
+    await request(app)
+      .post('/api/invites/send')
+      .send({ group_id: group.id, email: 'someone+bob@gmail.com' })
+      .expect(201);
+
+    currentActor = invitee.user_id;
+    const pending = await request(app).get('/api/invites/pending').expect(200);
+    expect(pending.body).toHaveLength(1);
+
+    await request(app).post(`/api/invites/${pending.body[0].id}/accept`).expect(200);
+    const membership = await UserGroup.findOne({ where: { user_uuid: invitee.id, group_id: group.id } });
+    expect(membership.status).toBe('active');
+  });
+});

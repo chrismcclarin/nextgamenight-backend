@@ -225,6 +225,16 @@ router.get('/user/:user_id', async (req, res) => {
     // Get all groups with their members and recent events
     const groups = await Group.findAll({
       where: { id: groupIds },
+      // DECISION quick-261121-inv G1 (owner ruling 2026-11-21: "A, we already have the calendar to
+      // deal with soonest game night"): the list is ordered by name, A to Z without regard to case,
+      // then by id so two groups with one name keep their places. Chosen OVER no order at all (what
+      // shipped: rows came back in storage order, so saving a group's settings moved it to the end
+      // of the owner's list) and OVER soonest-game-night-first (reshuffles as nights pass). The
+      // frontend shows the list as sent. tests/routes/groups.test.js ("name order, A to Z") pins it.
+      order: [
+        [sequelize.fn('LOWER', sequelize.col('Group.name')), 'ASC'],
+        ['id', 'ASC'],
+      ],
       include: [
         {
           model: User,

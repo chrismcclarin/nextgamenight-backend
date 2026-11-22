@@ -340,7 +340,7 @@ class EmailService {
       </ul>
 
       <div style="text-align: center; margin: 30px 0;">
-        <a href="${dashboardUrl}" class="button">Review Suggestions</a>
+        <a href="${dashboardUrl}" class="button" style="color: #ffffff; text-decoration: none;">Review Suggestions</a>
       </div>
     </div>
   </div>
@@ -681,7 +681,7 @@ This is an automated notification from Next Game Night.
       <p>The group has ${memberCount} member${memberCount !== 1 ? 's' : ''}.</p>
 
       <div style="text-align: center; margin: 30px 0;">
-        <a href="${inviteUrl}" class="button">View Invite</a>
+        <a href="${inviteUrl}" class="button" style="color: #ffffff; text-decoration: none;">View Invite</a>
       </div>
 
       <p>If you don't have an account yet, you'll be able to create one when you click the link above.</p>
@@ -806,7 +806,7 @@ This is an automated notification from Next Game Night.
       <p>If you want to keep it, you can take it over. Follow the link below and you become the group's owner, and everything comes back exactly as it was.</p>
 
       <div style="text-align: center; margin: 30px 0;">
-        <a href="${restoreUrl}" class="button">Take over this group</a>
+        <a href="${restoreUrl}" class="button" style="color: #ffffff; text-decoration: none;">Take over this group</a>
       </div>
 
       <p>If nobody takes it over by <span class="deadline">${safeDeadline}</span>, the group and everything in it is erased.</p>
@@ -1250,7 +1250,7 @@ RSVP:
       </div>
 
       <div style="text-align: center;">
-        <a href="${eventUrl}" class="button">View Event Details</a>
+        <a href="${eventUrl}" class="button" style="color: #ffffff; text-decoration: none;">View Event Details</a>
       </div>
 
       <p>We hope to see you there!</p>
@@ -1443,7 +1443,7 @@ RSVP (re-confirm your attendance):
       </div>
 
       <div style="text-align: center;">
-        <a href="${eventUrl}" class="button">View Event Details</a>
+        <a href="${eventUrl}" class="button" style="color: #ffffff; text-decoration: none;">View Event Details</a>
       </div>
 
       <div class="footer">
@@ -1546,7 +1546,7 @@ You can manage your notification preferences in your profile: ${this.frontendUrl
       </div>
 
       <div style="text-align: center;">
-        <a href="${groupUrl}" class="button">Go to Group</a>
+        <a href="${groupUrl}" class="button" style="color: #ffffff; text-decoration: none;">Go to Group</a>
       </div>
 
       <div class="footer">
