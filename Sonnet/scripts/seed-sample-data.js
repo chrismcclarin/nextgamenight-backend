@@ -53,8 +53,25 @@ const sampleUsers = buildSampleUsers(process.env);
 const pendingInviteeEmail = seedAddress('pending-invitee', process.env);
 const stagingEmailBase = process.env.SEED_EMAIL_BASE;
 
+// DECISION quick-261122-ico (owner, 2026-11-22): two seeded groups carry a group icon, OVER
+// leaving every group without one — no seeded group had an icon, so the icon slot on the
+// Home card, the group page title row and the calendar tiles was never seen on a walk or
+// a capture. Weekend Warriors gets the PICTURE form and Photo Club the EMOJI form (one of
+// the eight defaults Group Settings offers), so both render arms are on screen.
+// The picture is the frontend's own /seed/photo-club-table.jpg as an ABSOLUTE address
+// built from FRONTEND_URL (set in walk-states sub-block (e), beside Photo Club's header
+// image), OVER a relative '/seed/...' path: the frontend would draw a relative path, but
+// Group Settings sends the stored icon back on every save and validateGroupUpdate
+// (middleware/validators.js) accepts only an http(s) address or a string of 10
+// characters or fewer, so a relative path made every settings save on the group fail with
+// 400 (review of PR #79). Also OVER a third-party host (every page load would reach an
+// outside site). It reuses Photo Club's header picture; a dedicated icon file would need
+// a frontend change and one path here. This is a static seed value, not a spec-time
+// mutation, so e2e-fixtures.js "DECISION Phase 88.3 (OQ-1)" (Weekend Warriors is never
+// mutated from inside a spec) still holds. Removing either icon is a decision, not a
+// cleanup.
 const sampleGroups = [
-  { group_id: 'weekend-warriors', name: 'Weekend Warriors' },
+  { group_id: 'weekend-warriors', name: 'Weekend Warriors' }, // its picture icon is set in walk-states sub-block (e), quick-261122-ico
   { group_id: 'strategy-squad', name: 'Strategy Squad' },
   { group_id: 'casual-gamers', name: 'Casual Gamers' },
   // Phase 88.9 round 1b (walk fixtures): Alice is a member of NEITHER. Dice
@@ -67,7 +84,7 @@ const sampleGroups = [
   // from every list by the paranoid clause until someone restores it.
   { group_id: 'retired-raiders', name: 'Retired Raiders' },
   // Quick 261110-ugi: appended at index 6 so every existing groups[N] stays put; see sub-block (e) U3.
-  { group_id: 'photo-club', name: 'Photo Club' }, // 88.9-R2 fixture — Photo Club (N16)
+  { group_id: 'photo-club', name: 'Photo Club', profile_picture_url: '\u{1F3B2}' }, // 88.9-R2 fixture — Photo Club (N16); the dice emoji icon is quick-261122-ico
 ];
 
 const sampleGames = [
@@ -832,6 +849,7 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
     const photoClub = groups[6];
     await photoClub.update({ background_image_url: `${frontendUrl}/seed/photo-club-table.jpg` }); // 88.9-R2 fixture — photo card with NO stored colour (N16)
+    await groups[0].update({ profile_picture_url: `${frontendUrl}/seed/photo-club-table.jpg` }); // quick-261122-ico — Weekend Warriors' picture icon (see the DECISION above sampleGroups)
     const photoClubNight = await Event.create({ // 88.9-R2 fixture — Photo Club's Last Game night (N16)
       group_id: photoClub.id,
       game_id: games[1].id, // Ticket to Ride

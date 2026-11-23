@@ -298,6 +298,38 @@ describe('seed look fixtures (88.9 round 2, quick 261110-ugi)', () => {
     expect(weekend.background_image_url).toBeNull();
   }, 120000);
 
+  it('group icons: Photo Club carries a default emoji icon and Weekend Warriors a picture icon, both values pass the settings-save validator, and every other seeded group has none', async () => {
+    const walkOrigin = 'http://walk.test:3999';
+    process.env.FRONTEND_URL = walkOrigin;
+    await runSeed();
+    const club = await Group.findOne({ where: { group_id: 'photo-club' } });
+    // One of the eight defaults Group Settings offers (FE GroupSettings.js DEFAULT_PROFILE_PICTURES).
+    expect(club.profile_picture_url).toBe('\u{1F3B2}');
+    const weekend = await Group.findOne({ where: { group_id: 'weekend-warriors' } });
+    // ABSOLUTE, built from FRONTEND_URL: Group Settings sends the stored icon back on every
+    // save, and validateGroupUpdate rejects a relative path (review of PR #79, HIGH).
+    expect(weekend.profile_picture_url).toBe(`${walkOrigin}/seed/photo-club-table.jpg`);
+    // The save path's own rule, run on each seeded icon: a seeded value the validator
+    // rejects makes every settings save on that group fail with 400.
+    const { validationResult } = require('express-validator');
+    const { validateGroupUpdate } = require('../../middleware/validators');
+    for (const group of [club, weekend]) {
+      const req = { body: { profile_picture_url: group.profile_picture_url } };
+      for (const chain of validateGroupUpdate) {
+        if (typeof chain.run === 'function') await chain.run(req);
+      }
+      const iconErrors = validationResult(req).array().filter((e) => e.path === 'profile_picture_url');
+      expect(iconErrors).toEqual([]);
+    }
+    // paranoid: false so the soft-deleted Retired Raiders is counted too.
+    const others = await Group.findAll({
+      where: { group_id: ['strategy-squad', 'casual-gamers', 'dice-dynasty', 'no-games-yet', 'retired-raiders'] },
+      paranoid: false,
+    });
+    expect(others).toHaveLength(5);
+    for (const group of others) expect(group.profile_picture_url).toBeNull();
+  }, 120000);
+
   it('N16: Photo Club is a photo card with NO stored colour that Alice belongs to — the image is the app\'s own game-table picture /seed/photo-club-table.jpg (a busy picture, not a logo), and Dice Dynasty and No Games Yet still have no Alice', async () => {
     // A FRONTEND_URL distinct from the seed's localhost:3000 fallback, so the pin can tell
     // an env read from a hardcoded origin (review L-2). Per test only: parseRsvpLink
