@@ -298,19 +298,35 @@ describe('seed look fixtures (88.9 round 2, quick 261110-ugi)', () => {
     expect(weekend.background_image_url).toBeNull();
   }, 120000);
 
-  it('group icons: Photo Club carries a default emoji icon and Weekend Warriors a picture icon, and every other seeded group has none', async () => {
+  it('group icons: Photo Club carries a default emoji icon and Weekend Warriors a picture icon, both values pass the settings-save validator, and every other seeded group has none', async () => {
+    const walkOrigin = 'http://walk.test:3999';
+    process.env.FRONTEND_URL = walkOrigin;
     await runSeed();
     const club = await Group.findOne({ where: { group_id: 'photo-club' } });
     // One of the eight defaults Group Settings offers (FE GroupSettings.js DEFAULT_PROFILE_PICTURES).
     expect(club.profile_picture_url).toBe('\u{1F3B2}');
     const weekend = await Group.findOne({ where: { group_id: 'weekend-warriors' } });
-    // A relative ref: the FE's icon sinks accept a value that starts with '/', so the
-    // picture is served by whichever frontend renders it and needs no FRONTEND_URL.
-    expect(weekend.profile_picture_url).toBe('/seed/photo-club-table.jpg');
+    // ABSOLUTE, built from FRONTEND_URL: Group Settings sends the stored icon back on every
+    // save, and validateGroupUpdate rejects a relative path (review of PR #79, HIGH).
+    expect(weekend.profile_picture_url).toBe(`${walkOrigin}/seed/photo-club-table.jpg`);
+    // The save path's own rule, run on each seeded icon: a seeded value the validator
+    // rejects makes every settings save on that group fail with 400.
+    const { validationResult } = require('express-validator');
+    const { validateGroupUpdate } = require('../../middleware/validators');
+    for (const group of [club, weekend]) {
+      const req = { body: { profile_picture_url: group.profile_picture_url } };
+      for (const chain of validateGroupUpdate) {
+        if (typeof chain.run === 'function') await chain.run(req);
+      }
+      const iconErrors = validationResult(req).array().filter((e) => e.path === 'profile_picture_url');
+      expect(iconErrors).toEqual([]);
+    }
+    // paranoid: false so the soft-deleted Retired Raiders is counted too.
     const others = await Group.findAll({
-      where: { group_id: ['strategy-squad', 'casual-gamers', 'dice-dynasty', 'no-games-yet'] },
+      where: { group_id: ['strategy-squad', 'casual-gamers', 'dice-dynasty', 'no-games-yet', 'retired-raiders'] },
+      paranoid: false,
     });
-    expect(others).toHaveLength(4);
+    expect(others).toHaveLength(5);
     for (const group of others) expect(group.profile_picture_url).toBeNull();
   }, 120000);
 

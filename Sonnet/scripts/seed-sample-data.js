@@ -58,16 +58,20 @@ const stagingEmailBase = process.env.SEED_EMAIL_BASE;
 // Home card, the group page title row and the calendar tiles was never seen on a walk or
 // a capture. Weekend Warriors gets the PICTURE form and Photo Club the EMOJI form (one of
 // the eight defaults Group Settings offers), so both render arms are on screen.
-// The picture is the frontend's own /seed/photo-club-table.jpg as a RELATIVE ref, OVER an
-// absolute FRONTEND_URL address (the icon sinks accept a value starting with '/', unlike
-// the header-image sink, so the picture follows whichever frontend renders it) and OVER a
-// third-party host (every page load would reach an outside site). It reuses Photo Club's
-// header picture; a dedicated icon file would need a frontend change and no seed change
-// beyond this path. This is a static seed value, not a spec-time mutation, so
-// e2e-fixtures.js "DECISION Phase 88.3 (OQ-1)" (Weekend Warriors is never mutated from
-// inside a spec) still holds. Removing either icon is a decision, not a cleanup.
+// The picture is the frontend's own /seed/photo-club-table.jpg as an ABSOLUTE address
+// built from FRONTEND_URL (set in walk-states sub-block (e), beside Photo Club's header
+// image), OVER a relative '/seed/...' path: the frontend would draw a relative path, but
+// Group Settings sends the stored icon back on every save and validateGroupUpdate
+// (middleware/validators.js) accepts only an http(s) address or a string of 10
+// characters or fewer, so a relative path made every settings save on the group fail with
+// 400 (review of PR #79). Also OVER a third-party host (every page load would reach an
+// outside site). It reuses Photo Club's header picture; a dedicated icon file would need
+// a frontend change and one path here. This is a static seed value, not a spec-time
+// mutation, so e2e-fixtures.js "DECISION Phase 88.3 (OQ-1)" (Weekend Warriors is never
+// mutated from inside a spec) still holds. Removing either icon is a decision, not a
+// cleanup.
 const sampleGroups = [
-  { group_id: 'weekend-warriors', name: 'Weekend Warriors', profile_picture_url: '/seed/photo-club-table.jpg' },
+  { group_id: 'weekend-warriors', name: 'Weekend Warriors' }, // its picture icon is set in walk-states sub-block (e), quick-261122-ico
   { group_id: 'strategy-squad', name: 'Strategy Squad' },
   { group_id: 'casual-gamers', name: 'Casual Gamers' },
   // Phase 88.9 round 1b (walk fixtures): Alice is a member of NEITHER. Dice
@@ -845,6 +849,7 @@ async function seedDatabase({ syncSchema = true, closeConnection = true } = {}) 
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
     const photoClub = groups[6];
     await photoClub.update({ background_image_url: `${frontendUrl}/seed/photo-club-table.jpg` }); // 88.9-R2 fixture — photo card with NO stored colour (N16)
+    await groups[0].update({ profile_picture_url: `${frontendUrl}/seed/photo-club-table.jpg` }); // quick-261122-ico — Weekend Warriors' picture icon (see the DECISION above sampleGroups)
     const photoClubNight = await Event.create({ // 88.9-R2 fixture — Photo Club's Last Game night (N16)
       group_id: photoClub.id,
       game_id: games[1].id, // Ticket to Ride
