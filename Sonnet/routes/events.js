@@ -12,6 +12,8 @@ const { isUuid } = require('../utils/resolveTargetUser');
 // on the very next line at each of those sites are attribution labels, not
 // people-chips, and stay literal id-and-username pairs on purpose.
 const { PUBLIC_USER_ATTRS } = require('../utils/publicUserAttrs');
+// Phase 89.6-28 (X42 backend twin): the invite preview and join gates; see the helper's DECISION marker.
+const { isNightOver } = require('../utils/isNightOver');
 // Phase 88.8 plan 06 (SPEC A1 / D-13): the single home of the JIT provisioning policy.
 const provisioningService = require('../services/provisioningService');
 const { Op } = require('sequelize');
@@ -1313,7 +1315,7 @@ router.get('/invite-preview/:token', async (req, res) => {
     }
 
     // Check if event has already passed
-    if (new Date(event.start_date) < new Date()) {
+    if (isNightOver(event)) {
       return res.status(410).json({ error: 'This game night has already passed', expired: true });
     }
 
@@ -1360,7 +1362,7 @@ router.post('/join-game-by-token', async (req, res) => {
     }
 
     // Check if event has already passed
-    if (new Date(event.start_date) < new Date()) {
+    if (isNightOver(event)) {
       return res.status(410).json({ error: 'This game night has already passed', expired: true });
     }
 
